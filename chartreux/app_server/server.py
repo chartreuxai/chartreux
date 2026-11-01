@@ -37,6 +37,7 @@ from chartreux.app_server.protocol import (
     CallbackCallResponse,
     CallbackResultError,
     CallbackResultParams,
+    ChildCallbackClosedParams,
     ClientCapabilities,
     ClientInfo,
     ConfigReloadParams,
@@ -1394,7 +1395,16 @@ class AppServer:
     async def _record_child_notification(
         self, method: str, params: ProtocolModel
     ) -> None:
-        del method
+        if method == ChildCallbackClosedParams.NOTIFICATION_METHOD:
+            # Child history never enters the ROOT projection, and every other
+            # child notification is only re-sequenced (its state lives in the
+            # child session). This one must reach the attached client: without
+            # it a parent-side widget for a torn-down child callback strands.
+            # _notify validates the declared method and routes it on the normal
+            # notification path — through the root backend stream when one is
+            # subscribed, straight to the transport otherwise.
+            await self._notify(method, params)
+            return
         self._sequence_notification(params)
 
     def client_info(self) -> ClientInfo:

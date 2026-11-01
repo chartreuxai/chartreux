@@ -10,6 +10,22 @@ else resolves ask-class (the ``network.egress`` dangerous operation, the same
 class as git push), so interactive main sessions surface the approval dialog
 and headless or child sessions deny with remediation.
 
+Since v0.7.0 S3 the rule models a third client, HTTPie's ``http``, under a
+RESTRICTED positional-only grammar: ``http [METHOD] URL [ITEM...]`` with a
+closed method set, a literal ``http(s)://`` URL, and literal request items
+only (no option, no request item that reads a local file). Every spelling
+outside that enumerated grammar — and every effect the model cannot bound,
+such as an option or a startup-config indirection — HARD-DENIES: it is not a
+destination question, so no operation ID exists and no grant can approve it.
+A destination the model can name but cannot prove loopback still resolves
+ask-class. The other two clients S3 names stay on the shipped denylist:
+``httpie``, because its 3.x entry point is the plugin/CLI manager and the
+admission prerequisite is a confirmed request grammar at the installed entry
+point, and ``wget2``, because no effective redirect-disable has been
+documented and tested for it — so every ``wget2`` spelling, its loopback
+auto-allow included, resolves denied rather than inheriting wget's redirect
+default or its FTP PASV residual.
+
 Recognition is syntactic and fail-closed on every axis:
 
 - Only literal-URL destinations are classified. A schemeless operand
@@ -91,10 +107,11 @@ from chartreux.core.tools.builtins._shell_argv import (
     _scan_options,
 )
 
-# The modeled network clients: off the shipped denylist since v0.5.9 P2-a,
-# classified by destination here. Every other egress-capable client stays
-# denylisted until modeled.
-NETWORK_CLIENTS = frozenset({"curl", "wget"})
+# The modeled network clients. curl and wget left the shipped denylist in
+# v0.5.9 P2-a and http (HTTPie) in v0.7.0 S3; all three are classified by
+# destination here, with http under the restricted grammar below. Every other
+# egress-capable client stays denylisted until modeled.
+NETWORK_CLIENTS = frozenset({"curl", "http", "wget"})
 
 # curl's value-taking options. The scanner consumes their operands (separate
 # and attached spellings alike) so they never surface as positional
@@ -495,10 +512,13 @@ class EgressClassification:
     destination-changing behavior gate fired, so the invocation resolves
     run-class. ``ask``: the invocation resolves ask-class (the
     ``network.egress`` dangerous operation); ``reason`` names the behavior
-    class or the offending destination.
+    class or the offending destination. ``deny`` (v0.7.0 S3): an
+    unrecognized grammar or an effect the client's model cannot bound — a
+    hard denial with no operation ID and no grant path, so ``reason`` is the
+    whole denial text.
     """
 
-    kind: Literal["routine", "ask"]
+    kind: Literal["routine", "ask", "deny"]
     reason: str | None = None
 
 
@@ -659,6 +679,139 @@ def _non_loopback_proxy_key(env: Mapping[str, str]) -> str | None:
     return None
 
 
+# HTTPie's ``http`` client under the restricted positional-only grammar
+# (v0.7.0 S3). The admitted forms are exactly:
+#
+#   http URL
+#   http METHOD URL
+#   http [METHOD] URL ITEM...
+#
+# where METHOD is one of the closed set below, URL is a literal ``http://`` /
+# ``https://`` URL, and every ITEM is one of HTTPie's four literal request-item
+# spellings (``name=value`` data, ``name:=value`` raw JSON, ``name==value``
+# query parameter, ``name:value`` header). Every other spelling hard-denies:
+# an option, an ``@file``/``<file`` item (a local read the grammar does not
+# model), a non-http(s) scheme, a missing destination, or a stray operand.
+# HTTPie follows no redirects by default — ``--follow`` is an option, so it is
+# never admitted — which is what makes a literal loopback destination enough
+# for run-class.
+_HTTP_METHODS = frozenset({"DELETE", "GET", "HEAD", "OPTIONS", "PATCH", "POST", "PUT"})
+_HTTP_URL_SCHEMES = frozenset({"http", "https"})
+# Longest first, so ``name:=value`` and ``name==value`` are never read as the
+# single-character forms.
+_HTTP_ITEM_SEPARATORS = (":=", "==", "=", ":")
+# Characters a request-item NAME may not carry: the separators themselves,
+# whitespace, and the ``@``/``<``/``>`` spellings that turn an item into a file
+# upload or a file read.
+_HTTP_ITEM_FORBIDDEN_NAME_CHARACTERS = frozenset("@=:<> \t")
+# HTTPie's own startup config discovery: ``$HTTPIE_CONFIG_DIR/config.json``,
+# then ``$XDG_CONFIG_HOME/httpie/config.json``, then ``$HOME/.config/...``.
+# A config's ``default_options`` can add options (``--proxy``, ``--follow``,
+# ``--download``) the restricted grammar never saw, so an invocation carrying
+# one of these variables hard-denies. An ambient config file is the user's own
+# trust boundary, exactly like an ambient ``~/.curlrc``.
+_HTTP_CONFIG_ENV_KEYS = frozenset({"HTTPIE_CONFIG_DIR", "XDG_CONFIG_HOME", "HOME"})
+
+
+def _http_request_item_is_literal(item: str) -> bool:
+    """Whether an operand is one of HTTPie's literal request-item spellings.
+
+    The literal spellings carry data, a raw-JSON payload, a query parameter, or
+    a header to the destination and read no local file. ``name@file`` (upload),
+    a ``@file`` body, and the ``<file``/``=@file`` forms read local content the
+    http grammar does not model, so they are not literal. A missing separator,
+    an empty name or value, and a separator inside the name all fail closed.
+    """
+    for separator in _HTTP_ITEM_SEPARATORS:
+        name, found, value = item.partition(separator)
+        if not found:
+            continue
+        if not name or not value:
+            return False
+        if any(character in _HTTP_ITEM_FORBIDDEN_NAME_CHARACTERS for character in name):
+            return False
+        return value[0] not in {"@", "<"}
+    return False
+
+
+def _classify_http_invocation(  # noqa: PLR0911
+    args: list[str],
+    injected_env: Mapping[str, str] | None,
+    command_env: Mapping[str, str] | None,
+) -> EgressClassification:
+    """Classify an HTTPie ``http`` invocation under the restricted grammar.
+
+    ``deny`` is the verdict for every spelling outside the enumerated grammar
+    and for every effect the model cannot bound: an option (none is admitted),
+    a request item that reads a local file, a non-http(s) scheme, a missing
+    destination, a stray operand, or an invocation whose OWN command-line
+    environment points HTTPie at an uninspectable startup config. ``ask`` is
+    reserved for a destination the model can name but not prove loopback: a
+    non-loopback host, an unparseable or schemeless operand, and a loopback
+    invocation whose effective environment carries a non-loopback proxy.
+    """
+    for key in command_env or {}:
+        if key.upper() in _HTTP_CONFIG_ENV_KEYS:
+            return EgressClassification(
+                "deny",
+                f"the invocation's environment sets {key}, pointing HTTPie at "
+                "an uninspectable startup config whose default options the "
+                "http grammar does not model",
+            )
+    tokens = list(args)
+    if any(token.startswith("-") for token in tokens):
+        return EgressClassification(
+            "deny",
+            "the http grammar admits no options; the invocation carries one "
+            "the model cannot bound",
+        )
+    index = 1 if tokens and tokens[0] in _HTTP_METHODS else 0
+    if index >= len(tokens):
+        return EgressClassification(
+            "deny",
+            "the http grammar requires a literal http:// or https:// URL destination",
+        )
+    for item in tokens[index + 1 :]:
+        if not _http_request_item_is_literal(item):
+            return EgressClassification(
+                "deny",
+                f"the request item '{item}' is outside the http grammar: only "
+                "a literal name=value, name:=value, name==value, or "
+                "name:value item is admitted",
+            )
+    url = tokens[index]
+    try:
+        scheme = urlparse(url).scheme.casefold() if _URL_SCHEME.match(url) else ""
+    except ValueError:
+        scheme = ""
+    if scheme and scheme not in _HTTP_URL_SCHEMES:
+        return EgressClassification(
+            "deny",
+            f"the destination '{url}' is not an http:// or https:// URL; the "
+            "http grammar models no other scheme",
+        )
+    host = parse_literal_url_host(url)
+    if host is None:
+        return EgressClassification(
+            "ask", f"the destination '{url}' is not a recognizable literal URL"
+        )
+    if not is_loopback_host(host):
+        return EgressClassification("ask", f"the destination '{url}' is not loopback")
+    # The same effective-environment proxy binding the other modeled clients
+    # use: a non-loopback proxy carries the connection elsewhere.
+    effective_env: dict[str, str] = dict(injected_env or {})
+    effective_env.update(command_env or {})
+    if effective_env:
+        proxy_key = _non_loopback_proxy_key(effective_env)
+        if proxy_key is not None:
+            return EgressClassification(
+                "ask",
+                f"the invocation's environment sets {proxy_key} to a "
+                "non-loopback proxy",
+            )
+    return EgressClassification("routine")
+
+
 def _client_table(client: str) -> _OptionTable:
     return _WGET_TABLE if client == "wget" else _CURL_TABLE
 
@@ -765,6 +918,10 @@ def classify_network_egress(  # noqa: PLR0911, PLR0912
     resolve ask regardless of a literal loopback destination; every
     destination candidate must parse as a literal URL with a loopback host;
     a missing or unparseable destination resolves ask (never loopback).
+    HTTPie's ``http`` is delegated to :func:`_classify_http_invocation`, whose
+    restricted grammar is the only spelling set it admits: everything outside
+    it hard-denies rather than asking, because a grant must never make an
+    unbounded form approvable.
 
     ``injected_env`` is the trust-gated project environment the bash call's
     subprocess actually receives. ``command_env`` is the invocation's OWN
@@ -786,6 +943,12 @@ def classify_network_egress(  # noqa: PLR0911, PLR0912
     if not tokens:
         return EgressClassification("routine")
     client = _command_name(tokens[0])
+    if client == "http":
+        # v0.7.0 S3: HTTPie's request client has its own restricted grammar,
+        # so it never reaches the curl/wget option model below.
+        return _classify_http_invocation(
+            [str(token) for token in tokens[1:]], injected_env, command_env
+        )
     if client not in NETWORK_CLIENTS:
         return EgressClassification("routine")
     args = [str(token) for token in tokens[1:]]

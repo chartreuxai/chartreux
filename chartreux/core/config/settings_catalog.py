@@ -519,7 +519,8 @@ STATUS_LINE_SETTING = SettingDescriptor(
 # Inspection/revocation hook for dangerous-command permission authority. This
 # is deliberately not an editable setting: grants are approved per command in
 # the runtime flow and are never set through config writes, so the protected
-# dangerous_command_grants_by_project field stays excluded from the catalog.
+# dangerous_command_grants_by_project and remote_exec_grants_by_project fields
+# stay excluded from the catalog.
 SHELL_PERMISSIONS_SETTING = SettingDescriptor(
     "shell_permissions",
     "Shell Permissions",
@@ -611,6 +612,7 @@ EXCLUDED_SETTINGS = frozenset({
     "authorized_roots_by_project",
     "credential_env_passthrough",
     "dangerous_command_grants_by_project",
+    "remote_exec_grants_by_project",
     "session_logging.permission_repair_dir",
     "tools.<name>.allowlist",
     "tools.<name>.denylist",

@@ -45,6 +45,7 @@ from chartreux.app_server.events import (
     AgentsUpdate,
     AppServerEvent,
     CallbackRequested,
+    ChildCallbackClosed,
     HistoryEntryAdded,
     HistoryEntryUpdated,
     ServerError,
@@ -99,11 +100,15 @@ from chartreux.cli.process_start import PROCESS_START_WALLCLOCK
 from chartreux.cli.textual_ui.agent_browser import (
     AgentBrowserController,
     _AgentTranscriptSource as _AgentTranscriptSource,
+    _markdown_literal,
 )
 from chartreux.cli.textual_ui.bottom_panel import (
     DOUBLE_ESC_DELAY as DOUBLE_ESC_DELAY,
     BottomApp,
     BottomPanelController,
+)
+from chartreux.cli.textual_ui.effective_thinking import (
+    status_rows as thinking_status_rows,
 )
 from chartreux.cli.textual_ui.external_editor import ExternalEditor
 from chartreux.cli.textual_ui.handlers.event_handler import EventHandler
@@ -241,6 +246,7 @@ _DIAGNOSTIC_HEARTBEAT_DRIFT_WARNING_SECONDS = 0.25
 if TYPE_CHECKING:
     from chartreux.app_server.session import AppServerSession, SessionExitSummary
     from chartreux.cli.textual_ui.quit_manager import ExitConsequencesScreen
+    from chartreux.cli.textual_ui.screens.routes import RoutesSnapshot, RoutesUpdate
     from chartreux.cli.textual_ui.screens.settings import SettingsScreen
     from chartreux.cli.textual_ui.widgets.debug_console import DebugConsole
     from chartreux.cli.textual_ui.widgets.log_level_picker import LogLevelPickerApp
@@ -715,6 +721,7 @@ class ChartreuxApp(App):  # noqa: PLR0904
             poll_interval=_usage_poll_interval_seconds,
         )
         self._usage_worker: Worker[None] | None = None
+        self._routes_worker: Worker[None] | None = None
         self._app_server_event_handler_lock = asyncio.Lock()
         self._init_controllers()
 
@@ -1182,6 +1189,11 @@ class ChartreuxApp(App):  # noqa: PLR0904
     def get_default_screen(self) -> Screen:
         return _get_word_select_screen_class()(id="_default")
 
+    def _completion_workspace_root(self) -> Path:
+        if self._app_server is not None:
+            return Path(self._app_server.cwd)
+        return Path.cwd()
+
     def compose(self) -> ComposeResult:
         yield from self._compose_main_ui()
 
@@ -1245,6 +1257,7 @@ class ChartreuxApp(App):  # noqa: PLR0904
                 id="input-container",
                 skill_entries_getter=self._get_skill_entries,
                 file_watcher_for_autocomplete_getter=self._is_file_watcher_enabled,
+                workspace_root_getter=self._completion_workspace_root,
                 queue_edit_active_getter=self._is_queue_edit_active,
                 queue_items_getter=self._queue.queue_item_texts,
                 queue_selected_index_getter=self._queue_selected_queue_index,
@@ -3236,6 +3249,28 @@ class ChartreuxApp(App):  # noqa: PLR0904
                 )
                 self._refresh_context_progress()
 
+    async def _refresh_effective_thinking_for(self, event: AppServerEvent) -> None:
+        """Re-project the next-request thinking estimate after a history change.
+
+        Retained Anthropic thinking forces a level on the next request, so a
+        completed reasoning entry is where the estimate can change.
+        """
+        entry = _public_entry(event)
+        if (
+            isinstance(entry, PublicReasoningEntry)
+            and entry.generation_status is PublicEntryGenerationStatus.COMPLETED
+        ):
+            await self._refresh_effective_thinking()
+
+    async def _refresh_effective_thinking(self) -> None:
+        """Re-read the server-owned estimate instead of caching one here."""
+        try:
+            await self.app_server.resources.runtime.refresh()
+        except Exception:
+            logger.debug("Effective-thinking refresh failed", exc_info=True)
+            return
+        self._refresh_banner()
+
     async def _handle_agents_update(
         self, event: AgentsUpdate, received_at: float
     ) -> None:
@@ -3245,6 +3280,7 @@ class ChartreuxApp(App):  # noqa: PLR0904
         received_at = time.monotonic()
         self._turn_supervisor._track_turn_outcome(event)
         self._refresh_status_for_event(event)
+        await self._refresh_effective_thinking_for(event)
         if (
             isinstance(event, (TurnStarted, TurnUpdated, TurnCompleted))
             and self._loading_widget is not None
@@ -3262,8 +3298,15 @@ class ChartreuxApp(App):  # noqa: PLR0904
         if isinstance(event, ServerError):
             self.notify(event.params.error.message, severity="error")
             return
-        if isinstance(event, CallbackRequested):
-            await self._show_callback(event.callback)
+        if isinstance(event, (CallbackRequested, ChildCallbackClosed)):
+            if isinstance(event, CallbackRequested):
+                await self._show_callback(event.callback)
+            else:
+                # A child-owned callback became terminal (Q2b). It never enters
+                # the ROOT projection, so this notification is the only route by
+                # which the parent learns the widget must go; the supervisor
+                # matches it on the callback identity before dismissing.
+                await self._turn_supervisor._question_closed_by_child(event.params)
             return
         if isinstance(event, StatsUpdated):
             self._update_context_progress(event)
@@ -3272,14 +3315,16 @@ class ChartreuxApp(App):  # noqa: PLR0904
         if (
             isinstance(event, HistoryEntryUpdated)
             and isinstance(entry, PublicCallbackEntry)
-            and entry.state.status == "expired"
+            and entry.state.status != "open"
         ):
-            # The server expired this question unanswered (plan U/OD1): close
-            # the live question UI, preserve the draft, and continue. The
+            # The server closed this question — expired unanswered (plan
+            # U/OD1), cancelled, or answered elsewhere. Any non-open state
+            # closes the live question UI: it can no longer be resolved, so
+            # leaving the widget up strands it (the overnight incident). The
             # entry still flows through the generic handler so history shows
-            # the terminal expired state.
+            # the terminal state.
             self._invalidate_user_input()
-            await self._turn_supervisor.question_expired(entry)
+            await self._turn_supervisor._question_closed(entry)
         if isinstance(entry, PublicNoticeEntry) and isinstance(
             entry.detail, WaitingForInputNoticeDetail
         ):
@@ -3629,6 +3674,10 @@ class ChartreuxApp(App):  # noqa: PLR0904
         )
 
     async def _show_status(self, **kwargs: Any) -> None:
+        try:
+            await self.app_server.resources.runtime.refresh()
+        except Exception:
+            logger.debug("Status refresh failed; showing cached runtime state")
         stats = self.app_server.resources.runtime.stats
         session_cached = (
             f" _(including {stats.session_cached_tokens:,} cached)_"
@@ -3649,6 +3698,7 @@ class ChartreuxApp(App):  # noqa: PLR0904
 - **Last Turn Tokens**: {stats.last_turn_total_tokens:,}{last_turn_cached}
 - **Cost**: ${stats.session_cost:.4f}
 """
+        status_text += self._format_thinking_estimate()
         try:
             roots = await self.app_server.resources.config.read_roots()
             effective = (
@@ -3667,7 +3717,49 @@ class ChartreuxApp(App):  # noqa: PLR0904
             )
         except Exception:
             status_text += "\n## Authorized Roots\n\nProject roots unavailable.\n"
+        status_text += self._format_background_agent_results()
         await self._mount_and_scroll(UserCommandMessage(status_text))
+
+    def _format_background_agent_results(self) -> str:
+        """Uncollected background results from the last `agents/update` payload.
+
+        The TUI holds no on-demand agent-inventory read, so this section is a
+        point-in-time view of the snapshot the agent browser last received and
+        is worded as such (design B6); it never claims `check_agents` freshness.
+        """
+        lines = [
+            "",
+            "## Background Agent Results",
+            "",
+            "_As of the last agents update, bounded to the visible agent inventory._",
+            "",
+        ]
+        agents = [agent for agent in self._agent_summaries if agent.uncollected_run_ids]
+        if not agents:
+            lines.append("No visible uncollected results.")
+        else:
+            for agent in agents:
+                name = _markdown_literal(agent.name or agent.agent_id)
+                handle = _markdown_literal(agent.agent_id)
+                run_ids = ", ".join(
+                    _markdown_literal(run_id) for run_id in agent.uncollected_run_ids
+                )
+                lines.append(f"- **{name}** ({handle}): {run_ids}")
+        return "\n".join(lines) + "\n"
+
+    def _format_thinking_estimate(self) -> str:
+        rows = thinking_status_rows(
+            self.config.effective_thinking, requested=self.config.active_model.thinking
+        )
+        lines = [
+            "",
+            "## Thinking (next request)",
+            "",
+            "_Next-request estimate; an in-flight call or failover can differ._",
+            "",
+            *(f"- **{label}**: {value}" for label, value in rows),
+        ]
+        return "\n".join(lines) + "\n"
 
     async def _show_model(self, **kwargs: Any) -> None:
         """Switch to the model picker in the bottom panel."""
@@ -3710,6 +3802,49 @@ class ChartreuxApp(App):  # noqa: PLR0904
             self._usage_worker = None
             if not self._shutdown_started:
                 await self._present_pending_callback()
+
+    async def _show_routes(self, **kwargs: Any) -> None:
+        if self._shutdown_started or (
+            self._routes_worker is not None and not self._routes_worker.is_finished
+        ):
+            return
+        from chartreux.cli.textual_ui.screens.routes import RoutesScreen
+
+        if any(isinstance(screen, RoutesScreen) for screen in self.screen_stack):
+            return
+        self._routes_worker = self.run_worker(
+            self._wait_for_routes(), exclusive=False, name="routes"
+        )
+
+    async def _wait_for_routes(self) -> None:
+        from chartreux.cli.textual_ui.screens.routes import RoutesScreen
+
+        try:
+            # Push before reading: the browser owns its read-error state.
+            await self.push_screen_wait(
+                RoutesScreen(self._read_live_routes, self._subscribe_route_table())
+            )
+        finally:
+            self._routes_worker = None
+            if not self._shutdown_started:
+                await self._present_pending_callback()
+
+    def _read_live_routes(self) -> RoutesSnapshot:
+        """The conversation's LIVE table: the config view the app server keeps
+        current, re-read on every refresh so a reload swap is visible.
+        """
+        from chartreux.cli.textual_ui.screens.routes import RoutesSnapshot
+
+        view = self.config
+        return RoutesSnapshot(tuple(view.routes), view.routes_error)
+
+    def _subscribe_route_table(self) -> RoutesUpdate:
+        """Re-render the open browser when the app server republishes config."""
+
+        def subscribe(callback: Callable[[], None]) -> Callable[[], None]:
+            return self.app_server.resources.config.subscribe(lambda _view: callback())
+
+        return subscribe
 
     async def _show_settings(self, **kwargs: Any) -> None:
         if (
@@ -4354,6 +4489,8 @@ class ChartreuxApp(App):  # noqa: PLR0904
             # until the next model call, so nothing pushes the gauge down on its
             # own and it would keep showing the context compaction replaced.
             self._refresh_context_progress()
+            # Compaction rewrote the history the thinking estimate depends on.
+            self._refresh_banner()
             compact_msg.set_complete()
             # Compaction rewrote the context: the record changes owner back to
             # an idle prompt instead of leaving the pre-compaction state.
@@ -4611,6 +4748,7 @@ class ChartreuxApp(App):  # noqa: PLR0904
             in {
                 "settings-screen",
                 "usage-screen",
+                "routes-screen",
                 "websearch-screen",
                 "status-line-settings-screen",
                 "shell-permissions-screen",

@@ -259,6 +259,7 @@ class BottomPanelController:
             _get_thinking_picker_app_class()(
                 thinking_levels=THINKING_LEVELS,
                 current_thinking=self._app.config.active_model.thinking,
+                effective=self._app.config.effective_thinking,
             )
         )
 

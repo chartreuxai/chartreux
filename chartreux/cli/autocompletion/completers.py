@@ -119,10 +119,15 @@ class PathCompleter(Completer):
         max_entries_to_process: int | None = None,
         target_matches: int = DEFAULT_TARGET_MATCHES,
         watcher_enabled_getter: Callable[[], bool] | None = None,
+        workspace_root_getter: Callable[[], Path] | None = None,
     ) -> None:
         self._indexer = FileIndexer(should_enable_watcher=watcher_enabled_getter)
         self._max_entries_to_process = max_entries_to_process
         self._target_matches = target_matches
+        self._workspace_root_getter = workspace_root_getter or Path.cwd
+
+    def _workspace_root(self) -> Path:
+        return self._workspace_root_getter().expanduser().resolve()
 
     def shutdown(self) -> None:
         self._indexer.shutdown()
@@ -413,9 +418,9 @@ class PathCompleter(Completer):
             return None
         dir_portion, suffix = split
 
-        root = Path(".").resolve()
+        root = self._workspace_root()
         try:
-            target_dir = (Path(".") / dir_portion).resolve()
+            target_dir = (root / dir_portion).resolve()
         except (OSError, ValueError):
             return None
 
@@ -441,7 +446,7 @@ class PathCompleter(Completer):
     ) -> list[str]:
         entries: list[Path] = []
         try:
-            for entry in Path(".").iterdir():
+            for entry in self._workspace_root().iterdir():
                 if should_cancel and should_cancel():
                     return []
                 if not entry.name.startswith("."):
@@ -484,8 +489,7 @@ class PathCompleter(Completer):
         context = self._build_search_context(partial_path)
 
         try:
-            # TODO (Vince): doing the assumption that "." is the root directory... Reliable?
-            file_index = self._indexer.get_index(Path("."), should_cancel)
+            file_index = self._indexer.get_index(self._workspace_root(), should_cancel)
         except (OSError, RuntimeError):
             return []
 

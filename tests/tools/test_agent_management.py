@@ -404,6 +404,8 @@ async def test_check_agents_returns_agent_summaries() -> None:
         "compacting": False,
         "stop_reason": "budget_exceeded",
         "last_failure": None,
+        # O1: the latest run's audit stamp defaults to None (no retained run).
+        "completion_audit": None,
         "recovery_chain_id": None,
         "same_agent_resumes_used": None,
         "resumed_from_run_id": None,
@@ -415,7 +417,44 @@ async def test_check_agents_returns_agent_summaries() -> None:
         # The identity pair carries the committed launch identity.
         "identity": "coder",
         "identity_revision": None,
+        # U2: the uncollected-result list is always present, empty included.
+        "uncollected_run_ids": [],
     }
+
+
+def test_agent_summary_uncollected_run_ids_default_is_independent() -> None:
+    """U2: the core summary's empty-list default is per instance."""
+    first = AgentSummary(
+        agent_id="agent-1",
+        availability=AgentAvailability.IDLE,
+        current_run_id=None,
+        current_run_status=None,
+    )
+    second = AgentSummary(
+        agent_id="agent-2",
+        availability=AgentAvailability.IDLE,
+        current_run_id=None,
+        current_run_status=None,
+    )
+
+    first.uncollected_run_ids.append("run-1")
+
+    assert first.uncollected_run_ids == ["run-1"]
+    assert second.uncollected_run_ids == []
+
+
+def test_check_agents_prompt_documents_uncollected_run_ids() -> None:
+    """U3b/A2: the tool text explains the field once the data is real.
+
+    Each listed ID names a retained, retrievable result, and collecting an
+    older run requires PINNED collection by its run_id.
+    """
+    prompt = CheckAgents.get_tool_prompt()
+    assert prompt is not None
+    assert "uncollected_run_ids" in prompt
+    assert "retained and retrievable right now" in prompt
+    assert "newest first" in prompt
+    assert "PINNED collection by its `run_id`" in prompt
 
 
 @pytest.mark.asyncio

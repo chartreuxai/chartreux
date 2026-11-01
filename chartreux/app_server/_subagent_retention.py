@@ -195,6 +195,16 @@ class AgentRetention:
             if candidate is not None and candidate.failure is not None:
                 last_failure = candidate.failure
                 break
+        # O1: the terminal run's audit stamp, carried exactly like the failure
+        # envelope — only while that run's result is retained.
+        terminal_result = run.result if run is not None else None
+        completion_audit = (
+            terminal_result.completion_audit
+            if terminal_result is not None
+            and run is not None
+            and (agent_id, run.run_id) not in self._view._expired_results
+            else None
+        )
         summary = AgentSummary(
             agent_id=agent_id,
             identity=record.identity,
@@ -218,6 +228,7 @@ class AgentRetention:
             compacting=record.compacting,
             stop_reason=record.stop_reason,
             last_failure=last_failure,
+            completion_audit=completion_audit,
             result_expired=(
                 (agent_id, latest_run_id) in self._view._expired_results
                 if latest_run_id is not None

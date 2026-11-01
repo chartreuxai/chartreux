@@ -23,6 +23,10 @@ from chartreux.core.tools.builtins._shell_argument_positions import (
     is_read_only_argument_position,
     read_only_positions,
 )
+from chartreux.core.tools.builtins._shell_argv import split_shell_tokens
+from chartreux.core.tools.builtins._shell_permission_analysis import (
+    analyze_shell_command,
+)
 from chartreux.core.tools.builtins._shell_static_expansion import (
     _SIMULATION_READ_CAP_BYTES,
     evaluate_expansion_for_position,
@@ -771,6 +775,45 @@ def test_read_only_positions_listing() -> None:
     assert "positional:1" in read_only_positions("grep")
     assert "positional:1+" in read_only_positions("cat")
     assert read_only_positions("unknown-cmd") == frozenset()
+
+
+# --- S1 safe-pattern admissions (analysis-only, no execution) -----------------
+
+
+def test_s1_admissions_run_under_the_execution_ban() -> None:
+    """The quoted-marker and status-probe admissions never execute anything."""
+    for command in ("echo '=ls'", "echo \\=ls", "ls; echo $?"):
+        assert not analyze_shell_command(command).requires_approval
+
+
+def test_equals_marker_admission_emits_the_executed_source() -> None:
+    """The marker proof admits the word; no replacement text is fabricated."""
+    for command in ("echo '=ls'", "echo \\=ls"):
+        analysis = analyze_shell_command(command)
+        assert analysis.command_parts == (command,)
+        assert list(split_shell_tokens(analysis.command_parts[0])) == ["echo", "=ls"]
+
+
+def test_equals_marker_that_can_expand_past_one_word_keeps_its_denial() -> None:
+    analysis = analyze_shell_command("echo '='*")
+
+    assert analysis.approval_reasons == (
+        "an equals-marker word the shell can still expand",
+    )
+
+
+def test_status_probe_admission_keeps_the_executed_source_token() -> None:
+    """Analysis-replacement never diverges from execution."""
+    # The admitted part is the source the shell runs; the shell substitutes
+    # the status number, so the analysis keeps `$?` and fabricates no literal.
+    analysis = analyze_shell_command("ls; echo $?")
+
+    assert analysis.command_parts == ("ls", "echo $?")
+
+
+def test_status_probe_consumes_only_the_exact_admitted_shape() -> None:
+    for command in ("ls | echo $?", "ls && echo $?", "ls; echo $?; id"):
+        assert analyze_shell_command(command).requires_approval
 
 
 # --- the group execution-impossibility proof -----------------------------------

@@ -105,6 +105,7 @@ _ORDINARY_OVERRIDE_EXCLUDED_FIELDS = {
     *_CATALOG_FIELDS,
     "authorized_roots_by_project",
     "dangerous_command_grants_by_project",
+    "remote_exec_grants_by_project",
 }
 
 

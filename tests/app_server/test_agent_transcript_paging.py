@@ -1,15 +1,29 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
+from typing import cast
 
+from chartreux.app_server import _agent_transcript, _projection, _subagent_transcript
 from chartreux.app_server._agent_transcript import (
     _RESPONSE_BYTE_LIMIT,
+    _project_entries,
     read_agent_transcript,
     read_live_agent_transcript,
 )
-from chartreux.app_server.protocol import AgentTranscriptEntryKind, AgentTranscriptState
-from chartreux.core.llm_models import LLMMessage
+from chartreux.app_server._subagent_records import (
+    ArchiveTranscriptSource,
+    TranscriptMessageView,
+)
+from chartreux.app_server.protocol import (
+    AgentTranscriptEntry,
+    AgentTranscriptEntryKind,
+    AgentTranscriptState,
+    AgentTranscriptToolStatus,
+)
+from chartreux.core.llm_models import LLMMessage, Role
+from chartreux.core.session.transcript_archive import ArchivedPrefixV1
 
 
 def _write_session(path: Path, messages: list[dict[str, object]]) -> None:
@@ -527,6 +541,36 @@ def test_oversized_single_result_stays_bounded_and_pages_without_empty_trap(
     assert not older.has_more
 
 
+def test_archive_reads_go_through_the_shared_read_interface() -> None:
+    """One archive reader: the app-server consumers reach the sealed prefix
+    through the P4a1 interface (or its thin app-server re-export) and never
+    read, hash, or parse the transcript prefix themselves.
+    """
+    from chartreux.core.session import transcript_archive as shared
+
+    assert _agent_transcript.iter_archived_records is shared.iter_archived_records
+    assert _agent_transcript.archived_prefix_chunks is shared.archived_prefix_chunks
+    assert (
+        _projection.verify_archived_prefix_on_disk
+        is shared.verify_archived_prefix_on_disk
+    )
+    assert (
+        _projection.iter_archived_messages is _agent_transcript.iter_archived_messages
+    )
+    assert (
+        _projection.archive_transcript_source
+        is _agent_transcript.archive_transcript_source
+    )
+    assert (
+        _subagent_transcript.archive_transcript_source
+        is _agent_transcript.archive_transcript_source
+    )
+    for module in (_projection, _subagent_transcript):
+        source = Path(cast(str, module.__file__)).read_text()
+        assert "iter_archived_records" not in source
+        assert "messages.jsonl" not in source
+
+
 def test_missing_or_malformed_saved_files_do_not_crash(tmp_path: Path) -> None:
     assert read_agent_transcript(tmp_path, lambda: True).state is (
         AgentTranscriptState.NO_SAVED_TRANSCRIPT
@@ -536,3 +580,155 @@ def test_missing_or_malformed_saved_files_do_not_crash(tmp_path: Path) -> None:
     assert read_agent_transcript(tmp_path, lambda: True).state is (
         AgentTranscriptState.NO_SAVED_TRANSCRIPT
     )
+
+
+_ARCHIVED_RECORDS: list[dict[str, object]] = [
+    {"role": "user", "message_id": "user-1", "content": "one"},
+    {
+        "role": "assistant",
+        "message_id": "assistant-1",
+        "content": "two",
+        "tool_calls": [
+            {"id": "call-1", "function": {"name": "read_file", "arguments": "{}"}}
+        ],
+    },
+    {
+        "role": "tool",
+        "message_id": "tool-1",
+        "tool_call_id": "call-1",
+        "content": "file body",
+    },
+]
+
+
+def _archive_source(
+    directory: Path,
+    records: list[dict[str, object]],
+    *,
+    archived_count: int | None = None,
+    prefix_end_byte: int | None = None,
+) -> ArchiveTranscriptSource:
+    payload = b"".join(json.dumps(record).encode("utf-8") + b"\n" for record in records)
+    transcript = directory / "messages.jsonl"
+    transcript.write_bytes(payload)
+    return ArchiveTranscriptSource(
+        descriptor=ArchivedPrefixV1(
+            session_id="child-1",
+            message_epoch=0,
+            archived_count=(len(records) if archived_count is None else archived_count),
+            prefix_end_byte=(
+                len(payload) if prefix_end_byte is None else prefix_end_byte
+            ),
+            prefix_sha256=hashlib.sha256(payload).hexdigest(),
+            boundary_message_id="boundary-1",
+            trim_mode="payloads",
+        ),
+        path=transcript,
+    )
+
+
+def _trimmed_prefix_copies() -> list[LLMMessage]:
+    """The RAM copies of the sealed prefix: no tool_calls, no result content."""
+    return [
+        LLMMessage(role=Role.user, message_id="user-1", content="one"),
+        LLMMessage(role=Role.assistant, message_id="assistant-1", content="two"),
+        LLMMessage(role=Role.tool, message_id="tool-1", tool_call_id="call-1"),
+    ]
+
+
+def _live_tail() -> list[LLMMessage]:
+    return [
+        LLMMessage(role=Role.user, message_id="user-2", content="three"),
+        LLMMessage(role=Role.assistant, message_id="assistant-2", content="four"),
+    ]
+
+
+def _archived_view(
+    directory: Path, records: list[dict[str, object]]
+) -> TranscriptMessageView:
+    return TranscriptMessageView(
+        [
+            LLMMessage(role=Role.system, content="instructions"),
+            *_trimmed_prefix_copies(),
+            *_live_tail(),
+        ],
+        _archive_source(directory, records),
+    )
+
+
+def _all_pages(view: list[LLMMessage], limit: int) -> list[AgentTranscriptEntry]:
+    entries: list[AgentTranscriptEntry] = []
+    before = None
+    while True:
+        page = read_live_agent_transcript(view, before=before, limit=limit)
+        assert page.state is AgentTranscriptState.AVAILABLE
+        entries = [*(page.entries or []), *entries]
+        if not page.has_more:
+            return entries
+        assert page.oldest_cursor is not None
+        before = page.oldest_cursor
+
+
+def test_archived_prefix_and_live_tail_page_as_one_transcript(tmp_path: Path) -> None:
+    """Paging crosses the archive boundary: the archived disk records and the
+    live tail form one continuous transcript with no gap and no duplicate.
+    """
+    view = _archived_view(tmp_path, _ARCHIVED_RECORDS)
+    expected = _project_entries([
+        *_ARCHIVED_RECORDS,
+        *(
+            message.model_dump(exclude_none=True, mode="json")
+            for message in _live_tail()
+        ),
+    ])
+
+    assert _all_pages(view, 2) == expected
+
+
+def test_archived_paging_reads_disk_originals_not_the_trimmed_copies(
+    tmp_path: Path,
+) -> None:
+    """A prefix whose RAM copies lost their tool structure still pages the
+    persisted call and its matched result.
+    """
+    entries = _all_pages(_archived_view(tmp_path, _ARCHIVED_RECORDS), 50)
+
+    calls = [
+        entry for entry in entries if entry.kind is AgentTranscriptEntryKind.TOOL_CALL
+    ]
+    assert [entry.tool_name for entry in calls] == ["read_file"]
+    assert calls[0].tool_call_id == "call-1"
+    assert calls[0].status is AgentTranscriptToolStatus.COMPLETED
+    assert [entry.display_text for entry in entries][:2] == ["one", "two"]
+
+
+def test_unverifiable_archived_prefix_reports_changed(tmp_path: Path) -> None:
+    """A prefix the descriptor does not vouch for is never paged as if it
+    were the sealed transcript.
+    """
+    view = _archived_view(tmp_path, _ARCHIVED_RECORDS)
+    transcript = tmp_path / "messages.jsonl"
+    transcript.write_bytes(transcript.read_bytes().replace(b"one", b"ONE"))
+
+    response = read_live_agent_transcript(view)
+
+    assert response.state is AgentTranscriptState.CHANGED
+
+
+def test_archived_prefix_over_the_viewer_budget_reports_exceeds_limit(
+    tmp_path: Path,
+) -> None:
+    """The archived prefix obeys the same bounded-input limit as a disk read."""
+    view = TranscriptMessageView(
+        [*_trimmed_prefix_copies(), *_live_tail()],
+        _archive_source(
+            tmp_path,
+            _ARCHIVED_RECORDS,
+            archived_count=1,
+            prefix_end_byte=(16 * 1024 * 1024) + 1,
+        ),
+    )
+
+    response = read_live_agent_transcript(view)
+
+    assert response.state is AgentTranscriptState.EXCEEDS_VIEWER_LIMIT

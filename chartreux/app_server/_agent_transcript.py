@@ -1,17 +1,21 @@
 from __future__ import annotations
 
 import base64
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from functools import lru_cache
 import hashlib
 import json
 from pathlib import Path
-from typing import Any, cast
+from typing import TYPE_CHECKING, Any, cast
 
 from pydantic import JsonValue, ValidationError
 
+from chartreux.app_server._subagent_records import (
+    ArchiveTranscriptSource,
+    TranscriptMessageView,
+)
 from chartreux.app_server._tool_projection import (
     project_effect_detail,
     project_effect_output_value,
@@ -37,10 +41,17 @@ from chartreux.app_server.protocol import (
     AgentTranscriptTruncation,
 )
 from chartreux.core.llm_models import LLMMessage, Role
+from chartreux.core.message_list import MessageList
+from chartreux.core.session.session_index import MESSAGES_FILENAME
 from chartreux.core.session.session_loader import (
     BoundedSessionLoadState,
     SessionFileContainmentError,
     SessionLoader,
+)
+from chartreux.core.session.transcript_archive import (
+    ArchiveIntegrityError,
+    archived_prefix_chunks,
+    iter_archived_records,
 )
 from chartreux.core.utils import CANCELLATION_TAG, TOOL_ERROR_TAG, TaggedText
 from chartreux.utils.tool_presentation import (
@@ -51,13 +62,103 @@ from chartreux.utils.tool_presentation import (
     ToolResultPresentation,
 )
 
-__all__ = ["read_agent_transcript", "read_live_agent_transcript"]
+if TYPE_CHECKING:
+    from chartreux.core.agent_loop import AgentLoop
+
+__all__ = [
+    "archive_transcript_source",
+    "iter_archived_message_dicts",
+    "iter_archived_messages",
+    "live_tail_after_archived_prefix",
+    "read_agent_transcript",
+    "read_live_agent_transcript",
+]
 
 _INPUT_BYTE_LIMIT = 16 * 1024 * 1024
 _RESPONSE_BYTE_LIMIT = 512 * 1024
 _DISPLAY_TEXT_LIMIT = 8 * 1024
 _DEFAULT_LIMIT = 50
 _MAX_LIMIT = 200
+
+
+def archive_transcript_source(agent_loop: AgentLoop) -> ArchiveTranscriptSource | None:
+    """The sealed-prefix read source for a loop, when it owns archive state.
+
+    Only the authoritative pairing yields a source: the message list must
+    own a descriptor for THIS session and THIS message epoch, and the
+    session must have a directory to read the transcript from. Anything
+    else describes a list the RAM view no longer is, so the caller keeps
+    using the live view.
+    """
+    messages = agent_loop.messages
+    if not isinstance(messages, MessageList):
+        return None
+    descriptor = messages.archive_descriptor
+    if descriptor is None or descriptor.message_epoch != messages.message_epoch:
+        return None
+    if descriptor.session_id != agent_loop.session_id:
+        return None
+    session_dir = agent_loop.session_logger.session_dir
+    if session_dir is None:
+        return None
+    return ArchiveTranscriptSource(
+        descriptor=descriptor, path=session_dir / MESSAGES_FILENAME
+    )
+
+
+def iter_archived_message_dicts(
+    source: ArchiveTranscriptSource,
+) -> Iterator[dict[str, Any]]:
+    """Stream the sealed prefix's records through the shared read interface.
+
+    The records are hashed and counted as they stream; a byte count, record
+    count, or hash mismatch with the descriptor raises
+    ``ArchiveIntegrityError`` once the prefix is exhausted. An unreadable
+    file surfaces as the same typed failure.
+    """
+    try:
+        yield from iter_archived_records(
+            source.descriptor,
+            archived_prefix_chunks(source.path, source.descriptor.prefix_end_byte),
+        )
+    except OSError as exc:
+        raise ArchiveIntegrityError(
+            f"cannot read the sealed transcript prefix at {source.path}: {exc}"
+        ) from exc
+
+
+def iter_archived_messages(source: ArchiveTranscriptSource) -> Iterator[LLMMessage]:
+    """Stream the sealed prefix as messages, hydrated exactly as a load does.
+
+    A record that cannot be hydrated is an integrity failure of the prefix,
+    not a partial read: it surfaces as ``ArchiveIntegrityError``.
+    """
+    for record in iter_archived_message_dicts(source):
+        try:
+            yield LLMMessage.model_validate(record)
+        except ValidationError as exc:
+            raise ArchiveIntegrityError(
+                f"sealed transcript record cannot be hydrated: {exc}"
+            ) from exc
+
+
+def live_tail_after_archived_prefix(
+    messages: Sequence[LLMMessage], archived_count: int
+) -> list[LLMMessage]:
+    """The live messages after the first ``archived_count`` non-system ones.
+
+    The persisted transcript holds non-system records only, so the sealed
+    prefix consumes exactly that many non-system positions of the list; the
+    remainder is the live tail the archive does not cover.
+    """
+    consumed = 0
+    for index, message in enumerate(messages):
+        if message.role is Role.system:
+            continue
+        if consumed == archived_count:
+            return list(messages[index:])
+        consumed += 1
+    return []
 
 
 def read_agent_transcript(
@@ -105,12 +206,59 @@ def read_live_agent_transcript(
     before: str | None = None,
     limit: int = _DEFAULT_LIMIT,
 ) -> AgentTranscriptGetResponse:
-    """Project an in-memory child transcript through the persisted-view rules."""
+    """Project an in-memory child transcript through the persisted-view rules.
+
+    A plain message list pages exactly as it always has. A view carrying an
+    archive source pages the sealed prefix from the transcript on disk
+    (through the shared archive-read interface) together with the live
+    tail, so entries in the prefix come from the persisted originals rather
+    than from the payload-trimmed RAM copies.
+    """
     if not 1 <= limit <= _MAX_LIMIT:
         raise ValueError(f"limit must be between 1 and {_MAX_LIMIT}")
-    kept = [message for message in messages if message.role is not Role.system]
-    index = _describe_live_messages(kept)
-    materializer = _EntryMaterializer(index, kept, live=True)
+    source = (
+        messages.archive_source if isinstance(messages, TranscriptMessageView) else None
+    )
+    if source is None:
+        kept = [message for message in messages if message.role is not Role.system]
+        index = _describe_live_messages(kept)
+        materializer = _EntryMaterializer(index, kept, live=True)
+        return _read_selected_entries(index, materializer, before=before, limit=limit)
+    return _read_archived_live_entries(messages, source, before=before, limit=limit)
+
+
+def _read_archived_live_entries(
+    messages: list[LLMMessage],
+    source: ArchiveTranscriptSource,
+    *,
+    before: str | None,
+    limit: int,
+) -> AgentTranscriptGetResponse:
+    """Page the sealed disk prefix plus the live tail as one transcript.
+
+    The archived records and the live tail share one continuous message
+    index, so entry ids, digests, and cursors span the boundary exactly as
+    they do for a wholly persisted transcript. A prefix that cannot be read
+    or verified is reported as CHANGED: this path never renders a partial
+    or substituted transcript.
+    """
+    if source.descriptor.prefix_end_byte > _INPUT_BYTE_LIMIT:
+        return _state(AgentTranscriptState.EXCEEDS_VIEWER_LIMIT)
+    try:
+        archived = list(iter_archived_message_dicts(source))
+    except ArchiveIntegrityError:
+        return _state(AgentTranscriptState.CHANGED)
+    tail = live_tail_after_archived_prefix(messages, source.descriptor.archived_count)
+    combined = [
+        *archived,
+        *(
+            message.model_dump(exclude_none=True, mode="json")
+            for message in tail
+            if message.role is not Role.system
+        ),
+    ]
+    index = _describe_saved_messages(combined)
+    materializer = _EntryMaterializer(index, combined, live=False)
     return _read_selected_entries(index, materializer, before=before, limit=limit)
 
 

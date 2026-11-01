@@ -1,5 +1,10 @@
 from __future__ import annotations
 
+import asyncio
+from types import SimpleNamespace
+from typing import Any, cast
+from unittest.mock import AsyncMock, Mock
+
 from pydantic import JsonValue, ValidationError
 import pytest
 
@@ -69,6 +74,7 @@ from chartreux.core.events import (
     UserMessageEvent,
 )
 from chartreux.core.llm_models import ImageAttachment, InlineImageSource
+from chartreux.core.subagents import RunStatus
 from chartreux.core.tools.builtins.read_file import (
     ReadFile,
     ReadFileArgs,
@@ -76,6 +82,12 @@ from chartreux.core.tools.builtins.read_file import (
 )
 from chartreux.core.tools.ui import ToolUIDataAdapter
 from chartreux.user_content import UserDisplayContent, UserResourceLink
+from tests.app_server._subagent_test_support import (
+    _idle_record,
+    _ManualClock,
+    _retention_registry,
+    _stored_result,
+)
 
 
 def _projection() -> ClientProjection:
@@ -981,3 +993,125 @@ def test_unknown_notifications_fail_strictly(method: str) -> None:
 
     with pytest.raises(UnknownNotificationError, match=method):
         projection.consume(Notification(method=method, params={"revision": 1}))
+
+
+# ---------------------------------------------------------------------------
+# U3b/A9: one published result across every surface
+
+
+class _AgentsSink:
+    """A local agents/update sink that can park one delivery (no transport)."""
+
+    def __init__(self, *, block_call: int = 0) -> None:
+        self.calls = 0
+        self.block_call = block_call
+        self.delivered: list[list[AgentSummaryModel]] = []
+        self.entered = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def __call__(self, agents: list[AgentSummaryModel], evictions: list) -> None:
+        self.calls += 1
+        self.delivered.append(list(agents))
+        if self.calls == self.block_call:
+            self.entered.set()
+            await self.release.wait()
+
+
+def _browser_snapshot() -> Any:
+    """The agents-browser data path: the real controller, local fakes only."""
+    return SimpleNamespace(
+        agent_transcript_viewer=None,
+        selection_target=None,
+        agent_summaries=[],
+        _agent_evictions={},
+        _app=SimpleNamespace(
+            _request_agent_transcript_close=AsyncMock(),
+            _mount_and_scroll=AsyncMock(),
+            _turn_outcome_notice=SimpleNamespace(display=False),
+            _agent_bar=None,
+            _show_no_output_outcome=Mock(),
+            _agent_is_active=Mock(return_value=True),
+        ),
+    )
+
+
+async def _deliver_to_browser(payload: list[AgentSummaryModel]) -> dict[str, list[str]]:
+    from chartreux.cli.textual_ui.agent_browser import AgentBrowserController
+
+    browser = _browser_snapshot()
+    await AgentBrowserController.handle_agents_update(
+        cast(Any, browser), AgentsUpdate(payload), 0.0
+    )
+    return {
+        agent.agent_id: agent.uncollected_run_ids for agent in browser.agent_summaries
+    }
+
+
+def _status_snapshot(payload: list[AgentSummaryModel]) -> dict[str, list[str]]:
+    """The /status data path: the app property over the browser snapshot (B6)."""
+    from chartreux.cli.textual_ui.app import ChartreuxApp
+
+    browser = _browser_snapshot()
+    browser.agent_summaries = list(payload)
+    # The property is the /status seam: it reads the browser's last-received
+    # inventory and never an on-demand server read.
+    summaries = ChartreuxApp._agent_summaries.fget(  # type: ignore[misc]
+        SimpleNamespace(_agent_browser=browser)
+    )
+    return {agent.agent_id: agent.uncollected_run_ids for agent in summaries}
+
+
+@pytest.mark.asyncio
+async def test_one_published_result_clears_after_collection_on_every_surface() -> None:
+    """U3b/A9: publication -> delivery -> both surfaces -> collection -> cleared.
+
+    The first delivery is parked on the sink, so the collection lands while an
+    older payload is still in flight; the LAST delivered payload — projected
+    after the collection — is what both presentations must end up showing.
+    """
+    clock = _ManualClock(0)
+    registry = _retention_registry(clock)
+    record = _idle_record("agent-1", clock=clock)
+    registry._agent_records[record.agent_id] = record
+    sink = _AgentsSink(block_call=1)
+    registry._notify_agents = sink
+
+    # Publication: the finished run's result is retained in the result store
+    # and on the resident record — the two sources the projection unions.
+    registry._result_store[("agent-1", "run-1")] = _stored_result(
+        "agent-1", "run-1", completed_at=1
+    )
+    record.latest_run_id = "run-1"
+    record.last_run_status = RunStatus.COMPLETED
+
+    blocked = asyncio.create_task(registry._emit_agents_update())
+    await asyncio.wait_for(sink.entered.wait(), timeout=2)
+    published = sink.delivered[0]
+    assert [agent.uncollected_run_ids for agent in published] == [["run-1"]]
+    # check_agents reports the same list the wire carries.
+    assert {
+        summary.agent_id: summary.uncollected_run_ids
+        for summary in await registry.check_agents()
+    } == {"agent-1": ["run-1"]}
+
+    assert await _deliver_to_browser(published) == {"agent-1": ["run-1"]}
+    assert _status_snapshot(published) == {"agent-1": ["run-1"]}
+
+    # Collection while the earlier delivery is still parked on the sink.
+    assert await registry.get_agent_result("agent-1", "run-1") is not None
+    sink.release.set()
+    await asyncio.wait_for(blocked, timeout=2)
+    for _ in range(5):
+        task = registry._agents_update_task
+        if task is None:
+            break
+        await asyncio.gather(task, return_exceptions=True)
+
+    final = sink.delivered[-1]
+    assert [agent.uncollected_run_ids for agent in final] == [[]]
+    assert await _deliver_to_browser(final) == {"agent-1": []}
+    assert _status_snapshot(final) == {"agent-1": []}
+    assert {
+        summary.agent_id: summary.uncollected_run_ids
+        for summary in await registry.check_agents()
+    } == {"agent-1": []}

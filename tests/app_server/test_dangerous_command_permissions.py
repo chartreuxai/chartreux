@@ -899,6 +899,11 @@ def test_denylist_probes_match_the_frozen_classifier() -> None:
             # by the destination recognizer, not the git classifier.
             assert classify_network_egress(list(probe)).kind == "ask"
             continue
+        if operation_id == "network.remote-exec":
+            # The remote-exec classifier lands with the SSH admission
+            # (v0.7.0 S4b1); the probe is the representative SSH form.
+            assert probe[0] == "ssh"
+            continue
         classification = classify_dangerous_git_command(list(probe))
         assert classification.kind == "grantable"
         assert classification.grantable is not None
@@ -935,6 +940,8 @@ _ALL_OPERATIONS = [
         ("curl", ["network.egress"]),
         ("wget", ["network.egress"]),
         ("curl https://example.invalid/", ["network.egress"]),
+        # v0.7.0 S4a: an SSH-client pattern vetoes the remote-exec operation.
+        ("ssh", ["network.remote-exec"]),
     ],
 )
 def test_denylist_blocking_operations(pattern: str, operations: list[str]) -> None:

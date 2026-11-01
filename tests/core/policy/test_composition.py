@@ -284,9 +284,11 @@ def test_orchestrator_body_splices_every_cli_placeholder() -> None:
     assert "Route by purpose: the launch-target table" in result.text
     # The ceremony workflow carries the implement placeholder.
     assert "never edit repo files yourself" in result.text
-    # The launch-target table is a shared reference (step 7), not only a
-    # routing-region concern.
-    assert "### Launch targets" in result.text
+    # The launch-target table is NOT part of the served artifact (v0.7.0 P3:
+    # it lives in the task tool description); the hash-covered policy text
+    # retains it so a pre-change bundle still recomposes its frozen hash.
+    assert "### Launch targets" not in result.text
+    assert "### Launch targets" in result.policy_text
 
 
 def test_coder_body_carries_no_placeholder_regions() -> None:
@@ -784,21 +786,27 @@ def test_get_universal_system_prompt_serves_the_composed_artifact() -> None:
     assert "## Execution context — interactive main session" in prompt
     assert "# Workflow: minimal" in prompt
     assert "## Tool semantics" in prompt
-    assert "### Launch targets" in prompt
+    assert "### Launch targets" not in prompt
     assert "## Communication" in prompt
     assert "Your model name is:" in prompt
     assert prompt.rstrip().endswith("this closing note adds no new rules.")
     assert "$dispatch" not in prompt
-    # The launch-target table binds the session model of the config's
-    # catalog; the cost-tier-aware implementation row renders the
+    # The launch-target table renders exactly once, in the task tool
+    # description (v0.7.0 P3): it binds the session model of the config's
+    # catalog, and the cost-tier-aware implementation row renders the
     # $cheapest-capable marker.
+    task = render_task_description_for_composition(
+        routes=dict(config.purpose_routes.routes),
+        session_model=config.get_active_model().alias,
+        skeleton=task_skeleton(),
+    )
+    assert task.count("### Launch targets") == 1
     alias = config.get_active_model().alias
     assert f"| `review.deep` | `reviewer` | substantive | analytical | `{alias}` |" in (
-        prompt
+        task
     )
     assert (
-        "| `implementation` | `coder` | substantive | — | `$cheapest-capable` |"
-        in prompt
+        "| `implementation` | `coder` | substantive | — | `$cheapest-capable` |" in task
     )
 
 

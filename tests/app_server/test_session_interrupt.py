@@ -13,24 +13,39 @@ from pydantic import ValidationError
 import pytest
 
 from chartreux.app_server._turns import TurnController
+from chartreux.app_server.client import AppServerClient
 from chartreux.app_server.events import (
     CallbackRequested,
+    ClientProjection,
+    SessionSnapshot,
     TurnCompleted,
     TurnQueueUpdated,
     TurnStarted,
 )
 from chartreux.app_server.models import (
+    CancelledCallbackState,
+    IdleSessionStatus,
     ImageAttachment,
     InlineImageSource,
+    PublicCallbackEntry,
     PublicQueuedTurn,
+    PublicSession,
+    PublicSessionState,
     PublicTurnQueue,
     PublicTurnStatus,
     TextContentBlock,
+    UserAnswer,
+    UserInputCallbackOutput,
+    UserQuestionResult,
 )
 from chartreux.app_server.protocol import (
     AgentsCancelParams,
     AgentsCancelResponse,
     AppServerResponseError,
+    CallbackResultError,
+    ClientCapabilities,
+    ClientInfo,
+    Notification,
     ProtocolError,
     ProtocolErrorCode,
     SessionTextContentBlock,
@@ -39,6 +54,7 @@ from chartreux.app_server.protocol import (
     TurnUserInputEntry,
 )
 from chartreux.app_server.session import AppServerSession
+from chartreux.app_server.transport import memory_transport_pair
 from chartreux.core.config import SessionLoggingConfig
 from chartreux.core.events import AssistantEvent, UserMessageEvent
 from chartreux.core.llm_models import LLMMessage, Role
@@ -51,7 +67,7 @@ from tests.app_server._session_runtime_support import (
 )
 from tests.conftest import build_test_agent_loop, build_test_vibe_config
 from tests.mock.utils import mock_llm_chunk
-from tests.stubs.app_server import create_test_app_server_session
+from tests.stubs.app_server import build_test_app_server, create_test_app_server_session
 from tests.stubs.fake_backend import FakeBackend
 
 
@@ -914,11 +930,12 @@ async def test_rewind_clears_paused_queue_and_emits_queue_update() -> None:
         yield UserMessageEvent(content=msg, message_id="active-user")
 
     async def rewind(
-        message_index: int, *, restore_files: bool, inplace: bool = False
+        message_index: int, *, restore_files: bool, inplace: bool = False, archive=None
     ) -> tuple[str, list[str], list[str]]:
         assert message_index == user_index
         assert not restore_files
         assert not inplace
+        assert archive is None
         agent_loop.session_id = replacement_session_id
         agent_loop.parent_session_id = original_session_id
         agent_loop.session_logger.reset_session(
@@ -987,7 +1004,9 @@ async def test_rewind_uses_public_history_entry_id() -> None:
     finally:
         await session.close()
 
-    rewind.assert_awaited_once_with(user_index, restore_files=True, inplace=True)
+    rewind.assert_awaited_once_with(
+        user_index, restore_files=True, inplace=True, archive=None
+    )
     assert result.message == "rewind me"
     assert result.restore_errors == ["restore warning"]
     assert result.restored_paths == ["x.py"]
@@ -1004,9 +1023,9 @@ async def test_rewind_reserves_session_before_restoring_files() -> None:
     release = asyncio.Event()
 
     async def rewind(
-        message_index: int, *, restore_files: bool, inplace: bool = False
+        message_index: int, *, restore_files: bool, inplace: bool = False, archive=None
     ) -> tuple[str, list[str], list[str]]:
-        del message_index, restore_files, inplace
+        del message_index, restore_files, inplace, archive
         entered.set()
         await release.wait()
         return "rewind me", [], []
@@ -1051,3 +1070,192 @@ class _InterruptClient:
         if isinstance(self._result, Exception):
             raise self._result
         return self._result
+
+
+def _callback_answer() -> UserInputCallbackOutput:
+    return UserInputCallbackOutput(
+        result=UserQuestionResult(
+            answers=[UserAnswer(question="Ship it?", answer="Yes")]
+        )
+    )
+
+
+def _idle_state(session_id: str, *, event_id: int = 0) -> PublicSessionState:
+    return PublicSessionState(
+        event_id=event_id,
+        session=PublicSession(
+            id=session_id, status=IdleSessionStatus(), created_at=1, updated_at=1
+        ),
+        history=[],
+        turns=[],
+        active_callbacks=[],
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ["respond", "reject", "keep-waiting"])
+async def test_unowned_callback_fails_locally_without_a_request(operation: str) -> None:
+    session = object.__new__(AppServerSession)
+    session._callback_sessions = {}
+    ensure_attached = AsyncMock()
+    session._ensure_attached = ensure_attached
+
+    with pytest.raises(AppServerResponseError) as exc_info:
+        match operation:
+            case "respond":
+                await session.respond_to_callback("dead-callback", _callback_answer())
+            case "reject":
+                await session.reject_callback(
+                    "dead-callback", CallbackResultError(message="gone")
+                )
+            case _:
+                await session.keep_waiting_callback("dead-callback")
+
+    assert exc_info.value.error.code is ProtocolErrorCode.NOT_FOUND
+    assert exc_info.value.error.message == "Callback not found: dead-callback"
+    # No client was ever obtained, so no request left the process.
+    ensure_attached.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_registered_callback_routes_to_its_owning_session() -> None:
+    session = object.__new__(AppServerSession)
+    session._callback_sessions = {"child-callback": "child-session"}
+    client = AsyncMock()
+    client.request.return_value = {"accepted": True}
+    session._ensure_attached = AsyncMock(return_value=client)
+
+    await session.respond_to_callback("child-callback", _callback_answer())
+
+    assert client.request.await_args.args[1].session_id == "child-session"
+
+
+@pytest.mark.asyncio
+async def test_compaction_handoff_rewrites_callback_ownership() -> None:
+    session = object.__new__(AppServerSession)
+    session._callback_sessions = {
+        "open-callback": "session-1",
+        "other-callback": "session-9",
+    }
+    session._state = cast(
+        Any,
+        SimpleNamespace(
+            projection=ClientProjection(_idle_state("session-1")),
+            session_log=None,
+            reset_usage_baseline=Mock(),
+        ),
+    )
+    session._connection = cast(Any, SimpleNamespace(mark_session_attached=Mock()))
+    session.resources = cast(
+        Any, SimpleNamespace(consume_event=AsyncMock(return_value=True))
+    )
+    session._consume_non_projection_notification = AsyncMock(  # type: ignore[method-assign]
+        return_value=False
+    )
+
+    await session._handle_notification(
+        cast(AppServerClient, Mock()),
+        Notification(
+            method="session/compacted",
+            params={
+                "eventId": 1,
+                "sessionId": "session-2",
+                "oldSessionId": "session-1",
+                "emittedAt": 2,
+                "state": _idle_state("session-2", event_id=1).model_dump(
+                    mode="json", by_alias=True
+                ),
+                "sessionLog": {"enabled": False},
+                "summaryLength": 4,
+            },
+        ),
+    )
+
+    assert session._callback_sessions == {
+        "open-callback": "session-2",
+        "other-callback": "session-9",
+    }
+
+    client = AsyncMock()
+    client.request.return_value = {"accepted": True}
+    session._ensure_attached = AsyncMock(return_value=client)
+    await session.respond_to_callback("open-callback", _callback_answer())
+    assert client.request.await_args.args[1].session_id == "session-2"
+
+
+async def _attach_reconnectable(agent_loop: Any) -> AppServerSession:
+    client_transport, server_transport = memory_transport_pair()
+    server = build_test_app_server(agent_loop, server_transport)
+
+    def make_client(
+        next_client_transport: Any, next_server_transport: Any
+    ) -> AppServerClient:
+        async def serve() -> None:
+            await server.serve_connection(
+                next_server_transport, close_on_disconnect=False
+            )
+
+        return AppServerClient(next_client_transport, run_peer=serve)
+
+    return await AppServerSession.start(
+        make_client(client_transport, server_transport),
+        client_info=ClientInfo(name="q2a-reconnect", version="1"),
+        capabilities=ClientCapabilities(callback_kinds=["user_input"]),
+        client_factory=lambda: make_client(*memory_transport_pair()),
+    )
+
+
+@pytest.mark.asyncio
+async def test_reconnect_never_redelivers_a_closed_callback() -> None:
+    backend = FakeBackend([
+        [mock_llm_chunk(content="", tool_calls=[_question_tool_call()])],
+        [mock_llm_chunk(content="Done")],
+    ])
+    agent_loop = build_test_agent_loop(
+        config=build_test_vibe_config(enabled_tools=["ask_user_question"]),
+        backend=backend,
+        enable_streaming=True,
+    )
+    session = await _attach_reconnectable(agent_loop)
+    events = session.act("read todos")
+    try:
+        requested = await _next_event(events, CallbackRequested)
+        callback_id = requested.callback.callback_id
+        await session.interrupt()
+        with suppress(Exception):
+            await asyncio.wait_for(_consume(events), timeout=2)
+
+        # The cancelled terminal state left the open set the server's
+        # redelivery iterates.
+        closed = [
+            entry
+            for entry in session.history
+            if isinstance(entry, PublicCallbackEntry)
+            and entry.callback_id == callback_id
+        ]
+        assert closed
+        assert isinstance(closed[0].state, CancelledCallbackState)
+        assert session.state.active_callbacks == []
+
+        client = session._connection.current
+        assert client is not None
+        await client.close()
+        reconnected = session.events()
+        try:
+            snapshot = await asyncio.wait_for(
+                _next_event(reconnected, SessionSnapshot), timeout=2
+            )
+            assert snapshot.state.active_callbacks == []
+            redelivered: list[object] = []
+            with suppress(TimeoutError):
+                async with asyncio.timeout(0.2):
+                    async for event in reconnected:
+                        if isinstance(event, CallbackRequested):
+                            redelivered.append(event)
+            assert redelivered == []
+        finally:
+            await reconnected.aclose()
+    finally:
+        await events.aclose()
+        await session.close()
+        await agent_loop.aclose()

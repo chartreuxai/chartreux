@@ -4,6 +4,7 @@ from pathlib import Path
 
 import pytest
 
+from chartreux.core.tools.builtins._shell_argv import split_shell_tokens
 from chartreux.core.tools.builtins._shell_diagnostics import (
     DenialClass,
     Diagnostic,
@@ -14,6 +15,12 @@ from chartreux.core.tools.builtins._shell_permission_analysis import (
     analyze_shell_command,
     argv_permission_diagnostics,
     argv_permission_reasons,
+)
+
+# S1's equals-marker remediation: the exact wording the denial must carry.
+_EQUALS_MARKER_ALTERNATIVE = (
+    "quote the marker so the word stays one literal argument; or drop the "
+    "leading equals sign and invoke the command by its name or absolute path"
 )
 
 
@@ -752,12 +759,7 @@ def test_source_commands_are_extracted_as_parts(
             "split the work into separate simple commands, or use read_file "
             "with offset and limit, grep, and the edit tool for file work",
         ),
-        (
-            "echo =cmd",
-            "Zsh equals expansion",
-            "drop the leading equals sign and invoke the command by its "
-            "name or absolute path",
-        ),
+        ("echo =cmd", "Zsh equals expansion", _EQUALS_MARKER_ALTERNATIVE),
         (
             "echo $HOME",
             "variable expansion (unsupported in v0.1 because it can change arguments)",
@@ -1116,10 +1118,7 @@ def test_equals_unresolvable_command_keeps_its_denial(equals_path: str) -> None:
     assert analysis.approval_reasons == ("Zsh equals expansion",)
     diagnostic = analysis.diagnostics[0]
     assert diagnostic.denial_class is DenialClass.SYNTAX
-    assert diagnostic.alternative == (
-        "drop the leading equals sign and invoke the command by its name or "
-        "absolute path"
-    )
+    assert diagnostic.alternative == _EQUALS_MARKER_ALTERNATIVE
 
 
 def test_equals_in_argument_position_stays_denied(equals_path: str) -> None:
@@ -1127,6 +1126,129 @@ def test_equals_in_argument_position_stays_denied(equals_path: str) -> None:
 
     assert analysis.requires_approval
     assert analysis.approval_reasons == ("Zsh equals expansion",)
+
+
+# --- S1: quoted/escaped equals markers ----------------------------------------
+
+
+@pytest.mark.parametrize(
+    "command", ["echo '=ls'", 'echo "=ls"', "echo \\=ls", "echo '=ls' '=wc'"]
+)
+def test_quoted_or_escaped_equals_marker_is_admitted(command: str) -> None:
+    analysis = analyze_shell_command(command)
+
+    assert not analysis.requires_approval, analysis.approval_reasons
+    # The source text is the emitted part: no replacement is fabricated.
+    assert analysis.command_parts == (command,)
+
+
+@pytest.mark.parametrize("command", ["echo '=ls'", 'echo "=ls"', "echo \\=ls"])
+def test_equals_marker_proves_one_literal_argv_word(command: str) -> None:
+    analysis = analyze_shell_command(command)
+
+    assert [list(split_shell_tokens(part)) for part in analysis.command_parts] == [
+        ["echo", "=ls"]
+    ]
+
+
+@pytest.mark.parametrize("command", ["echo '='*", "echo \\=*", "echo '='?"])
+def test_equals_marker_that_can_expand_past_one_word_is_denied(command: str) -> None:
+    analysis = analyze_shell_command(command)
+
+    assert analysis.requires_approval
+    assert analysis.approval_reasons == (
+        "an equals-marker word the shell can still expand",
+    )
+
+
+def test_unquoted_equals_marker_denial_names_the_quoting_remediation() -> None:
+    for command in ("echo =ls", "echo ===X==="):
+        analysis = analyze_shell_command(command)
+        assert analysis.requires_approval
+        assert analysis.approval_reasons == ("Zsh equals expansion",)
+        assert analysis.diagnostics[0].denial_class is DenialClass.SYNTAX
+        assert analysis.diagnostics[0].alternative == _EQUALS_MARKER_ALTERNATIVE
+
+
+def test_equals_marker_maximal_denial_names_command_lookup_not_content() -> None:
+    # The anti-widening negative: a substitution after the marker is still
+    # command substitution, not a quoting problem.
+    analysis = analyze_shell_command("echo =$(id)")
+
+    assert analysis.requires_approval
+    assert "command substitution" in analysis.approval_reasons
+
+
+# --- S1: same-invocation `$?` status probe ------------------------------------
+
+
+@pytest.mark.parametrize("command", ["ls; echo $?", "true; printf $?"])
+def test_same_invocation_status_probe_is_admitted(command: str) -> None:
+    analysis = analyze_shell_command(command)
+
+    assert not analysis.requires_approval, analysis.approval_reasons
+    assert analysis.command_parts[-1].endswith(" $?")
+
+
+def test_status_probe_part_keeps_the_executed_source_token() -> None:
+    analysis = analyze_shell_command("ls; echo $?")
+
+    # Analysis-replacement never diverges from execution: the emitted part is
+    # the source the shell runs, and the shell substitutes the status number.
+    assert analysis.command_parts == ("ls", "echo $?")
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "ls | echo $?",  # pipeline
+        "ls && echo $?",  # conditional
+        "ls || echo $?",
+        "X=1; echo $?",  # assignment
+        "ls > out.txt; echo $?",  # redirect
+        "env ls; echo $?",  # wrapper
+        "sudo ls; echo $?",
+        "ls; env echo $?",  # wrapped status command
+        "ls; echo $?; id",  # subsequent command
+        "echo $?",  # no completed command to report
+        "ls\necho $?",  # not `;`-separated
+        "ls; echo $?;",  # trailing statement separator
+    ],
+)
+def test_status_probe_near_misses_stay_denied(command: str) -> None:
+    analysis = analyze_shell_command(command)
+
+    assert analysis.requires_approval
+    assert (
+        "variable expansion (unsupported in v0.1 because it can change arguments)"
+        in analysis.approval_reasons
+    )
+
+
+def test_status_probe_never_suppresses_a_sibling_denial() -> None:
+    analysis = analyze_shell_command("cat $HOME; echo $?")
+
+    assert (
+        "variable expansion (unsupported in v0.1 because it can change arguments)"
+        in analysis.approval_reasons
+    )
+
+
+@pytest.mark.parametrize(
+    ("command", "reason"),
+    [
+        ("echo $(id)", "command substitution"),
+        ("for i in 1 2; do echo $i; done", "for loop"),
+        (
+            "echo $HOME",
+            "variable expansion (unsupported in v0.1 because it can change arguments)",
+        ),
+        ("echo $((1+1))", "arithmetic expansion"),
+        ("x=1; echo $x", "an environment assignment with a non-uppercase name"),
+    ],
+)
+def test_s1_keep_denied_classes_stay_denied(command: str, reason: str) -> None:
+    assert reason in analyze_shell_command(command).approval_reasons
 
 
 @pytest.mark.parametrize(

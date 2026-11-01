@@ -1,6 +1,6 @@
 ---
 name: main-plan
-description: "Turn an approved design into an executable, bounded plan with work packages, dependencies, safe parallelism, acceptance checks, and verification. Delegates deep planning analysis to the advisor profile."
+description: "Turn an approved design into an executable, bounded plan with work packages, dependencies, safe parallelism, acceptance checks, and verification. Delegates deep planning analysis to the advisor identity via the planning-analysis purpose route."
 user-invocable: true
 allowed-tools:
   - read_file
@@ -16,7 +16,7 @@ Plan how to deliver an approved design without expanding scope. The main agent r
 
 ## Process
 
-1. **Read the design.** Read the approved design artifact (inline or workspace `state.md`), applicable AGENTS.md files, and relevant code or configuration.
+1. **Read the design.** Read the approved design artifact (inline or workspace `state.md`) and applicable AGENTS.md files. Delegate investigation of relevant code or configuration to a `search` or `exploration` child, naming the `sub-finder` or `sub-explorer` skill in the task brief.
 2. **Frame the planning question.** Define: the design goal, the files and subsystems involved, any cross-cutting concerns, and what the plan must address (dependencies, parallelism, verification, rollback).
 3. **Dispatch the advisor for planning analysis.** Request the `planning-analysis` purpose; the launch resolves the advisor identity and the model binding from the purpose route — pass the purpose as a top-level field:
 
@@ -24,19 +24,31 @@ Plan how to deliver an approved design without expanding scope. The main agent r
 task(task="Planning analysis for: <design goal>. Design: <approved approach>. Files and subsystems: <list>. Constraints: <dependencies, shared interfaces, preserved behavior>. Return: bounded work packages, dependency order, safe parallelism, acceptance checks per package, verification commands, and rollback approach.", purpose="planning-analysis")
 ```
 
+The launch runs in the background by default — collect the advisor's result with `wait_for_agent` before synthesizing.
+
 For cross-cutting changes that span multiple subsystems, first dispatch a bounded exploration child (`purpose="exploration"`) that loads `sub-architecture-mapper` to map interfaces and dependencies, then use that output to frame the planning question.
 
 4. **Synthesize.** Review the advisor's plan. The main agent owns the final plan — adjust work package boundaries, fix missing dependencies, and ensure the plan matches the approved design. If the advisor's plan contradicts the design, trust the design.
 5. **Present to the user.** Share the plan inline in the conversation. Obtain the user's explicit plan acceptance before proceeding to implementation; continued discussion, questions, or silence are not acceptance.
 
+## Work package quality
+
+Every work package must be:
+- **Concrete**: an exact file or artifact list, one primary behavior change, and one runnable acceptance check. A package described as "implement X and integrate it everywhere" is not a package — split it along a natural seam (a function, a module, a route, a test file).
+- **Independently verifiable**: its acceptance check runs without later packages and yields a pass/fail signal the main agent can evaluate without re-deriving the work. An implementation package's check must exercise its primary behavior, with the needed regression tests inside the package; static checks (lint, format) suffice only for genuinely mechanical or documentation work, and the package states that limitation. A package's acceptance check may also be frozen as a completion contract on the launch — `task(completion_check=[...], required_artifacts=[...])` — so the harness itself runs the mandated checks at finalization and stamps claim fidelity independently of the worker's report.
+- **Independently recoverable**: each package names its recovery entry — the prerequisite checkpoint it builds on, the changes it owns, and how to undo or salvage them without disturbing completed packages. A failed package is retried, replaced, or re-planned alone.
+- **Routed**: each package names its purpose route so it runs on the route its work class needs: `mechanical-edit` for bounded single-file edits with a known transformation, `implementation` for ordinary implementation, `verification` for packages whose deliverable is running checks, and `search`/`exploration`/`research` for investigation. Reserve `implementation-demanding-settled` for genuinely hard execution whose approach is already settled, and name its qualifying category — such a launch must carry `config.difficulty` from the qualifying set (`novel-algorithm`, `concurrency`, `subtle-invariant`) or admission fails.
+- **Disjoint or serialized**: no two parallel packages may modify the same file or the opposite sides of the same interface; packages that must touch the same file are serialized by dependency instead.
+
 ## Plan content
 
 The plan must define:
-- bounded work packages and the capability needed for each
+- bounded work packages, each naming its purpose route
 - dependencies and only safe parallel work
 - exact files or artifact paths in scope
-- acceptance checks and concrete verification commands
+- one runnable acceptance check per package, with concrete verification commands
 - behavioral checks, with source evidence separated from runtime evidence
+- each package's recovery entry (prerequisite checkpoint, owned changes, undo or salvage procedure)
 - non-destructive rollback or inverse edits that preserve unrelated changes
 - explicit blockers, assumptions, and non-goals
 

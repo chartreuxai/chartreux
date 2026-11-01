@@ -68,7 +68,7 @@ The system prompt is assembled once, at startup, in a fixed nine-step order:
 4. Execution context: interactive main, headless main, or bounded child.
 5. The selected workflow body.
 6. The selected orchestration strategy body, only if one is selected; `none` is absent, and it resolves concretely without loading a strategy body.
-7. Shared references: tool semantics, the rendered launch-target table, model catalog, skills catalog, communication style, scratchpad, environment.
+7. Shared references: tool semantics, model catalog, skills catalog, communication style, scratchpad, environment. The launch-target route table is not a shared reference: it renders once, in the `task` tool description.
 8. AGENTS.md layers — discovery and injection unchanged; when the user and project layers resolve to the same file, the canonical duplicate renders once, keeping the higher-precedence (project) label with both provenance positions recorded.
 9. A short closing re-anchor reinforcing the resolved contract, adding no new rules.
 

@@ -183,10 +183,11 @@ class QuestionApp(VimNavigationMixin, Container):
         self.post_message(self.KeepWaiting(callback_id=self._callback_id))
 
     def close_for_expiry(self) -> None:
-        """Close live input after the server expired this question (plan U).
+        """Close live input after the server closed this question (plan U, Q2c).
 
-        The unsent draft stays in ``other_texts`` for the supervisor to
-        preserve locally; it is never auto-delivered.
+        Covers every terminal close — expired unanswered, cancelled, or answered
+        elsewhere. The unsent draft stays in ``other_texts`` for the supervisor
+        to preserve locally; it is never auto-delivered.
         """
         self._stop_countdown()
         self._expired = True

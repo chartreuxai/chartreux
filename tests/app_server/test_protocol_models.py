@@ -1236,6 +1236,8 @@ def test_agents_update_carries_retention_metadata() -> None:
         "activeProvider": "test-provider",
         "effectiveThinking": "high",
         "resultExpired": True,
+        # U2: the uncollected-result list is always emitted, empty included.
+        "uncollectedRunIds": [],
         "lastFailure": None,
         # WP2: the warm-recovery summary fields default to None (no barrier).
         "recoveryChainId": None,
@@ -1245,6 +1247,8 @@ def test_agents_update_carries_retention_metadata() -> None:
         # WP5: the predecessor/package lineage pair defaults to None.
         "workPackageId": None,
         "predecessorAgentId": None,
+        # O1: the latest run's audit stamp defaults to None (no retained run).
+        "completionAudit": None,
     }
     assert update.model_dump(mode="json")["evictions"][0]["reason"] == "ttl"
 
@@ -1270,6 +1274,44 @@ def test_agent_context_contract_accepts_older_wire_payloads() -> None:
     # payload carrying it is rejected, never silently consumed (16a).
     with pytest.raises(ValidationError):
         validate_wire(AgentSummaryModel, old | {"profile": "worker"})
+
+
+def test_agent_summary_uncollected_run_ids_round_trip() -> None:
+    """U2: same-version clients round-trip the always-emitted key, order kept."""
+    summary = AgentSummaryModel(
+        agent_id="agent-1",
+        name="worker-base-1",
+        availability="idle",
+        uncollected_run_ids=["run-2", "run-1"],
+    )
+
+    dump = summary.model_dump(mode="json", by_alias=True)
+
+    assert dump["uncollectedRunIds"] == ["run-2", "run-1"]
+    assert validate_wire(AgentSummaryModel, dump) == summary
+
+
+def test_agent_summary_defaults_a_missing_uncollected_run_ids_key() -> None:
+    """U2: a new client parses an older payload without the key as [] and
+    re-emits it, so the key is always present after one round trip.
+    """
+    legacy = {"agentId": "agent-1", "name": "worker-base-1", "availability": "idle"}
+
+    summary = validate_wire(AgentSummaryModel, legacy)
+
+    assert summary.uncollected_run_ids == []
+    assert summary.model_dump(mode="json")["uncollectedRunIds"] == []
+
+
+def test_agent_summary_uncollected_run_ids_default_is_independent() -> None:
+    """U2: the empty-list default is per instance, never shared."""
+    first = AgentSummaryModel(agent_id="agent-1", name="a", availability="idle")
+    second = AgentSummaryModel(agent_id="agent-2", name="b", availability="idle")
+
+    first.uncollected_run_ids.append("run-1")
+
+    assert first.uncollected_run_ids == ["run-1"]
+    assert second.uncollected_run_ids == []
 
 
 def test_agents_update_carries_last_failure_envelope() -> None:
@@ -1476,6 +1518,63 @@ def test_completion_rejection_class_mirrors_to_the_wire() -> None:
     )
     assert projected.failure.failure_class is PublicFailureClass.COMPLETION_REJECTION
     assert projected.recovery.eligibility is PublicRecoveryEligibility.PROHIBITED
+
+
+def test_public_completion_audit_mirrors_the_core_classification() -> None:
+    """O1 boundary: the public audit stamp mirrors the canonical core
+    classification axis-for-axis, so the server-boundary projection cannot
+    silently drop or rename an axis.
+    """
+    from chartreux.app_server.models import (
+        PublicClaimFidelity,
+        PublicCompletionAudit,
+        PublicDeclaredOutcome,
+        PublicDisclosureCompleteness,
+        PublicMandateSatisfaction,
+        PublicRejectionReason,
+        PublicRuntimeFailure,
+    )
+    from chartreux.core import completion_contract as core
+
+    assert set(PublicCompletionAudit.model_fields) == set(
+        core.CompletionAuditClassification.model_fields
+    )
+    enum_pairs = [
+        (PublicClaimFidelity, core.CompletionClaimFidelity),
+        (PublicDisclosureCompleteness, core.CompletionDisclosure),
+        (PublicMandateSatisfaction, core.CompletionMandateSatisfaction),
+        (PublicDeclaredOutcome, core.CompletionDeclaredOutcome),
+        (PublicRuntimeFailure, core.CompletionRuntimeFailure),
+        (PublicRejectionReason, core.CompletionRejectionReason),
+    ]
+    for public_enum, core_enum in enum_pairs:
+        assert {item.value for item in public_enum} == {
+            item.value for item in core_enum
+        }, core_enum.__name__
+
+    classification = core.CompletionAuditClassification(
+        claim_fidelity=core.CompletionClaimFidelity.CLAIM_CONTRADICTED,
+        disclosure_completeness=core.CompletionDisclosure.DISCLOSURE_INCOMPLETE,
+        mandate_satisfaction=core.CompletionMandateSatisfaction.MANDATE_UNADDRESSED,
+        declared_outcome=core.CompletionDeclaredOutcome.OUTCOME_INCOMPLETE,
+        primary_runtime_failure=core.CompletionRuntimeFailure.RUNTIME_TIMEOUT,
+        rejection=core.CompletionRejectionReason.CLAIM_CONTRADICTED,
+    )
+    projected = PublicCompletionAudit.model_validate(
+        classification.model_dump(mode="json")
+    )
+    # The wire model speaks the protocol's camelCase aliases, so the mirror
+    # is pinned axis-by-axis: same axes, same values, nothing dropped.
+    assert projected.schema_version == classification.schema_version
+    for axis in (
+        "claim_fidelity",
+        "disclosure_completeness",
+        "mandate_satisfaction",
+        "declared_outcome",
+        "primary_runtime_failure",
+        "rejection",
+    ):
+        assert getattr(projected, axis).value == getattr(classification, axis).value
 
 
 def test_task_result_wire_contract_carries_failure_evidence() -> None:

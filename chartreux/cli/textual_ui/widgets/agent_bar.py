@@ -178,6 +178,35 @@ def _clip(text: str, width: int) -> str:
     return chop_cells(text, width - cell_len(marker))[0] + marker
 
 
+def _uncollected_badge(
+    count: int, separator: str, *, prefix: str, state_suffix: str, width: int
+) -> str:
+    """The badge suffix segment, kept out of the state label.
+
+    The long form yields to the short form, which drops entirely when even it
+    cannot share the row with the outcome: the outcome always wins, and the
+    unclipped details remain the badge's fallback.
+    """
+    if count <= 0:
+        return ""
+    for label in (f"uncollected: {count}", f"unc: {count}"):
+        candidate = separator + label
+        if cell_len(prefix) + cell_len(candidate) + cell_len(state_suffix) <= width:
+            return candidate
+    return ""
+
+
+def _uncollected_runs_text(agent: AgentSummaryModel) -> str:
+    """Retained uncollected results under their own label.
+
+    The list can include older runs, so it never borrows the latest-result
+    "result preserved"/"result expired" wording.
+    """
+    if not agent.uncollected_run_ids:
+        return ""
+    return "Uncollected runs: " + ", ".join(agent.uncollected_run_ids)
+
+
 def agent_model_display_name(agent: AgentSummaryModel) -> str:
     """Return the agent's resolved provider/wire-model display identity."""
     model = agent.effective_model or agent.base_model
@@ -1176,6 +1205,7 @@ class AgentBar(Vertical):  # noqa: PLR0904 -- Textual actions and event handlers
         *,
         secondary: str | None = None,
         state: str = "",
+        uncollected: int = 0,
     ) -> tuple[str, tuple[int, int] | None]:
         """Render one row, returning its text and the dim span of the handle."""
         prefix = (
@@ -1230,7 +1260,18 @@ class AgentBar(Vertical):  # noqa: PLR0904 -- Textual actions and event handlers
                 prefix = ""
         if cell_len(prefix) > width:
             prefix = ""
-        suffix = separator + state if state else ""
+        state_suffix = separator + state if state else ""
+        # The badge is its own suffix segment, never part of the state label.
+        suffix = (
+            _uncollected_badge(
+                uncollected,
+                separator,
+                prefix=prefix,
+                state_suffix=state_suffix,
+                width=width,
+            )
+            + state_suffix
+        )
         available = max(0, width - cell_len(prefix) - cell_len(suffix))
         details = _clip(identity, available)
         dim: tuple[int, int] | None = None
@@ -1257,6 +1298,7 @@ class AgentBar(Vertical):  # noqa: PLR0904 -- Textual actions and event handlers
             agent.name or agent.agent_id,
             secondary=agent.agent_id,
             state=state,
+            uncollected=len(agent.uncollected_run_ids),
         )
 
     def _bounded_details(self, first: str, second: str) -> str:
@@ -1337,7 +1379,13 @@ class AgentBar(Vertical):  # noqa: PLR0904 -- Textual actions and event handlers
             compacting=agent.compacting,
             last_recorded=availability in {"closed", "evicted"},
         )
-        second = [context, model, f"turns {turns}"]
+        second = []
+        uncollected = _uncollected_runs_text(agent)
+        if uncollected:
+            # Retained results lead the metadata line: they are load-bearing,
+            # so context, model and turn count yield to them at narrow widths.
+            second.append(uncollected)
+        second.extend([context, model, f"turns {turns}"])
         if agent.resumed_from_run_id is not None:
             second.append(f"resumed from {agent.resumed_from_run_id}")
         return self._bounded_details(details, _separator().join(second))
@@ -1385,6 +1433,7 @@ class AgentBar(Vertical):  # noqa: PLR0904 -- Textual actions and event handlers
                 str(agent.context_window) if agent.context_window is not None else None,
             ),
             ("Result expired", str(agent.result_expired)),
+            ("Uncollected runs", ", ".join(agent.uncollected_run_ids) or None),
             ("Initial task", agent.initial_task_summary),
             ("Current task", agent.current_task_summary),
             ("Provider", agent.active_provider),

@@ -61,6 +61,28 @@ def ids(usage_dir: Path) -> list[str]:
     ]
 
 
+class AppendScanProbe:
+    """Count ledger reads and parses performed by the append path."""
+
+    def __init__(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        self.reads = 0
+        self.parses = 0
+        original_open = _usage_io.open_nofollow
+        original_parse = _usage_io.parse_usage_jsonl
+
+        def counted_open(path: Path, *, directory: bool | None = None) -> int:
+            if directory is False:
+                self.reads += 1
+            return original_open(path, directory=directory)
+
+        def counted_parse(content: bytes) -> _usage_io.ParsedUsageLines:
+            self.parses += 1
+            return original_parse(content)
+
+        monkeypatch.setattr(_usage_io, "open_nofollow", counted_open)
+        monkeypatch.setattr(_usage_io, "parse_usage_jsonl", counted_parse)
+
+
 @pytest.mark.parametrize("terminated", [False, True])
 def test_append_after_deeply_nested_corrupt_line(
     tmp_path: Path, terminated: bool
@@ -99,6 +121,130 @@ def test_concurrent_appenders(tmp_path: Path, separate_writers: bool) -> None:
     assert results.count(UsageWriteDisposition.APPENDED) == 30
     assert results.count(UsageWriteDisposition.ALREADY_PRESENT) == 60
     assert sorted(ids(tmp_path)) == sorted(f"call-{index}" for index in range(30))
+
+
+def test_first_attempt_of_unattempted_record_skips_ledger_scan(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    writer = UsageWriter(tmp_path)
+    assert (
+        writer.append(make_record("call-1")).disposition
+        == UsageWriteDisposition.APPENDED
+    )
+    probe = AppendScanProbe(monkeypatch)
+    assert (
+        writer.append(make_record("call-2")).disposition
+        == UsageWriteDisposition.APPENDED
+    )
+    assert (probe.reads, probe.parses) == (0, 0)
+    assert ids(tmp_path) == ["call-1", "call-2"]
+
+
+def test_confirmed_reattempt_short_circuits_without_scanning(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    assert (
+        UsageWriter(tmp_path).append(make_record()).disposition
+        == UsageWriteDisposition.APPENDED
+    )
+    probe = AppendScanProbe(monkeypatch)
+    # A separate writer instance shares the process-local confirmation.
+    for _ in range(3):
+        assert (
+            UsageWriter(tmp_path).append(make_record()).disposition
+            == UsageWriteDisposition.ALREADY_PRESENT
+        )
+    assert (probe.reads, probe.parses) == (0, 0)
+    assert ids(tmp_path) == ["call-1"]
+
+
+def test_same_record_twice_appends_one_line(tmp_path: Path) -> None:
+    writer = UsageWriter(tmp_path)
+    assert writer.append(make_record()).disposition == UsageWriteDisposition.APPENDED
+    assert (
+        writer.append(make_record()).disposition
+        == UsageWriteDisposition.ALREADY_PRESENT
+    )
+    assert ledger(tmp_path).read_bytes().count(b"\n") == 1
+    assert ids(tmp_path) == ["call-1"]
+
+
+def test_identical_ids_in_distinct_ledgers_never_alias(tmp_path: Path) -> None:
+    first, second = tmp_path / "first", tmp_path / "second"
+    assert (
+        UsageWriter(first).append(make_record()).disposition
+        == UsageWriteDisposition.APPENDED
+    )
+    assert (
+        UsageWriter(second).append(make_record()).disposition
+        == UsageWriteDisposition.APPENDED
+    )
+    assert (
+        UsageWriter(first).append(make_record(root="other-root")).disposition
+        == UsageWriteDisposition.APPENDED
+    )
+    assert ids(first) == ["call-1"]
+    assert ids(second) == ["call-1"]
+    other = _usage_io.parse_usage_jsonl(
+        (first / "other-root" / "usage.jsonl").read_bytes()
+    )
+    assert [item["record_id"] for item in other.records] == ["call-1"]
+    assert (
+        UsageWriter(second).append(make_record()).disposition
+        == UsageWriteDisposition.ALREADY_PRESENT
+    )
+    assert ledger(second).read_bytes().count(b"\n") == 1
+
+
+def fail_durable_append_once(monkeypatch: pytest.MonkeyPatch, stage: str) -> None:
+    """Fail the first durable append at the requested stage, keeping its bytes."""
+    original = _usage_io.durable_append
+    calls = 0
+
+    def failing(path: Path, content: bytes, **kwargs) -> None:
+        nonlocal calls
+        calls += 1
+        if calls > 1:
+            return original(path, content, **kwargs)
+        if stage == "write":
+            raise OSError("write failure")
+        if stage == "file-sync":
+            with path.open("ab") as stream:
+                stream.write(content)
+            raise OSError("file sync failure")
+        with path.open("ab") as stream:
+            stream.write(content)
+            stream.flush()
+            os.fsync(stream.fileno())
+        raise OSError("directory publication failure")
+
+    monkeypatch.setattr(_usage_io, "durable_append", failing)
+
+
+@pytest.mark.parametrize(
+    ("stage", "disposition"),
+    [
+        ("write", UsageWriteDisposition.APPENDED),
+        ("file-sync", UsageWriteDisposition.ALREADY_PRESENT),
+        ("publication", UsageWriteDisposition.ALREADY_PRESENT),
+    ],
+)
+def test_unconfirmed_reattempt_rescans_and_never_duplicates(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    stage: str,
+    disposition: UsageWriteDisposition,
+) -> None:
+    fail_durable_append_once(monkeypatch, stage)
+    probe = AppendScanProbe(monkeypatch)
+    result = UsageWriter(tmp_path).append(make_record())
+    assert result.disposition == disposition
+    # The retry is an attempted-but-unconfirmed re-attempt: full scan, which
+    # parses even an absent ledger as empty.
+    assert probe.reads == 1
+    assert probe.parses == 1
+    assert ids(tmp_path) == ["call-1"]
+    assert ledger(tmp_path).read_bytes().count(b"\n") == 1
 
 
 @pytest.mark.parametrize("after_write", [False, True])

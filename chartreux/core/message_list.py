@@ -5,6 +5,7 @@ import threading
 from typing import overload
 
 from chartreux.core.llm_models import LLMMessage, Role
+from chartreux.core.session.transcript_archive import ArchivedPrefixV1
 
 
 class MessageList(Sequence[LLMMessage]):
@@ -12,6 +13,82 @@ class MessageList(Sequence[LLMMessage]):
         self._data: list[LLMMessage] = list(initial) if initial else []
         self._reset_hooks: list[Callable[[], None]] = []
         self._lock = threading.RLock()
+        # M1 archive ownership: the epoch changes on list reset/rebind only
+        # (never on cursor invalidation — that lives in the SessionLogger and
+        # does not touch this list); the descriptor is the live archive state
+        # this list owns, cleared alongside every rebind.
+        self._message_epoch = 0
+        self._archive_descriptor: ArchivedPrefixV1 | None = None
+
+    @property
+    def message_epoch(self) -> int:
+        """The current message epoch; bumped by reset/rebind only."""
+        return self._message_epoch
+
+    @property
+    def archive_descriptor(self) -> ArchivedPrefixV1 | None:
+        """The archive descriptor this list currently owns, if any."""
+        return self._archive_descriptor
+
+    def set_archive_descriptor(self, descriptor: ArchivedPrefixV1) -> None:
+        """Take ownership of ``descriptor`` for the current epoch.
+
+        A descriptor from an older epoch is stale (its prefix belonged to a
+        list that was reset/rebind since) and is rejected fail-closed.
+        """
+        with self._lock:
+            if descriptor.message_epoch != self._message_epoch:
+                raise ValueError(
+                    f"archive descriptor epoch {descriptor.message_epoch} does not "
+                    f"match the list epoch {self._message_epoch}"
+                )
+            self._archive_descriptor = descriptor
+
+    def clear_archive_descriptor(self) -> None:
+        """Drop the owned archive descriptor without changing the epoch."""
+        with self._lock:
+            self._archive_descriptor = None
+
+    def publish_archive_trim(
+        self, descriptor: ArchivedPrefixV1, replacements: Sequence[LLMMessage]
+    ) -> None:
+        """Publish sealed-prefix replacements same-slot, then take the descriptor.
+
+        M1 §4 step 6 list side: exactly ``descriptor.archived_count``
+        replacements are applied by absolute index over the non-system
+        sequence — no slot is inserted or deleted and system messages are
+        preserved — and the owned archive descriptor is set in the same lock
+        scope. No ``reset()`` is called and no reset hook fires.
+        """
+        with self._lock:
+            # Validate everything BEFORE mutating: a refused publication
+            # leaves the list and the owned descriptor untouched.
+            if descriptor.message_epoch != self._message_epoch:
+                raise ValueError(
+                    f"archive descriptor epoch {descriptor.message_epoch} does not "
+                    f"match the list epoch {self._message_epoch}"
+                )
+            non_system_indexes = [
+                index
+                for index, message in enumerate(self._data)
+                if message.role is not Role.system
+            ]
+            if descriptor.archived_count > len(non_system_indexes):
+                raise ValueError(
+                    f"descriptor archives {descriptor.archived_count} records but "
+                    f"the list holds only {len(non_system_indexes)} non-system "
+                    "messages"
+                )
+            if len(replacements) != descriptor.archived_count:
+                raise ValueError(
+                    f"trim publication replaces exactly one slot per archived "
+                    f"record: got {len(replacements)} replacements for "
+                    f"{descriptor.archived_count} sealed slots"
+                )
+            sealed_indexes = non_system_indexes[: descriptor.archived_count]
+            for slot, replacement in zip(sealed_indexes, replacements, strict=True):
+                self._data[slot] = replacement
+            self._archive_descriptor = descriptor
 
     def append(self, msg: LLMMessage) -> None:
         self._data.append(msg)
@@ -37,9 +114,16 @@ class MessageList(Sequence[LLMMessage]):
         self._reset_hooks.append(hook)
 
     def reset(self, new: list[LLMMessage]) -> None:
-        """Replace contents and fire reset hooks (e.g. RewindManager)."""
+        """Replace contents and fire reset hooks (e.g. RewindManager).
+
+        A reset/rebind starts a new message epoch and drops any owned archive
+        descriptor: the replacement list is complete, so no archived prefix
+        belongs to it.
+        """
         with self._lock:
             self._data = list(new)
+            self._message_epoch += 1
+            self._archive_descriptor = None
             for hook in self._reset_hooks:
                 hook()
 
@@ -53,6 +137,10 @@ class MessageList(Sequence[LLMMessage]):
         with self._lock:
             system = [m for m in self._data if m.role is Role.system]
             self._data = [*system, *tail]
+            # Resume rebind is a list rebind: new epoch, owned archive state
+            # cleared (the rebound list holds complete messages).
+            self._message_epoch += 1
+            self._archive_descriptor = None
             for hook in self._reset_hooks:
                 hook()
 

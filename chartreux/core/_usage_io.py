@@ -12,10 +12,21 @@ import fcntl
 import json
 import os
 from pathlib import Path
+from threading import Lock
 from typing import Any
 
 from chartreux.utils.durable_io import durable_append, durable_mkdir
 from chartreux.utils.private_paths import open_nofollow, restrict_fd
+
+# Process-local append state, keyed by ledger (usage_dir, root_session_id) and
+# then record ID. A record ID is generated once per call and never regenerated
+# on retry, so a same-ID re-attempt can only originate in the generating
+# process; recording attempts here preserves every reachable idempotency
+# scenario without rescanning the ledger on the first attempt. The attempted
+# set grows with a live process's record IDs and is deliberately never pruned.
+_STATE_LOCK = Lock()
+_ATTEMPTED_IDS: dict[tuple[str, str], set[str]] = {}
+_CONFIRMED_DURABLE_IDS: dict[tuple[str, str], set[str]] = {}
 
 
 @dataclass(frozen=True)
@@ -89,6 +100,9 @@ def append_usage_record(
 
     Errors propagate to the non-raising writer facade. Retrying with the same ID
     is safe even after a write, file sync, or directory publication failure.
+    A first attempt at a never-attempted ID skips the ledger read entirely; a
+    re-attempt of an unconfirmed ID rescans to reconcile bytes it may have left,
+    and a confirmed-durable ID short-circuits.
     """
     if (
         not root_session_id
@@ -96,6 +110,10 @@ def append_usage_record(
         or any(separator in root_session_id for separator in ("/", "\\", "\x00"))
     ):
         raise ValueError("Root session ID must be a single path component")
+    ledger_key = (os.fspath(usage_dir), root_session_id)
+    with _STATE_LOCK:
+        if record_id in _CONFIRMED_DURABLE_IDS.get(ledger_key, ()):
+            return False
     directory = usage_dir / root_session_id
     durable_mkdir(directory)
     for private_dir in (usage_dir, directory):
@@ -111,22 +129,43 @@ def append_usage_record(
         restrict_fd(lock_fd)
         fcntl.flock(lock_fd, fcntl.LOCK_EX)
         path = directory / "usage.jsonl"
-        try:
-            descriptor = open_nofollow(path, directory=False)
-        except FileNotFoundError:
-            existing = b""
-        else:
-            with os.fdopen(descriptor, "rb") as stream:
-                restrict_fd(stream.fileno())
-                existing = stream.read()
-        present = any(
-            record.get("record_id") == record_id
-            for record in parse_usage_jsonl(existing).records
-        )
+        # The attempt decision belongs under the ledger lock: a concurrent
+        # same-ID append either already confirmed, or left bytes this attempt
+        # must reconcile before appending again.
+        with _STATE_LOCK:
+            confirmed = _CONFIRMED_DURABLE_IDS.get(ledger_key)
+            if confirmed is not None and record_id in confirmed:
+                return False
+            attempted = _ATTEMPTED_IDS.get(ledger_key)
+            if attempted is None:
+                attempted = _ATTEMPTED_IDS[ledger_key] = set()
+            rescan = record_id in attempted
+            attempted.add(record_id)
+        present = False
+        if rescan:
+            try:
+                descriptor = open_nofollow(path, directory=False)
+            except FileNotFoundError:
+                existing = b""
+            else:
+                with os.fdopen(descriptor, "rb") as stream:
+                    restrict_fd(stream.fileno())
+                    existing = stream.read()
+            present = any(
+                record.get("record_id") == record_id
+                for record in parse_usage_jsonl(existing).records
+            )
         # ensure_newline never truncates: even an invalid tail remains as a
         # separate damaged line. Empty content still flushes/fsyncs and publishes
         # the file's directory entry on record-present reconciliation.
         durable_append(path, b"" if present else content, ensure_newline=True)
+        # Only a returned append proves the bytes are durable; exceptions above
+        # leave the ID attempted-but-unconfirmed so a retry still reconciles.
+        with _STATE_LOCK:
+            confirmed = _CONFIRMED_DURABLE_IDS.get(ledger_key)
+            if confirmed is None:
+                confirmed = _CONFIRMED_DURABLE_IDS[ledger_key] = set()
+            confirmed.add(record_id)
         return not present
     finally:
         # Closing also releases flock, including when acquisition failed.

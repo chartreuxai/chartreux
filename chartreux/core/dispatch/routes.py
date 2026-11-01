@@ -56,7 +56,7 @@ def _cost_tier_candidates(
     return {base: price for base, price in catalog_prices.items() if base in bases}
 
 
-def _effective_target_model(
+def effective_target_model(
     target_model: str,
     *,
     catalog: Mapping[str, object],
@@ -69,6 +69,10 @@ def _effective_target_model(
     ``$session`` resolves to the session model; the cost-tier default
     resolves to the cheapest capable model among the catalog's selectable,
     priced bases; any other binding is literal.
+
+    Public because route inspection (``route_inspection``) reports a target's
+    preview through the SAME resolution the launch path uses; a second copy of
+    this rule would let the two drift.
     """
     if target_model == SESSION_MODEL:
         return session_model
@@ -179,7 +183,7 @@ def resolve_route(
     selected_model = (
         model
         if model is not None
-        else _effective_target_model(
+        else effective_target_model(
             selected.model,
             catalog=catalog,
             session_model=session_model,
@@ -193,7 +197,7 @@ def resolve_route(
         )
     if require_diversity and route.requires_distinct_models > 1:
         names: Sequence[str] = [
-            _effective_target_model(
+            effective_target_model(
                 item.model,
                 catalog=catalog,
                 session_model=session_model,
@@ -206,7 +210,7 @@ def resolve_route(
             names = [
                 model
                 if (item.model == selected.model and item.seat == selected.seat)
-                else _effective_target_model(
+                else effective_target_model(
                     item.model,
                     catalog=catalog,
                     session_model=session_model,
@@ -215,8 +219,7 @@ def resolve_route(
                 )
                 for item in route.targets
             ]
-        canonical = canonical_models or {}
-        count = len({canonical.get(name, name) for name in names})
+        count = distinct_canonical_model_count(names, canonical_models)
         if count < route.requires_distinct_models:
             raise RouteResolutionError(
                 f"Purpose {purpose!r} requires {route.requires_distinct_models} distinct canonical models; resolved {count}. Configure distinct models explicitly."
@@ -231,22 +234,84 @@ def resolve_route(
     )
 
 
+def distinct_canonical_model_count(
+    models: Sequence[str], canonical_models: Mapping[str, str] | None = None
+) -> int:
+    """How many distinct canonical bases a set of model references names.
+
+    The one count both the launch path and route inspection report, so a
+    preview can never disagree with the launch verdict about diversity.
+    """
+    canonical = canonical_models or {}
+    return len({canonical.get(model, model) for model in models})
+
+
 def validate_canonical_diversity(
     models: Sequence[str],
     required: int,
     canonical_models: Mapping[str, str] | None = None,
 ) -> None:
-    canonical = canonical_models or {}
-    count = len({canonical.get(model, model) for model in models})
+    count = distinct_canonical_model_count(models, canonical_models)
     if count < required:
         raise RouteResolutionError(
             f"Requires {required} distinct canonical models; found {count}."
         )
 
 
-def _is_launch_marker(model: str) -> bool:
+def is_launch_marker(model: str) -> bool:
     """Whether a target binding defers to launch-time resolution."""
     return model in {SESSION_MODEL, COST_TIER_DEFAULT}
+
+
+def validate_route_diversity(
+    purpose: str,
+    route: PurposeRoute,
+    *,
+    catalog: Mapping[str, object],
+    session_model: str,
+    canonical_models: Mapping[str, str] | None = None,
+    catalog_prices: Mapping[str, float] | None = None,
+) -> None:
+    """Validate ONE route's distinct-model requirement for the reload (ADR 0022).
+
+    A route whose targets ALL bind the launch-time markers (``$session`` /
+    ``$cheapest-capable``) keeps its launch-time semantics: the requirement is
+    deferred, not faked, exactly as for the shipped ``review.deep`` default.
+
+    Raises :class:`RouteResolutionError` with an actionable message naming the
+    purpose. Split out of :func:`validate_route_table_diversity` so inspection
+    can report one route's reload verdict without losing the rest of the table.
+    """
+    if route.requires_distinct_models > len(route.targets):
+        raise RouteResolutionError(
+            f"Purpose {purpose!r} requires "
+            f"{route.requires_distinct_models} distinct canonical models "
+            f"but configures only {len(route.targets)} targets. Add "
+            "targets or lower the requirement."
+        )
+    if route.requires_distinct_models <= 1:
+        return
+    if all(is_launch_marker(target.model) for target in route.targets):
+        # Every binding defers to launch-time resolution (the session model,
+        # the price data): the requirement stays a launch-time rule.
+        return
+    names = [
+        effective_target_model(
+            target.model,
+            catalog=catalog,
+            session_model=session_model,
+            canonical_models=canonical_models,
+            catalog_prices=catalog_prices,
+        )
+        for target in route.targets
+    ]
+    count = distinct_canonical_model_count(names, canonical_models)
+    if count < route.requires_distinct_models:
+        raise RouteResolutionError(
+            f"Purpose {purpose!r} requires "
+            f"{route.requires_distinct_models} distinct canonical models; "
+            f"resolved {count}. Configure distinct models explicitly."
+        )
 
 
 def validate_route_table_diversity(
@@ -274,35 +339,11 @@ def validate_route_table_diversity(
     purpose; the caller (the reload guard) turns it into a rejected reload.
     """
     for purpose, route in routes.items():
-        if route.requires_distinct_models > len(route.targets):
-            raise RouteResolutionError(
-                f"Purpose {purpose!r} requires "
-                f"{route.requires_distinct_models} distinct canonical models "
-                f"but configures only {len(route.targets)} targets. Add "
-                "targets or lower the requirement."
-            )
-        if route.requires_distinct_models <= 1:
-            continue
-        if all(_is_launch_marker(target.model) for target in route.targets):
-            # Every binding defers to launch-time resolution (the session
-            # model, the price data): the requirement stays a launch-time
-            # rule, exactly as for the shipped review.deep default.
-            continue
-        names = [
-            _effective_target_model(
-                target.model,
-                catalog=catalog,
-                session_model=session_model,
-                canonical_models=canonical_models,
-                catalog_prices=catalog_prices,
-            )
-            for target in route.targets
-        ]
-        canonical = canonical_models or {}
-        count = len({canonical.get(name, name) for name in names})
-        if count < route.requires_distinct_models:
-            raise RouteResolutionError(
-                f"Purpose {purpose!r} requires "
-                f"{route.requires_distinct_models} distinct canonical models; "
-                f"resolved {count}. Configure distinct models explicitly."
-            )
+        validate_route_diversity(
+            purpose,
+            route,
+            catalog=catalog,
+            session_model=session_model,
+            canonical_models=canonical_models,
+            catalog_prices=catalog_prices,
+        )

@@ -184,6 +184,10 @@ class AgentBrowserController:
             # The viewer is reused per agent: refresh its header in place
             # when the selected handle re-tasks.
             viewer.set_header(selected.name, identity=selected.identity)
+            # O1: the payload's stamp is resolved against the latest run by the
+            # server, so an absent one (re-task, release, expiry) clears the
+            # section here instead of redisplaying a previous run's stamp.
+            viewer.set_audit_stamp(selected.completion_audit)
             if self._app._agent_bar is not None:
                 viewer.set_metadata(self._app._agent_bar.full_metadata(selected))
 
@@ -319,6 +323,7 @@ class AgentBrowserController:
                         else ""
                     ),
                     live=self._app._agent_is_active(agent),
+                    audit=agent.completion_audit,
                     show_message_timestamps=self._app.config.show_message_timestamps,
                 )
                 self.agent_transcript_viewer = viewer

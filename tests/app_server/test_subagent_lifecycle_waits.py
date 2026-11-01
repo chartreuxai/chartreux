@@ -55,14 +55,19 @@ from chartreux.core.llm_models import FunctionCall, LLMMessage, Role, ToolCall
 from chartreux.core.subagents import (
     AgentAvailability,
     AgentEviction,
+    AgentResultExpiredError,
     LaunchConfigError,
     RetentionPolicy,
+    RunStatus,
     TaskArgs,
+    TaskResult,
     UnknownAgentError,
+    WaitStatus,
 )
 from chartreux.core.tools.base import InvokeContext
 from tests.app_server._subagent_test_support import (
     BlockingBackend,
+    GatedRegistryLock,
     _background_result,
     _config,
     _GatedWakeup,
@@ -75,6 +80,7 @@ from tests.app_server._subagent_test_support import (
     _run,
     _stored_result,
     _tombstone,
+    _wait_result,
     _zero_retention_registry,
 )
 from tests.conftest import build_test_agent_loop
@@ -1613,6 +1619,234 @@ async def test_child_state_never_leaks_to_parent_siblings_or_after_close(
     finally:
         await registry.drain_children()
         await parent.aclose()
+
+
+# ---------------------------------------------------------------------------
+# v0.7.0 U3a: the wait paths' cancellation-safe collection commit (design B3)
+# ---------------------------------------------------------------------------
+
+
+def _task_result(agent_id: str, run_id: str) -> TaskResult:
+    return TaskResult(
+        response=f"result for {run_id}",
+        turns_used=1,
+        completed=True,
+        agent_id=agent_id,
+        run_id=run_id,
+    )
+
+
+def _pending_record(
+    agent_id: str, *, clock: _ManualClock, run_id: str = "run-1"
+) -> tuple[AgentRecord, RunRecord]:
+    record = _record(agent_id, clock=clock)
+    run = _run(record, run_id, started_at=0.0, status=RunStatus.RUNNING, done=False)
+    record.current_run = run
+    return record, run
+
+
+def _complete(record: AgentRecord, run: RunRecord) -> TaskResult:
+    result = _task_result(record.agent_id, run.run_id)
+    run.result = result
+    run.status = RunStatus.COMPLETED
+    cast(asyncio.Future[Any], run.completion_task).set_result(None)
+    return result
+
+
+@pytest.mark.asyncio
+async def test_completed_wait_marks_collection_for_the_returned_run() -> None:
+    registry = _retention_registry()
+    stored = _stored_result("agent-1", "run-1")
+    registry._result_store[("agent-1", "run-1")] = stored
+
+    assert await _wait_result(registry, "agent-1", "run-1") == stored.result
+    assert registry._collected_results == {("agent-1", "run-1")}
+    assert registry._wait_leases == {}
+
+    again = await registry.wait_for_agent("agent-1", "run-1")
+    assert again.status is WaitStatus.COMPLETED
+    assert again.result == stored.result
+    assert registry._collected_results == {("agent-1", "run-1")}
+
+
+@pytest.mark.asyncio
+async def test_wait_cancelled_before_completion_never_marks_collection() -> None:
+    clock = _ManualClock()
+    registry = _retention_registry(clock)
+    record, run = _pending_record("agent-1", clock=clock)
+    registry._agent_records[record.agent_id] = record
+
+    waiter = asyncio.create_task(_wait_result(registry, record.agent_id, run.run_id))
+    try:
+        await asyncio.sleep(0)
+        assert registry._wait_leases[(record.agent_id, run.run_id)] == 1
+        waiter.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await waiter
+        assert registry._collected_results == set()
+        assert registry._wait_leases == {}
+    finally:
+        await asyncio.gather(waiter, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_still_running_wait_never_marks_collection() -> None:
+    clock = _ManualClock()
+    registry = _retention_registry(clock)
+    record, run = _pending_record("agent-1", clock=clock)
+    registry._agent_records[record.agent_id] = record
+
+    disposition = await registry.wait_for_agent(
+        record.agent_id, run.run_id, timeout=0.01
+    )
+
+    assert disposition.status is WaitStatus.STILL_RUNNING
+    assert registry._collected_results == set()
+    assert registry._wait_leases == {}
+
+
+@pytest.mark.asyncio
+async def test_completed_wait_cancelled_while_its_commit_is_blocked_never_marks() -> (
+    None
+):
+    clock = _ManualClock()
+    registry = _retention_registry(clock)
+    record, run = _pending_record("agent-1", clock=clock)
+    registry._agent_records[record.agent_id] = record
+    commit_lock = GatedRegistryLock(registry._registry_lock, gate_entry=2)
+    registry._registry_lock = commit_lock  # type: ignore[assignment]
+
+    waiter = asyncio.create_task(_wait_result(registry, record.agent_id, run.run_id))
+    try:
+        await asyncio.sleep(0)
+        assert registry._wait_leases[(record.agent_id, run.run_id)] == 1
+        _complete(record, run)
+        # The wait's settle-and-mark commit is parked outside the lock.
+        await asyncio.wait_for(commit_lock.entered.wait(), 1)
+        assert registry._collected_results == set()
+        waiter.cancel()
+        commit_lock.release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await waiter
+        assert registry._collected_results == set()
+        assert registry._wait_leases == {}
+    finally:
+        commit_lock.release.set()
+        await asyncio.gather(waiter, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_timeout_boundary_completed_wait_marks_collection() -> None:
+    clock = _ManualClock()
+    registry = _retention_registry(clock)
+    record, run = _pending_record("agent-1", clock=clock)
+    registry._agent_records[record.agent_id] = record
+    boundary_lock = GatedRegistryLock(registry._registry_lock, gate_entry=2)
+    registry._registry_lock = boundary_lock  # type: ignore[assignment]
+
+    waiter = asyncio.create_task(
+        registry.wait_for_agent(record.agent_id, run.run_id, timeout=0.01)
+    )
+    try:
+        await asyncio.wait_for(boundary_lock.entered.wait(), 1)
+        # The pinned run settles exactly at the timeout boundary.
+        result = _complete(record, run)
+        boundary_lock.release.set()
+        disposition = await asyncio.wait_for(waiter, 1)
+        assert disposition.status is WaitStatus.COMPLETED
+        assert disposition.result == result
+        assert registry._collected_results == {(record.agent_id, run.run_id)}
+        assert registry._wait_leases == {}
+    finally:
+        boundary_lock.release.set()
+        await asyncio.gather(waiter, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_boundary_completed_wait_cancelled_while_blocked_never_marks() -> None:
+    clock = _ManualClock()
+    registry = _retention_registry(clock)
+    record, run = _pending_record("agent-1", clock=clock)
+    registry._agent_records[record.agent_id] = record
+    boundary_lock = GatedRegistryLock(registry._registry_lock, gate_entry=2)
+    registry._registry_lock = boundary_lock  # type: ignore[assignment]
+
+    waiter = asyncio.create_task(
+        registry.wait_for_agent(record.agent_id, run.run_id, timeout=0.01)
+    )
+    try:
+        await asyncio.wait_for(boundary_lock.entered.wait(), 1)
+        _complete(record, run)
+        waiter.cancel()
+        boundary_lock.release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await waiter
+        assert registry._collected_results == set()
+        assert registry._wait_leases == {}
+    finally:
+        boundary_lock.release.set()
+        await asyncio.gather(waiter, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_wait_then_expiry_keeps_the_marker_until_the_result_expires() -> None:
+    registry = _retention_registry()
+    key = ("agent-0", "target")
+    clock = _ManualClock()
+    record, run = _pending_record(key[0], clock=clock, run_id=key[1])
+    registry._agent_records[key[0]] = record
+    registry._result_store[key] = _stored_result(*key, completed_at=5.0)
+    for index in range(33):
+        stored = _stored_result(f"agent-{index + 1:02}", "run", completed_at=1.0)
+        registry._result_store[(stored.agent_id, stored.run_id)] = stored
+
+    waiter = asyncio.create_task(_wait_result(registry, *key))
+    await asyncio.sleep(0)
+    # The wait lease protects the result, so the sweep protects its marker too.
+    registry._expire_results_locked()
+    assert key not in registry._expired_results
+    assert key not in registry._collected_results
+
+    result = _complete(record, run)
+    assert await waiter == result
+    assert key in registry._collected_results
+
+    # Once the result itself expires, the marker goes with it.
+    for index in range(40):
+        stored = _stored_result(f"later-{index:02}", "run", completed_at=9.0)
+        registry._result_store[(stored.agent_id, stored.run_id)] = stored
+    registry._expire_results_locked()
+    assert key in registry._expired_results
+    assert key not in registry._collected_results
+
+
+@pytest.mark.asyncio
+async def test_release_while_waiting_never_marks_collection() -> None:
+    clock = _ManualClock()
+    registry = _retention_registry(clock)
+    record, run = _pending_record("agent-1", clock=clock)
+    record.runtime.turns.close = AsyncMock()
+    registry._agent_records[record.agent_id] = record
+    registry._children[record.session_id] = record.runtime
+    registry._result_store[(record.agent_id, run.run_id)] = _stored_result(
+        record.agent_id, run.run_id
+    )
+
+    waiter = asyncio.create_task(registry.wait_for_agent(record.agent_id, run.run_id))
+    try:
+        await asyncio.sleep(0)
+        assert registry._wait_leases[(record.agent_id, run.run_id)] == 1
+
+        await registry.release_agent(record.agent_id)
+
+        _complete(record, run)
+        with pytest.raises((UnknownAgentError, AgentResultExpiredError)):
+            await asyncio.wait_for(waiter, 1)
+        assert (record.agent_id, run.run_id) not in registry._collected_results
+        assert registry._wait_leases == {}
+    finally:
+        await asyncio.gather(waiter, return_exceptions=True)
+        await registry.drain_children()
 
 
 @pytest.mark.asyncio

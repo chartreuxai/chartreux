@@ -32,6 +32,7 @@ from typing import Any
 
 from chartreux.core.agent_loop._dangerous_command_grants import (
     DangerousCommandGrantStore,
+    RemoteExecGrantRequirement,
 )
 from chartreux.core.dangerous_commands import RepositoryScope
 from chartreux.core.tools.base import BaseTool, ToolPermission
@@ -44,13 +45,16 @@ class ExecutionAdmission:
     """Invocation-bound authority carried from the pre-check to the gate.
 
     ``once_requirements`` holds the (operation, repository scope) pairs an
-    "Allow once" approval authorized for exactly one invocation. The permit
-    itself is consumed before the call resumes, so no concurrent or later
-    identical call can inherit it; the gate re-arms it from these
-    requirements for its own revalidation only.
+    "Allow once" approval authorized for exactly one invocation, and
+    ``remote_exec_requirements`` holds the destination-bound pairs for a
+    remote-exec "Allow once". The permits themselves are consumed before the
+    call resumes, so no concurrent or later identical call can inherit them;
+    the gate re-arms them from these requirements for its own revalidation
+    only.
     """
 
     once_requirements: tuple[tuple[str, RepositoryScope], ...] | None = None
+    remote_exec_requirements: tuple[RemoteExecGrantRequirement, ...] | None = None
 
 
 def revalidate_execution_admission(
@@ -91,11 +95,21 @@ def revalidate_execution_admission(
     if config is not None and config.permission == ToolPermission.NEVER:
         return f"Tool '{tool_name}' is disabled by policy"
     once_requirements = admission.once_requirements if admission is not None else None
-    store = grant_store if once_requirements else None
+    remote_exec_requirements = (
+        admission.remote_exec_requirements if admission is not None else None
+    )
+    store = grant_store if (once_requirements or remote_exec_requirements) else None
     permit = None
+    remote_exec_permit = None
     if store is not None and once_requirements:
         # Re-arm the invocation-bound permit for this revalidation only.
         permit = store.install_once(frozenset(once_requirements))
+        tool_manager._invalidate_dangerous_command_authority()
+    if store is not None and remote_exec_requirements:
+        # Same re-arming rule for a destination-bound remote-exec permit.
+        remote_exec_permit = store.install_remote_exec_once(
+            frozenset(remote_exec_requirements)
+        )
         tool_manager._invalidate_dangerous_command_authority()
     try:
         resolved = tool.resolve_permission(args)
@@ -109,6 +123,9 @@ def revalidate_execution_admission(
             # Consume the re-armed permit whether the revalidation passed or
             # failed: it authorizes this invocation and nothing else.
             store.destroy_once(permit)
+            tool_manager._invalidate_dangerous_command_authority()
+        if remote_exec_permit is not None and store is not None:
+            store.destroy_remote_exec_once(remote_exec_permit)
             tool_manager._invalidate_dangerous_command_authority()
     if resolved is not None and resolved.permission == ToolPermission.NEVER:
         return resolved.reason or f"Tool '{tool_name}' is disabled by policy"

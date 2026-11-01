@@ -839,6 +839,8 @@ class SessionFlowController:
             )
             await self._app._queue.clear_server_queue()
             await self._app.app_server.resources.refresh()
+            # The rewind rewrote the history the thinking estimate depends on.
+            self._app._refresh_banner()
         except AppServerResponseError as exc:
             self._app.notify(exc.error.message, severity="error")
             return

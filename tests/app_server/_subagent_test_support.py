@@ -12,7 +12,8 @@ phase-(i) helper-relocation commit: the fake agent backends
 retention record builders (``_background_result``, ``_wait_result``,
 ``_stored_result``, ``_evicted_tombstone``, ``_idle_record``,
 ``_foreground_result``, ``_real_reused_background``), the clock and wakeup
-doubles (``_ManualClock``, ``_GatedWakeup``), the reaper arm helper
+doubles (``_ManualClock``, ``_GatedWakeup``), the gated registry lock
+(``GatedRegistryLock``), the reaper arm helper
 (``_rearm``), the event-stream helpers (``_consume``,
 ``_wait_for_turn_completion``). No test bodies, fixtures, or marks live here; the
 test population stays in ``test_subagents.py`` until the phase-(ii)
@@ -356,6 +357,36 @@ def _idle_record(
         idle_since=clock(),
         last_task_summary=summary,
     )
+
+
+class GatedRegistryLock:
+    """An ``asyncio.Lock`` wrapper that parks one counted acquisition.
+
+    ``gate_entry`` names the exact acquisition to park (1 = the first). The
+    wrapper holds the real lock only while counting, releases it BEFORE
+    waiting on ``release``, and re-acquires afterwards — so the parked task
+    is suspended outside any locked region and a test can observe or cancel
+    it at that seam, then let it continue with ``release.set()``.
+    """
+
+    def __init__(self, lock: asyncio.Lock, *, gate_entry: int) -> None:
+        self.lock = lock
+        self.gate_entry = gate_entry
+        self.entries = 0
+        self.entered = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def __aenter__(self) -> None:
+        await self.lock.acquire()
+        self.entries += 1
+        if self.entries == self.gate_entry:
+            self.entered.set()
+            self.lock.release()
+            await self.release.wait()
+            await self.lock.acquire()
+
+    async def __aexit__(self, *exc: object) -> None:
+        self.lock.release()
 
 
 class _GatedWakeup:

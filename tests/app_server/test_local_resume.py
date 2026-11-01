@@ -28,6 +28,7 @@ from chartreux.app_server.session import AppServerSession
 from chartreux.app_server.transport import memory_transport_pair
 from chartreux.core.agent_loop import AgentLoop
 from chartreux.core.config import SessionLoggingConfig
+from chartreux.core.llm_models import LLMMessage, Role
 from chartreux.core.session.resume_sessions import ResumeSessionInfo
 from chartreux.core.session.session_loader import SessionLoader
 from tests.app_server._local_runtime_support import (
@@ -35,6 +36,7 @@ from tests.app_server._local_runtime_support import (
     _init_repo,
 )
 from tests.app_server.test_usage_attribution import read_ledger
+from tests.archive_history_support import descriptor_for_prefix, write_transcript
 from tests.conftest import build_test_agent_loop, build_test_vibe_config
 from tests.stubs.app_server import create_legacy_app_server
 from tests.stubs.fake_backend import FakeBackend
@@ -393,6 +395,44 @@ async def test_resume_rebinds_session_in_place_preserving_backend(
         assert source.stats.session_prompt_tokens == 11
         assert source.stats.session_completion_tokens == 7
         assert not source_backend.closed
+    finally:
+        await source.aclose()
+
+
+@pytest.mark.asyncio
+async def test_warm_child_continuation_retains_the_archive_descriptor(
+    tmp_path: Path,
+) -> None:
+    """M1's resume rule: a warm continuation keeps its existing descriptor.
+
+    The warm-continuation rebind (``rebind_to_session`` for a resident root,
+    ``resume_child`` for a child) both commit through
+    ``SessionLogger.apply_resumed_session``; retention is session-scoped, so
+    the same conversation keeps its archive authority and resume does not
+    re-trim.
+    """
+    logging = SessionLoggingConfig(
+        enabled=True, save_dir=str(tmp_path / "sessions"), session_prefix="session"
+    )
+    source = build_test_agent_loop(
+        config=build_test_vibe_config(session_logging=logging)
+    )
+    await source.persist_empty_session()
+    transcript = tmp_path / "messages.jsonl"
+    write_transcript(
+        transcript, [LLMMessage(role=Role.user, content="question", message_id="u1")]
+    )
+    descriptor = descriptor_for_prefix(
+        transcript,
+        1,
+        session_id=source.session_id,
+        message_epoch=source.messages.message_epoch,
+    )
+    source.session_logger.retain_archive_descriptor(descriptor)
+    try:
+        await runtime.AgentRuntimeFactory().resume_root(source, source.session_id)
+
+        assert source.session_logger.archive_descriptor is descriptor
     finally:
         await source.aclose()
 

@@ -15,7 +15,9 @@ from chartreux.core.config._catalog import validate_catalog_scope
 from chartreux.core.config._credential_authority import validate_credential_env_source
 from chartreux.core.config._dangerous_command_authority import (
     ProjectDangerousCommandGrant,
+    ProjectRemoteExecGrant,
     validate_grant_source,
+    validate_remote_exec_grant_source,
 )
 from chartreux.core.config._restrictions import (
     ConfigCandidate,
@@ -244,10 +246,12 @@ class ConfigBuilder[S: ConfigSchema]:
                     raw = replacement.replace_in(raw)
                 roots = validate_root_source(raw, layer=layer)
                 grants = validate_grant_source(raw, layer=layer)
+                remote_exec_grants = validate_remote_exec_grant_source(raw, layer=layer)
                 self._check_accepted_interpretation(
                     layer=layer,
                     roots=roots,
                     grants=grants,
+                    remote_exec_grants=remote_exec_grants,
                     force_load=force_load,
                     replacement=replacement,
                 )
@@ -316,6 +320,7 @@ class ConfigBuilder[S: ConfigSchema]:
         validate_credential_env_source(raw, layer=layer)
         validate_root_source(raw, layer=layer)
         validate_grant_source(raw, layer=layer)
+        validate_remote_exec_grant_source(raw, layer=layer)
 
     def _check_accepted_interpretation(
         self,
@@ -323,6 +328,7 @@ class ConfigBuilder[S: ConfigSchema]:
         layer: ConfigLayer[RawConfig],
         roots: tuple[ProjectRootAuthority, ...],
         grants: tuple[ProjectDangerousCommandGrant, ...],
+        remote_exec_grants: tuple[ProjectRemoteExecGrant, ...],
         force_load: bool,
         replacement: SourceRestrictions | None,
     ) -> None:
@@ -345,6 +351,10 @@ class ConfigBuilder[S: ConfigSchema]:
                 raise ValueError(
                     "Dangerous command grant interpretation changed; "
                     "explicit reload required"
+                )
+            if remote_exec_grants != accepted.remote_exec_grants:
+                raise ValueError(
+                    "Remote-exec grant interpretation changed; explicit reload required"
                 )
 
     def _merge_fields(

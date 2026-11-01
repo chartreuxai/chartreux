@@ -85,12 +85,15 @@ class PathCompletionController:
         app = getattr(self._view, "app", None)
         if app:
             with self._query_lock:
-                self._pending_future = self._executor.submit(
+                future = self._executor.submit(
                     self._compute_completions, text, cursor_index, generation
                 )
-                self._pending_future.add_done_callback(
-                    lambda f: self._handle_completion_result(f, query, generation)
-                )
+                self._pending_future = future
+            # A future that finishes before this call runs its callback inline in
+            # this thread, so the callback must never be registered under the lock.
+            future.add_done_callback(
+                lambda f: self._handle_completion_result(f, query, generation)
+            )
         else:
             suggestions = self._compute_completions(text, cursor_index, generation)
             self._update_suggestions(suggestions)

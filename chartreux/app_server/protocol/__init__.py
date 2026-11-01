@@ -200,6 +200,7 @@ from chartreux.app_server.protocol.notifications import (
     AgentEvictionModel as AgentEvictionModel,
     AgentSummaryModel as AgentSummaryModel,
     AgentsUpdateParams as AgentsUpdateParams,
+    ChildCallbackClosedParams as ChildCallbackClosedParams,
     EventNotificationParams as EventNotificationParams,
     HistoryEntryAddedParams as HistoryEntryAddedParams,
     HistoryEntryUpdatedParams as HistoryEntryUpdatedParams,

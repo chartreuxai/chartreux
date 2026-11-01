@@ -13,6 +13,7 @@ from chartreux.app_server._model import ProtocolModel
 from chartreux.app_server.models import (
     AgentStatsSnapshot,
     JsonPatchOperation,
+    PublicCompletionAudit,
     PublicFailureEnvelope,
     PublicHistoryEntry,
     PublicRecoveryEligibility,
@@ -129,6 +130,10 @@ class AgentSummaryModel(ProtocolModel):
     active_provider: str | None = None
     effective_thinking: str | None = None
     result_expired: bool = False
+    # U2/B8: retrievable, not-yet-collected run results, newest first. The
+    # key is ALWAYS emitted, including an empty list: its presence is part
+    # of the wire contract, so no exclude_if may be added here.
+    uncollected_run_ids: list[str] = Field(default_factory=list)
     # Public typed failure envelope of the latest failed run (WP1); bounded
     # and redacted, full diagnostics stay private. The public wire model
     # mirrors the core envelope (the public layer cannot import core).
@@ -147,6 +152,11 @@ class AgentSummaryModel(ProtocolModel):
     # agent_id with predecessor/package lineage). None when unclaimed.
     work_package_id: str | None = None
     predecessor_agent_id: str | None = None
+    # O1: the typed completion-audit stamp of the LATEST run, resolved against
+    # that run's retained result. None when the latest run has no retained
+    # result, has not finished, or its result expired — a previous run's stamp
+    # never rides a new run's summary.
+    completion_audit: PublicCompletionAudit | None = None
 
 
 class AgentEvictionModel(ProtocolModel):
@@ -169,6 +179,30 @@ class StatsUpdatedParams(EventNotificationParams):
 
     stats: AgentStatsSnapshot
     context_window: int | None
+
+
+class ChildCallbackClosedParams(ProtocolModel):
+    """A child-session callback reached a terminal state.
+
+    Child callbacks never enter the ROOT projection: their history entries
+    stay in the child session, so the parent client cannot learn the closure
+    from history patches. This notification is the only route. ``session_id``
+    is the OWNING child session and ``callback_id`` is unique per session, so
+    a client matches the closure against the callback it delivered earlier —
+    never against a newer callback.
+
+    Producer set note: after Q1 no shipped producer can mint a child question.
+    The channel is defense-in-depth for pre-Q1 callbacks in running sessions
+    and for future child-askable callback kinds; the strict-client
+    compatibility caveat is paid knowingly (older clients drop the unknown
+    notification method, exactly as they drop any unhandled notification).
+    """
+
+    NOTIFICATION_METHOD: ClassVar[str] = "callback/childClosed"
+
+    session_id: str
+    callback_id: str
+    reason: str
 
 
 class UsageUpdatedParams(ProtocolModel):

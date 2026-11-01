@@ -17,6 +17,7 @@ from chartreux.app_server.models import (
     BlockedEffectState,
     CallbackDetail,
     CallbackOutput,
+    CancelledCallbackState,
     CancelledEffectState,
     CompletedEffectState,
     EffectCallDisplay,
@@ -438,6 +439,59 @@ class EventProjector:
                                 path="/state",
                                 value=RunningEffectState(
                                     output_text=output_text
+                                ).model_dump(mode="json", by_alias=True),
+                            )
+                        ],
+                    )
+                )
+        return updates
+
+    def close_callback(self, callback_id: str, reason: str) -> list[ProjectedUpdate]:
+        """Publish the terminal cancelled state for an open callback.
+
+        Mirrors expire_callback: the entry becomes terminal history, so a
+        reconnecting client (which redelivers OpenCallbackState entries only)
+        never sees a ghost callback, and the blocked related effect unblocks.
+        Idempotent by entry state: a callback that already reached a terminal
+        state publishes nothing, so exactly one terminal result wins.
+        """
+        entry_id = self._callback_entries.get(callback_id)
+        if entry_id is None:
+            return []
+        entry = cast(PublicCallbackEntry, self._entries[entry_id])
+        if not isinstance(entry.state, OpenCallbackState):
+            return []
+        updates = [
+            self._patch(
+                entry_id,
+                [
+                    JsonPatchOperation(
+                        op="replace",
+                        path="/state",
+                        value=CancelledCallbackState(reason=reason).model_dump(
+                            mode="json", by_alias=True
+                        ),
+                    ),
+                    JsonPatchOperation(
+                        op="replace", path="/generationStatus", value="completed"
+                    ),
+                ],
+            )
+        ]
+        if entry.related_entry_id in self._entries:
+            effect = self._entries[cast(str, entry.related_entry_id)]
+            if isinstance(effect, PublicEffectEntry) and isinstance(
+                effect.state, BlockedEffectState
+            ):
+                updates.append(
+                    self._patch(
+                        effect.id,
+                        [
+                            JsonPatchOperation(
+                                op="replace",
+                                path="/state",
+                                value=RunningEffectState(
+                                    output_text=effect.state.output_text
                                 ).model_dump(mode="json", by_alias=True),
                             )
                         ],

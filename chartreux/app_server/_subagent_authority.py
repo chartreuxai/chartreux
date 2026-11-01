@@ -84,6 +84,38 @@ class DangerousCommandAuthority:
             expected_revision=expected_revision,
         )
 
+    async def save_remote_exec_grant(
+        self, *, session_id: str, destination: str, expected_revision: str
+    ) -> ConfigSaveResult:
+        """Persist one approved remote-exec destination through the root orchestrator.
+
+        Same routing as the operation grant save: the caller's registered cwd
+        keys the save, child orchestrators never write, and nothing is
+        published.
+        """
+        caller = self._resolve_session_loop(session_id)
+        root_runtime = self._resolve_root()
+        if caller is None or root_runtime is None:
+            raise ValueError(
+                "Remote-exec grant save requires a registered session and root"
+            )
+        return await root_runtime.agent_loop.config_orchestrator.save_remote_exec_grant(
+            project=caller.cwd,
+            destination=destination,
+            expected_revision=expected_revision,
+        )
+
+    def _remote_exec_grant_save(
+        self, session_id: str, project: Path, destination: str, expected_revision: str
+    ) -> Awaitable[ConfigSaveResult]:
+        # The loop's proposal project is not a trusted key, exactly as above.
+        del project
+        return self.save_remote_exec_grant(
+            session_id=session_id,
+            destination=destination,
+            expected_revision=expected_revision,
+        )
+
     async def read_dangerous_command_authority(
         self, session_id: str
     ) -> DangerousCommandAuthorityReadResponse:

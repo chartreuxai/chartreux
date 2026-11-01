@@ -22,15 +22,12 @@ from chartreux.app_server._sessions import (
 from chartreux.app_server._turns import TurnController
 from chartreux.app_server.events import CallbackRequested
 from chartreux.app_server.models import (
-    CompletedEffectState,
+    FailedEffectState,
     PublicEffectEntry,
     PublicMessageEntry,
     PublicTurn,
     PublicTurnStatus,
     SubagentEffectDetail,
-    UserAnswer,
-    UserInputCallbackOutput,
-    UserQuestionResult,
 )
 from chartreux.app_server.protocol import AppServerResponseError, ProtocolErrorCode
 from chartreux.app_server.server import AppServer
@@ -213,14 +210,19 @@ async def test_child_registration_rolls_back_when_projection_fails(
 
 
 @pytest.mark.asyncio
-async def test_child_callbacks_round_trip_using_child_session_id(monkeypatch) -> None:
-    # The custom "interactive" identity is a user prompt file installed by
-    # the autouse conftest fixture; agents/*.toml discovery is retired (16a).
-    todo_call = ToolCall(
-        id="todo-1",
-        index=0,
-        function=FunctionCall(name="todo", arguments='{"action":"read"}'),
-    )
+async def test_child_question_is_denied_without_minting_a_callback(monkeypatch) -> None:
+    """A child's ask_user_question is refused before the broker.
+
+    Q1 coverage disposition: this test used to assert child-callback
+    round-trip delivery through the app server using its child session id.
+    Child questions are now execution-denied before any callback is minted
+    (question-widget fix design, Q1), so that delivery coverage is RECORDED
+    as retired here and replaced by Q2b's end-to-end child-callback closure
+    test — not silently lost.
+
+    The custom "interactive" identity is a user prompt file installed by
+    the autouse conftest fixture; agents/*.toml discovery is retired (16a).
+    """
     question_call = ToolCall(
         id="question-1",
         index=0,
@@ -237,7 +239,6 @@ async def test_child_callbacks_round_trip_using_child_session_id(monkeypatch) ->
         ),
     )
     child_backend = FakeBackend([
-        [mock_llm_chunk(content="", tool_calls=[todo_call])],
         [mock_llm_chunk(content="", tool_calls=[question_call])],
         [mock_llm_chunk(content="Child completed")],
     ])
@@ -253,44 +254,45 @@ async def test_child_callbacks_round_trip_using_child_session_id(monkeypatch) ->
         [mock_llm_chunk(content="Parent completed")],
     ])
     config = build_test_vibe_config(
-        enabled_tools=["task", "todo", "ask_user_question"],
-        tools={
-            "task": {"permission": ToolPermission.ALWAYS.value},
-            "todo": {"permission": ToolPermission.ALWAYS.value},
-        },
+        enabled_tools=["task", "ask_user_question"],
+        tools={"task": {"permission": ToolPermission.ALWAYS.value}},
     )
     parent = build_test_agent_loop(
         config=config, backend=parent_backend, enable_streaming=True
     )
     session = await create_test_app_server_session(parent)
-    callbacks = []
+    callbacks: list[CallbackRequested] = []
 
     try:
         async for event in session.act("Delegate this"):
-            if not isinstance(event, CallbackRequested):
-                continue
-            callbacks.append(event.callback)
-            output = UserInputCallbackOutput(
-                result=UserQuestionResult(
-                    answers=[UserAnswer(question="Ship it?", answer="Yes")]
-                )
-            )
-            await session.respond_to_callback(event.callback.callback_id, output)
+            if isinstance(event, CallbackRequested):
+                callbacks.append(event)
 
-        assert callbacks, session.history
-        assert [callback.detail.kind for callback in callbacks] == ["user_input"]
-        child_session_ids = {callback.session_id for callback in callbacks}
-        assert len(child_session_ids) == 1
-        child_session_id = child_session_ids.pop()
+        assert callbacks == [], "a child question must never mint a callback"
+        subagent_effect = next(
+            entry
+            for entry in session.history or []
+            if isinstance(entry, PublicEffectEntry)
+            and entry.detail.kind is ToolEffectKind.SUBAGENT
+        )
+        assert isinstance(subagent_effect.detail, SubagentEffectDetail)
+        child_session_id = subagent_effect.detail.child_session_id
+        assert child_session_id is not None
         assert child_session_id != session.session_id
+
         child_state = await _read_child(session, child_session_id)
+        question_effect = next(
+            entry
+            for entry in child_state.history or []
+            if isinstance(entry, PublicEffectEntry)
+            and entry.title == "ask_user_question"
+        )
+        assert isinstance(question_effect.state, FailedEffectState)
+        assert "not available to subagents" in question_effect.state.error.message
+        assert "blocker" in question_effect.state.error.message
+        # The denial is an ordinary tool error: the child turn completes.
         assert any(
             isinstance(entry, PublicMessageEntry) and entry.text == "Child completed"
-            for entry in child_state.history or []
-        )
-        assert any(
-            isinstance(entry, PublicEffectEntry)
-            and isinstance(entry.state, CompletedEffectState)
             for entry in child_state.history or []
         )
     finally:

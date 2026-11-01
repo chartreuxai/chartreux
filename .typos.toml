@@ -17,6 +17,9 @@ unparseable = "unparseable"
 # contract-fixed command text, not the words "and"/"on".
 nd = "nd"
 pn = "pn"
+# Common Lisp Object System acronym in skills/sub-summarizer/SKILL.md —
+# contract-fixed token, not the word "close".
+CLOS = "CLOS"
 
 [default.extend-identifiers]
 # macOS pasteboard four-char-code for the PNG flavor — required verbatim

@@ -42,6 +42,11 @@ class _NeverCalledGrantPort:
     ) -> ConfigSaveResult:
         raise AssertionError("A session without an approval must not save grants")
 
+    async def save_remote_exec_grant(
+        self, session_id: str, project: Path, destination: str, expected_revision: str
+    ) -> ConfigSaveResult:
+        raise AssertionError("A session without an approval must not save grants")
+
 
 async def test_refusal_memory_does_not_block_unrelated_operations(
     tmp_path: Path,

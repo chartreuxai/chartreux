@@ -34,6 +34,7 @@ prompt, prints a response, and exits.
 | --- | --- |
 | `chartreux models migrate [--preview \| --apply]` | Preview (default) or move legacy catalog tables to `models.toml`. |
 | `chartreux doctor [--live] [--smoke] [--provider ID] [--model BASE] [--json]` | Read-only diagnostics; see tiers below. |
+| `chartreux skills diff [NAME] [--json]` | Compare user skill copies in `~/.chartreux/skills` and `~/.agents/skills` with the shipped copy of the same name. `NAME` limits the report to one skill; an unknown name is an error. The report is read-only: it never removes or edits a skill. `--json` emits `entries` and `exit_code`. Exit codes: `0` nothing differs, `1` a loaded user copy differs, `2` operational error (including invalid UTF-8 or an unknown `NAME`). |
 | `chartreux mcp remove NAME` | Remove a user-configured MCP server. |
 | `chartreux mcp add NAME` | `--transport {streamable-http,stdio}` (default `streamable-http`), `--url`, `--command`, repeatable `--arg VALUE`, repeatable `--env NAME=VALUE`, repeatable `--header NAME=VALUE`, `--api-key-env VAR` (also `--bearer-token-env-var`), `--api-key-header HEADER`, `--api-key-format FORMAT`, `--no-login`, `--startup-timeout-sec SECONDS`, `--tool-timeout-sec SECONDS`. Remote servers require `--url`; stdio servers require `--command`. |
 
@@ -58,6 +59,19 @@ bypasses `config.allowed_models`: diagnostics probe the selected deployment
 regardless of the agent-allowed set. `--live` and `--smoke` are independent.
 No mode creates or repairs configuration, persists trust, or writes sessions.
 Skipped, unsupported, and unverified results are not passes or failures.
+`warn` results are advisory — doctor reports one per user skill copy that
+shadows a shipped skill, naming the winning copy, and suggests removal only for
+an identical copy after you review its support files. No removal is automatic,
+and `warn` never changes the exit code: only `fail` does.
+The route section reports the `[orchestration.routes]` table the trusted
+configuration independently loads — never a running conversation's live table
+(that is `/routes`). It lists each target's seat, binding, identity, tier, and
+overlay, the model a marker binding resolves to today (a preview, not a launch
+guarantee), and the distinct-model requirement beside the resolved count
+(`UNKNOWN` when a target cannot resolve). Reload validation and launch-time
+diversity are separate facts: the shipped `review.deep` default passes reload
+validation (every target defers to launch) while its launch-time diversity
+fails, and both are reported.
 `--json` emits only JSON on stdout: a `checks` array of objects with `name`,
 `status`, and `reason`, plus `exit_code`. Exit codes: `0` no failed checks,
 `1` failed checks, `2` invalid invocation. Redirected stdio is supported.
@@ -92,8 +106,9 @@ can add commands.
 | `/agents` | Toggle the docked agent browser above the input: Main plus subagents grouped by lifecycle (Active, Retained Idle, Recent) with Resident/Active/Idle/Recent/All filter tabs, name-first rows with dimmed handles, and active-only status counts. |
 | `/compact [instructions]` | Summarize the conversation context. |
 | `/exit`, `exit`, `quit`, `:q`, `:quit` | Exit immediately while idle. During consequential active work, opens the exit confirmation dialog. |
-| `/status` | Display agent statistics. |
+| `/status` | Display agent statistics plus the next request's thinking estimate: **Requested**, **Semantic**, and **API effort** (the provider's wire value, or `unknown` when it cannot be resolved). |
 | `/usage` | Browse recorded usage and USD cost estimates by calendar window and project; available while a turn runs. |
+| `/routes` | Browse this conversation's live `[orchestration.routes]` table: each target's purpose, seat, configured binding, identity, tier, and overlay, the model a marker binding resolves to today (a preview, not a launch guarantee), and `requires_distinct_models` beside the resolved distinct-model count. Reload validation and launch-time diversity are reported separately; a reload that swaps the table updates the open browser. Read-only, available while a turn runs. |
 | `/proxy-setup` | Configure proxy and certificate settings. See [networking](../integrations/networking.md). |
 | `/providers` | Open Provider Settings to add or manage model providers. |
 | `/resume`, `/continue` | Browse, resume, or delete saved sessions. |

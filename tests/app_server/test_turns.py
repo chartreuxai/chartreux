@@ -5,22 +5,37 @@ from collections.abc import AsyncIterator
 from contextlib import suppress
 from pathlib import Path
 import threading
+from typing import Any
 
 import pytest
 
+from chartreux.app_server._turns import CallbackRejectedError, TurnController
 from chartreux.app_server.client import AppServerClient
 from chartreux.app_server.events import (
+    CallbackRequested,
     HistoryEntryAdded,
     SessionSnapshot,
     SessionUpdated,
     StatsUpdated,
     TurnRetrying,
 )
-from chartreux.app_server.models import PublicRetryCategory
+from chartreux.app_server.models import (
+    AnsweredCallbackState,
+    CancelledCallbackState,
+    PublicRetryCategory,
+    UserAnswer,
+    UserInputCallbackOutput,
+    UserQuestionResult,
+)
+from chartreux.app_server.protocol import HistoryEntryUpdatedParams
 from chartreux.app_server.transport import memory_transport_pair
 from chartreux.core.config import SessionLoggingConfig
 from chartreux.core.events import AssistantEvent, UserMessageEvent
 from chartreux.core.utils import RetryReason
+from tests.app_server._session_runtime_support import (
+    _isolate_recovery_registry,  # noqa: F401 - autouse fixture registered via module namespace
+    _question_tool_call,
+)
 from tests.conftest import build_test_agent_loop, build_test_vibe_config
 from tests.mock.utils import mock_llm_chunk
 from tests.stubs.app_server import (
@@ -369,3 +384,163 @@ async def _next_event[EventT](
         if isinstance(event, event_type):
             return event
     raise AssertionError(f"Event stream ended before {event_type.__name__}")
+
+
+def _question_answer() -> UserInputCallbackOutput:
+    return UserInputCallbackOutput(
+        result=UserQuestionResult(
+            answers=[UserAnswer(question="Ship it?", answer="Yes")]
+        )
+    )
+
+
+async def _open_question_session() -> tuple[Any, TurnController, Any]:
+    """Attach a session whose first turn opens one ``ask_user_question``."""
+    backend = FakeBackend([
+        [mock_llm_chunk(content="", tool_calls=[_question_tool_call()])],
+        [mock_llm_chunk(content="Done")],
+    ])
+    agent_loop = build_test_agent_loop(
+        config=build_test_vibe_config(enabled_tools=["ask_user_question"]),
+        backend=backend,
+        enable_streaming=True,
+    )
+    client_transport, server_transport = memory_transport_pair()
+    server = build_test_app_server(agent_loop, server_transport)
+    session = await attach_test_app_server_session(
+        AppServerClient(client_transport, run_peer=server.serve)
+    )
+    return session, legacy_backend(server).session.turns, agent_loop
+
+
+def _record_callback_patches(
+    turns: TurnController, callback_id: str, record: Any
+) -> tuple[list[tuple[bool, object]], list[str]]:
+    """Record each callback patch as it is emitted, before delivery.
+
+    Returns ``(observed, future_states)``: for every patch, whether the
+    record already carried a terminal disposition (a resolution or the
+    core-side rejection) and the patched entry's state, plus the raw asyncio
+    future state at that moment.
+    """
+    observed: list[tuple[bool, object]] = []
+    future_states: list[str] = []
+    original = turns._emit_projected
+
+    async def recording(update: Any) -> None:
+        params = update.params
+        if (
+            isinstance(params, HistoryEntryUpdatedParams)
+            and params.entry_id == f"callback:{callback_id}"
+        ):
+            entry = next(
+                item for item in turns.callbacks if item.callback_id == callback_id
+            )
+            terminal = record.core_resolved or record.resolution is not None
+            observed.append((terminal, entry.state))
+            future = record.future
+            future_states.append(
+                "cancelled"
+                if future.cancelled()
+                else "done"
+                if future.done()
+                else "pending"
+            )
+        await original(update)
+
+    turns._emit_projected = recording  # type: ignore[method-assign]
+    return observed, future_states
+
+
+async def _drain(events: AsyncIterator[object]) -> None:
+    with suppress(Exception):
+        await asyncio.wait_for(_consume(events), timeout=2)
+
+
+@pytest.mark.asyncio
+async def test_cancel_callbacks_terminalizes_before_the_waiter_resolves() -> None:
+    session, turns, agent_loop = await _open_question_session()
+    events = session.act("read todos")
+    try:
+        requested = await _next_event(events, CallbackRequested)
+        callback_id = requested.callback.callback_id
+        record = turns._callbacks[callback_id]
+        observed, future_states = _record_callback_patches(turns, callback_id, record)
+
+        await turns._cancel_callbacks("App server closed")
+
+        assert len(observed) == 1
+        terminal_before_publish, state = observed[0]
+        assert terminal_before_publish is False
+        assert future_states == ["pending"]
+        assert isinstance(state, CancelledCallbackState)
+        assert state.reason == "App server closed"
+        assert isinstance(record.future.exception(), CallbackRejectedError)
+
+        # A repeat terminalization publishes nothing and re-rejects nothing.
+        await turns._cancel_callbacks("App server closed")
+        assert len(observed) == 1
+        assert isinstance(record.future.exception(), CallbackRejectedError)
+    finally:
+        await _drain(events)
+        await session.close()
+        await agent_loop.aclose()
+
+
+@pytest.mark.asyncio
+async def test_reset_terminalizes_open_callbacks_before_dropping_state() -> None:
+    session, turns, agent_loop = await _open_question_session()
+    events = session.act("read todos")
+    try:
+        requested = await _next_event(events, CallbackRequested)
+        callback_id = requested.callback.callback_id
+        record = turns._callbacks[callback_id]
+        observed, _ = _record_callback_patches(turns, callback_id, record)
+
+        await turns.reset()
+
+        # Reset funnels through close(), which cancels the turn task before
+        # dropping the projector: the terminal patch is published while the
+        # callback record still has no terminal disposition.
+        assert observed
+        terminal_before_publish, state = observed[0]
+        assert terminal_before_publish is False
+        assert isinstance(state, CancelledCallbackState)
+        assert turns.callbacks == []
+        assert turns._callbacks == {}
+        # The waiter itself was already cancelled with the turn task; the
+        # record carries the core-side rejection.
+        assert record.core_resolved is True
+    finally:
+        await _drain(events)
+        await session.close()
+        await agent_loop.aclose()
+
+
+@pytest.mark.asyncio
+async def test_close_never_overwrites_an_answered_callback() -> None:
+    session, turns, agent_loop = await _open_question_session()
+    events = session.act("read todos")
+    try:
+        requested = await _next_event(events, CallbackRequested)
+        callback_id = requested.callback.callback_id
+        record = turns._callbacks[callback_id]
+        answer = _question_answer()
+
+        await session.respond_to_callback(callback_id, answer)
+        answered = next(
+            entry for entry in turns.callbacks if entry.callback_id == callback_id
+        )
+        assert isinstance(answered.state, AnsweredCallbackState)
+        observed, _ = _record_callback_patches(turns, callback_id, record)
+
+        await turns._cancel_callbacks("App server closed")
+
+        # The terminal cancelled patch belongs to open entries only: the
+        # answered record keeps exactly one terminal result.
+        assert observed == []
+        assert record.future.result() == answer
+    finally:
+        await _drain(events)
+        await session.close()
+        await agent_loop.aclose()

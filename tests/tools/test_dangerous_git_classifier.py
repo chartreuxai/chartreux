@@ -42,6 +42,9 @@ FROZEN_OPERATION_IDS = (
     # v0.5.9 P2-a: destination-aware egress — publication-class like
     # git.push, so the ask-class rule grants it the same way.
     "network.egress",
+    # v0.7.0 S4a: remote-exec authorization — a destination grant, distinct
+    # from network.egress; its SSH classifier lands with S4b1.
+    "network.remote-exec",
 )
 
 
@@ -1503,11 +1506,15 @@ def test_registry_matches_the_frozen_contract() -> None:
         for operation_id, operation in OPERATION_REGISTRY.items()
         if operation.persistable
     ]
-    # Only publication is persistable.
-    assert persistable == ["git.push", "network.egress"]
+    # Publication and remote-exec are persistable; consequential never is.
+    assert persistable == ["git.push", "network.egress", "network.remote-exec"]
     for operation in OPERATION_REGISTRY.values():
         assert operation.consequence
-        assert operation.command_class in {"publication", "consequential"}
+        assert operation.command_class in {
+            "publication",
+            "consequential",
+            "remote_exec",
+        }
 
 
 def test_operations_for_ids_resolves_in_registry_order() -> None:

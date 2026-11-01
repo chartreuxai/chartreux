@@ -11,7 +11,7 @@ from collections.abc import (
     Sequence,
 )
 from contextlib import ExitStack, asynccontextmanager, contextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 import time
 from typing import TYPE_CHECKING, Any, cast
@@ -103,6 +103,7 @@ from chartreux.app_server.models import (
     CallbackOutput,
     OpenCallbackState,
     PublicCallbackEntry,
+    PublicCompletionAudit,
     PublicFailureEnvelope,
     PublicHistoryEntry,
     PublicRecoveryEligibility,
@@ -123,6 +124,7 @@ from chartreux.core.agent_loop import AgentLoop
 from chartreux.core.agent_loop._loop import _PreparedPolicyReplacement
 from chartreux.core.agents.launch import LaunchCandidate
 from chartreux.core.agents.manager import requested_identity_reference
+from chartreux.core.completion_contract import CompletionAuditClassification
 from chartreux.core.config._restrictions import (
     SourceRestrictions,
     partition_policy_sources,
@@ -196,6 +198,21 @@ def _public_failure_envelope(
     return PublicFailureEnvelope.model_validate(
         envelope.model_dump(mode="json", by_alias=True)
     )
+
+
+def _public_completion_audit(
+    audit: CompletionAuditClassification | None,
+) -> PublicCompletionAudit | None:
+    """Project a run's typed audit stamp onto the public wire model (O1).
+
+    The wire model mirrors the core classification axis-for-axis; the stamp
+    classifies the run's completion claims against harness-collected evidence
+    and says nothing about correctness, so no summary or chronology text is
+    derived here.
+    """
+    if audit is None:
+        return None
+    return PublicCompletionAudit.model_validate(audit.model_dump(mode="json"))
 
 
 @dataclass(slots=True)
@@ -293,6 +310,10 @@ class SessionRuntimeRegistry(SubagentRunnerPort):  # noqa: PLR0904
         self._evicted_agents: dict[str, _AgentTombstone] = {}
         self._result_store: dict[tuple[str, str], StoredRunResult] = {}
         self._expired_results: set[tuple[str, str]] = set()
+        # v0.7.0 U3a: (agent_id, run_id) keys the registry already returned as
+        # a TaskResult. Ephemeral bookkeeping only — it records an existing
+        # runtime event and never extends a result's lifetime.
+        self._collected_results: set[tuple[str, str]] = set()
         self._latest_run_ids: dict[str, str] = {}
         self._wait_leases: dict[tuple[str, str], int] = {}
         self._pending_notifications: set[tuple[str, str]] = set()
@@ -310,6 +331,15 @@ class SessionRuntimeRegistry(SubagentRunnerPort):  # noqa: PLR0904
         self._monitor_tasks: set[asyncio.Task[None]] = set()
         self._eviction_tasks: set[asyncio.Task[bool]] = set()
         self._registry_lock = asyncio.Lock()
+        # B2/U1: the agents/update emission state. The guard admits a single
+        # in-flight delivery; the dirty flag makes the in-flight (or next)
+        # delivery re-project the inventory; the queue carries eviction
+        # payloads handed over while another delivery was in flight, so
+        # coalescing never drops an eviction record.
+        self._agents_update_lock = asyncio.Lock()
+        self._agents_update_dirty = False
+        self._agents_update_task: asyncio.Task[None] | None = None
+        self._pending_agents_evictions: list[AgentEviction] = []
         self._clock = clock
         self._wakeup = wakeup
         self._reaper_task: asyncio.Task[None] | None = None
@@ -528,6 +558,13 @@ class SessionRuntimeRegistry(SubagentRunnerPort):  # noqa: PLR0904
         # by the registered caller session's cwd, exactly like the roots save.
         return self._dangerous_command_authority._dangerous_command_grant_save(
             session_id, project, operation_id, expected_revision
+        )
+
+    def _remote_exec_grant_save(
+        self, session_id: str, project: Path, destination: str, expected_revision: str
+    ) -> Awaitable[ConfigSaveResult]:
+        return self._dangerous_command_authority._remote_exec_grant_save(
+            session_id, project, destination, expected_revision
         )
 
     def resolve_live_session(self, session_id: str) -> SessionRuntime | None:
@@ -756,7 +793,9 @@ class SessionRuntimeRegistry(SubagentRunnerPort):  # noqa: PLR0904
         )
         runtime.agent_loop.bind_dangerous_command_grant_port(
             SessionDangerousCommandGrantPort(
-                self._resolve_session_loop, self._dangerous_command_grant_save
+                self._resolve_session_loop,
+                self._dangerous_command_grant_save,
+                self._remote_exec_grant_save,
             )
         )
 
@@ -1976,6 +2015,19 @@ class SessionRuntimeRegistry(SubagentRunnerPort):  # noqa: PLR0904
                 compacting=record.compacting,
                 stop_reason=record.stop_reason,
                 last_failure=last_failure,
+                # O1: the audit stamp rides ONLY the latest run's retained
+                # result. A re-task replaces `latest_run` with the new
+                # (result-less) run, expiry clears the run's result, and a
+                # released agent has no record at all — so a previous run's
+                # stamp can never attach to a newer run's summary.
+                completion_audit=(
+                    latest_run.result.completion_audit
+                    if latest_run is not None
+                    and latest_run.result is not None
+                    and (record.agent_id, latest_run.run_id)
+                    not in self._expired_results
+                    else None
+                ),
                 recovery_chain_id=record.recovery_chain_id,
                 same_agent_resumes_used=(
                     record.same_agent_resumes_used
@@ -1996,6 +2048,8 @@ class SessionRuntimeRegistry(SubagentRunnerPort):  # noqa: PLR0904
                     if latest_run_id is not None
                     else False
                 ),
+                # U3b: the resident row's retrievable, uncollected results.
+                uncollected_run_ids=self._uncollected_run_ids(record.agent_id),
                 name=self._record_name(record),
             )
             entries.append((record, summary))
@@ -2052,7 +2106,18 @@ class SessionRuntimeRegistry(SubagentRunnerPort):  # noqa: PLR0904
         return [
             *(summary for _record, summary in active),
             *(summary for _record, summary in idle),
-            *(tombstone.summary for tombstone in tombstones),
+            # U3b: a terminal row is projected as a COPY. The stored
+            # tombstone summary stays the frozen record of closure, so the
+            # per-projection uncollected list is never written into it.
+            *(
+                replace(
+                    tombstone.summary,
+                    uncollected_run_ids=self._uncollected_run_ids(
+                        tombstone.summary.agent_id
+                    ),
+                )
+                for tombstone in tombstones
+            ),
         ]
 
     def _visible_summaries(self) -> list[AgentSummary]:
@@ -2077,90 +2142,170 @@ class SessionRuntimeRegistry(SubagentRunnerPort):  # noqa: PLR0904
             if summary.agent_id not in expired
         ]
 
+    def _agents_update_guard(self) -> asyncio.Lock:
+        """The single-delivery serializer, materialized on first use.
+
+        A registry builds this in `__init__`; bare registries (tests
+        construct instances with `object.__new__` and set only the state
+        they exercise) never run the constructor, so it is created lazily
+        rather than assumed.
+        """
+        lock = getattr(self, "_agents_update_lock", None)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._agents_update_lock = lock
+        return lock
+
+    def _agents_eviction_queue(self) -> list[AgentEviction]:
+        """Eviction payloads awaiting delivery by the next emission pass."""
+        pending = getattr(self, "_pending_agents_evictions", None)
+        if pending is None:
+            pending = []
+            self._pending_agents_evictions = pending
+        return pending
+
+    def _agents_update_payload(self) -> list[AgentSummaryModel]:
+        """Project the current public inventory onto the wire models."""
+        return [
+            AgentSummaryModel(
+                agent_id=summary.agent_id,
+                identity=summary.identity,
+                identity_revision=summary.identity_revision,
+                name=summary.name,
+                launch_purposes=(
+                    project_launch_purposes(record.runtime.agent_loop)
+                    if (record := self._agent_records.get(summary.agent_id)) is not None
+                    else []
+                ),
+                availability=summary.availability.value,
+                current_run_id=summary.current_run_id,
+                current_run_status=(
+                    summary.current_run_status.value
+                    if summary.current_run_status is not None
+                    else None
+                ),
+                turns_used=summary.turns_used,
+                last_run_status=(
+                    summary.last_run_status.value
+                    if summary.last_run_status is not None
+                    else None
+                ),
+                initial_task_summary=summary.initial_task_summary,
+                current_task_summary=summary.current_task_summary,
+                idle_seconds=summary.idle_seconds,
+                latest_run_id=summary.latest_run_id,
+                run_elapsed_seconds=summary.run_elapsed_seconds,
+                ttl_remaining_seconds=summary.ttl_remaining_seconds,
+                effective_model=summary.effective_model,
+                base_model=summary.base_model,
+                active_provider=summary.active_provider,
+                effective_thinking=summary.effective_thinking,
+                context_tokens=summary.context_tokens,
+                context_window=summary.context_window,
+                compacting=summary.compacting,
+                stop_reason=(
+                    PublicRunStopReason(summary.stop_reason.value)
+                    if summary.stop_reason is not None
+                    else None
+                ),
+                last_failure=_public_failure_envelope(summary.last_failure),
+                recovery_chain_id=summary.recovery_chain_id,
+                same_agent_resumes_used=summary.same_agent_resumes_used,
+                resumed_from_run_id=summary.resumed_from_run_id,
+                recovery_eligibility=(
+                    PublicRecoveryEligibility(summary.recovery_eligibility.value)
+                    if summary.recovery_eligibility is not None
+                    else None
+                ),
+                # WP5: the predecessor/package lineage pair.
+                work_package_id=summary.work_package_id,
+                predecessor_agent_id=summary.predecessor_agent_id,
+                result_expired=summary.result_expired,
+                # U2/B8: always projected, so the wire always carries the key.
+                uncollected_run_ids=list(summary.uncollected_run_ids),
+                # O1: the latest run's audit stamp, cleared with the
+                # result expiry that also clears result_expired's payload.
+                completion_audit=(
+                    _public_completion_audit(summary.completion_audit)
+                    if not summary.result_expired
+                    else None
+                ),
+            )
+            for summary in self._visible_summaries()
+        ]
+
     async def _emit_agents_update(
         self, evictions: list[AgentEviction] | None = None
     ) -> None:
-        if self._notify_agents is None:
+        """Deliver agents/update through the registry's serialized emission path.
+
+        At most one delivery is in flight per registry. A caller that arrives
+        while a delivery is awaiting the sink neither overlaps it nor awaits
+        the sink: it queues its eviction payload, sets the dirty flag, and
+        returns, so the in-flight delivery makes a later pass that re-projects
+        `_visible_summaries()` FRESH at that pass's start. The caller that owns
+        the in-flight delivery re-projects before every payload, so a stale
+        snapshot can never overtake a newer one, and the eviction queue means
+        coalescing never drops an eviction record. A failed delivery restores
+        the pending flag and re-raises, and a later emission (or a later
+        scheduled publisher) delivers again, so the emitter cannot wedge.
+        """
+        notify = self._notify_agents
+        if notify is None:
             return
-        await self._notify_agents(
-            [
-                AgentSummaryModel(
-                    agent_id=summary.agent_id,
-                    identity=summary.identity,
-                    identity_revision=summary.identity_revision,
-                    name=summary.name,
-                    launch_purposes=(
-                        project_launch_purposes(record.runtime.agent_loop)
-                        if (record := self._agent_records.get(summary.agent_id))
-                        is not None
-                        else []
-                    ),
-                    availability=summary.availability.value,
-                    current_run_id=summary.current_run_id,
-                    current_run_status=(
-                        summary.current_run_status.value
-                        if summary.current_run_status is not None
-                        else None
-                    ),
-                    turns_used=summary.turns_used,
-                    last_run_status=(
-                        summary.last_run_status.value
-                        if summary.last_run_status is not None
-                        else None
-                    ),
-                    initial_task_summary=summary.initial_task_summary,
-                    current_task_summary=summary.current_task_summary,
-                    idle_seconds=summary.idle_seconds,
-                    latest_run_id=summary.latest_run_id,
-                    run_elapsed_seconds=summary.run_elapsed_seconds,
-                    ttl_remaining_seconds=summary.ttl_remaining_seconds,
-                    effective_model=summary.effective_model,
-                    base_model=summary.base_model,
-                    active_provider=summary.active_provider,
-                    effective_thinking=summary.effective_thinking,
-                    context_tokens=summary.context_tokens,
-                    context_window=summary.context_window,
-                    compacting=summary.compacting,
-                    stop_reason=(
-                        PublicRunStopReason(summary.stop_reason.value)
-                        if summary.stop_reason is not None
-                        else None
-                    ),
-                    last_failure=_public_failure_envelope(summary.last_failure),
-                    recovery_chain_id=summary.recovery_chain_id,
-                    same_agent_resumes_used=summary.same_agent_resumes_used,
-                    resumed_from_run_id=summary.resumed_from_run_id,
-                    recovery_eligibility=(
-                        PublicRecoveryEligibility(summary.recovery_eligibility.value)
-                        if summary.recovery_eligibility is not None
-                        else None
-                    ),
-                    # WP5: the predecessor/package lineage pair.
-                    work_package_id=summary.work_package_id,
-                    predecessor_agent_id=summary.predecessor_agent_id,
-                    result_expired=summary.result_expired,
-                )
-                for summary in self._visible_summaries()
-            ],
-            evictions or [],
-        )
+        if evictions:
+            self._agents_eviction_queue().extend(evictions)
+        guard = self._agents_update_guard()
+        if guard.locked():
+            # Fold into the delivery already in flight rather than awaiting
+            # the sink here: a blocked sink must not hang an unrelated caller,
+            # and the in-flight pass re-projects after its payload settles.
+            self._agents_update_dirty = True
+            return
+        async with guard:
+            self._agents_update_dirty = True
+            while self._agents_update_dirty:
+                self._agents_update_dirty = False
+                pending = self._agents_eviction_queue()
+                self._pending_agents_evictions = []
+                try:
+                    await notify(self._agents_update_payload(), pending)
+                except BaseException:
+                    # The change is still unpublished: keep it pending so the
+                    # next emission delivers it, including after cancellation.
+                    self._agents_update_dirty = True
+                    raise
 
     def _schedule_agents_update_locked(self) -> None:
-        """Publish the current inventory on a later turn (caller holds the lock)."""
+        """Schedule one coalesced inventory publication (caller holds the lock).
+
+        Scheduling never awaits the notification. At most one publisher task
+        runs per registry: a change observed while it is delivering sets the
+        dirty flag, and the delivery loop re-projects the inventory on its
+        next pass instead of the caller awaiting the sink under the lock.
+        """
         if self._notify_agents is None or self._draining_children:
             return
-
-        async def publish() -> None:
-            try:
-                await self._emit_agents_update()
-            except Exception as exc:
-                logger.warning(
-                    "Failed to publish background agent update", exc_info=exc
-                )
-
-        task = asyncio.create_task(publish(), name="vibe-subagent-agents-update")
+        self._agents_update_dirty = True
+        running = getattr(self, "_agents_update_task", None)
+        if running is not None and not running.done():
+            return
+        task = asyncio.create_task(
+            self._publish_agents_update_scheduled(), name="vibe-subagent-agents-update"
+        )
+        self._agents_update_task = task
         self._teardown_tasks.add(task)
         task.add_done_callback(self._teardown_tasks.discard)
+
+    async def _publish_agents_update_scheduled(self) -> None:
+        """Deliver the scheduled inventory without wedging the emitter."""
+        try:
+            await self._emit_agents_update()
+        except Exception as exc:
+            logger.warning("Failed to publish background agent update", exc_info=exc)
+        finally:
+            if getattr(self, "_agents_update_task", None) is asyncio.current_task():
+                self._agents_update_task = None
 
     async def check_agents(self) -> list[AgentSummary]:
         async with self._registry_lock:
@@ -2253,6 +2398,28 @@ class SessionRuntimeRegistry(SubagentRunnerPort):  # noqa: PLR0904
     ) -> tuple[tuple[str, str], RunRecord | StoredRunResult] | None:
         """Delegate to the run results collaborator."""
         return self._run_results.resolve_locked(agent_id, run_id)
+
+    def _uncollected_run_ids(self, agent_id: str) -> list[str]:
+        """Delegate to the run results collaborator (caller holds the lock)."""
+        return self._run_results.uncollected_run_ids_locked(agent_id)
+
+    def _note_uncollected_change_locked(self, agent_id: str) -> None:
+        """Schedule a fresh publication after a visible list change (locked).
+
+        The caller holds the registry lock and has already applied the
+        transition: a collection or an expiry that removed a run from the
+        agent's uncollected list. A change to an agent with no published row
+        — no resident record and no live terminal metadata — renders nowhere,
+        so it schedules nothing. Scheduling goes through the coalesced
+        scheduled-update seam: an in-flight delivery re-projects the
+        inventory instead of a caller spawning a second delivery from an
+        unrelated (possibly cancellation-unwinding) path.
+        """
+        if agent_id not in self._agent_records:
+            tombstone = self._evicted_agents.get(agent_id)
+            if tombstone is None or self._tombstone_expired(tombstone, self._clock()):
+                return
+        self._schedule_agents_update_locked()
 
     async def get_agent_result(
         self, agent_id: str, run_id: str | None = None

@@ -14,9 +14,12 @@ import pytest
 
 from chartreux.cli import doctor_command as doctor
 from chartreux.core.config.chartreux_schema import (
+    ChartreuxConfigSchema,
     load_dotenv_values as _original_load_dotenv,
 )
 from chartreux.core.config.models import MCPHttp, MCPOAuth, MCPStaticAuth, MCPStdio
+from chartreux.core.dispatch.route_inspection import DOCTOR_SECTION_LABEL, PREVIEW_LABEL
+from chartreux.core.dispatch.route_models import PackageTier, PurposeRoute, RouteTarget
 from chartreux.core.llm.provider_smoke import (
     CapabilityResult,
     ProviderSmokeResult,
@@ -27,6 +30,7 @@ from chartreux.core.model_catalog.defaults import SHIPPED_CATALOG
 from chartreux.core.model_catalog.loader import CatalogSnapshot
 from chartreux.core.model_catalog.schema import BaseModelDefinition, ModelCatalog
 from chartreux.core.tools.mcp.tools import list_tools_http as _original_mcp_listing
+from tests.conftest import build_test_vibe_config, cost_tier_catalog
 
 
 def _ambiguous_catalog(base: str, definition: BaseModelDefinition) -> ModelCatalog:
@@ -871,3 +875,379 @@ async def test_live_mcp_suppresses_actual_sdk_raw_result_logs(
         logging.root.level,
         logging.root.handlers,
     )
+
+
+BROKEN_SKILL_TEXT = "---\nname: broken-skill\n---\n\nNo description field.\n"
+REPAIRED_SKILL_TEXT = "---\nname: broken-skill\ndescription: Repaired.\n---\n\nBody.\n"
+DOCTOR_REMEDIATION = "fix the file and rerun chartreux doctor"
+
+
+@pytest.fixture
+def user_skills_dir(config_dir: Path) -> Path:
+    path = config_dir / "skills"
+    path.mkdir()
+    return path
+
+
+def install_broken_skill(
+    directory: Path, name: str, text: str = BROKEN_SKILL_TEXT
+) -> Path:
+    skill_dir = directory / name
+    skill_dir.mkdir(parents=True)
+    skill_file = skill_dir / "SKILL.md"
+    skill_file.write_text(text, encoding="utf-8")
+    return skill_file
+
+
+def skill_warnings(result: dict) -> list[dict]:
+    # Doctor keeps ONE advisory list: the route section's own warns (O2) are
+    # also ``warn`` checks, so this helper names the skill ones explicitly.
+    return [
+        check
+        for check in result["checks"]
+        if check["status"] == "warn"
+        and check["name"].startswith(("skill ", "user skill "))
+    ]
+
+
+def test_broken_skill_warns_once_with_remediation_and_exits_zero(
+    user_skills_dir: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    skill_file = install_broken_skill(user_skills_dir, "broken-skill")
+    code, result = invoke(capsys)
+    warnings = skill_warnings(result)
+    assert len(warnings) == 1
+    assert warnings[0]["name"] == "skill broken-skill"
+    assert str(skill_file) in warnings[0]["reason"]
+    assert "(global)" in warnings[0]["reason"]
+    assert DOCTOR_REMEDIATION in warnings[0]["reason"]
+    # A warn is advisory: doctor still exits 0.
+    assert code == 0
+    assert result["exit_code"] == 0
+
+
+def test_warn_count_matches_the_failure_count(
+    user_skills_dir: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    broken = [
+        install_broken_skill(user_skills_dir, "broken-skill"),
+        install_broken_skill(user_skills_dir, "another-broken", "not a skill file\n"),
+    ]
+    code, result = invoke(capsys)
+    warnings = skill_warnings(result)
+    assert code == 0
+    # Exactly one warn per failure, and nothing else.
+    assert len(warnings) == len(broken)
+    assert {check["name"] for check in warnings} == {
+        "skill broken-skill",
+        "skill another-broken",
+    }
+    for check in warnings:
+        assert DOCTOR_REMEDIATION in check["reason"]
+    assert all(str(path) in json.dumps(warnings) for path in broken)
+
+
+def test_unparsable_file_warns_without_a_parsed_name(
+    user_skills_dir: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    skill_file = install_broken_skill(
+        user_skills_dir, "nameless-skill", "No frontmatter here\n"
+    )
+    code, result = invoke(capsys)
+    (warning,) = skill_warnings(result)
+    assert code == 0
+    assert str(skill_file) in warning["reason"]
+    assert "Missing or invalid YAML frontmatter" in warning["reason"]
+    assert DOCTOR_REMEDIATION in warning["reason"]
+
+
+def test_remediation_makes_no_slash_invocability_claim(
+    user_skills_dir: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    install_broken_skill(user_skills_dir, "broken-skill")
+    _, result = invoke(capsys)
+    (warning,) = skill_warnings(result)
+    remediation = warning["reason"].rsplit("; ", 1)[-1]
+    assert remediation == DOCTOR_REMEDIATION
+    assert "/" not in remediation
+    assert "invok" not in warning["reason"].lower()
+
+
+def test_surfaced_message_omits_raw_frontmatter_values(
+    user_skills_dir: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    secret = "super-secret-frontmatter-value"
+    install_broken_skill(
+        user_skills_dir, "broken-skill", f"---\nname: {secret}\n---\n\nBody.\n"
+    )
+    code, result = invoke(capsys)
+    (warning,) = skill_warnings(result)
+    assert code == 0
+    assert secret not in warning["reason"]
+    assert secret not in json.dumps(result)
+
+
+def test_repaired_file_clears_the_warning(
+    user_skills_dir: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    skill_file = install_broken_skill(user_skills_dir, "broken-skill")
+    assert len(skill_warnings(invoke(capsys)[1])) == 1
+    skill_file.write_text(REPAIRED_SKILL_TEXT, encoding="utf-8")
+    code, result = invoke(capsys)
+    checks = {check["name"]: check for check in result["checks"]}
+    assert code == 0
+    assert skill_warnings(result) == []
+    assert checks["user skills"]["status"] == "pass"
+
+
+# --- Route-table section (O2) -------------------------------------------------
+
+TWO_TARGET_ROUTE = PurposeRoute(
+    targets=(
+        RouteTarget(
+            model="premium-model",
+            identity="reviewer",
+            tier=PackageTier.SUBSTANTIVE,
+            seat="analytical",
+        ),
+        RouteTarget(
+            model="budget-model",
+            identity="coder",
+            tier=PackageTier.MECHANICAL,
+            seat="execution",
+            overlay="review-execution",
+        ),
+    ),
+    requires_distinct_models=2,
+)
+
+MIXED_TARGET_ROUTE = PurposeRoute(
+    targets=(
+        RouteTarget(
+            model="budget-model",
+            identity="reviewer",
+            tier=PackageTier.SUBSTANTIVE,
+            seat="analytical",
+        ),
+        RouteTarget(
+            model="missing-model",
+            identity="coder",
+            tier=PackageTier.SUBSTANTIVE,
+            seat="peer",
+        ),
+    ),
+    requires_distinct_models=2,
+)
+
+ALL_MARKER_CONFIG = """
+[orchestration.routes.review-custom]
+requires_distinct_models = 2
+
+[[orchestration.routes.review-custom.targets]]
+model = "$session"
+identity = "reviewer"
+tier = "substantive"
+seat = "analytical"
+
+[[orchestration.routes.review-custom.targets]]
+model = "$session"
+identity = "reviewer"
+tier = "substantive"
+seat = "peer"
+"""
+
+
+MIXED_TARGET_ERROR_CONFIG = """
+[orchestration.routes.review-mixed]
+requires_distinct_models = 2
+
+[[orchestration.routes.review-mixed.targets]]
+model = "{valid}"
+identity = "reviewer"
+tier = "substantive"
+seat = "analytical"
+
+[[orchestration.routes.review-mixed.targets]]
+model = "definitely-missing-model"
+identity = "coder"
+tier = "substantive"
+seat = "peer"
+"""
+
+
+def route_config(
+    routes: dict[str, PurposeRoute], *, catalog: bool = True
+) -> ChartreuxConfigSchema:
+    config = build_test_vibe_config(
+        orchestration={"routes": routes}, active_model="budget-model"
+    )
+    if catalog:
+        config.attach_catalog_snapshot(CatalogSnapshot(cost_tier_catalog(), "fixture"))
+    else:
+        object.__setattr__(config, "_catalog_snapshot", None)
+    return config
+
+
+def route_checks(config: ChartreuxConfigSchema) -> dict[str, doctor.Check]:
+    return {check.name: check for check in doctor._routes_checks(config)}
+
+
+def test_route_heading_names_the_independently_loaded_configuration(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    with pytest.raises(SystemExit) as exc:
+        doctor.run_doctor_cli([])
+    captured = capsys.readouterr()
+    assert captured.err == ""
+    assert exc.value.code == 0
+    # Pinned literal: the section is the independently loaded configuration,
+    # never a running conversation's live table.
+    assert DOCTOR_SECTION_LABEL == "Independently loaded configuration"
+    assert f"routes: {DOCTOR_SECTION_LABEL}" in captured.out
+    assert "not from a running conversation" in captured.out
+
+
+def test_route_section_reports_every_design_field_for_a_two_target_route() -> None:
+    check = route_checks(route_config({"review.custom": TWO_TARGET_ROUTE}))[
+        "route review.custom"
+    ]
+    assert check.status == "pass"
+    for phrase in (
+        "purpose=review.custom",
+        "requires_distinct_models=2",
+        "resolved_distinct_models=2",
+        "reload validation=pass",
+        "launch diversity=pass",
+        "seat=analytical",
+        "binding=premium-model",
+        "identity=reviewer",
+        "tier=substantive",
+        "seat=execution",
+        "binding=budget-model",
+        "identity=coder",
+        "tier=mechanical",
+        "overlay=review-execution",
+    ):
+        assert phrase in check.reason, phrase
+    # Every binding preview is labeled a preview, in the text assignment too.
+    assert check.reason.count(PREVIEW_LABEL) == 2
+
+
+def test_route_section_keeps_unaffected_rows_when_one_target_errors() -> None:
+    checks = route_checks(
+        route_config({
+            "review.good": TWO_TARGET_ROUTE,
+            "review.mixed": MIXED_TARGET_ROUTE,
+        })
+    )
+    assert checks["route review.good"].status == "pass"
+    mixed = checks["route review.mixed"]
+    # The failing binding is a doctor failure; the valid route is untouched.
+    assert mixed.status == "fail"
+    assert "error=" in mixed.reason
+    assert "missing-model" in mixed.reason
+    assert "resolved_distinct_models=UNKNOWN" in mixed.reason
+    assert "launch diversity=unknown" in mixed.reason
+    # Diversity is reported separately from the model failure, not merged.
+    assert "could not be resolved, so the distinct-model count cannot be decided" in (
+        mixed.reason
+    )
+
+
+def test_route_section_reports_a_met_threshold_separately_from_model_errors() -> None:
+    unmet = PurposeRoute(
+        targets=(
+            RouteTarget(
+                model="budget-model",
+                identity="reviewer",
+                tier=PackageTier.SUBSTANTIVE,
+                seat="analytical",
+            ),
+            RouteTarget(
+                model="budget-model",
+                identity="reviewer",
+                tier=PackageTier.SUBSTANTIVE,
+                seat="peer",
+            ),
+        ),
+        requires_distinct_models=2,
+    )
+    check = route_checks(route_config({"review.same": unmet}))["route review.same"]
+    # A statically decidable unmet threshold rejects the reload: a real failure.
+    assert check.status == "fail"
+    assert "reload validation=fail" in check.reason
+    assert "requires 2 distinct canonical models; resolved 1" in check.reason
+    assert "error=" not in check.reason
+
+
+def test_all_marker_route_shows_both_facts_and_keeps_warn_advisory(
+    config_dir: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    (config_dir / "config.toml").write_text(ALL_MARKER_CONFIG, encoding="utf-8")
+    code, result = invoke(capsys)
+    checks = {check["name"]: check for check in result["checks"]}
+    route = checks["route review-custom"]
+    # Reload validation passes (every binding defers to launch) …
+    assert "reload validation=pass" in route["reason"]
+    # … while launch-time diversity fails: BOTH facts are displayed.
+    assert "launch diversity=fail" in route["reason"]
+    assert "requires 2 distinct canonical models; resolved 1" in route["reason"]
+    assert route["status"] == "warn"
+    assert checks["routes"]["status"] == "warn"
+    # A warn is advisory: doctor still exits 0, and the section is one list.
+    assert code == 0
+    assert result["exit_code"] == 0
+
+
+def test_route_section_renders_target_errors_in_text_and_json(
+    config_dir: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    valid = next(iter(SHIPPED_CATALOG.models))
+    (config_dir / "config.toml").write_text(
+        MIXED_TARGET_ERROR_CONFIG.format(valid=valid), encoding="utf-8"
+    )
+
+    with pytest.raises(SystemExit):
+        doctor.run_doctor_cli([])
+    text = capsys.readouterr().out
+    # The one failing target is reported as a per-target error, and the count
+    # stays UNKNOWN instead of claiming a number.
+    assert "FAIL: route review-mixed:" in text
+    assert "binding=definitely-missing-model" in text
+    assert "error=" in text
+    assert "resolved_distinct_models=UNKNOWN" in text
+    assert "launch diversity=unknown" in text
+
+    code, result = invoke(capsys)
+    checks = {check["name"]: check for check in result["checks"]}
+    route = checks["route review-mixed"]
+    assert route["status"] == "fail"
+    assert "definitely-missing-model" in route["reason"]
+    assert "resolved_distinct_models=UNKNOWN" in route["reason"]
+    # A rejected binding is a doctor failure, so the exit code is nonzero.
+    assert code == 1
+    assert result["exit_code"] == 1
+
+
+def test_route_section_uses_the_single_check_mechanism(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    checks = doctor._routes_checks(route_config({"review.custom": TWO_TARGET_ROUTE}))
+    assert all(isinstance(check, doctor.Check) for check in checks)
+    assert {check.status for check in checks} <= {"pass", "warn", "fail", "unverified"}
+    # The route checks ride doctor's ONE list: same JSON array, same fields.
+    _, result = invoke(capsys)
+    names = [check["name"] for check in result["checks"]]
+    assert names.count("routes") == 1
+    assert sum(name.startswith("route ") for name in names) >= 1
+    assert all(set(check) == {"name", "status", "reason"} for check in result["checks"])
+
+
+def test_route_section_is_unverified_without_an_attached_catalog() -> None:
+    config = route_config({"review.custom": TWO_TARGET_ROUTE}, catalog=False)
+    (check,) = doctor._routes_checks(config)
+    assert check.name == "routes"
+    # Unverified, not a pass and not a failure: nothing was inspected.
+    assert check.status == "unverified"
+    assert DOCTOR_SECTION_LABEL in check.reason
+    assert "catalog" in check.reason.lower()

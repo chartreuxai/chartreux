@@ -81,9 +81,10 @@ The default `denylist` no longer contains the recognized dangerous git operation
 
 Recognized dangerous git operations have first-class typed policy instead of denylist membership. A pure classifier assigns each whole shell call an operation set from a frozen registry, and execution is denied unless authority exists for every required operation in the command's exact repository scope (`git_dir`/`work_tree`; sibling worktrees are isolated) — except for the narrow state-aware clean-tree checkout exemption described below.
 
-There are three policy classes:
+There are four policy classes:
 
 - **Publication** (`git.push`, ordinary `git push` only; `network.egress`, non-loopback egress through a modeled client) — grantable in an interactive session with the choices Deny (default), Allow once, Allow this session, or Always for this project.
+- **Remote-exec** (`network.remote-exec`, a command run on a remote machine) — grantable with the same four choices, but the persistent grant is a destination grant: it authorizes one exact `user@host:port` destination, never the operation in general, and never a contained payload. See [remote-exec destination grants](#remote-exec-destination-grants-v070).
 - **Consequential** (`git.push.force`, `git.push.delete`, `git.push.mirror`, `git.checkout`, `git.restore`, `git.switch.discard`, `git.stash.drop`, `git.stash.clear`, `git.reflog.expire`, `git.reflog.delete`) — grantable with Deny (default), Allow once, or Allow this session. **Never** "Always": a push combining consequential mechanisms requires all classified consequential operations, and `git.push` authority never covers them.
 - **Hard guards** (`git reset --hard`, forced non-dry-run `git clean`, unmodeled or ambiguous forms; recursive `rm` everywhere outside the clean-tree carve-out below) — no operation ID and no grant path: the user runs the command themselves.
 
@@ -92,11 +93,11 @@ Grant and denial semantics:
 - A dangerous command denied for lack of authority triggers a runtime approval question in interactive sessions. Approval is **permission authority, not standing intent to publish**: a grant lets the tool call run; it is not a standing instruction that the project should be published or that further dangerous commands are pre-approved.
 - **Allow once** authorizes exactly one invocation of the original call, including every listed occurrence of the command; it is never shared across concurrent identical calls.
 - **Allow this session** installs session authority keyed by operation and repository scope; it survives compaction and `/reload` and expires with the session, a new conversation or branch, or resume (session grants are not auto-restored).
-- **Always for this project** persists the grant to the protected user-layer `dangerous_command_grants_by_project` field (only the publication operations, `git.push` and `network.egress`, are persistable). The saved grant keys to the session's project (`cwd`), matching the authorized-roots flow; for a cross-project command targeting an authorized root, the saved grant still keys to the session's own project.
+- **Always for this project** persists the grant to the protected user-layer `dangerous_command_grants_by_project` field (the persistable operations are `git.push`, `network.egress`, and `network.remote-exec`; a remote-exec approval persists its exact destination to `remote_exec_grants_by_project` instead). The saved grant keys to the session's project (`cwd`), matching the authorized-roots flow; for a cross-project command targeting an authorized root, the saved grant still keys to the session's own project.
 - **Refusal memory**: a denial records the decided call's repository-bound canonical identity, so the exact decided call returns an honest denial instead of re-prompting. Whitespace and quoting variants that tokenize identically match; a reformulated command re-prompts. It is per decided call, not a blanket block.
 - **Recheck is the final gate**: an approval installs runtime authority and then the full permission pipeline rechecks (tool disablement, denylist, sensitivity, path and parent-ceiling restrictions, repository identity). On a recheck failure nothing executes and an unused once authority is destroyed. Child approval never lifts a missing parent dangerous-command authority.
-- **Noninteractive sessions** deny dangerous commands promptly with remediation naming the actual path: publication operations point to the persistent knob (`Add git.push to dangerous_command_grants_by_project for this project in your user config.toml`); consequential operations state they cannot be pre-authorized and require approval in an interactive session; a mixed call's remediation covers only the persistable subset, naming the operations that still need interactive approval. The denial carries the resolver's reason. This is the headless statement for every ask-class operation: dangerous git commands and `network.egress` (non-loopback egress through modeled `curl`/`wget`) alike are denied with remediation in headless/programmatic mode, and `dangerous_command_grants_by_project` is the pre-authorization path for both.
-- **Child sessions** deny dangerous commands outright regardless of user-input capability: the denial with remediation returns a blocker to the parent, and `dangerous_command_grants_by_project` is the only child pre-authorization path — a saved project grant runs in a child with no prompt. Main interactive sessions keep their approval dialogs. The same blanket denial covers ask-class `network.egress` egress and the out-of-root grant flow: a child never surfaces the interactive root-grant prompt, and out-of-root scope comes only from already-issued child-local grants, parent-directed scope changes, or `authorized_roots_by_project`.
+- **Noninteractive sessions** deny dangerous commands promptly with remediation naming the actual path: publication operations point to the persistent knob (`Add git.push to dangerous_command_grants_by_project for this project in your user config.toml`); consequential operations state they cannot be pre-authorized and require approval in an interactive session; a mixed call's remediation covers only the persistable subset, naming the operations that still need interactive approval. The denial carries the resolver's reason. This is the headless statement for every ask-class operation: dangerous git commands, `network.egress` (non-loopback egress through modeled `curl`/`wget`), and `network.remote-exec` alike are denied with remediation in headless/programmatic mode, and `dangerous_command_grants_by_project` is the pre-authorization path (a remote-exec denial names `remote_exec_grants_by_project` and the exact destination instead).
+- **Child sessions** deny dangerous commands outright regardless of user-input capability: the denial with remediation returns a blocker to the parent, and the persisted grant fields are the only child pre-authorization paths — `dangerous_command_grants_by_project` for the scope-keyed operations and `remote_exec_grants_by_project` for a remote-exec destination. A saved project grant runs in a child with no prompt, while a session grant never propagates: grants are store-local to the loop that owns them. Main interactive sessions keep their approval dialogs. The same blanket denial covers ask-class `network.egress` egress, remote-exec, and the out-of-root grant flow: a child never surfaces the interactive root-grant prompt, and out-of-root scope comes only from already-issued child-local grants, parent-directed scope changes, or `authorized_roots_by_project`.
 - Revocation and inspection: the app server exposes `policy/dangerous_commands/read` and `policy/dangerous_commands/revoke` (see [App server](../integrations/app-server.md)); there is deliberately no public "grant an arbitrary operation" endpoint — grants come only from the runtime approval flow. The Textual settings panel **Settings > Shell Permissions** (in the Advanced & Tools group) shows live and saved dangerous-command authority and lets the user revoke it.
 
 ### State-aware clean-tree checkout exemption
@@ -106,6 +107,15 @@ Grant and denial semantics:
 The exemption holds only when every candidate repository scope passes the state guardrails, each fail-closed on any unestablishable state: a fully clean work tree (no unstaged, staged, or untracked changes), no in-progress operation marker (merge, rebase, cherry-pick, revert), and no repository configuration that selects a program the invocation could run (`core.hooksPath` and the other program-selection keys). The plain branch form additionally requires the target to exist as a local branch (a sanitized `show-ref` probe), so a pathspec fallback, a tag, a remote-tracking name, or a commit-ish never rides the exemption.
 
 Because the bash tool executes a command string, the executed command of every exempt checkout is rewritten at execution time — `--no-overwrite-ignore` is inserted immediately after the `checkout` subcommand token, leaving every other byte of the command untouched — so an ignored-file collision fails closed (checkout refuses) instead of silently clobbering local content; the original string stays original for display and result surfaces. The exemption never bypasses the denylist veto, parent ceilings, or any other recheck, and the pure classifier's `git.checkout` classification is unchanged. Branch merging, switches to remote-tracking branches, and operations on branches other than the current working branch remain user-owned. See [ADR 0019](../adr/0019-dangerous-git-permissions.md).
+
+### Remote-exec destination grants (v0.7.0)
+
+A command run on a remote machine is a separate operation, `network.remote-exec`, distinct from `network.egress`: an egress grant never admits a remote command, and a remote-exec destination grant never admits non-remote egress or publication. The grant model is destination-keyed, so authorization is a tuple of project scope, the operation, and one exact destination.
+
+- **Exact identity, no patterns.** A destination is `user@host:port`. The user is mandatory; the host is lowercased; a missing port canonicalizes to 22. Grants match the exact canonical `(user, host, port)` tuple, so another user, another host, or another port is a different grant. Wildcards (`*`, `?`), ranges, and comma-separated alias groups never parse, and v1 has no alias-group support: an SSH-config alias is not a destination identity.
+- **Lifecycle.** Deny records the decided call so it is not re-prompted. Allow once installs one destination-bound permit for exactly this invocation. Allow this session installs destination authority in the session store. Always for this project persists the destination to the protected user-layer `remote_exec_grants_by_project` field, keyed to the session's project. Session grants do not propagate to children; a persisted destination grant authorizes the parent and its children; children never prompt.
+- **Honest scope.** The approval question states that remote commands and their effects are outside chartreux's local guards — trusting the destination, not approving a contained payload. The grant authorizes reaching the host; it does not contain or review what runs there.
+- **Resolver boundary.** Loopback and local-machine destinations are hard-denied regardless of any grant, and the SSH grammar that produces a proposal is admitted separately from this grant model: a grant can only authorize a destination the resolver has already validated.
 
 ### Breaking change
 
@@ -238,9 +248,12 @@ denied, and `VIRTUAL_ENV` is no longer a dangerous environment assignment (it
 is a benign venv hint), so a `VIRTUAL_ENV=...` prefix no longer denies.
 
 Probed egress-capable clients without destination modeling — `ssh`, `scp`,
-`rsync`, `ftp`, `telnet`, `http`/`httpie`, `wget2`, `aria2c`, `lftp` — ship on
-the default `[tools.bash]` denylist until they are modeled; removing an entry
-re-enables that client as an ordinary denylist edit.
+`rsync`, `ftp`, `telnet`, `httpie`, `https`, `wget2`, `aria2c`, `lftp` — ship
+on the default `[tools.bash]` denylist until they are modeled; removing an
+entry re-enables that client as an ordinary denylist edit. HTTPie's `http`
+left that denylist in v0.7.0 under the restricted grammar described in
+[Network-client egress modeling](#network-client-egress-modeling-v070), as
+`curl` and `wget` did under the destination-aware egress rule.
 
 ### Recursive rm analysis
 
@@ -264,6 +277,102 @@ candidate token and command segment and explain that they cannot be safely
 inspected. Feedback previews are bounded, registered secrets are redacted before
 escaping or truncation, and control characters and markup delimiters are escaped.
 These messages explain existing denials; they do not grant authority.
+
+### Safe-pattern admissions (v0.7.0)
+
+Two previously blanket-denied shell shapes are admitted with guards:
+
+- **Quoted or escaped `=` marker.** A word whose leading `=` is neutralized by
+  quoting or escaping and which proves exactly one literal argument is
+  admitted as written: `echo '=ls'` and `echo \=ls` pass, and the analysis
+  emits the same source word the shell executes. The proof rejects any word
+  that can still expand past one argument — an unquoted glob metacharacter
+  (`echo '='*`) stays denied — and an unquoted leading `=` keeps its live zsh
+  equals-expansion denial whose remediation says "quote the marker" (an
+  unquoted `echo ===X===` is never admitted). Zsh equals expansion at the
+  command position is unchanged.
+- **Same-invocation `$?` probe.** Exactly one shape is admitted: a plain
+  simple command, a `;` separator, then `echo $?` or `printf $?` as the
+  entire last statement (`ls; echo $?`). The probe reports the completed
+  command's status, and the analysis keeps the `$?` source token — the shell
+  substitutes the number — so the analyzed argv never diverges from the
+  executed command. A pipeline, conditional, assignment-only statement,
+  redirect, wrapper (`env ls; echo $?`), or any statement after the probe
+  keeps the ordinary expansion denial, and the admission never suppresses a
+  sibling denial of the preceding command.
+
+KEEP-DENIED unchanged: command substitution (except the existing sed
+recognizer), loops and `if` statements, general variable and arithmetic
+expansion, and lowercase assignments. Dangerous-git and hard-guard
+classification is untouched, and a probe cannot launder a dangerous command
+(`git reset --hard; echo $?` keeps its hard-guard denial).
+
+### Network-client egress modeling (v0.7.0)
+
+HTTPie's request client `http` leaves the default denylist under a restricted,
+positional-only grammar. The admitted forms are exactly:
+
+- `http URL` — one literal `http://` or `https://` URL.
+- `http METHOD URL` — `METHOD` is one of `GET`, `POST`, `PUT`, `PATCH`,
+  `DELETE`, `HEAD`, `OPTIONS`.
+- `http [METHOD] URL ITEM...` — request items that carry literal data only:
+  `name=value` (data), `name:=value` (raw JSON), `name==value` (query
+  parameter; it must be quoted, because zsh's magic-equals expansion would
+  otherwise split the word and the shell layer denies the unquoted spelling),
+  and `name:value` (header).
+
+A literal loopback destination resolves run-class. A non-loopback destination,
+and any destination the recognizer cannot parse — a schemeless operand such as
+`localhost:8080`, a bare name, an unparseable URL — resolves ask-class as
+`network.egress`, the same grantable operation as a non-loopback `curl` call,
+and so does a loopback invocation whose effective environment carries a
+proxy-family variable set to a non-loopback proxy. Everything else is a hard
+denial with no operation ID and no approval path: any option (`--follow`,
+`--proxy`, `-o FILE`, `--session`, `--download`), a request item that reads a
+local file (`field@upload.txt`, `@body.json`, `payload:=@data.json`), a scheme
+other than `http` or `https`, a missing destination, a stray operand, and an
+invocation whose own environment sets `HTTPIE_CONFIG_DIR` — an uninspectable
+startup config whose `default_options` can add options the grammar never saw
+(the `XDG_CONFIG_HOME` and `HOME` spellings of that same chain are already
+denied as dangerous environment assignments). HTTPie follows no redirects by
+default and `--follow` is not admitted, so a literal loopback destination is
+enough for run-class. As with every modeled client, a call's local reads and
+writes are collected and gated first: a redirect target or an explicit output
+file outside policy is denied by the path layer before any egress authority is
+considered.
+
+`httpie` and `wget2` stay on the default denylist, and HTTPie's `https`
+entry point joins them:
+
+- **`httpie`.** Admission is gated on a test confirming that the INSTALLED
+  entry point carries HTTPie's request grammar. That confirmation does not
+  hold: HTTPie 3.x ships its plugin/CLI manager (`httpie plugins install ...`)
+  under this name, and the request client is `http`. The gate fails closed, so
+  every `httpie` spelling stays denied.
+- **`https`.** HTTPie's `https` entry point is the same request client with
+  the https scheme defaulted, and it has no documented, corpus-tested grammar
+  of its own — the `http` model above admits only HTTPie's request grammar.
+  Under the same prerequisite rule that keeps `wget2` and `httpie` denied, the
+  entry stays and every `https` spelling resolves denied fail-closed: a plain
+  remote destination, a loopback destination, and an https-scheme destination
+  alike, so no auto-allow rides beside the modeled `http`. Grammar modeling is
+  deferred to the v0.8.0 backlog.
+- **`wget2`.** Loopback auto-allow requires a documented, corpus-tested effective redirect-disable, and no effective redirect-disable is established for wget2 in this release, so the denylist entry stays and every `wget2` spelling resolves denied — loopback `http(s)://` operands included. The remaining gates are pinned the same way rather than inherited from wget: recursive retrieval (`-r`/`--recursive`, `-p`, `-m`), input and config files (`-i FILE`/`--input-file`, `--config=FILE`, `--post-file`, `--body-file`), and an `-O` output path outside policy are all denied. wget2's user manual documents `--max-redirect=number` (default 20) with no documented disable value, and its `-e`/`--execute` option runs a startup command straight from the command line while `--local-plugin`/`--plugin` load code — effects a destination model would have to bound before admission. No wget2 binary is installed in the environment this release was verified in, so none of these flags were checked against a running client; the spellings come from the manual and the denial corpus pins the outcome, not flag parsing.
+
+#### FTP PASV residual
+
+The wget FTP PASV residual is not inherited by wget2. wget's default passive
+FTP honors the address in the server's PASV response and has no
+`--ftp-skip-pasv-ip` equivalent, so that destination-choosing behavior is
+DISCLOSED for the modeled `wget` rather than gated; a future wget2 admission
+must gate or disclose it again instead of inheriting it silently. Until then a `wget2 ftp://...` operand is denied with the retained entry, and the corpus row that pins it records that denial rather than a loopback auto-allow.
+
+The `ssh`, `scp`, `rsync`, `ftp`, `telnet`, `aria2c`, `lftp`, and `watch`
+denials stand: destination parsing cannot bound remote command execution,
+secondary connections, or scripting, and `watch` is a command repeater rather
+than an egress client. In particular `ssh`, `scp`, and `rsync` are never
+classified as `network.egress`, so the separate `network.remote-exec` path can
+be modeled on top of them without this rule shadowing it.
 
 ### Retained shell-policy limitations
 

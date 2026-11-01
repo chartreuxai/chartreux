@@ -84,6 +84,7 @@ from chartreux.core.hooks.models import HookConfigResult
 from chartreux.core.llm_models import LLMMessage, Role
 from chartreux.core.paths import WORKTREES_DIR
 from chartreux.core.recovery_models import PackageTier
+from chartreux.core.rewind import archived_history_for, complete_history
 from chartreux.core.scratchpad import cleanup_scratchpad
 from chartreux.core.session import last_session_pointer
 from chartreux.core.session.session_id import extract_suffix, generate_session_id
@@ -1205,15 +1206,28 @@ class SessionDangerousCommandGrantPort:
         self,
         resolve_session: Callable[[str], AgentLoop | None],
         save_grant: Callable[[str, Path, str, str], Awaitable[ConfigSaveResult]],
+        save_remote_exec_grant: (
+            Callable[[str, Path, str, str], Awaitable[ConfigSaveResult]] | None
+        ) = None,
     ) -> None:
         self._resolve_session = resolve_session
         self._save_grant = save_grant
+        self._save_remote_exec_grant = save_remote_exec_grant
 
     async def save_dangerous_command_grant(
         self, session_id: str, project: Path, operation_id: str, expected_revision: str
     ) -> ConfigSaveResult:
         return await self._save_grant(
             session_id, project, operation_id, expected_revision
+        )
+
+    async def save_remote_exec_grant(
+        self, session_id: str, project: Path, destination: str, expected_revision: str
+    ) -> ConfigSaveResult:
+        if self._save_remote_exec_grant is None:
+            return ConfigSaveResult("user", "not_saved", "unchanged")
+        return await self._save_remote_exec_grant(
+            session_id, project, destination, expected_revision
         )
 
 
@@ -2086,9 +2100,14 @@ def _apply_stored_stats(loop: AgentLoop, metadata: dict[str, object]) -> None:
 
 
 def _messages_for_fork(source: AgentLoop, message_id: str | None) -> list[LLMMessage]:
-    messages = [
-        message for message in source.messages if message.role is not Role.system
-    ]
+    # Archive-aware materialization (M1 §3): a forked session starts from a
+    # complete snapshot, so the sealed prefix is hydrated from the source
+    # transcript before the fork hands its history to a fresh logger — a
+    # tombstone or trimmed payload never crosses into the new session.
+    complete = complete_history(
+        source.messages, archived_history_for(source.messages, source.session_logger)
+    )
+    messages = [message for message in complete if message.role is not Role.system]
     if message_id is None:
         return [message.model_copy(deep=True) for message in messages]
 

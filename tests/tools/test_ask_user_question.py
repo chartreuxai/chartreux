@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 from pydantic import ValidationError
 import pytest
 
@@ -11,6 +13,8 @@ from chartreux.core.tools.builtins.ask_user_question import (
     AskUserQuestionConfig,
     AskUserQuestionResult,
 )
+from chartreux.core.tools.manager import ToolManager
+from chartreux.core.tools.models import ToolPermission
 from chartreux.questions import (
     QuestionChoice as Choice,
     QuestionKind,
@@ -22,6 +26,7 @@ from chartreux.questions import (
     UserQuestion as Question,
     UserQuestionResult,
 )
+from tests.conftest import build_test_vibe_config
 from tests.stubs.fake_interaction_requests import FakeInteractionRequests
 
 
@@ -385,3 +390,96 @@ async def _coroutine_answer():
     return UserQuestionResult(
         answers=[Answer(question="Which logging level?", answer="Info")]
     )
+
+
+def _manager(
+    tmp_path: Path, *, parent: ToolManager | None = None, **config: object
+) -> ToolManager:
+    resolved = build_test_vibe_config(**config)  # type: ignore[arg-type]
+    return ToolManager(
+        lambda: resolved,
+        cwd=tmp_path,
+        defer_mcp=True,
+        accepted_token_getter=lambda: "accepted",
+        parent_authority_getter=(lambda: parent) if parent is not None else None,
+    )
+
+
+class TestChildAdmission:
+    """Q1: bounded children never prompt the user (question-widget fix)."""
+
+    @pytest.mark.asyncio
+    async def test_child_execution_denied_before_the_broker(
+        self, tool, single_question_args
+    ):
+        requests = FakeInteractionRequests(user_input=lambda args: _coroutine_answer())
+        ctx = InvokeContext(
+            interaction_requests=requests, tool_call_id="123", is_subagent=True
+        )
+
+        with pytest.raises(ToolError) as err:
+            async for _ in tool.run(single_question_args, ctx):
+                pass
+
+        message = str(err.value)
+        assert "not available to subagents" in message
+        assert "blocker" in message
+        # The denial precedes the broker: no callback minted, no wait started.
+        assert requests.origins == []
+
+    @pytest.mark.asyncio
+    async def test_root_execution_still_asks(self, tool, single_question_args):
+        requests = FakeInteractionRequests(user_input=lambda args: _coroutine_answer())
+        ctx = InvokeContext(interaction_requests=requests, tool_call_id="123")
+
+        result = None
+        async for item in tool.run(single_question_args, ctx):
+            result = item
+
+        assert isinstance(result, UserQuestionResult)
+        assert requests.origins == [UserInputOrigin.MODEL_QUESTION]
+
+    def test_root_catalog_advertises_the_tool(self, tmp_path):
+        manager = _manager(tmp_path)
+        assert "ask_user_question" in {
+            spec.name for spec in manager.available_tool_specs()
+        }
+
+    def test_child_catalog_withholds_the_tool(self, tmp_path):
+        parent = _manager(tmp_path)
+        child = _manager(tmp_path, parent=parent)
+
+        assert "ask_user_question" in {
+            spec.name for spec in parent.available_tool_specs()
+        }
+        child_specs = {spec.name for spec in child.available_tool_specs()}
+        assert "ask_user_question" not in child_specs
+        # Per-tool withholding, not a blanket child catalog cut.
+        assert "task" in child_specs
+
+    @pytest.mark.asyncio
+    async def test_explicit_child_tool_selection_cannot_reenable_the_question(
+        self, tmp_path, single_question_args
+    ):
+        parent = _manager(tmp_path)
+        child = _manager(
+            tmp_path,
+            parent=parent,
+            enabled_tools=["ask_user_question"],
+            tools={"ask_user_question": {"permission": ToolPermission.ALWAYS.value}},
+        )
+
+        assert "ask_user_question" in child.available_tools
+        assert "ask_user_question" not in {
+            spec.name for spec in child.available_tool_specs()
+        }
+
+        requests = FakeInteractionRequests(user_input=lambda args: _coroutine_answer())
+        ctx = InvokeContext(
+            interaction_requests=requests, tool_call_id="123", is_subagent=True
+        )
+        instance = child.get("ask_user_question")
+        with pytest.raises(ToolError, match="blocker"):
+            async for _ in instance.run(single_question_args, ctx):
+                pass
+        assert requests.origins == []

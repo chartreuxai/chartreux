@@ -69,3 +69,55 @@ def test_finds_files_when_pattern_matches_directory_name(file_tree: Path) -> Non
         "@chartreux/cli/autocompletion/completers.py",
         "@chartreux/cli/autocompletion/fuzzy.py",
     ]
+
+
+@pytest.fixture()
+def workspace_away_from_cwd(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    workspace = tmp_path / "project" / "workspace"
+    (workspace / "chartreux" / "acp").mkdir(parents=True)
+    (workspace / "chartreux" / "acp" / "entrypoint.py").write_text("")
+    (workspace / "README.md").write_text("")
+    sibling = tmp_path / "project" / "sibling"
+    (sibling / "nested").mkdir(parents=True)
+    (sibling / "note.txt").write_text("")
+    cwd = tmp_path / "elsewhere" / "cwd"
+    cwd.mkdir(parents=True)
+    (cwd / "cwd_marker.txt").write_text("")
+    monkeypatch.chdir(cwd)
+    return workspace
+
+
+def test_root_listing_anchors_at_workspace_root_not_cwd(
+    workspace_away_from_cwd: Path,
+) -> None:
+    completer = PathCompleter(workspace_root_getter=lambda: workspace_away_from_cwd)
+
+    assert completer.get_completions("@", cursor_pos=1) == ["@chartreux/", "@README.md"]
+
+
+def test_recursive_index_anchors_at_workspace_root_not_cwd(
+    workspace_away_from_cwd: Path,
+) -> None:
+    completer = PathCompleter(workspace_root_getter=lambda: workspace_away_from_cwd)
+
+    assert completer.get_completions("@entryp", cursor_pos=7) == [
+        "@chartreux/acp/entrypoint.py"
+    ]
+    assert completer.get_completions("@acp/entry", cursor_pos=10) == [
+        "@chartreux/acp/entrypoint.py"
+    ]
+
+
+def test_parent_traversal_anchors_at_workspace_root_not_cwd(
+    workspace_away_from_cwd: Path,
+) -> None:
+    completer = PathCompleter(workspace_root_getter=lambda: workspace_away_from_cwd)
+
+    assert completer.get_completions("@../", cursor_pos=4) == [
+        "@../sibling/",
+        "@../workspace/",
+    ]
+    assert completer.get_completions("@../sibling/", cursor_pos=12) == [
+        "@../sibling/nested/",
+        "@../sibling/note.txt",
+    ]

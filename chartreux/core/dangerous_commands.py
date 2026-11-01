@@ -1,8 +1,11 @@
 """Typed models for the dangerous-command permission feature.
 
-The operation registry is frozen: every recognized git operation carries a
+The operation registry is frozen: every recognized operation carries a
 stable operation ID, a grant-choice class, a consequence summary, and whether
-the operation is persistable (only ordinary publication is). The
+the operation is persistable (publication and remote-exec are; consequential
+operations never are). Remote-exec authority is a destination grant: it
+matches one exact canonical (user, host, port) identity and never
+cross-authorizes publication or egress. The
 classification models describe what the pure classifier in the shell-command
 policy layer reports for one whole call; the authority and proposal types are
 the immutable shapes later packages use for resolver snapshots, runtime-owned
@@ -14,11 +17,13 @@ from __future__ import annotations
 
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
+import ipaddress
 from pathlib import Path
+import re
 from types import MappingProxyType
 from typing import Literal
 
-DangerousCommandClass = Literal["publication", "consequential"]
+DangerousCommandClass = Literal["publication", "consequential", "remote_exec"]
 GrantChoice = Literal["deny", "allow_once", "allow_session", "allow_project"]
 AuthoritySource = Literal["protected_config", "runtime_grant"]
 ClassificationKind = Literal["routine", "hard_denied", "grantable"]
@@ -120,6 +125,16 @@ _OPERATION_ENTRIES: tuple[DangerousOperation, ...] = (
         ),
         persistable=True,
     ),
+    DangerousOperation(
+        operation_id="network.remote-exec",
+        command_class="remote_exec",
+        consequence=(
+            "Run a command on a remote machine. The remote command and its "
+            "effects run under the remote host's accounts and policy, not "
+            "under Chartreux's local guards."
+        ),
+        persistable=True,
+    ),
 )
 
 OPERATION_REGISTRY: Mapping[str, DangerousOperation] = MappingProxyType({
@@ -137,11 +152,12 @@ CONSEQUENTIAL_OPERATION_IDS: frozenset[str] = frozenset(
 )
 
 _GRANT_CHOICES_BY_CLASS: dict[DangerousCommandClass, tuple[GrantChoice, ...]] = {
-    # Publication may be remembered for the project; consequential operations
-    # never offer a persistent choice, and a forged "always" answer for one is
-    # rejected even if a client sends it.
+    # Publication and remote-exec may be remembered for the project;
+    # consequential operations never offer a persistent choice, and a forged
+    # "always" answer for one is rejected even if a client sends it.
     "publication": ("deny", "allow_once", "allow_session", "allow_project"),
     "consequential": ("deny", "allow_once", "allow_session"),
+    "remote_exec": ("deny", "allow_once", "allow_session", "allow_project"),
 }
 
 
@@ -174,6 +190,70 @@ def is_grant_choice_valid(operation_id: str, choice: GrantChoice) -> bool:
     if operation is None:
         return False
     return choice in _GRANT_CHOICES_BY_CLASS[operation.command_class]
+
+
+REMOTE_EXEC_OPERATION_ID = "network.remote-exec"
+
+# A destination is one explicit user, one concrete host (DNS name or IP
+# literal; IPv6 only in brackets), and an optional port. Wildcards, ranges,
+# and comma-separated alias groups never parse, so v1 admits exact
+# destinations only.
+_REMOTE_DESTINATION_RE = re.compile(
+    r"(?P<user>[A-Za-z0-9._+-]+)@"
+    r"(?P<host>\[[0-9A-Fa-f:.]+\]|[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?)"
+    r"(?::(?P<port>[0-9]{1,5}))?"
+)
+_MAX_TCP_PORT = 65535
+
+
+@dataclass(frozen=True)
+class RemoteDestination:
+    """Canonical remote-exec destination identity.
+
+    Equality is exact over the (user, host, port) tuple, so a near miss —
+    another user, another host, another port — never matches a grant.
+    """
+
+    user: str
+    host: str
+    port: int = 22
+
+    @property
+    def key(self) -> str:
+        """The canonical persisted spelling (``user@host:port``)."""
+        host = f"[{self.host}]" if ":" in self.host else self.host
+        return f"{self.user}@{host}:{self.port}"
+
+    def __str__(self) -> str:
+        return self.key
+
+
+def canonical_remote_destination(value: str) -> RemoteDestination | None:
+    """Parse one destination spelling into its canonical identity.
+
+    The user is mandatory and case-sensitive (POSIX account names are). The
+    host is lowercased, an IPv6 literal is compressed, and a missing port
+    canonicalizes to 22. Wildcards, alias groups, empty parts, and
+    out-of-range ports return None: the caller fails closed, never guesses.
+    """
+    if not isinstance(value, str):
+        return None
+    match = _REMOTE_DESTINATION_RE.fullmatch(value.strip())
+    if match is None:
+        return None
+    raw_host = match.group("host")
+    if raw_host.startswith("["):
+        try:
+            host = ipaddress.IPv6Address(raw_host[1:-1]).compressed
+        except ValueError:
+            return None
+    else:
+        host = raw_host.lower()
+    raw_port = match.group("port")
+    port = 22 if raw_port is None else int(raw_port)
+    if not 1 <= port <= _MAX_TCP_PORT:
+        return None
+    return RemoteDestination(user=match.group("user"), host=host, port=port)
 
 
 @dataclass(frozen=True)
@@ -256,12 +336,41 @@ class DangerousCommandAuthority:
 
     Authority is keyed by operation and repository/worktree scope, never by
     shell prefixes; later packages assemble snapshots from accepted protected
-    sources and runtime-owned grants.
+    sources and runtime-owned grants. A remote-exec authority additionally
+    carries the exact destination it was granted for; no other authority
+    carries one.
     """
 
     operations: frozenset[str]
     scope: RepositoryScope
     source: AuthoritySource
+    destination: RemoteDestination | None = None
+
+
+def authority_admits(
+    authority: DangerousCommandAuthority,
+    operation_id: str,
+    scope: RepositoryScope,
+    *,
+    destination: RemoteDestination | None = None,
+) -> bool:
+    """Whether one authority snapshot admits one operation at one scope.
+
+    Operation classes never cross-authorize. A destination authority admits
+    only ``network.remote-exec``, and only for the exact destination it was
+    granted for; a scope-only authority (``git.push``, ``network.egress``)
+    never admits a remote command, and a remote-exec destination grant never
+    admits non-remote egress or publication.
+    """
+    if authority.scope != scope or operation_id not in authority.operations:
+        return False
+    if operation_id == REMOTE_EXEC_OPERATION_ID:
+        return (
+            destination is not None
+            and authority.destination is not None
+            and authority.destination == destination
+        )
+    return authority.destination is None
 
 
 @dataclass(frozen=True)
@@ -270,7 +379,8 @@ class DangerousCommandProposal:
 
     Runtime-derived by the permission flow: the literal original command, the
     registered project, the repository/worktree identity, the required
-    operation IDs, and the consequence summary.
+    operation IDs, the consequence summary, and — for a remote-exec call —
+    the exact destination the grant would cover.
     """
 
     command: tuple[str, ...]
@@ -278,3 +388,4 @@ class DangerousCommandProposal:
     scope: RepositoryScope
     operations: tuple[str, ...]
     consequence: str
+    destination: RemoteDestination | None = None

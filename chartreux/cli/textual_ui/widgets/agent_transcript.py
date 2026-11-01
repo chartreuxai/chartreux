@@ -25,11 +25,17 @@ from chartreux.app_server.models import (
     ImageAttachment,
     ImageContentBlock,
     InlineImageSource,
+    PublicClaimFidelity,
+    PublicCompletionAudit,
+    PublicDeclaredOutcome,
+    PublicDisclosureCompleteness,
     PublicEffectEntry,
     PublicError,
     PublicHistoryEntry,
+    PublicMandateSatisfaction,
     PublicMessageEntry,
     PublicReasoningEntry,
+    PublicRuntimeFailure,
     TextContentBlock,
 )
 from chartreux.app_server.protocol import (
@@ -119,6 +125,67 @@ class _TranscriptScroll(VerticalScroll):
         super()._on_mouse_scroll_up(event)
 
 
+_AUDIT_SECTION_TITLE = "Completion Audit"
+_AUDIT_UNSUPPORTED_VERSION = "Audit version unsupported"
+_SUPPORTED_AUDIT_SCHEMA_VERSION = 1
+
+_CLAIM_LINES = {
+    PublicClaimFidelity.CLAIM_MATCHED: "Claims matched",
+    PublicClaimFidelity.CLAIM_UNVERIFIED: "Claims unverified",
+    PublicClaimFidelity.CLAIM_CONTRADICTED: "Claims contradicted",
+}
+_DISCLOSURE_LINES = {
+    PublicDisclosureCompleteness.DISCLOSURE_COMPLETE: "Disclosure complete",
+    PublicDisclosureCompleteness.DISCLOSURE_INCOMPLETE: "Disclosure incomplete",
+}
+_MANDATE_LINES = {
+    PublicMandateSatisfaction.MANDATE_SATISFIED: "Mandates satisfied",
+    PublicMandateSatisfaction.MANDATE_UNADDRESSED: "Mandates unaddressed",
+    PublicMandateSatisfaction.MANDATE_DISABLED: "Mandates disabled",
+}
+_DECLARED_OUTCOME_LINES = {
+    PublicDeclaredOutcome.OUTCOME_COMPLETED: "Worker-declared completed",
+    PublicDeclaredOutcome.OUTCOME_INCOMPLETE: "Worker-declared incomplete",
+}
+# The health axis is a fault signal: a healthy verifier renders NO line.
+_RUNTIME_FAILURE_LINES = {
+    PublicRuntimeFailure.RUNTIME_DENIED: "Runtime failure: denied",
+    PublicRuntimeFailure.RUNTIME_TIMEOUT: "Runtime failure: timeout",
+    PublicRuntimeFailure.RUNTIME_UNAVAILABLE: "Runtime failure: unavailable",
+    PublicRuntimeFailure.RUNTIME_UNRUNNABLE: "Runtime failure: unrunnable",
+}
+
+
+def completion_audit_lines(audit: PublicCompletionAudit | None) -> list[str]:
+    """The completion-audit section's lines for the selected agent (O1).
+
+    An absent stamp renders no section; an unsupported schema version renders
+    one neutral notice instead of interpreting axes this build does not know.
+    Every line is a fixed phrase — the text carries the signal — and the
+    section holds no chronology (no timestamps, durations, or run ids), so
+    run history never leaks through it. The stamp classifies completion
+    CLAIMS against harness evidence; it never reports that the task was
+    verified.
+    """
+    if audit is None:
+        return []
+    if audit.schema_version != _SUPPORTED_AUDIT_SCHEMA_VERSION:
+        return [_AUDIT_SECTION_TITLE, _AUDIT_UNSUPPORTED_VERSION]
+    lines = [
+        _AUDIT_SECTION_TITLE,
+        _CLAIM_LINES[audit.claim_fidelity],
+        _DISCLOSURE_LINES[audit.disclosure_completeness],
+        _MANDATE_LINES[audit.mandate_satisfaction],
+        _DECLARED_OUTCOME_LINES[audit.declared_outcome],
+    ]
+    failure = _RUNTIME_FAILURE_LINES.get(audit.primary_runtime_failure)
+    if failure is not None:
+        lines.append(failure)
+    if audit.rejection is not None:
+        lines.append(f"Rejection: {audit.rejection.value.replace('_', ' ')}")
+    return lines
+
+
 class AgentTranscriptViewer(Vertical):
     """A read-only, paginated view of an agent transcript."""
 
@@ -158,6 +225,13 @@ class AgentTranscriptViewer(Vertical):
     #agent-transcript-feedback.-warning { color: $warning; }
     #agent-transcript-feedback.-error { color: $error; }
 
+    #agent-transcript-audit {
+        height: auto;
+        padding: 0 1;
+        margin-bottom: 1;
+        color: $text-muted;
+    }
+
     #agent-transcript-content-scroll {
         height: 1fr;
         padding: 0 1;
@@ -193,6 +267,7 @@ class AgentTranscriptViewer(Vertical):
         name: str = "",
         metadata: str = "",
         live: bool = False,
+        audit: PublicCompletionAudit | None = None,
         page_size: int = DEFAULT_TRANSCRIPT_PAGE_SIZE,
         show_message_timestamps: bool = True,
     ) -> None:
@@ -206,6 +281,10 @@ class AgentTranscriptViewer(Vertical):
         # the other full_metadata fields) may contain markup-looking characters
         # from a custom identity's display name.
         self._metadata_widget: NoMarkupStatic | None = None
+        # The audit stamp is the latest run's, passed by the browser each
+        # update: a re-task, release, or expiry simply arrives without one.
+        self._audit = audit
+        self._audit_widget: NoMarkupStatic | None = None
         self._header_widget: NoMarkupStatic | None = None
         self._live = live
         self._live_timer: Timer | None = None
@@ -280,6 +359,10 @@ class AgentTranscriptViewer(Vertical):
                     self._metadata, classes="agent-transcript-metadata"
                 )
                 yield self._metadata_widget
+            audit_text = self._audit_text()
+            self._audit_widget = NoMarkupStatic(audit_text, id="agent-transcript-audit")
+            self._audit_widget.display = bool(audit_text)
+            yield self._audit_widget
             with Vertical(id="agent-transcript-content") as content:
                 self._content = content
                 self._status_widget = Static(self._loading_text())
@@ -325,6 +408,25 @@ class AgentTranscriptViewer(Vertical):
             self._metadata = metadata
             if self._metadata_widget is not None:
                 self._metadata_widget.update(metadata)
+
+    def _audit_text(self) -> str:
+        return "\n".join(completion_audit_lines(self._audit))
+
+    def set_audit_stamp(self, audit: PublicCompletionAudit | None) -> None:
+        """Replace the displayed audit stamp; ``None`` clears the section.
+
+        The browser passes the stamp of whichever run the inventory resolves
+        as latest, so a re-task, a release, or a result expiry arrives as
+        ``None`` and the section disappears immediately — a previous run's
+        stamp is never redisplayed for a new run.
+        """
+        if audit == self._audit:
+            return
+        self._audit = audit
+        if self._audit_widget is not None:
+            text = self._audit_text()
+            self._audit_widget.update(text)
+            self._audit_widget.display = bool(text)
 
     def set_live(self, live: bool) -> None:
         """Update live state without replacing the converged transcript view."""

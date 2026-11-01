@@ -6,6 +6,7 @@ from typing import Any
 from chartreux.core.agent_loop._transcript_integrity import (
     check_tool_message_admission,
     is_synthetic_tool_placeholder,
+    live_archive_authority,
 )
 from chartreux.core.agent_loop.llm_gateway import TranscriptAppend
 from chartreux.core.events import ToolCallEvent
@@ -163,7 +164,12 @@ class TranscriptRecorder:
             # unless it would create an unrepairable [user, tool]
             # adjacency; the request-build/save/load/admission seams police
             # the resulting transcript and fail closed on it.
-            check_tool_message_admission(self._messages, len(self._messages), message)
+            check_tool_message_admission(
+                self._messages,
+                len(self._messages),
+                message,
+                archived_prefix=live_archive_authority(self._messages),
+            )
             self._messages.append(message)
             return
         owner_calls = {
@@ -187,11 +193,21 @@ class TranscriptRecorder:
                 # TOOL_NO_RESPONSE placeholder for the same call in place, in
                 # the owner's own result run (a reused call id under a LATER
                 # assistant call never touches an earlier turn's placeholder).
-                check_tool_message_admission(self._messages, insertion, message)
+                check_tool_message_admission(
+                    self._messages,
+                    insertion,
+                    message,
+                    archived_prefix=live_archive_authority(self._messages),
+                )
                 self._messages.replace(insertion, message)
                 return
             insertion += 1
-        check_tool_message_admission(self._messages, insertion, message)
+        check_tool_message_admission(
+            self._messages,
+            insertion,
+            message,
+            archived_prefix=live_archive_authority(self._messages),
+        )
         if insertion < len(self._messages):
             # An interior insertion invalidates the cursor's boundary proof,
             # even if repeated records make the shifted boundary slot look

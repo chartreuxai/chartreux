@@ -16,7 +16,9 @@ if TYPE_CHECKING:
     from chartreux.core.config.chartreux_schema import ChartreuxConfigSchema
     from chartreux.core.config.harness_files import HarnessFilesManager
     from chartreux.core.config.models import MCPHttp, MCPServer, ModelConfig
+    from chartreux.core.dispatch.route_inspection import RouteReport
     from chartreux.core.model_catalog.schema import ProviderDefinition
+    from chartreux.core.skills.manager import ShadowEntry, SkillLoadFailure
 
 
 @dataclass(frozen=True)
@@ -172,6 +174,142 @@ def _retired_inputs_checks(manager: HarnessFilesManager) -> list[Check]:
     return checks
 
 
+def _skills_checks(
+    config: ChartreuxConfigSchema, manager: HarnessFilesManager
+) -> list[Check]:
+    """Advisory skill checks from the ONE shared skill inventory (K1/K2).
+
+    Read-only: the inventory reports the loader's own selection and the
+    typed load-failure records its discovery captured. ``warn`` never
+    changes doctor's exit code; only ``fail`` does.
+    """
+    from chartreux.core.skills import manager as skills_manager
+
+    inventory = skills_manager.build_shadow_inventory(
+        lambda: config, harness_files=manager
+    )
+    checks = [
+        Check(
+            f"skill {failure.path.parent.name}", "warn", _load_failure_reason(failure)
+        )
+        for failure in inventory.load_failures
+    ]
+    checks.extend(
+        Check(f"user skill {entry.name}", "warn", _shadow_reason(entry))
+        for entry in inventory.entries
+    )
+    if not checks:
+        return [Check("user skills", "pass", "no user skill shadows a skill copy")]
+    return checks
+
+
+def _routes_checks(config: ChartreuxConfigSchema) -> list[Check]:
+    """Report the purpose-route table this configuration independently loads.
+
+    Same advisory mechanism as the skill checks: one ``Check`` per purpose
+    route plus one heading, all in doctor's single check list. ``warn`` never
+    changes doctor's exit code; only ``fail`` does. The section renders the
+    table loaded for THIS run — never a running conversation's live table
+    (the ``/routes`` browser owns that one).
+    """
+    from chartreux.core.dispatch.route_inspection import (
+        DOCTOR_SECTION_LABEL,
+        inspect_config_routes,
+    )
+
+    report = inspect_config_routes(config)
+    if report.error is not None:
+        return [
+            Check(
+                "routes",
+                "unverified",
+                f"{DOCTOR_SECTION_LABEL}: [orchestration.routes] read from the "
+                "trusted configuration on this machine, not from a running "
+                f"conversation; the table could not be inspected: {report.error}",
+            )
+        ]
+    statuses = [_route_check_status(route) for route in report.routes]
+    counts = {status: statuses.count(status) for status in ("pass", "warn", "fail")}
+    return [
+        Check(
+            "routes",
+            _worst_status(statuses),
+            f"{DOCTOR_SECTION_LABEL}: [orchestration.routes] read from the trusted "
+            "configuration on this machine, not from a running conversation. "
+            f"{len(report.routes)} purpose route(s): {counts['pass']} pass, "
+            f"{counts['warn']} warn, {counts['fail']} fail. Model bindings are "
+            "previews, not launch guarantees.",
+        ),
+        *(
+            Check(
+                f"route {route.purpose}",
+                _route_check_status(route),
+                _route_reason(route),
+            )
+            for route in report.routes
+        ),
+    ]
+
+
+def _route_check_status(route: RouteReport) -> str:
+    """``fail`` for a rejected reload or an unresolvable binding; ``warn`` for
+    a launch-time diversity fact (the shipped all-marker case included).
+    """
+    if route.reload_status == "fail" or any(
+        target.error is not None for target in route.targets
+    ):
+        return "fail"
+    if route.launch_status != "pass":
+        return "warn"
+    return "pass"
+
+
+def _worst_status(statuses: list[str]) -> str:
+    for status in ("fail", "warn", "pass"):
+        if status in statuses:
+            return status
+    return "pass"
+
+
+def _route_reason(route: RouteReport) -> str:
+    return "; ".join([route.summary(), *(target.summary() for target in route.targets)])
+
+
+def _load_failure_reason(failure: SkillLoadFailure) -> str:
+    return (
+        f"cannot load {failure.path} ({failure.origin}): {failure.diagnostic}; "
+        "fix the file and rerun chartreux doctor"
+    )
+
+
+def _shadow_reason(entry: ShadowEntry) -> str:
+    from chartreux.core.skills.manager import ShadowState
+
+    match entry.state:
+        case ShadowState.IDENTICAL:
+            return (
+                f"identical to the shipped copy at {entry.shipped_path}; "
+                "suggest removal after reviewing support files — never automatic"
+            )
+        case ShadowState.DIVERGED:
+            return (
+                f"differs from the shipped copy at {entry.shipped_path}; "
+                f"review it with `chartreux skills diff {entry.name}`"
+            )
+        case ShadowState.INACTIVE:
+            winner = (
+                f"{entry.winner_path} ({entry.winner_scope})"
+                if entry.winner_path is not None
+                else f"the {entry.winner_scope} skill"
+            )
+            return (
+                f"inactive: {winner} loads instead; editing this copy at "
+                f"{entry.skill_path} has no effect"
+            )
+        case _:
+            return f"unverified: {entry.reason}"
+
+
 def _config_failure_check(exc: BaseException) -> Check:
     """Surface the loader's own diagnostic instead of a generic one.
 
@@ -250,6 +388,8 @@ async def _diagnose(args: argparse.Namespace) -> list[Check]:
             *source_checks,
             Check("config", "pass", "trusted configuration validated"),
             *_retired_inputs_checks(manager),
+            *_skills_checks(config, manager),
+            *_routes_checks(config),
         ])
     except Exception as exc:
         checks.append(_config_failure_check(exc))

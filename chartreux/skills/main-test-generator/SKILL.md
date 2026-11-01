@@ -236,6 +236,8 @@ Before finalizing, verify:
   - unittest: `python -m unittest {test_file_path}`
   - Prove (Common Lisp): Implementation-specific, check project
 
+Optionally, rather than running the tests inline, you may request the `verification` purpose to dispatch a verification worker with the resolved run command and have it report the outcome.
+
 **Handle test failures:**
 If tests fail, determine the cause:
 1. **Expected failure** (user requested tests before implementation/bugfix): Report as expected, note that implementation is needed

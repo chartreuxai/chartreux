@@ -770,6 +770,81 @@ class PublicFailureEnvelope(BaseModel):
     recovery: PublicEnvelopeRecovery
 
 
+# --- Completion-audit stamp (O1) -------------------------------------------
+# Public projection of a run's typed, versioned completion-audit stamp
+# (``chartreux.core.completion_contract.CompletionAuditClassification``). The
+# public app-server layer cannot import core, so these wire models mirror the
+# core axes value-for-value — pinned by a mirror-contract test — and the
+# server boundary projects the resolved stamp onto them. The stamp classifies
+# the run's completion CLAIMS against harness-collected evidence; it never
+# states that the task was verified.
+
+
+class PublicClaimFidelity(StrEnum):
+    """The claim-fidelity axis."""
+
+    CLAIM_MATCHED = "claim_matched"
+    CLAIM_UNVERIFIED = "claim_unverified"
+    CLAIM_CONTRADICTED = "claim_contradicted"
+
+
+class PublicDisclosureCompleteness(StrEnum):
+    """The disclosure-completeness axis."""
+
+    DISCLOSURE_COMPLETE = "disclosure_complete"
+    DISCLOSURE_INCOMPLETE = "disclosure_incomplete"
+
+
+class PublicMandateSatisfaction(StrEnum):
+    """The mandate-satisfaction axis."""
+
+    MANDATE_SATISFIED = "mandate_satisfied"
+    MANDATE_UNADDRESSED = "mandate_unaddressed"
+    MANDATE_DISABLED = "mandate_disabled"
+
+
+class PublicDeclaredOutcome(StrEnum):
+    """The declared-outcome axis: what the worker itself declared."""
+
+    OUTCOME_COMPLETED = "outcome_completed"
+    OUTCOME_INCOMPLETE = "outcome_incomplete"
+
+
+class PublicRuntimeFailure(StrEnum):
+    """The primary-runtime-failure axis: the verifier's own health."""
+
+    RUNTIME_HEALTHY = "runtime_healthy"
+    RUNTIME_DENIED = "runtime_denied"
+    RUNTIME_TIMEOUT = "runtime_timeout"
+    RUNTIME_UNAVAILABLE = "runtime_unavailable"
+    RUNTIME_UNRUNNABLE = "runtime_unrunnable"
+
+
+class PublicRejectionReason(StrEnum):
+    """The typed rejection vocabulary the failure class consumes."""
+
+    ENVELOPE_MALFORMED = "envelope_malformed"
+    ENVELOPE_DUPLICATE = "envelope_duplicate"
+    ENVELOPE_UNKNOWN_FIELD = "envelope_unknown_field"
+    ENVELOPE_OVERSIZED = "envelope_oversized"
+    REQUIREMENT_ID_UNKNOWN = "requirement_id_unknown"
+    REQUIREMENT_ID_DUPLICATE = "requirement_id_duplicate"
+    RECEIPT_UNVERIFIABLE = "receipt_unverifiable"
+    CLAIM_CONTRADICTED = "claim_contradicted"
+
+
+class PublicCompletionAudit(ProtocolModel):
+    """One retained run's audit stamp, resolved against the LATEST run."""
+
+    schema_version: int = Field(ge=1)
+    claim_fidelity: PublicClaimFidelity
+    disclosure_completeness: PublicDisclosureCompleteness
+    mandate_satisfaction: PublicMandateSatisfaction
+    declared_outcome: PublicDeclaredOutcome
+    primary_runtime_failure: PublicRuntimeFailure
+    rejection: PublicRejectionReason | None = None
+
+
 class SkillSummary(ProtocolModel):
     name: str
     description: str

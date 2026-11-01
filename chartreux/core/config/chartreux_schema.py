@@ -52,6 +52,7 @@ from chartreux.core.config.models import (
     _default_purpose_routes,
     normalize_authorized_roots,
     normalize_dangerous_command_grants,
+    normalize_remote_exec_grants,
 )
 
 if TYPE_CHECKING:
@@ -310,6 +311,18 @@ class ChartreuxConfigSchema(ConfigSchema):
         default_factory=dict,
         description=(
             "User-source-only saved dangerous-command grants by canonical project."
+        ),
+    )
+    # Projection only, as above: remote-exec destination grants are persisted
+    # through the dedicated approval path, never a generic config write.
+    remote_exec_grants_by_project: Annotated[
+        dict[str, list[str]],
+        WithReplaceMerge(),
+        AfterValidator(normalize_remote_exec_grants),
+    ] = Field(
+        default_factory=dict,
+        description=(
+            "User-source-only saved remote-exec destinations by canonical project."
         ),
     )
 

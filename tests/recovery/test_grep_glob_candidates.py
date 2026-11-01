@@ -58,7 +58,7 @@ first positional is the regex PATTERN, not a path, so it is excluded from
 ``positional_values`` (``_grep_positional_values``); only the remaining
 positionals are path candidates. The resolver's glob heuristic itself is
 unchanged. The 22 pattern cases G0 marked as known bugs are flipped to
-``allowed`` below and pinned by ``_G1_PATTERN_OPERAND_IDS``; the 19
+``allowed`` below and pinned by ``_G1_PATTERN_OPERAND_IDS``; the 18
 protection cases in ``_G1_PROTECTION_IDS`` stay denied.
 
 Recorded diagnostic categories (one per matrix row):
@@ -222,7 +222,13 @@ _GENUINE_GLOB_CASES: list[_CASE] = [
     ("E5", "ls src/*.py", ALLOWED, "scoped listing-glob exemption"),
     ("E6", "ls ../*.py", DENIED_PATH_GLOB, "protection: unscoped parent directory"),
     ("E7", "ls /tmp/*.py", DENIED_PATH_GLOB, "protection: outside-workspace glob"),
-    ("E8", "cat *.py", DENIED_PATH_GLOB, "protection: non-ls reader glob"),
+    (
+        "E8",
+        "cat *.py",
+        ALLOWED,
+        "S2: cat/wc whitelist binds the glob to the literal-argv transport; "
+        "the protection is the containment boundary, not a blanket denial",
+    ),
     (
         "E9",
         "ls src/[a-c]*.py",
@@ -417,7 +423,6 @@ _G1_PROTECTION_IDS = frozenset({
     "E3",
     "E6",
     "E7",
-    "E8",
     "E9",
     "E10",
     "E11",

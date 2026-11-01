@@ -328,12 +328,19 @@ async def test_drain_owns_the_reaper_displaced_by_an_ordinary_rearm() -> None:
         # displaced reaper must settle even when an assertion fails.
         gate.set()
     await asyncio.sleep(0.01)
-    # The stale snapshot is delivered at most mid-drain — never after
-    # drain's final empty payload.
+    # A coalesced delivery settles at most mid-drain — never after drain's
+    # final empty payload.
     assert delivered[-1] == ([], [])
     assert len(delivered) == 3
-    stale = delivered[1][0]
+    # The displaced reaper's in-flight snapshot was projected before the
+    # release, so it is the stale one (serialized emission: the deliverer
+    # re-projects before each of its own payloads). The release's change
+    # folded into that delivery instead of racing it, and the follow-up
+    # pass re-projected the post-release inventory.
+    stale = delivered[0][0]
     assert any(summary.agent_id == "agent-keep" for summary in stale)
+    refreshed = delivered[1][0]
+    assert not any(summary.agent_id == "agent-keep" for summary in refreshed)
     # The displaced reaper was drain-owned (registered at the rearm) and
     # has settled; the drain-owned set is empty again.
     assert reaper.done()

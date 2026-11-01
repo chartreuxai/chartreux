@@ -15,6 +15,8 @@ import pytest
 
 from chartreux.app_server.models import PublicCheckpointEntry
 from chartreux.app_server.server import AppServer
+from chartreux.core.agent_loop._transcript_integrity import archive_reference
+from chartreux.core.compaction import CompactionManager
 from chartreux.core.file_revision import FileRevision
 from chartreux.core.llm_models import Role
 from chartreux.core.subagents import WaitStatus
@@ -231,6 +233,91 @@ async def test_parent_auto_compact_envelope_carries_file_state(
         assert wait_disposition.status is WaitStatus.COMPLETED
         assert wait_disposition.result is not None
         assert wait_disposition.result.response == "child finished"
+    finally:
+        child_release.set()
+        await session.close()
+
+
+@pytest.mark.asyncio
+async def test_parent_auto_compact_mid_run_keeps_the_active_invocation_intact(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """P4d activates the trim; the closed-prefix restriction is what protects a
+    mid-run compaction. The parent's auto-compaction boundary (fired while a
+    background child runs) ENTERS the trim path — asserted by a SPY on the
+    manager's ``_trim_archived_prefix`` — but the active-turn guard keeps the
+    sealing surface untouched, so no message carries an archive marker and the
+    in-flight turn stays intact for finalization.
+    """
+    child_backend = GatedSequenceBackend([[mock_llm_chunk(content="child finished")]])
+    child_started, child_release = child_backend.add_gate()
+    monkeypatch.setattr(
+        "chartreux.core.agent_loop._loop.create_backend", lambda **_: child_backend
+    )
+    parent_backend = FakeBackend([
+        # Turn 1: launch the background subagent, then acknowledge it.
+        [mock_llm_chunk(content="", tool_calls=[_task_call(background=True)])],
+        [mock_llm_chunk(content="parent acknowledged the launch")],
+        # Turn 2: auto-compact fires first (summary), then the turn itself.
+        [mock_llm_chunk(content="<summary>parent compacted mid-run</summary>")],
+        [mock_llm_chunk(content="parent continued after compaction")],
+    ])
+    parent = build_test_agent_loop(
+        config=_config(), backend=parent_backend, enable_streaming=True
+    )
+
+    # One entry per trim-path entry, recording the active-turn guard's value
+    # AT CALL TIME (the turn has ended by the time the assertions run).
+    trim_calls: list[bool] = []
+    original_trim = CompactionManager._trim_archived_prefix
+
+    async def _trim_spy(self: CompactionManager) -> None:
+        has_active_turn = self._has_active_turn
+        trim_calls.append(has_active_turn() if has_active_turn is not None else False)
+        return await original_trim(self)
+
+    monkeypatch.setattr(CompactionManager, "_trim_archived_prefix", _trim_spy)
+
+    client = start_test_app_server(parent)
+    run_peer = client._run_peer
+    assert run_peer is not None
+    server = cast(AppServer, cast(Any, run_peer).__self__)
+    session = await attach_test_app_server_session(client)
+
+    try:
+        # The P4b wiring is in place: the loop hands the manager the sealing
+        # surface and the closed-prefix (active-turn) guard.
+        session_logger_getter = parent.compaction_manager._session_logger_getter
+        assert session_logger_getter is not None
+        assert session_logger_getter() is parent.session_logger
+        has_active_turn = parent.compaction_manager._has_active_turn
+        assert has_active_turn is not None
+        assert isinstance(has_active_turn(), bool)
+
+        await _consume(session.act("launch background work"))
+        await asyncio.wait_for(child_started.wait(), timeout=5)
+        registry = legacy_backend(server).children
+        assert (await registry.check_agents())[0].availability.value == "running"
+
+        # Force the parent's auto-compact to fire while the child runs.
+        parent.stats.context_tokens = 500_000
+        await _consume(session.act("continue while the child works"))
+        assert any(
+            isinstance(entry, PublicCheckpointEntry) and entry.kind == "compaction"
+            for entry in session.history
+        )
+
+        # The SPY proves the trim path WAS entered (the flag is active) while
+        # the active-turn guard refused to touch the sealing surface, so no
+        # slot was sealed or marked.
+        assert trim_calls, "the activated trim path must be entered"
+        assert all(trim_calls), "the active-turn guard must hold at every entry"
+        assert parent.messages.archive_descriptor is None
+        assert parent.session_logger.archive_descriptor is None
+        assert all(archive_reference(m) is None for m in parent.messages)
+        # The boundary itself is real and the conversation is intact.
+        assert any(m.context_boundary == "compaction" for m in parent.messages)
+        assert len(parent.messages) == len(list(parent.messages))
     finally:
         child_release.set()
         await session.close()

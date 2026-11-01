@@ -146,8 +146,8 @@ _TOOLS_DIRECT = (
 )
 
 _ROUTING_PROSE = (
-    "Route by purpose: the launch-target table in the shared references "
-    "binds each purpose to its launch target. Explicit `model` and "
+    "Route by purpose: the launch-target table in the `task` tool's "
+    "description binds each purpose to its launch target. Explicit `model` and "
     "`identity` fields override the route's corresponding field; multi-seat "
     "purposes require an explicit seat, with no implicit fan-out. Purpose "
     "labels organize work; they never grant permission. Select a route afresh "
@@ -156,6 +156,15 @@ _ROUTING_PROSE = (
     "fails, diagnose the failure, retry with a different approach, or "
     "dispatch read-only analysis; escalate architectural blockers to the "
     "design-analysis purpose and authorization or scope blockers to the user."
+)
+
+# A bounded child cannot launch agents: it gets neither the routing rules nor
+# a pointer to a table it can never see.
+_ROUTING_CHILD_PROSE = (
+    "This bounded child session has one assigned task: complete it with the "
+    "tools granted to you, within the acceptance criteria the task states. "
+    "You have no model or purpose selection of your own, and you cannot "
+    "launch agents; the parent owns the session's decisions."
 )
 
 _COMPOSITION_REUSE = (
@@ -218,12 +227,16 @@ def composition_review_region(routes: Mapping[str, PurposeRoute]) -> str:
     return _COMPOSITION_REVIEW_OPENING + sentence
 
 
-def render_composition_regions(*, delegation: Delegation | None) -> dict[str, str]:
+def render_composition_regions(
+    *, delegation: Delegation | None, bounded_child: bool = False
+) -> dict[str, str]:
     """The CLI-side ``$dispatch_*`` regions keyed on typed identity facts.
 
     A delegation-required identity (the orchestrator) gets the delegation
     posture regions; every other identity — and custom identities, which
-    carry no harness-known posture — get the direct-execution regions.
+    carry no harness-known posture — get the direct-execution regions. A
+    bounded child gets the child routing guidance instead of the routing
+    rules: it can launch no agents, so the rules have nothing to govern.
     """
     direct = delegation is not Delegation.REQUIRED
     return {
@@ -232,7 +245,7 @@ def render_composition_regions(*, delegation: Delegation | None) -> dict[str, st
         "identity": _IDENTITY_DIRECT if direct else _IDENTITY_ORCHESTRATED,
         "tools": _TOOLS_DIRECT if direct else _TOOLS_ORCHESTRATED,
         "disclosure": _BRIEF_DISCLOSURE,
-        "routing": _ROUTING_PROSE,
+        "routing": _ROUTING_CHILD_PROSE if bounded_child else _ROUTING_PROSE,
     }
 
 
@@ -310,13 +323,22 @@ def splice_composition_regions(skeleton: str, regions: Mapping[str, str]) -> str
 def render_task_description_for_composition(
     *, routes: Mapping[str, PurposeRoute], session_model: str, skeleton: str
 ) -> str:
-    """Render the task tool description from the route facts (new pipeline)."""
-    text, _ = _splice(
-        skeleton,
-        render_composition_task_regions(routes=routes, session_model=session_model),
-        TASK_PLACEHOLDERS,
-        "task",
+    """Render the task tool description from the route facts (new pipeline).
+
+    The live launch-target table renders exactly once, and it is the only
+    place the table renders at all (v0.7.0 P3): in place of the
+    ``$dispatch_routing`` placeholder when the skeleton carries it, otherwise
+    as its own appended section. A custom description without the
+    placeholder contract is preserved untouched and never suppresses the
+    live table.
+    """
+    regions = render_composition_task_regions(
+        routes=routes, session_model=session_model
     )
+    text, _ = _splice(skeleton, regions, TASK_PLACEHOLDERS, "task")
+    if TASK_PLACEHOLDERS["routing"] not in skeleton:
+        prefix = text.rstrip()
+        text = f"{prefix}\n\n{regions['routing']}" if prefix else regions["routing"]
     return text
 
 

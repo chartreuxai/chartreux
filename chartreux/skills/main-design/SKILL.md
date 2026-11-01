@@ -1,6 +1,6 @@
 ---
 name: main-design
-description: "Shape an approved problem into a concise design with goals, constraints, rationale, non-goals. Delegates deep design analysis to the advisor profile."
+description: "Shape an approved problem into a concise design with goals, constraints, rationale, non-goals. Delegates deep design analysis to the advisor identity via the design-analysis purpose route."
 user-invocable: true
 allowed-tools:
   - read_file
@@ -12,7 +12,7 @@ allowed-tools:
 
 # Main Design
 
-Own the what and why before implementation. The main agent gathers context and frames the design question; the advisor identity does the deep design analysis. The main agent synthesizes and owns the final design.
+Own the what and why before implementation. The main agent gathers context and frames the design question; the advisor identity, reached through the `design-analysis` purpose route, does the deep design analysis. The main agent synthesizes and owns the final design.
 
 ## Process
 
@@ -23,6 +23,8 @@ Own the what and why before implementation. The main agent gathers context and f
 ```text
 task(task="Design analysis for: <problem>. Context: <relevant code, interfaces, constraints>. Requirements: <what the design must address, preserved behavior, non-goals>. Return a recommended approach with rationale, alternatives rejected, risks, and assumptions.", purpose="design-analysis")
 ```
+
+The launch runs in the background by default — collect the advisor's result with `wait_for_agent` before synthesizing.
 
 For large or cross-cutting changes, first dispatch a bounded exploration child (`purpose="exploration"`) that loads `sub-architecture-mapper` to map the affected subsystems, then use that output to frame the design question.
 

@@ -25,7 +25,7 @@ from chartreux.app_server.models import (
     UserInputCallbackOutput,
     UserQuestionResult,
 )
-from chartreux.app_server.protocol import AppServerResponseError
+from chartreux.app_server.protocol import AppServerResponseError, ProtocolErrorCode
 from chartreux.cli.textual_ui.notifications import NotificationContext
 from chartreux.cli.textual_ui.widgets.chat_input.text_area import ChatTextArea
 from chartreux.cli.textual_ui.widgets.loading import (
@@ -44,6 +44,7 @@ if TYPE_CHECKING:
         PublicHistoryEntry,
         UserQuestionRequest,
     )
+    from chartreux.app_server.protocol import ChildCallbackClosedParams
     from chartreux.cli.textual_ui.app import ChartreuxApp
     from chartreux.cli.textual_ui.widgets.messages import SlashCommandMessage
     from chartreux.cli.textual_ui.widgets.question_app import QuestionApp
@@ -138,6 +139,21 @@ _INTERRUPT_STILL_STOPPING_WARNING = (
 # ErrorMessage disclosure shows the retained excerpt; anything beyond this
 # bound is dropped here so a megabyte blob is never carried into the TUI.
 _MAX_TURN_ERROR_CHARS = 4000
+
+# Q2c: protocol codes that mean the callback this UI is showing is gone — the
+# server no longer has it, or it is already terminal. No answer can ever land,
+# so the widget is dismissed instead of offering the draft-and-retry hint;
+# keeping it undismissible is what stranded the overnight incident for ~9
+# hours.
+_DEAD_CALLBACK_ERROR_CODES = frozenset({
+    ProtocolErrorCode.NOT_FOUND,
+    ProtocolErrorCode.CALLBACK_CLOSED,
+})
+
+# Dismissal copy. A closed callback keeps no draft-resend affordance: there is
+# nowhere left to deliver the draft.
+_CLOSED_CALLBACK_MESSAGE = "This question was closed; it can no longer be answered."
+_DEAD_CALLBACK_MESSAGE = "This question is no longer open; it cannot be answered."
 
 
 def _truncate_error_payload(message: str) -> str:
@@ -1101,50 +1117,102 @@ class TurnSupervisor:
                 severity="warning",
             )
 
-    async def question_expired(self, entry: PublicCallbackEntry) -> None:
-        """Close the UI for a callback the server expired unanswered (plan U).
+    async def _question_closed(self, entry: PublicCallbackEntry) -> None:
+        """Close the UI for a callback the server reported terminal.
 
-        The live input is closed, the unsent draft is preserved locally (never
-        auto-delivered), and the next pending callback (if any) is shown.
+        Covers every non-open state: expired unanswered (plan U/OD1), answered
+        elsewhere, and cancelled (including a child closure, Q2b). Any terminal
+        state closes the live widget: it can no longer be resolved.
         """
         callback_id = entry.callback_id
         self._prune_expired_pending()
         active = self.active_callback
         if active is not None and active.callback_id == callback_id:
-            from chartreux.cli.textual_ui.app import _get_question_app_class
-
-            try:
-                question = self._app.query_one(_get_question_app_class())
-            except Exception:
-                question = None
-            if question is not None and question._callback_id == callback_id:
-                # Preserve the unsent draft locally; never auto-deliver it.
-                self.expired_question_drafts[callback_id] = dict(question.other_texts)
-                question.close_for_expiry()
-            self.active_callback = None
-            self._app.notify("Unanswered — deferred", severity="warning")
-            if self.pending_callbacks:
-                await self._app._show_callback(self.pending_callbacks.popleft())
-                return
-            if self._app._loading_widget is not None:
-                self._app._loading_widget.end_action_required()
-            generation = self._app._program_status.generation
-            await self._app._switch_to_input_app()
-            # An active turn resumes after its question expires; without one
-            # the prompt is back. The switch awaits, so a turn that finished in
-            # the gap has already settled a durable outcome: report only while
-            # this return still owns the record.
-            if self._app._program_status.generation == generation:
-                self._app._program_status.emit(
-                    "working" if self.agent_job_active() else "idle"
+            if entry.state.status == "expired":
+                await self._dismiss_closed_callback(
+                    active, "Unanswered — deferred", preserve_draft=True
+                )
+            else:
+                await self._dismiss_closed_callback(
+                    active, _CLOSED_CALLBACK_MESSAGE, preserve_draft=False
                 )
             return
-        # A queued callback expired before it was ever displayed.
+        # A queued callback closed before it was ever displayed.
         self.pending_callbacks = deque(
             pending
             for pending in self.pending_callbacks
             if pending.callback_id != callback_id
         )
+
+    async def question_expired(self, entry: PublicCallbackEntry) -> None:
+        """Close the UI for a callback the server expired unanswered (plan U)."""
+        await self._question_closed(entry)
+
+    async def _question_closed_by_child(
+        self, params: ChildCallbackClosedParams
+    ) -> None:
+        """Dismiss the widget for a child callback the server reported terminal.
+
+        Child callbacks never enter the ROOT projection, so this notification is
+        the only route the parent client has to their closure (Q2b). Matched on
+        the callback identity: a closure for any other callback — notably a
+        newer one — dismisses nothing.
+        """
+        callback_id = params.callback_id
+        active = self.active_callback
+        if active is not None and active.callback_id == callback_id:
+            await self._dismiss_closed_callback(
+                active, _CLOSED_CALLBACK_MESSAGE, preserve_draft=False
+            )
+            return
+        self.pending_callbacks = deque(
+            pending
+            for pending in self.pending_callbacks
+            if pending.callback_id != callback_id
+        )
+
+    async def _dismiss_closed_callback(
+        self, callback: PublicCallbackEntry, message: str, *, preserve_draft: bool
+    ) -> None:
+        """Close a terminal callback's widget and hand the surface to what is next.
+
+        Mirrors the expiry advance (plan U): the queued callbacks the projection
+        already closed are pruned, the widget is closed, and the next pending
+        callback — or the prompt — takes over. The draft is preserved locally
+        only for a closure whose draft could still be shown later; a dead
+        callback can never accept it, and its widget must not linger with a
+        resend hint that can only fail again.
+        """
+        from chartreux.cli.textual_ui.app import _get_question_app_class
+
+        self._prune_expired_pending()
+        try:
+            question = self._app.query_one(_get_question_app_class())
+        except Exception:
+            question = None
+        if question is not None and question._callback_id == callback.callback_id:
+            if preserve_draft:
+                self.expired_question_drafts[callback.callback_id] = dict(
+                    question.other_texts
+                )
+            question.close_for_expiry()
+        self.active_callback = None
+        self._app.notify(message, severity="warning")
+        generation = self._app._program_status.generation
+        if self.pending_callbacks:
+            await self._app._show_callback(self.pending_callbacks.popleft())
+            return
+        if self._app._loading_widget is not None:
+            self._app._loading_widget.end_action_required()
+        await self._app._switch_to_input_app()
+        # An active turn resumes after its question closes; without one the
+        # prompt is back. The switch awaits, so a turn that finished in the gap
+        # has already settled a durable outcome: report only while this return
+        # still owns the record.
+        if self._app._program_status.generation == generation:
+            self._app._program_status.emit(
+                "working" if self.agent_job_active() else "idle"
+            )
 
     def _prune_expired_pending(self) -> None:
         """Drop queued callbacks the server already closed (plan U/OD1).
@@ -1325,6 +1393,17 @@ class TurnSupervisor:
         try:
             await self._app.app_server.respond_to_callback(callback.callback_id, output)
         except AppServerResponseError as exc:
+            if exc.error.code in _DEAD_CALLBACK_ERROR_CODES:
+                # The callback is gone: its turn closed, its child was torn
+                # down, or it was already terminal. No answer can ever land, so
+                # dismiss the widget instead of keeping one the retry hint can
+                # only fail again. The error is typed, so this branch is
+                # definitely not a delivery of unknown outcome.
+                if self.active_callback is callback:
+                    await self._dismiss_closed_callback(
+                        callback, _DEAD_CALLBACK_MESSAGE, preserve_draft=False
+                    )
+                return
             # A protocol rejection is definite: the same draft may be corrected
             # and submitted again without guessing whether the server accepted it.
             question.set_submission_status(

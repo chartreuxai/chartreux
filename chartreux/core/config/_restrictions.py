@@ -10,8 +10,11 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from chartreux.core.config._dangerous_command_authority import (
     GRANTS_FIELD,
+    REMOTE_EXEC_GRANTS_FIELD,
     ProjectDangerousCommandGrant,
+    ProjectRemoteExecGrant,
     validate_grant_source,
+    validate_remote_exec_grant_source,
 )
 from chartreux.core.config._root_authority import (
     ROOTS_FIELD,
@@ -77,6 +80,7 @@ class SourceRestrictions:
     identity: PolicySourceIdentity | None = None
     authorized_roots: tuple[ProjectRootAuthority, ...] = ()
     dangerous_command_grants: tuple[ProjectDangerousCommandGrant, ...] = ()
+    remote_exec_grants: tuple[ProjectRemoteExecGrant, ...] = ()
     # An empty explicit overlay revokes persisted roots; a tool-only projection
     # must leave the backing source's roots alone.
     replaces_roots: bool = False
@@ -118,9 +122,11 @@ class SourceRestrictions:
 
     def preserves(self, previous: SourceRestrictions) -> bool:
         """Conservative syntactic check; generic patches cannot revoke authority."""
-        if self.authorized_roots != previous.authorized_roots:
-            return False
-        if self.dangerous_command_grants != previous.dangerous_command_grants:
+        if (
+            self.authorized_roots != previous.authorized_roots
+            or self.dangerous_command_grants != previous.dangerous_command_grants
+            or self.remote_exec_grants != previous.remote_exec_grants
+        ):
             return False
         tools = {tool.tool_name: tool for tool in self.tools}
         for old in previous.tools:
@@ -159,11 +165,20 @@ class SourceRestrictions:
                     "Dangerous command grant source provenance unavailable: "
                     "dangerous_command_grants_by_project (source: unknown)"
                 )
+            if REMOTE_EXEC_GRANTS_FIELD in data:
+                raise ValueError(
+                    "Remote-exec grant source provenance unavailable: "
+                    "remote_exec_grants_by_project (source: unknown)"
+                )
             authorized_roots = ()
             dangerous_command_grants = ()
+            remote_exec_grants = ()
         else:
             authorized_roots = validate_root_source(data, layer=root_layer)
             dangerous_command_grants = validate_grant_source(data, layer=root_layer)
+            remote_exec_grants = validate_remote_exec_grant_source(
+                data, layer=root_layer
+            )
         try:
             if replacement:
                 _ReplacementInput.model_validate(data)
@@ -182,6 +197,7 @@ class SourceRestrictions:
             identity=identity,
             authorized_roots=authorized_roots,
             dangerous_command_grants=dangerous_command_grants,
+            remote_exec_grants=remote_exec_grants,
             replaces_roots=replaces_roots,
             locator=locator,
             kind=kind,

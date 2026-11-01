@@ -25,10 +25,12 @@ from chartreux.core.agent_loop._dangerous_command_grants import (
     DANGEROUS_COMMAND_DECLINED_FEEDBACK,
     DangerousCommandCallIdentity,
     DangerousCommandGrantStore,
+    RemoteExecGrantRequirement,
     dangerous_command_grant_save_note,
     dangerous_command_request,
     derive_call_requirements,
     parse_dangerous_command_result,
+    remote_exec_grant_save_note,
 )
 from chartreux.core.agent_loop._execution_admission import ExecutionAdmission
 from chartreux.core.agent_loop._loop_types import ToolDecision, ToolExecutionResponse
@@ -91,6 +93,18 @@ def _dangerous_command_denial(
 ) -> ToolDecision:
     """Denial decision naming the persistent config knob for the operation."""
     reason = ctx.reason or f"Tool '{tool_name}' is disabled by policy"
+    if proposal.destination is not None:
+        # A remote-exec grant is a destination grant: the persistent knob
+        # names the exact destination, never a bare operation ID.
+        return ToolDecision(
+            verdict=ToolExecutionResponse.SKIP,
+            approval_type=ToolPermission.NEVER,
+            feedback=(
+                f"{reason} Add the destination {proposal.destination} to "
+                "remote_exec_grants_by_project for this project in your user "
+                "config.toml to authorize it."
+            ),
+        )
     persistable = tuple(
         operation_id
         for operation_id in proposal.operations
@@ -137,6 +151,26 @@ def _declined_dangerous_command_decision() -> ToolDecision:
         approval_type=ToolPermission.NEVER,
         feedback=DANGEROUS_COMMAND_DECLINED_FEEDBACK,
     )
+
+
+def _prompt_outcome_decision(
+    store: DangerousCommandGrantStore,
+    identity: DangerousCommandCallIdentity,
+    proposal: DangerousCommandProposal,
+    choice: GrantChoice | None,
+    ctx: PermissionContext,
+    tool_name: str,
+) -> ToolDecision:
+    """Turn a failed or declined prompt into the matching denial.
+
+    ``None`` means the prompt itself failed, which denies without recording a
+    refusal so a retry can prompt again; ``deny`` is a decision and is
+    remembered.
+    """
+    if choice is None:
+        return _dangerous_command_denial(ctx, tool_name, proposal)
+    store.record_refusal(identity)
+    return _declined_dangerous_command_decision()
 
 
 def _retrieve_future_exception(future: asyncio.Future[str]) -> None:
@@ -210,6 +244,19 @@ class ToolDecisionCoordinator:
         # batch teardown can abandon it synchronously.
         self._root_grant_askers: set[asyncio.Task[None]] = set()
 
+    def _live_scratchpad_roots(self) -> frozenset[Path]:
+        """The live scratch roots both derivation call sites thread.
+
+        An unavailable authority chain — a retired manager, a broken parent
+        link — must not turn a grant decision into an exception, and the
+        re-derivation's requirements never read roots, so an unavailable
+        chain degrades to no roots.
+        """
+        try:
+            return self._tool_manager_getter().scratchpad_roots
+        except Exception:
+            return frozenset()
+
     async def resolve_dangerous_command_grant(
         self,
         tool: BaseTool,
@@ -228,12 +275,23 @@ class ToolDecisionCoordinator:
         returns the honest refusal.
         """
         proposal = ctx.dangerous_command_proposal
+        if proposal is not None and proposal.destination is not None:
+            # A remote-exec denial is a destination grant, a separate
+            # authority class from the scope-keyed operations below.
+            return await self.resolve_remote_exec_grant(
+                tool, args, ctx, tool_name, tool_call_id
+            )
         command = getattr(args, "command", None)
         # Derive the approval's coverage in the same synchronous window as the
         # denial, so a world change before the answer fails the recheck instead
         # of silently re-scoping the approval to a different repository.
         requirements = (
-            derive_call_requirements(command, proposal.project, proposal.operations)
+            derive_call_requirements(
+                command,
+                proposal.project,
+                proposal.operations,
+                scratchpad_roots=self._live_scratchpad_roots(),
+            )
             if proposal is not None and isinstance(command, str)
             else None
         )
@@ -245,8 +303,10 @@ class ToolDecisionCoordinator:
             # Blanket child denial: a child session never prompts for
             # ask-class authority, whatever its user-input capability — the
             # denial with remediation flows back to the parent as a blocker,
-            # and dangerous_command_grants_by_project stays the only child
-            # pre-authorization path. A runtime-managed session that cannot
+            # and the persisted grant fields
+            # (dangerous_command_grants_by_project, and
+            # remote_exec_grants_by_project for a destination) stay the only
+            # child pre-authorization paths. A runtime-managed session that cannot
             # prompt names the persistent config knob (publication only); a
             # bare loop keeps the existing denial text unchanged.
             return (
@@ -261,11 +321,10 @@ class ToolDecisionCoordinator:
         if store.is_refused(identity):
             return _declined_dangerous_command_decision()
         choice = await self.prompt_dangerous_command_grant(proposal, tool_call_id)
-        if choice is None:
-            return _dangerous_command_denial(ctx, tool_name, proposal)
-        if choice == "deny":
-            store.record_refusal(identity)
-            return _declined_dangerous_command_decision()
+        if choice is None or choice == "deny":
+            return _prompt_outcome_decision(
+                store, identity, proposal, choice, ctx, tool_name
+            )
         return await self.resume_after_dangerous_command_grant(
             tool, args, tool_name, proposal, choice, requirements
         )
@@ -280,7 +339,9 @@ class ToolDecisionCoordinator:
         """
         try:
             answer = await self._request_broker.request_user_input(
-                dangerous_command_request(proposal),
+                dangerous_command_request(
+                    proposal, scratchpad_roots=self._live_scratchpad_roots()
+                ),
                 tool_call_id or "",
                 # Runtime approval, never a model question: permanently
                 # ineligible for unattended expiry (plan U/OD1).
@@ -466,6 +527,184 @@ class ToolDecisionCoordinator:
             )
         return dangerous_command_grant_save_note(
             proposal.project, proposal.scope, tuple(outcomes)
+        )
+
+    @staticmethod
+    def _remote_exec_requirements(
+        proposal: DangerousCommandProposal,
+    ) -> frozenset[RemoteExecGrantRequirement] | None:
+        if proposal.destination is None:
+            return None
+        return frozenset({
+            RemoteExecGrantRequirement(
+                scope=proposal.scope, destination=proposal.destination
+            )
+        })
+
+    async def resolve_remote_exec_grant(
+        self,
+        tool: BaseTool,
+        args: BaseModel,
+        ctx: PermissionContext,
+        tool_name: str,
+        tool_call_id: str | None,
+    ) -> ToolDecision | None:
+        """Resolve a grantable remote-exec denial, prompting when allowed.
+
+        The destination comes from the proposal (the later SSH admission
+        classifies one validated destination per call). Returns None when the
+        denial must keep the existing behavior: no typed proposal, no
+        destination, or a bare loop without user input. A child never
+        prompts, whatever its user-input capability; it denies with the
+        persisted destination knob named. A decided call identity is never
+        re-prompted.
+        """
+        proposal = ctx.dangerous_command_proposal
+        if proposal is None:
+            return None
+        requirements = self._remote_exec_requirements(proposal)
+        if requirements is None:
+            return None
+        if self._is_subagent_getter() or not self._user_input_capability_getter():
+            return (
+                _dangerous_command_denial(ctx, tool_name, proposal)
+                if self._grant_port_getter() is not None
+                else None
+            )
+        store = self._grants_store
+        identity = DangerousCommandCallIdentity(
+            scope=proposal.scope, command=proposal.command
+        )
+        if store.is_refused(identity):
+            return _declined_dangerous_command_decision()
+        choice = await self.prompt_dangerous_command_grant(proposal, tool_call_id)
+        if choice is None or choice == "deny":
+            return _prompt_outcome_decision(
+                store, identity, proposal, choice, ctx, tool_name
+            )
+        return await self.resume_after_remote_exec_grant(
+            tool, args, tool_name, proposal, choice, requirements
+        )
+
+    async def resume_after_remote_exec_grant(
+        self,
+        tool: BaseTool,
+        args: BaseModel,
+        tool_name: str,
+        proposal: DangerousCommandProposal,
+        choice: GrantChoice,
+        requirements: frozenset[RemoteExecGrantRequirement],
+    ) -> ToolDecision:
+        """Apply a remote-exec destination grant, recheck, and resume the call.
+
+        Same discipline as the scope-keyed flow: install runtime authority
+        first, fully re-resolve, destroy an unconsumed once permit on every
+        exit path, and recheck once more after a persistence await.
+        """
+        store = self._grants_store
+        permit = None
+        try:
+            if choice == "allow_once":
+                if requirements:
+                    permit = store.install_remote_exec_once(requirements)
+                    self._tool_manager_getter()._invalidate_dangerous_command_authority()
+            elif store.grant_remote_exec_session(requirements):
+                self._tool_manager_getter()._invalidate_dangerous_command_authority()
+            resolved = tool.resolve_permission(args)
+            if resolved is not None and resolved.permission == ToolPermission.NEVER:
+                return ToolDecision(
+                    verdict=ToolExecutionResponse.SKIP,
+                    approval_type=ToolPermission.NEVER,
+                    feedback=(
+                        resolved.reason or f"Tool '{tool_name}' is disabled by policy"
+                    ),
+                )
+            if permit is not None:
+                store.destroy_remote_exec_once(permit)
+                self._tool_manager_getter()._invalidate_dangerous_command_authority()
+                permit = None
+            result_note = None
+            if choice == "allow_project":
+                result_note = await self.persist_project_remote_exec_grant(proposal)
+                self._tool_manager_getter()._invalidate_dangerous_command_authority()
+                resolved = tool.resolve_permission(args)
+                if resolved is not None and resolved.permission == ToolPermission.NEVER:
+                    return ToolDecision(
+                        verdict=ToolExecutionResponse.SKIP,
+                        approval_type=ToolPermission.NEVER,
+                        feedback=(
+                            resolved.reason
+                            or f"Tool '{tool_name}' is disabled by policy"
+                        ),
+                    )
+            return ToolDecision(
+                verdict=ToolExecutionResponse.EXECUTE,
+                approval_type=ToolPermission.ALWAYS,
+                result_note=result_note,
+                admission=(
+                    ExecutionAdmission(remote_exec_requirements=tuple(requirements))
+                    if choice == "allow_once"
+                    else None
+                ),
+            )
+        finally:
+            if permit is not None:
+                store.destroy_remote_exec_once(permit)
+                self._tool_manager_getter()._invalidate_dangerous_command_authority()
+
+    async def persist_project_remote_exec_grant(
+        self, proposal: DangerousCommandProposal
+    ) -> str:
+        """Attempt to persist an approved destination grant; report it apart.
+
+        The live destination grant is already applied; this only reports the
+        persistence outcome. A failed or uncertain save never blocks the
+        session grant; cancellation propagates.
+        """
+        destination = proposal.destination
+        if destination is None:
+            return "Remote-exec grant applies to this session only."
+        port = self._grant_port_getter()
+        if port is None:
+            return (
+                f"Remote-exec grant for {destination} applies to this session; "
+                "this session cannot save remote-exec grants to your user config."
+            )
+        try:
+            saved = await self._read_saved_grants(
+                self._config_orchestrator_getter(), proposal.project
+            )
+        except Exception:
+            logger.warning(
+                "Saved remote-exec grants read failed for %s",
+                proposal.project,
+                exc_info=True,
+            )
+            saved = None
+        if saved is None or saved.unavailable is not None or not saved.user_revision:
+            return (
+                f"Remote-exec grant for {destination} applies to this session "
+                "only; your saved grants could not be read, so it was not saved "
+                "to your config."
+            )
+        try:
+            result = await port.save_remote_exec_grant(
+                self._session_id_getter(),
+                proposal.project,
+                destination.key,
+                saved.user_revision,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.warning(
+                "Project remote-exec grant save failed for %s",
+                destination,
+                exc_info=True,
+            )
+            result = None
+        return remote_exec_grant_save_note(
+            proposal.project, proposal.scope, destination, result
         )
 
     async def resolve_out_of_root_grant(

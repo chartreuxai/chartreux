@@ -3,7 +3,7 @@ from __future__ import annotations
 import pytest
 from textual.app import App, ComposeResult
 
-from chartreux.app_server.config import ConfigView, ThinkingLevel
+from chartreux.app_server.config import ConfigView, EffectiveThinkingView, ThinkingLevel
 from chartreux.app_server.models import MCPSourceStatus, MCPSourceSummary, MCPState
 from chartreux.cli.textual_ui.widgets.banner.banner import (
     Banner,
@@ -20,6 +20,7 @@ def _make_config(
     active_model: str = "test-model",
     thinking: ThinkingLevel = "off",
     display_name: str | None = None,
+    effective: EffectiveThinkingView | None = None,
 ) -> ConfigView:
     config = build_test_app_config()
     model = config.active_model.model_copy(
@@ -35,7 +36,25 @@ def _make_config(
             "active_model": model,
             "models": [model],
             "disable_welcome_banner_animation": True,
+            "effective_thinking": effective,
         }
+    )
+
+
+def _effective(
+    *,
+    requested: ThinkingLevel = "medium",
+    semantic: ThinkingLevel | None = "medium",
+    api_effort: str | None = "high",
+    known: bool = True,
+    matches: bool | None = False,
+) -> EffectiveThinkingView:
+    return EffectiveThinkingView(
+        requested=requested,
+        semantic=semantic,
+        api_effort=api_effort,
+        known=known,
+        matches_requested=matches,
     )
 
 
@@ -241,3 +260,56 @@ class TestBannerHooksCount:
         banner.set_state(config=_make_config(), skills_count=0, hooks_count=7)
 
         assert banner.state.hooks_count == 7
+
+
+class TestBannerEffectiveThinking:
+    def test_equal_effort_keeps_the_bare_level(self) -> None:
+        banner = Banner(
+            config=_make_config(
+                thinking="medium",
+                effective=_effective(api_effort="medium", matches=True),
+            ),
+            skills_count=0,
+        )
+
+        assert banner._initial_state.active_model == "test-model[medium]"
+
+    def test_known_mismatch_labels_the_api_effort(self) -> None:
+        banner = Banner(
+            config=_make_config(thinking="medium", effective=_effective()),
+            skills_count=0,
+        )
+
+        assert banner._initial_state.active_model == "test-model[medium; API: high]"
+
+    def test_unknown_effort_never_claims_the_requested_level(self) -> None:
+        banner = Banner(
+            config=_make_config(
+                thinking="medium",
+                effective=_effective(
+                    semantic=None, api_effort=None, known=False, matches=None
+                ),
+            ),
+            skills_count=0,
+        )
+
+        assert banner._initial_state.active_model == "test-model[medium; API: unknown]"
+
+    def test_missing_projection_adds_no_annotation(self) -> None:
+        banner = Banner(
+            config=_make_config(thinking="medium", effective=None), skills_count=0
+        )
+
+        assert banner._initial_state.active_model == "test-model[medium]"
+
+    @pytest.mark.asyncio
+    async def test_mismatch_annotation_reaches_the_rendered_banner(self) -> None:
+        banner = Banner(
+            config=_make_config(thinking="medium", effective=_effective()),
+            skills_count=0,
+        )
+        app = _BannerHostApp(banner)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+
+            assert _banner_model_text(banner) == "test-model[medium; API: high]"

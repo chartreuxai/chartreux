@@ -23,6 +23,7 @@ from chartreux.core.config.harness_files import (
 )
 from chartreux.core.dangerous_commands import (
     OPERATION_REGISTRY,
+    REMOTE_EXEC_OPERATION_ID,
     DangerousCommandAuthority,
     GitRepositoryRelocation,
 )
@@ -149,6 +150,16 @@ def identity_allows_name(identity: AgentIdentity, tool_name: str) -> bool:
     if tool_name in identity.execution_carve_out:
         return True
     return posture_allows_name(identity.personal_tools, tool_name)
+
+
+# Bounded children never prompt the user (question-widget fix design, Q1):
+# they return blockers to their parent instead, and a child-origin question is
+# excluded from unattended expiry. ``AskUserQuestion.run`` denies execution —
+# the load-bearing check — and this set keeps the tool out of a child's
+# advertised catalog. Withholding is advertisement-only on purpose: a forced
+# or stale call still resolves and hits the explicit blocker ToolError rather
+# than an opaque unknown-tool failure.
+_CHILD_WITHHELD_TOOLS = frozenset({"ask_user_question"})
 
 
 class ToolManager:  # noqa: PLR0904 - reviewed authority lookup joins the full method budget
@@ -291,6 +302,21 @@ class ToolManager:  # noqa: PLR0904 - reviewed authority lookup joins the full m
             self._tool_descriptions: dict[str, str] = dict(
                 self._iter_tool_descriptions(self._search_paths)
             )
+        self._resolve_task_description_state(discovery_source)
+        self._install_task_description(task_description)
+        if not defer_mcp:
+            self.integrate_all()
+
+    def _resolve_task_description_state(
+        self, discovery_source: ToolManager | None
+    ) -> None:
+        """The task-description ownership state, from discovery or this manager.
+
+        A discovered ``prompts/task.md`` without dispatch placeholders is
+        user-owned: ``_custom_task_skeleton`` keeps its pristine text while
+        the served description gets the live route table appended (v0.7.0
+        P3). The staging copy inherits both facts.
+        """
         discovered_task = self._tool_descriptions.get("task")
         self._custom_task_description = (
             discovery_source._custom_task_description
@@ -298,9 +324,15 @@ class ToolManager:  # noqa: PLR0904 - reviewed authority lookup joins the full m
             else discovered_task is not None
             and not contains_dispatch_placeholder(discovered_task)
         )
-        self._install_task_description(task_description)
-        if not defer_mcp:
-            self.integrate_all()
+        self._custom_task_skeleton = (
+            discovery_source._custom_task_skeleton
+            if discovery_source is not None
+            else (
+                discovered_task
+                if self._custom_task_description and discovered_task is not None
+                else None
+            )
+        )
 
     def _install_task_description(self, task_description: str | None) -> None:
         """Install the policy-bound `task` tool description.
@@ -308,11 +340,17 @@ class ToolManager:  # noqa: PLR0904 - reviewed authority lookup joins the full m
         The shipped ``prompts/task.md`` is a skeleton carrying the dispatch
         placeholders; the rendered description replaces it, bypassing the
         process-global ``Task.get_tool_prompt`` cache. A custom
-        ``prompts/task.md`` without placeholders is user-owned and always wins.
-        The per-instance spec cache already keys on the description, so a
-        different policy re-keys it.
+        ``prompts/task.md`` without placeholders is user-owned: its text is
+        preserved verbatim, and the live launch-target table still renders as
+        its own appended section (v0.7.0 P3), so a custom description can
+        never suppress the table. The per-instance spec cache already keys on
+        the description, so a different policy re-keys it.
         """
         if self._custom_task_description:
+            if self._custom_task_skeleton is not None:
+                self._tool_descriptions["task"] = render_task_description_for_config(
+                    self._config_getter(), self._custom_task_skeleton
+                )
             return
         if task_description is None:
             skeleton = self._tool_descriptions.get("task")
@@ -1364,6 +1402,20 @@ class ToolManager:  # noqa: PLR0904 - reviewed authority lookup joins the full m
             }
         return result
 
+    def _child_catalog_withholds(self, tool_name: str) -> bool:
+        """Whether this manager's advertised catalog withholds ``tool_name``.
+
+        ``parent_authority_getter`` is armed for every child manager by
+        ``child_runtime_policy`` and stays None for roots, so no separate
+        subagent flag is needed. Withholding narrows only the model-facing
+        specs: execution is denied by the tool itself, which no catalog
+        selection can widen.
+        """
+        return (
+            self._parent_authority_getter is not None
+            and tool_name in _CHILD_WITHHELD_TOOLS
+        )
+
     @property
     def available_tools(self) -> dict[str, type[BaseTool]]:
         """Tools this identity may execute itself (personal axis).
@@ -1712,7 +1764,11 @@ class ToolManager:  # noqa: PLR0904 - reviewed authority lookup joins the full m
         Cache JSON schemas by the currently available tool classes, their argument
         models, resolved descriptions, and (for MCP tools) live input schemas. The
         active set is recomputed first, so configuration filters, MCP changes, and
-        parent authority changes remain visible. Copy schemas on return because
+        parent authority changes remain visible. A child's advertised catalog
+        additionally withholds ``_CHILD_WITHHELD_TOOLS`` (Q1): the child never
+        sees the user-question tool, while a forced call still resolves and is
+        denied by ``AskUserQuestion.run`` with the blocker direction. Copy
+        schemas on return because
         consumers may mutate them. The key captures tool names, classes,
         argument-model classes, descriptions, and live remote parameter-schema
         content; future ``get_parameters`` dependencies on other mutable state must
@@ -1732,6 +1788,7 @@ class ToolManager:  # noqa: PLR0904 - reviewed authority lookup joins the full m
                 ),
             )
             for name, cls in self.available_tools.items()
+            if not self._child_catalog_withholds(name)
         }
         cache_key = frozenset(
             (name, cls, args_model, description, schema_state)
@@ -1908,6 +1965,21 @@ class ToolManager:  # noqa: PLR0904 - reviewed authority lookup joins the full m
                             source="protected_config",
                         )
                     )
+            for destination_grant in source.remote_exec_grants:
+                scope = resolve_repository_scope(
+                    destination_grant.project, GitRepositoryRelocation()
+                )
+                if scope is None:
+                    continue
+                authorities.extend(
+                    DangerousCommandAuthority(
+                        operations=frozenset({REMOTE_EXEC_OPERATION_ID}),
+                        scope=scope,
+                        source="protected_config",
+                        destination=destination,
+                    )
+                    for destination in destination_grant.destinations
+                )
         provider = self._dangerous_command_authority_provider
         if provider is not None:
             try:

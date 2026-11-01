@@ -13,6 +13,7 @@ from chartreux.core.agents.identities import (
 )
 from chartreux.core.config import ChartreuxConfigSchema
 from chartreux.core.dispatch import SHIPPED_PURPOSES
+from chartreux.core.dispatch.renderer import task_description_for_config
 from chartreux.core.model_catalog.defaults import SHIPPED_CATALOG
 from chartreux.core.model_catalog.loader import CatalogSnapshot
 from chartreux.core.model_catalog.schema import ModelCatalog
@@ -185,22 +186,23 @@ def test_model_catalog_section_renders_thin_descriptions_and_routes_by_vocabular
     assert "| @quick | base | low | quick preset |" in prompt
     assert "| disabled |" not in prompt
     assert "@unavailable" not in prompt
-    # The routing renders from the package-4 route facts: the launch-target
-    # table binds the session-bound shipped targets to the session model
-    # `base` and the four cost-tier-aware purposes to the $cheapest-capable
-    # marker, so the rendering is model-bound and role-free rather than
-    # role-routed.
-    assert "### Launch targets" in prompt
-    assert "| Purpose | Identity | Tier | Seat | Model |" in prompt
+    # The routing renders from the package-4 route facts in the task tool
+    # description (v0.7.0 P3): the launch-target table binds the session-bound
+    # shipped targets to the session model `base` and the four cost-tier-aware
+    # purposes to the $cheapest-capable marker, so the rendering is model-bound
+    # and role-free rather than role-routed. The served prompt carries none.
+    task = task_description_for_config(config)
+    assert "### Launch targets" not in prompt
+    assert "| Purpose | Identity | Tier | Seat | Model |" in task
     assert (
-        "| `implementation` | `coder` | substantive | — | `$cheapest-capable` |"
-        in prompt
+        "| `implementation` | `coder` | substantive | — | `$cheapest-capable` |" in task
     )
-    assert "| `research` | `researcher` | substantive | — | `base` |" in prompt
-    assert "### Purpose meanings" in prompt
-    assert "| `mechanical` | `worker` |" not in prompt
-    assert "`@scout` for search" not in prompt
+    assert "| `research` | `researcher` | substantive | — | `base` |" in task
+    assert "### Purpose meanings" in task
+    assert "| `mechanical` | `worker` |" not in task
+    assert "`@scout` for search" not in task
     assert "$dispatch" not in prompt
+    assert "$dispatch" not in task
 
     restricted = config.model_copy(update={"allowed_models": ["base"]})
     restricted_prompt = get_universal_system_prompt(
@@ -535,8 +537,9 @@ def test_default_prompt_composes_the_coder_minimal_selection(
     assert "## Background subagents" not in prompt
     assert "**Delegation posture.** Delegation is optional:" in prompt
     assert "Direct tools: the full granted tool set." in prompt
-    # Routing is the launch-target table, not a slot table.
-    assert "### Launch targets" in prompt
+    # Routing is the launch-target table in the task description, not a slot
+    # table in the served prompt (v0.7.0 P3 dedup).
+    assert "### Launch targets" not in prompt
     assert "### Authoritative active slot bindings" not in prompt
     # The closing re-anchor is last.
     assert prompt.rstrip().endswith("this closing note adds no new rules.")
@@ -1094,8 +1097,9 @@ def test_rendered_orchestrated_multi_model_prompt_routes_by_task_not_difficulty(
     load_orchestrator: OrchestratorLoader[ChartreuxConfigSchema],
 ) -> None:
     # The composed orchestrator prompt routes by purpose: the launch-target
-    # table binds every shipped default target to the session model, and the
-    # routing prose rejects difficulty-based escalation.
+    # table in the task description binds every shipped default target to the
+    # session model, and the routing prose rejects difficulty-based
+    # escalation.
     config = build_config(
         agent={
             "identity": "orchestrator",
@@ -1112,24 +1116,25 @@ def test_rendered_orchestrated_multi_model_prompt_routes_by_task_not_difficulty(
         config, SkillManager(lambda: config), AgentManager(load_orchestrator(config))
     )
 
-    # The launch-target table binds the session model of the catalog; the
-    # four cost-tier-aware purposes render the $cheapest-capable marker
-    # (resolved at launch from the catalog's price data).
-    assert "### Launch targets" in prompt
-    assert "| Purpose | Identity | Tier | Seat | Model |" in prompt
+    # The launch-target table renders only in the task tool description
+    # (v0.7.0 P3); it binds the session model of the catalog, and the four
+    # cost-tier-aware purposes render the $cheapest-capable marker (resolved
+    # at launch from the catalog's price data).
+    task = task_description_for_config(config)
+    assert "### Launch targets" not in prompt
+    assert "| Purpose | Identity | Tier | Seat | Model |" in task
     assert (
-        "| `implementation` | `coder` | substantive | — | `$cheapest-capable` |"
-        in prompt
+        "| `implementation` | `coder` | substantive | — | `$cheapest-capable` |" in task
     )
     assert (
         "| `review.deep` | `reviewer` | substantive | analytical | `beta-model` |"
-        in prompt
+        in task
     )
     assert (
-        "| `review.deep` | `coder` | substantive | execution | `beta-model` |" in prompt
+        "| `review.deep` | `coder` | substantive | execution | `beta-model` |" in task
     )
     # Unmet model-diversity requirements are reported, never faked.
-    assert "`review.deep`: 3 distinct canonical models" in prompt
+    assert "`review.deep`: 3 distinct canonical models" in task
     # The routing prose rides in the orchestrator identity body.
     assert "Route by purpose: the launch-target table" in prompt
     assert (

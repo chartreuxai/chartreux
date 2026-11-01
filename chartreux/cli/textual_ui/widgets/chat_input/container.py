@@ -60,6 +60,7 @@ class ChatInputContainer(Vertical):
         history_file: Path | None = None,
         skill_entries_getter: Callable[[], list[tuple[str, str]]] | None = None,
         file_watcher_for_autocomplete_getter: Callable[[], bool] | None = None,
+        workspace_root_getter: Callable[[], Path] | None = None,
         queue_edit_active_getter: Callable[[], bool] | None = None,
         queue_items_getter: Callable[[], list[tuple[int, str]]] | None = None,
         queue_selected_index_getter: Callable[[], int | None] | None = None,
@@ -78,7 +79,8 @@ class ChatInputContainer(Vertical):
         self._custom_border_label: str | None = None
 
         self._path_completer = PathCompleter(
-            watcher_enabled_getter=self._file_watcher_for_autocomplete_getter
+            watcher_enabled_getter=self._file_watcher_for_autocomplete_getter,
+            workspace_root_getter=workspace_root_getter,
         )
         self._completion_manager = MultiCompletionManager([
             SlashCommandController(CommandCompleter(self._get_slash_entries), self),

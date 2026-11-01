@@ -11,8 +11,9 @@ package-4 route facts, and assembles them in the design's fixed order:
 4. execution context (interactive main / headless main / bounded child)
 5. selected workflow body (absent for bounded children)
 6. selected orchestration strategy body (only if selected; ``none`` = absent)
-7. shared references (tool semantics, launch-target table, catalogs,
-   communication, scratchpad, environment)
+7. shared references (tool semantics, catalogs, communication, scratchpad,
+   environment — the launch-target table lives in the task tool description,
+   never in the served prompt)
 8. AGENTS.md layers — discovery unchanged, canonical dedup at composition
 9. short closing re-anchor (no new rules)
 
@@ -309,7 +310,10 @@ def compose_policy(inputs: CompositionInputs) -> CompositionResult:  # noqa: PLR
 
     ``text`` is the served artifact; ``policy_text`` is the harness-owned
     composition (the AGENTS layers and the optional detail sections are
-    session content, never S8-linted) that the S8 lint validates.
+    session content, never S8-linted) that the S8 lint validates. The served
+    artifact excludes the launch-target table (v0.7.0 P3); ``policy_text``
+    retains it so a bundle persisted before the dedup still recomposes the
+    frozen-policy hash it carries.
     """
     opening, behavior = split_identity_body(inputs.identity.content or "")
     if behavior:
@@ -389,7 +393,14 @@ def compose_policy(inputs: CompositionInputs) -> CompositionResult:  # noqa: PLR
 
     # 7. Shared references: harness-owned parts are always present; the
     # optional detail sections are session content (never S8-linted).
-    shared_parts = [inputs.tool_semantics, inputs.launch_targets]
+    #
+    # The launch-target table is EXCLUDED from the served artifact (v0.7.0
+    # P3): it lives in the task tool description, so a prompt that carried
+    # it too would ship the table twice. ``policy_text`` deliberately keeps
+    # it — that text is what the frozen-policy hash covers, and a bundle
+    # persisted before the dedup must recompose the identical policy hash to
+    # stay resumable, table included, so its integrity checks still apply.
+    shared_parts = [inputs.tool_semantics]
     if inputs.model_info:
         shared_parts.append(inputs.model_info)
     if inputs.skills:

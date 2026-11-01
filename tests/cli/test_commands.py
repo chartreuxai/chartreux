@@ -258,6 +258,25 @@ class TestCommandRegistry:
             CommandRegistry(excluded_commands=["usage"]).parse_command("/usage") is None
         )
 
+    @pytest.mark.parametrize("invocation", ["/routes", "  /ROUTES  "])
+    def test_routes_command_registration(self, invocation: str) -> None:
+        registry = CommandRegistry()
+        result = registry.parse_command(invocation)
+        assert result is not None
+        name, command, args = result
+        assert name == "routes"
+        assert command.handler == "_show_routes"
+        assert (
+            command.description == "Browse this conversation's live purpose-route table"
+        )
+        assert command.side_channel is True
+        assert command.exits is False
+        assert args == ""
+        assert (
+            "`/routes`: Browse this conversation's live purpose-route table"
+            in registry.get_help_text()
+        )
+
     def test_settings_command_registration(self) -> None:
         registry = CommandRegistry()
         assert registry.get_command_name("/settings") == "settings"

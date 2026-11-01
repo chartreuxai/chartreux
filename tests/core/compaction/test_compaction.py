@@ -548,3 +548,73 @@ def test_select_model_context_keeps_state_blocks_after_the_boundary() -> None:
         str(_state_block().content),
         "after compaction",
     ]
+
+
+def test_archive_trim_flag_is_active_at_p4d() -> None:
+    # P4d ACTIVATES payload-only trimming: P4b landed the same wiring inert
+    # behind this flag, and the flag is the package's activation switch. The
+    # behavior itself (seal -> fence -> publish, originals retained on failure)
+    # is pinned in test_archive_trim_activation.py.
+    from chartreux.core.compaction.manager import ARCHIVE_TRIM_ENABLED
+
+    assert ARCHIVE_TRIM_ENABLED is True
+
+
+def test_archived_replacement_payloads_releases_only_reasoning_payloads() -> None:
+    # M1's replacement model, payloads mode: content, tool structure, image
+    # references and display fields are retained; ONLY reasoning_payloads is
+    # released; the original is never mutated.
+    from chartreux.core.llm_models import archived_replacement
+
+    message = LLMMessage(
+        role=Role.assistant,
+        content="answer",
+        reasoning_content="visible thinking",
+        reasoning_payloads=[{"opaque": "payload"}],
+        tool_calls=[
+            ToolCall(
+                id="t1", index=0, function=FunctionCall(name="bash", arguments="{}")
+            )
+        ],
+        message_id="m-1",
+    )
+
+    replacement = archived_replacement(message, "ref-1")
+
+    assert replacement is not message
+    assert replacement.reasoning_payloads is None
+    assert replacement.content == "answer"
+    assert replacement.reasoning_content == "visible thinking"
+    assert replacement.tool_calls is not None and replacement.tool_calls[0].id == "t1"
+    assert replacement.message_id == "m-1"
+    assert replacement._archive_reference == "ref-1"
+    # The private reference never serializes.
+    assert "_archive_reference" not in replacement.model_dump(mode="json")
+    # The original keeps its payload graph and carries no marker.
+    assert message.reasoning_payloads == [{"opaque": "payload"}]
+    assert message._archive_reference is None
+
+
+def test_archived_replacement_tombstones_keep_only_identity_fields() -> None:
+    from chartreux.core.llm_models import archived_replacement
+
+    message = LLMMessage(
+        role=Role.assistant,
+        content="answer",
+        reasoning_payloads=[{"opaque": "payload"}],
+        tool_calls=[
+            ToolCall(
+                id="t1", index=0, function=FunctionCall(name="bash", arguments="{}")
+            )
+        ],
+        message_id="m-2",
+    )
+
+    tombstone = archived_replacement(message, "ref-2", trim_mode="tombstones")
+
+    record = tombstone.model_dump(exclude_none=True, mode="json")
+    assert set(record) <= {"role", "message_id", "injected"}
+    assert record["role"] == "assistant"
+    assert record["message_id"] == "m-2"
+    assert tombstone._archive_reference == "ref-2"
+    assert message.content == "answer"

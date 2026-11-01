@@ -1555,7 +1555,6 @@ class TestShippedDenylistMigration:
             "rsync",
             "ftp",
             "telnet",
-            "http",
             "httpie",
             "wget2",
             "aria2c",
@@ -1563,6 +1562,12 @@ class TestShippedDenylistMigration:
             "watch",
         ):
             assert entry in denylist
+        # v0.7.0 S3: HTTPie's request client `http` left the shipped denylist
+        # under its restricted grammar. `httpie` and `wget2` stayed because
+        # their admission prerequisites are not established (the installed
+        # `httpie` entry point is not confirmed to carry the request grammar;
+        # no effective redirect-disable is documented and tested for wget2).
+        assert "http" not in denylist
 
     @pytest.mark.parametrize(
         "command",
@@ -1573,7 +1578,11 @@ class TestShippedDenylistMigration:
             "rsync -a src/ host:dst/",
             "ftp host",
             "telnet host",
-            "http GET https://example.com",
+            # v0.7.0 S3: `http` is modeled, so its non-loopback destination is
+            # now an ask-class network.egress proposal (pinned in
+            # tests/tools/test_bash_permissions.py and the permission corpus),
+            # not a denylist denial. `httpie` and `wget2` keep the fail-closed
+            # denylist denial.
             "httpie GET https://example.com",
             "wget2 http://example.com",
             "aria2c http://example.com",

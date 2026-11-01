@@ -95,6 +95,7 @@ from tests.app_server._subagent_test_support import (
     _ManualClock,
     _retention_registry,
     _stored_result,
+    _tombstone,
     _wait_result,
 )
 from tests.conftest import build_test_agent_loop
@@ -372,6 +373,78 @@ async def test_tombstone_name_survives_metadata_expiry_window() -> None:
     clock.advance(2)
     assert await registry.check_agents() == []
     await registry.drain_children()
+
+
+@pytest.mark.asyncio
+async def test_check_agents_and_wire_carry_identical_uncollected_lists() -> None:
+    """U3b: both public surfaces project the SAME real uncollected lists.
+
+    ``check_agents`` and ``agents/update`` are separate projections of one
+    inventory: a resident row's list unions the record's retained results with
+    the store's, a tombstoned row's list comes from the store alone, and both
+    surfaces report the same newest-first IDs.
+    """
+    clock = _ManualClock(0)
+    registry = _retention_registry(clock)
+    _resident_record(registry, "agent-1", clock=clock, latest_run_id="run-2")
+    registry._result_store[("agent-1", "run-2")] = _stored_result(
+        "agent-1", "run-2", completed_at=20
+    )
+    registry._result_store[("agent-1", "run-1")] = _stored_result(
+        "agent-1", "run-1", completed_at=10
+    )
+    registry._evicted_agents["agent-2"] = _tombstone(
+        "agent-2", reason="evicted", closed_at=0, expires_at=900, run_id="run-9"
+    )
+    registry._result_store[("agent-2", "run-9")] = _stored_result(
+        "agent-2", "run-9", completed_at=5
+    )
+
+    summaries = await registry.check_agents()
+    wire = registry._agents_update_payload()
+
+    expected = {"agent-1": ["run-2", "run-1"], "agent-2": ["run-9"]}
+    assert {
+        summary.agent_id: summary.uncollected_run_ids for summary in summaries
+    } == expected
+    assert {model.agent_id: model.uncollected_run_ids for model in wire} == expected
+    # The wire key is always present with exactly these IDs.
+    assert [
+        model.model_dump(mode="json", by_alias=True)["uncollectedRunIds"]
+        for model in wire
+    ] == [["run-2", "run-1"], ["run-9"]]
+
+
+@pytest.mark.asyncio
+async def test_tombstone_projection_copies_and_never_mutates_the_stored_summary() -> (
+    None
+):
+    """U3b: a terminal row's list is projected as a COPY of its tombstone.
+
+    The stored tombstone summary is the frozen record of closure: the
+    projection installs the live list on a copy, so neither the projection nor
+    a later in-place mutation of the original can cross-contaminate the other.
+    """
+    clock = _ManualClock(0)
+    registry = _retention_registry(clock)
+    tombstone = _tombstone(
+        "agent-2", reason="closed", closed_at=0, expires_at=900, run_id="run-1"
+    )
+    registry._evicted_agents["agent-2"] = tombstone
+    registry._result_store[("agent-2", "run-1")] = _stored_result("agent-2", "run-1")
+
+    projected = (await registry.check_agents())[0]
+    assert projected.uncollected_run_ids == ["run-1"]
+    assert projected is not tombstone.summary
+    # The live list never reaches the stored summary.
+    assert tombstone.summary.uncollected_run_ids == []
+
+    # In-place mutation of the ORIGINAL after the copy cannot reach the
+    # projected list, and the next projection still reports the authoritative
+    # registry state instead of the mutated field.
+    tombstone.summary.uncollected_run_ids.append("stale-run")
+    assert projected.uncollected_run_ids == ["run-1"]
+    assert (await registry.check_agents())[0].uncollected_run_ids == ["run-1"]
 
 
 @pytest.mark.asyncio

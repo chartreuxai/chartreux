@@ -685,19 +685,38 @@ class TestFreshProcessResume:
             # client-side, and the old callback id is unknown.
             assert legacy_backend(server2).session.turns._callbacks == {}
             assert session2.state.active_callbacks == []
-            with pytest.raises(AppServerResponseError) as exc_info:
-                await session2.respond_to_callback(
-                    old_callback_id,
-                    UserInputCallbackOutput(
-                        result=UserQuestionResult(
-                            answers=[
-                                UserAnswer(question="Authorize this?", answer="Yes")
-                            ]
-                        )
-                    ),
-                )
+            assert session2._callback_sessions == {}
+            attachments: list[bool] = []
+            original_ensure_attached = session2._ensure_attached
+
+            async def recording_ensure_attached() -> object:
+                attachments.append(True)
+                return await original_ensure_attached()
+
+            session2._ensure_attached = recording_ensure_attached  # type: ignore[method-assign]
+            try:
+                with pytest.raises(AppServerResponseError) as exc_info:
+                    await session2.respond_to_callback(
+                        old_callback_id,
+                        UserInputCallbackOutput(
+                            result=UserQuestionResult(
+                                answers=[
+                                    UserAnswer(question="Authorize this?", answer="Yes")
+                                ]
+                            )
+                        ),
+                    )
+            finally:
+                session2._ensure_attached = original_ensure_attached  # type: ignore[method-assign]
+            # The unknown owner fails the same way the server used to answer
+            # it, but LOCALLY: the error carries the server's NOT_FOUND shape
+            # and no request was ever sent (no client was obtained, so the
+            # dead id never reached the parent registry).
             assert exc_info.value.error.code is ProtocolErrorCode.NOT_FOUND
-            assert "Callback not found" in exc_info.value.error.message
+            assert (
+                exc_info.value.error.message == f"Callback not found: {old_callback_id}"
+            )
+            assert attachments == []
             # ...and NEVER the session-only grants: both stores start empty.
             assert resumed_loop._session_root_grants.roots == set()
             assert (

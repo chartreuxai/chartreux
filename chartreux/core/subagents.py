@@ -602,6 +602,12 @@ class AgentSummary:
     """Current/latest run's structured stop reason, retained after finalization."""
     last_failure: FailureEnvelope | None = None
     """Public typed failure envelope of the latest failed run, if any."""
+    completion_audit: CompletionAuditClassification | None = None
+    """Typed audit stamp of the LATEST run, while its result is retained.
+
+    None when the latest run has not finished, has no retained result, or its
+    result expired: a previous run's stamp never rides a new run's summary.
+    """
     recovery_chain_id: str | None = None
     """Stable recovery-chain identity across the resumes of one episode (WP2)."""
     same_agent_resumes_used: int | None = None
@@ -628,6 +634,12 @@ class AgentSummary:
     identity: str | None = None
     """Canonical identity identifier of the agent's committed launch."""
     identity_revision: str | None = None
+    uncollected_run_ids: list[str] = field(default_factory=list)
+    """Retrievable run results not yet collected for this agent (newest first).
+
+    Always present, including an empty list; the registry projects its
+    collection state onto this field.
+    """
 
 
 _AGENT_HANDLE_PREFIX = "agent-"

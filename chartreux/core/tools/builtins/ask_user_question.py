@@ -122,6 +122,16 @@ class AskUserQuestion(
             raise ToolError(
                 "User input not available. This tool requires an interactive UI."
             )
+        # Bounded children report blockers to their parent and never prompt the
+        # user (question-widget fix design, Q1). This is the load-bearing
+        # denial: it runs before the broker, so no callback is minted, no
+        # widget renders, and no wait starts. Launch tool overrides can only
+        # narrow the catalog, so catalog state never bypasses this check.
+        if ctx.is_subagent:
+            raise ToolError(
+                "ask_user_question is not available to subagents; return a "
+                "blocker naming the question instead of asking the user"
+            )
 
         result = await ctx.interaction_requests.request_user_input(
             args,

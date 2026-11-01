@@ -121,6 +121,8 @@ The `name` must be lowercase letters, numbers, and hyphens. `description` tells 
 
 Chartreux first loads Python built-in skills, whose names are reserved and cannot be overridden. It then searches configured `skill_paths`, skills shipped with Chartreux, trusted project directories `.chartreux/skills/` and `.agents/skills/`, and finally `~/.chartreux/skills/` and `~/.agents/skills/`. Configured, project, and user skills shadow a shipped skill; among those local directories, the first definition of a name wins.
 
+Shadowed copies are reported, never moved or deleted. `chartreux skills diff` compares every user copy in `~/.chartreux/skills` and `~/.agents/skills` with the shipped copy of the same name and prints a unified diff with the shipped copy as the old side. Each copy is identical (it matches the shipped skill), diverged (it differs), inactive (another copy wins the name, and the report names the winning copy), or unverified (the comparison failed). `chartreux doctor` reports the same states as advisory warnings, so a skipped removal is visible without one.
+
 ```toml
 skill_paths = ["/work/shared/chartreux-skills"]
 ```

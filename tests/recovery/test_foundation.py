@@ -993,6 +993,7 @@ class _StubResultsView:
         self._agent_records: dict[str, Any] = {}
         self._result_store: dict[tuple[str, str], Any] = {}
         self._expired_results: set[tuple[str, str]] = set()
+        self._collected_results: set[tuple[str, str]] = set()
         self._latest_run_ids: dict[str, str] = {}
         self._wait_leases: dict[tuple[str, str], int] = {}
         self._pending_notifications: set[tuple[str, str]] = set()
@@ -1010,6 +1011,9 @@ class _StubResultsView:
 
     def _generation_is_current(self, generation: int) -> bool:
         return True
+
+    def _note_uncollected_change_locked(self, agent_id: str) -> None:
+        return None
 
 
 def _publication_context(

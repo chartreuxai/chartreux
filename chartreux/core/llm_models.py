@@ -204,6 +204,13 @@ class LLMMessage(BaseModel):
     _context_injection_origin: Literal["context_injector.tool_pair.v1"] | None = (
         PrivateAttr(default=None)
     )
+    # Private, per-message ARCHIVE reference (M1): set only on the replacement
+    # copies a trim publication places into a sealed prefix, so converting a
+    # MessageList to a plain list does not lose archived status. The integrity
+    # validator reads it duck-typed via ARCHIVE_REFERENCE_ATTRIBUTE. Private
+    # attributes are absent from ``model_dump``, so the marker never
+    # serializes to the session transcript or a provider wire payload.
+    _archive_reference: Any = PrivateAttr(default=None)
 
     @model_validator(mode="before")
     @classmethod
@@ -313,6 +320,50 @@ class LLMMessage(BaseModel):
             context_boundary=self.context_boundary or other.context_boundary,
             deployment_identity=(self.deployment_identity or other.deployment_identity),
         )
+
+
+def archived_replacement(
+    message: LLMMessage,
+    reference: Any,
+    *,
+    trim_mode: Literal["payloads", "tombstones"] = "payloads",
+) -> LLMMessage:
+    """Build the RAM replacement for a sealed message (M1's replacement model).
+
+    The original is never mutated: the replacement is a copy carrying the
+    private archive reference ``reference``, so converting a MessageList to a
+    plain list does not lose archived status. Under ``payloads`` only
+    ``reasoning_payloads`` is released — content, tool structure, image
+    references and display fields are retained; under ``tombstones`` every
+    payload field is released and only role/message_id/injected survive
+    serialization. The private reference itself never serializes.
+    """
+    if trim_mode == "tombstones":
+        replacement = message.model_copy(
+            update={
+                "content": None,
+                "images": None,
+                "reasoning_content": None,
+                "reasoning_payloads": None,
+                "reasoning_message_id": None,
+                "tool_calls": None,
+                "name": None,
+                "tool_call_id": None,
+                "tool_result": None,
+                "posted_at": None,
+                "turn_duration": None,
+                "user_display_content": None,
+                "input_text": None,
+                "resources": None,
+                "manual_shell": None,
+                "context_boundary": None,
+                "deployment_identity": None,
+            }
+        )
+    else:
+        replacement = message.model_copy(update={"reasoning_payloads": None})
+    replacement._archive_reference = reference
+    return replacement
 
 
 class LLMUsage(BaseModel):

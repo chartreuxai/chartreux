@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import dataclass
 from datetime import datetime
 import os
 from pathlib import Path
+import re
 import subprocess
 from time import monotonic
 from typing import TYPE_CHECKING, ClassVar, cast
@@ -18,13 +20,24 @@ from chartreux.observability.logging import logger
 from chartreux.utils.io import read_safe_async
 
 if TYPE_CHECKING:
+    from rich.style import Style as RichStyle
+    from textual.css.styles import RulesMap
     from textual.timer import Timer
     from textual.widgets import Markdown
-    from textual.widgets._markdown import MarkdownStream
+    from textual.widgets._markdown import (
+        MarkdownBlock,
+        MarkdownBullet,
+        MarkdownBulletList,
+        MarkdownListItem,
+        MarkdownParagraph,
+        MarkdownStream,
+    )
 
     from chartreux.cli.textual_ui.app import ChatScroll
 
 
+from rich.cells import cell_len
+from rich.segment import Segment
 from textual import events
 from textual.app import ComposeResult
 from textual.color import Color
@@ -35,7 +48,8 @@ from textual.geometry import Size
 from textual.message import Message
 from textual.reactive import reactive
 from textual.strip import Strip
-from textual.visual import Visual
+from textual.style import Style
+from textual.visual import RenderOptions, Visual
 from textual.widget import Widget
 from textual.widgets import Button, Link, Static
 
@@ -69,6 +83,592 @@ STREAM_WRITE_FRAME_DEADBAND_SECONDS = 0.005
 # A pause longer than this is the stream idling, not render back-pressure: the
 # next frame restarts cadence tracking instead of over-correcting for the gap.
 STREAM_WRITE_FRAME_GAP_RESET_SECONDS = 0.25
+
+
+@dataclass(slots=True)
+class StreamWriteCounters:
+    """Process-local byte and flush accounting for the streaming write path.
+
+    Measurement surface only: the perf suite reads these to attribute a
+    streaming turn's cost to its buffered flushes, and no code branches on them.
+    Counters are cumulative, so a reader resets them before measuring a turn.
+    """
+
+    flush_count: int = 0
+    flush_bytes: int = 0
+    initial_write_count: int = 0
+    initial_write_bytes: int = 0
+    final_flush_count: int = 0
+    final_flush_bytes: int = 0
+
+    def reset(self) -> None:
+        self.flush_count = 0
+        self.flush_bytes = 0
+        self.initial_write_count = 0
+        self.initial_write_bytes = 0
+        self.final_flush_count = 0
+        self.final_flush_bytes = 0
+
+
+STREAM_WRITE_COUNTERS = StreamWriteCounters()
+
+# ---------------------------------------------------------------------------
+# P5b — simple-list streaming fast path.
+#
+# Textual's Markdown.append re-tokenizes the entire unparsed tail on every
+# streaming frame while a list is open (_last_parsed_line stays pinned at the
+# list's first line), so a growing list costs O(document) parse per frame — the
+# reparse channel that dominated the P5a freeze (78% of the 400-item wall).
+# For documents the parser confirms are SIMPLE — a paragraph prefix plus one
+# tight bullet list of single-line items whose inline content carries no
+# reference-style brackets — SimpleListStreamEngine renders each item exactly
+# once: completed items are mounted as list-item widgets and are never
+# reparsed or reflowed again, and only the active (last) item is reparsed per
+# frame. Anything else (loose lists, code fences, nested containers, late
+# reference definitions) takes the whole-document path — Markdown.update per
+# frame — which may reparse earlier items for correct rendering.
+# ---------------------------------------------------------------------------
+
+# A simple-list item marker: a bullet at column 0 ("- ", "* ", "+ ").
+_SIMPLE_ITEM_MARKER_RE = re.compile(r"^[-*+] ")
+_LIST_START_RE = re.compile(r"(?:^|\n)[-*+] ")
+
+# Inline tokens a simple item may contain. Any "[" anywhere in the document
+# forces the whole-document path, so a reference definition arriving late can
+# never change an already-finalized item.
+_SIMPLE_INLINE_TOKEN_TYPES = frozenset({
+    "text",
+    "code_inline",
+    "em_open",
+    "em_close",
+    "strong_open",
+    "strong_close",
+    "s_open",
+    "s_close",
+})
+
+
+class _CompletedListItem:
+    """One finalized simple-list item: its parsed inline content plus the
+    strips it was last rendered to.
+
+    Completed items live here rather than as widgets. While the layout key
+    holds they are never re-parsed or re-wrapped — the canvas serves their
+    cached strips — so a streaming frame's layout pass stays O(1) in list
+    length instead of O(items x widgets-per-item).
+    """
+
+    __slots__ = ("content", "bullet", "strips")
+
+    def __init__(self, content: Content, bullet: str) -> None:
+        self.content = content
+        self.bullet = bullet
+        self.strips: list[Strip] = []
+
+
+class _SimpleListCanvas(Widget):
+    """Renders the completed prefix of a simple list from cached strips.
+
+    A single widget carries every completed item, so appending an item never
+    grows the widget tree and a relayout never re-measures old items.
+    """
+
+    DEFAULT_CSS = """
+    _SimpleListCanvas {
+        width: 1fr;
+        height: auto;
+    }
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._lines: list[Strip] = []
+
+    def set_lines(self, lines: list[Strip]) -> None:
+        self._lines = lines
+        self.refresh(layout=True)
+
+    def get_content_height(self, container: Size, viewport: Size, width: int) -> int:
+        return len(self._lines)
+
+    def render_line(self, y: int) -> Strip:
+        try:
+            return self._lines[y]
+        except IndexError:
+            return Strip.blank(self.size.width, self.visual_style.rich_style)
+
+
+class SimpleListStreamEngine:
+    """Incremental render engine for parser-confirmed simple bullet lists.
+
+    ``write`` returns True when it consumed the chunk itself (fast path or
+    whole-document fallback); False means the caller should use the plain
+    MarkdownStream path (document not list-shaped yet). The counters
+    (``parse_bytes_log``, ``layout_cache``, ``cache_invalidations``,
+    ``fallback_count``) are a measurement surface read by tests; no rendering
+    decision branches on them.
+
+    In fast mode the list block holds exactly two children: a
+    ``_SimpleListCanvas`` carrying every completed item as cached strips, and
+    the active item's ``Horizontal`` subtree, whose paragraph is updated in
+    place per frame. Each frame parses only item-sized source ranges.
+    """
+
+    def __init__(self, owner: StreamingMessageBase) -> None:
+        self._owner = owner
+        self.mode = "undecided"  # "undecided" | "fast" | "fallback"
+        self._consumed = 0  # char offset up to which complete lines are processed
+        self._scanned = 0  # char offset already scanned for a list start
+        self._active_offset: int | None = None  # start of the active item's line
+        self._list_block: MarkdownBulletList | None = None
+        self._canvas: _SimpleListCanvas | None = None
+        self._completed: list[_CompletedListItem] = []
+        self._active_h: Horizontal | None = None  # active item's Horizontal widget
+        self._active_bullet: MarkdownBullet | None = None
+        self._active_para: MarkdownParagraph | None = None  # active item's paragraph
+        self._render_options: RenderOptions | None = None
+        self._bullet_style: RichStyle | None = None
+        self._style_generation = 0
+        self._last_theme: str | None = None
+        self._cache_key: tuple[int, int] | None = None
+        self.parse_bytes_log: list[int] = []
+        self.layout_cache: dict[tuple[int, int], list[_CompletedListItem]] = {}
+        self.cache_invalidations = 0
+        self.fallback_count = 0
+
+    @property
+    def _item_count(self) -> int:
+        """Items rendered so far: completed cache entries plus the active item."""
+        return len(self._completed) + (1 if self._active_h is not None else 0)
+
+    def reset(self) -> None:
+        """Return to undecided (ReasoningMessage expansion replays content)."""
+        self.mode = "undecided"
+        self._consumed = 0
+        self._scanned = 0
+        self._active_offset = None
+        self._list_block = None
+        self._canvas = None
+        self._completed.clear()
+        self._active_h = None
+        self._active_bullet = None
+        self._active_para = None
+        self._render_options = None
+        self._bullet_style = None
+        self._cache_key = None
+        self.parse_bytes_log.clear()
+        self.layout_cache.clear()
+        self.cache_invalidations = 0
+        self.fallback_count = 0
+
+    async def write(self, chunk: str, full: str) -> bool:
+        """Handle one buffered write; True when consumed here."""
+        if self.mode == "undecided":
+            window = full[max(0, self._scanned - 2) :]
+            self._scanned = len(full)
+            if _LIST_START_RE.search(window):
+                if self._is_simple_document(full):
+                    await self._engage(full)
+                    return True
+                await self._fallback(full)
+                return True
+            return False
+        if self.mode == "fast":
+            await self._fast_write(full)
+            return True
+        await self._fallback(full)
+        return True
+
+    # -- shape confirmation (parser-confirmed, via the widget's own parser) --
+
+    def _is_simple_document(self, text: str) -> bool:
+        if "[" in text:
+            return False
+        from textual.widgets._markdown import MarkdownBulletList, MarkdownParagraph
+
+        md = self._owner._get_markdown()
+        blocks = md._build_from_source(text)
+        list_blocks = [b for b in blocks if isinstance(b, MarkdownBulletList)]
+        if len(list_blocks) > 1 or (list_blocks and blocks[-1] is not list_blocks[0]):
+            return False
+        prefix = blocks[: len(blocks) - 1] if list_blocks else blocks
+        if any(not isinstance(b, MarkdownParagraph) for b in prefix):
+            return False
+        if not list_blocks:
+            return True
+        if not self._list_region_lines_ok(text):
+            return False
+        return all(
+            self._single_item_paragraph(item) is not None
+            for item in list_blocks[0]._blocks
+        )
+
+    @staticmethod
+    def _list_region_lines_ok(text: str) -> bool:
+        """Every complete line from the first marker on is a marker line."""
+        # split("\n") leaves a trailing element: the split artifact after a final
+        # newline, or the still-partial last line — either way it is not complete.
+        lines = text.split("\n")[:-1]
+        for index, line in enumerate(lines):
+            if _SIMPLE_ITEM_MARKER_RE.match(line):
+                return all(_SIMPLE_ITEM_MARKER_RE.match(l) for l in lines[index:])
+        return False
+
+    def _single_item_paragraph(self, item: MarkdownBlock) -> MarkdownParagraph | None:
+        """The item's single tight paragraph, or None when the item is not simple."""
+        from textual.widgets._markdown import (
+            MarkdownParagraph,
+            MarkdownUnorderedListItem,
+        )
+
+        if not isinstance(item, MarkdownUnorderedListItem):
+            return None
+        if len(item._blocks) != 1 or not isinstance(item._blocks[0], MarkdownParagraph):
+            return None
+        para = item._blocks[0]
+        if not para._token.hidden:  # tight list only; loose lists fall back
+            return None
+        inline = para._inline_token
+        if inline is not None and inline.children is not None:
+            if any(c.type not in _SIMPLE_INLINE_TOKEN_TYPES for c in inline.children):
+                return None
+        return para
+
+    def _parse_single_item(self, src: str) -> MarkdownListItem | None:
+        """Parse one item's source; return its list-item block or None."""
+        from textual.widgets._markdown import MarkdownBulletList, MarkdownListItem
+
+        md = self._owner._get_markdown()
+        blocks = md._build_from_source(src if src.endswith("\n") else src + "\n")
+        if len(blocks) != 1 or not isinstance(blocks[0], MarkdownBulletList):
+            return None
+        items = blocks[0]._blocks
+        if len(items) != 1 or not isinstance(items[0], MarkdownListItem):
+            return None
+        item = items[0]
+        if self._single_item_paragraph(item) is None:
+            return None
+        return item
+
+    # -- fast path --
+
+    @staticmethod
+    def _line_offsets(full: str) -> tuple[int, int | None, int | None]:
+        """(end of complete lines, first marker-line start, active-line start).
+
+        The active line is the last marker line — complete or the still
+        partial tail.
+        """
+        parts = full.split("\n")
+        partial = "" if full.endswith("\n") else parts[-1]
+        pos = 0
+        list_start: int | None = None
+        active_offset: int | None = None
+        for line in parts[:-1]:
+            if _SIMPLE_ITEM_MARKER_RE.match(line):
+                if list_start is None:
+                    list_start = pos
+                active_offset = pos
+            pos += len(line) + 1
+        if partial and _SIMPLE_ITEM_MARKER_RE.match(partial):
+            if list_start is None:
+                list_start = pos
+            active_offset = pos
+        return pos, list_start, active_offset
+
+    async def _engage(self, full: str) -> None:
+        await self._stop_owner_stream()
+        md = self._owner._get_markdown()
+        self.mode = "fast"
+        self.parse_bytes_log.append(len(full.encode("utf-8")))
+        from textual.widgets._markdown import MarkdownBulletList, MarkdownListItem
+
+        consumed, list_start, active_offset = self._line_offsets(full)
+        if list_start is None:
+            await self._fallback(full)
+            return
+        self._consumed = consumed
+        self._active_offset = active_offset
+        prefix, list_src = full[:list_start], full[list_start:]
+        # Render only the prefix through Markdown.update (in the common case the
+        # plain stream already wrote exactly this), and build the list from a
+        # region parse — never a whole-document reparse or remount.
+        await md.update(prefix)
+        parsed = md._build_from_source(
+            list_src if list_src.endswith("\n") else list_src + "\n"
+        )
+        list_block = next(
+            (b for b in parsed if isinstance(b, MarkdownBulletList)), None
+        )
+        items = list(list_block._blocks) if list_block is not None else []
+        if (
+            list_block is None
+            or not items
+            or any(not isinstance(item, MarkdownListItem) for item in items)
+            or any(self._single_item_paragraph(item) is None for item in items)
+        ):
+            await self._fallback(full)
+            return
+        list_items = [cast("MarkdownListItem", item) for item in items]
+        await self._mount_fast_list(md, list_block, list_items)
+        md._markdown = full
+        self._sync_layout_cache()
+
+    async def _mount_fast_list(
+        self,
+        md: Markdown,
+        list_block: MarkdownBulletList,
+        list_items: list[MarkdownListItem],
+    ) -> None:
+        """Mount the list block empty, then the canvas and the active subtree.
+
+        Every item's parsed paragraph is harvested into the completed-item
+        cache without mounting the whole-document item widgets; the last item
+        stays live as the active one.
+        """
+        from textual.widgets._markdown import MarkdownBullet
+
+        for item in list_items[:-1]:
+            para = cast("MarkdownParagraph", item._blocks[0])
+            self._completed.append(_CompletedListItem(para._content, item.bullet))
+        active_item = list_items[-1]
+        active_para = cast("MarkdownParagraph", active_item._blocks[0])
+        list_block._blocks.clear()
+        await md.mount(list_block)
+        self._list_block = list_block
+        canvas = _SimpleListCanvas()
+        await list_block.mount(canvas)
+        self._canvas = canvas
+        bullet = MarkdownBullet()
+        bullet.symbol = active_item.bullet
+        horizontal = Horizontal(bullet, Vertical(active_para))
+        await list_block.mount(horizontal)
+        self._active_h = horizontal
+        self._active_bullet = bullet
+        self._active_para = active_para
+
+    def _capture_render_context(self) -> None:
+        """Borrow wrap rules and bullet style from the live item widgets so
+        canvas-rendered rows match a whole-document render exactly.
+        """
+        para = self._active_para
+        if para is not None:
+            self._render_options = RenderOptions(
+                para._get_style, cast("RulesMap", para.styles), None, None
+            )
+        bullet = self._active_bullet
+        if bullet is not None:
+            self._bullet_style = bullet.visual_style.rich_style
+
+    async def _fast_write(self, full: str) -> None:
+        md = self._owner._get_markdown()
+        list_block = self._list_block
+        if list_block is None:
+            await self._fallback(full)
+            return
+        parsed_bytes = 0
+        parts = full[self._consumed :].split("\n")
+        complete, tail = parts[:-1], parts[-1]
+        consumed = self._consumed
+        # (line, ends_with_newline): every complete line, plus the still
+        # partial tail line when present. All but the last become completed
+        # cache entries; the last is the active item.
+        lines: list[tuple[str, bool]] = [(line, True) for line in complete]
+        if tail:
+            lines.append((tail, False))
+        with md.app.batch_update():
+            if (
+                complete
+                and self._active_offset is not None
+                and self._active_offset < consumed
+            ):
+                # The previously active line is complete now: finalize it.
+                src = full[self._active_offset : consumed]
+                parsed_bytes += len(src.encode("utf-8"))
+                if not self._complete_item(src):
+                    await self._fallback(full)
+                    return
+            for line, _is_complete in lines[:-1]:
+                consumed += len(line) + 1
+                if not _SIMPLE_ITEM_MARKER_RE.match(line):
+                    await self._fallback(full)
+                    return
+                parsed_bytes += len(line.encode("utf-8")) + 1
+                if not self._complete_item(line + "\n"):
+                    await self._fallback(full)
+                    return
+            if lines:
+                line, is_complete = lines[-1]
+                line_start = consumed
+                if is_complete:
+                    consumed += len(line) + 1
+                if not _SIMPLE_ITEM_MARKER_RE.match(line):
+                    await self._fallback(full)
+                    return
+                parsed_bytes += len(line.encode("utf-8")) + 1
+                src = full[line_start:]
+                item = self._parse_single_item(
+                    src if src.endswith("\n") else src + "\n"
+                )
+                if item is None or not await self._activate_item(item, line_start):
+                    await self._fallback(full)
+                    return
+        self._consumed = consumed
+        md._markdown = full
+        self.parse_bytes_log.append(parsed_bytes)
+        self._push_canvas_lines()
+        self._sync_layout_cache()
+
+    def _complete_item(self, src: str) -> bool:
+        """Parse one finalized item line into the completed-item cache."""
+        item = self._parse_single_item(src)
+        if item is None:
+            return False
+        para = cast("MarkdownParagraph", item._blocks[0])
+        entry = _CompletedListItem(para._content, item.bullet)
+        if self._cache_key is not None:
+            entry.strips = self._item_strips(
+                entry.content, entry.bullet, self._cache_key[0], self._render_options
+            )
+        self._completed.append(entry)
+        return True
+
+    async def _activate_item(self, item: MarkdownListItem, line_start: int) -> bool:
+        """Make ``item`` the active item: reuse the live subtree in place, or
+        mount one when the list was empty at engagement.
+        """
+        para = cast("MarkdownParagraph", item._blocks[0])
+        self._active_offset = line_start
+        if self._active_h is None or self._active_para is None:
+            list_block = self._list_block
+            if list_block is None:
+                return False
+            from textual.widgets._markdown import MarkdownBullet
+
+            bullet = MarkdownBullet()
+            bullet.symbol = item.bullet
+            horizontal = Horizontal(bullet, Vertical(para))
+            await list_block.mount(horizontal)
+            self._active_h = horizontal
+            self._active_para = para
+            self._active_bullet = bullet
+            self._capture_render_context()
+        else:
+            if self._active_bullet is not None:
+                self._active_bullet.symbol = item.bullet
+            await self._active_para._update_from_block(para)
+        return True
+
+    # -- completed-item strip cache --
+
+    def _item_strips(
+        self, content: Content, bullet: str, width: int, options: RenderOptions | None
+    ) -> list[Strip]:
+        """Render one item to rows exactly as a whole-document render would:
+        the bullet on the first row, the paragraph wrapped to the remaining
+        width (borrowed wrap rules), blank bullet cells on later rows.
+        """
+        if width <= 0 or options is None:
+            return []
+        bullet_width = cell_len(bullet)
+        para_width = max(1, width - bullet_width)
+        para_strips = content.render_strips(para_width, None, Style.null(), options)
+        rows: list[Strip] = []
+        for index, para_strip in enumerate(para_strips):
+            prefix = (
+                Strip([Segment(bullet, self._bullet_style)])
+                if index == 0
+                else Strip.blank(bullet_width)
+            )
+            rows.append(prefix + para_strip)
+        return rows
+
+    def _render_completed_strips(self, key: tuple[int, int]) -> None:
+        """Re-wrap every completed item at ``key`` from its cached parsed
+        content — a re-render on invalidation, never a re-parse.
+        """
+        width = key[0]
+        options = self._render_options
+        for entry in self._completed:
+            entry.strips = self._item_strips(
+                entry.content, entry.bullet, width, options
+            )
+
+    def _push_canvas_lines(self) -> None:
+        canvas = self._canvas
+        if canvas is None:
+            return
+        lines: list[Strip] = []
+        for entry in self._completed:
+            lines.extend(entry.strips)
+        canvas.set_lines(lines)
+
+    # -- whole-document fallback --
+
+    async def _fallback(self, full: str) -> None:
+        self.mode = "fallback"
+        self.fallback_count += 1
+        await self._stop_owner_stream()
+        md = self._owner._get_markdown()
+        # Markdown.update removes the old blocks — including the canvas and
+        # the active subtree — and remounts whole-document blocks.
+        await md.update(full)
+        self._list_block = None
+        self._canvas = None
+        self._completed.clear()
+        self._active_h = None
+        self._active_bullet = None
+        self._active_para = None
+        self._render_options = None
+        self._active_offset = None
+        self._cache_key = None
+        self.layout_cache.clear()
+
+    async def _stop_owner_stream(self) -> None:
+        stream = self._owner._stream
+        if stream is not None:
+            self._owner._stream = None
+            await stream.stop()
+
+    # -- completed-item layout cache --
+
+    def current_layout_key(self) -> tuple[int, int]:
+        """(effective width, theme/style generation) the items are rendered at.
+
+        The style generation is derived lazily from the app theme — no watcher
+        is registered, so a removed message widget stays collectable.
+        """
+        md = self._owner._get_markdown()
+        theme = self._owner.app.theme
+        if theme != self._last_theme:
+            self._last_theme = theme
+            self._style_generation += 1
+        return (md.content_region.width, self._style_generation)
+
+    def _sync_layout_cache(self) -> None:
+        """Key the completed-item layout cache by width and style generation.
+
+        While the key holds, completed items are served from their cached
+        strips and are never re-parsed or re-wrapped; a width or theme change
+        invalidates the old key and re-wraps the completed items — from their
+        cached parsed content, never re-parsed — under the new one.
+        """
+        list_block = self._list_block
+        if self.mode != "fast" or list_block is None:
+            return
+        key = self.current_layout_key()
+        if key == self._cache_key:
+            return
+        if self._cache_key is not None:
+            self.layout_cache.pop(self._cache_key, None)
+        self._cache_key = key
+        self.cache_invalidations += 1
+        if self._active_para is not None or self._active_bullet is not None:
+            self._capture_render_context()
+        self._render_completed_strips(key)
+        self._push_canvas_lines()
+        self.layout_cache[key] = list(self._completed)
+
 
 # A fatal provider error can carry a multi-kilobyte single-line excerpt that
 # fold-wraps into dozens of rows and obscures the transcript. Errors estimated
@@ -346,6 +946,7 @@ class StreamingMessageBase(Static):
         self._to_write_buffer = ""
         self._frame_delay = STREAM_WRITE_FRAME_SECONDS
         self._last_frame_started: float | None = None
+        self._list_engine: SimpleListStreamEngine | None = None
 
     def _get_markdown(self) -> Markdown:
         if self._markdown is None:
@@ -360,6 +961,26 @@ class StreamingMessageBase(Static):
 
             self._stream = Markdown.get_stream(self._get_markdown())
         return self._stream
+
+    def _ensure_list_engine(self) -> SimpleListStreamEngine | None:
+        """The fast path needs a live Markdown widget; doubles without one keep
+        the plain stream path.
+        """
+        if self._markdown is None:
+            return None
+        engine = getattr(self, "_list_engine", None)
+        if engine is None:
+            engine = SimpleListStreamEngine(self)
+            self._list_engine = engine
+        return engine
+
+    async def _write_chunk(self, text: str) -> None:
+        """Route one buffered write to the simple-list fast path or the stream."""
+        engine = self._ensure_list_engine()
+        if engine is not None and await engine.write(text, self._content):
+            return
+        stream = self._ensure_stream()
+        await stream.write(text)
 
     def _is_chat_at_bottom(self) -> bool:
         try:
@@ -395,8 +1016,9 @@ class StreamingMessageBase(Static):
         self._adapt_frame_delay(monotonic())
         to_write = self._to_write_buffer
         self._to_write_buffer = ""
-        stream = self._ensure_stream()
-        await stream.write(to_write)
+        STREAM_WRITE_COUNTERS.flush_count += 1
+        STREAM_WRITE_COUNTERS.flush_bytes += len(to_write.encode("utf-8"))
+        await self._write_chunk(to_write)
 
     def _adapt_frame_delay(self, started: float) -> None:
         """Steer the scheduled delay so frames land every STREAM_WRITE_FRAME_SECONDS.
@@ -437,15 +1059,21 @@ class StreamingMessageBase(Static):
         self._content_initialized = True
         if self._content and self._should_write_content():
             self._cancel_write_timer()
-            stream = self._ensure_stream()
-            await stream.write(self._content)
+            STREAM_WRITE_COUNTERS.initial_write_count += 1
+            STREAM_WRITE_COUNTERS.initial_write_bytes += len(
+                self._content.encode("utf-8")
+            )
+            await self._write_chunk(self._content)
             self._to_write_buffer = ""
 
     async def stop_stream(self) -> None:
         self._cancel_write_timer()
         if self._to_write_buffer and self._should_write_content():
-            stream = self._ensure_stream()
-            await stream.write(self._to_write_buffer)
+            STREAM_WRITE_COUNTERS.final_flush_count += 1
+            STREAM_WRITE_COUNTERS.final_flush_bytes += len(
+                self._to_write_buffer.encode("utf-8")
+            )
+            await self._write_chunk(self._to_write_buffer)
         self._to_write_buffer = ""
 
         if self._stream is None:
@@ -462,6 +1090,7 @@ class StreamingMessageBase(Static):
         # signature it overrides is sync — the cancelled task ends on its own.
         self._cancel_write_timer()
         self._to_write_buffer = ""
+        self._list_engine = None
         if self._stream is not None:
             stream, self._stream = self._stream, None
             if stream._task is not None:
@@ -629,8 +1258,10 @@ class ReasoningMessage(ClickWithoutDragMixin, SpinnerMixin, StreamingMessageBase
                     await self._stream.stop()
                     self._stream = None
                 await self._markdown.update("")
-                stream = self._ensure_stream()
-                await stream.write(self._content)
+                engine = getattr(self, "_list_engine", None)
+                if engine is not None:
+                    engine.reset()
+                await self._write_chunk(self._content)
                 self._to_write_buffer = ""
 
 

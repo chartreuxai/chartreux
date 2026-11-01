@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from unittest.mock import Mock
+from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
 
@@ -956,3 +956,93 @@ async def test_envelope_without_file_state_getter_is_unchanged() -> None:
     assert messages[-1].tool_result is not None
     assert messages[-1].tool_result.output == {"todo_state": {"todos": []}}
     assert "<file_state_summary>" not in str(messages[-1].content)
+
+
+@pytest.mark.asyncio
+async def test_archive_trim_path_is_entered_after_activation() -> None:
+    # P4d ACTIVATES the trim: a successful compaction enters the trim path —
+    # proven by a SPY on CompactionManager._trim_archived_prefix. A manager
+    # with no sealing surface (no session logger) still leaves the list
+    # unmarked: the path is entered, then declines without a sealing surface.
+    from chartreux.core.agent_loop._transcript_integrity import archive_reference
+    from chartreux.core.compaction.manager import (
+        ARCHIVE_TRIM_ENABLED,
+        CompactionManager as _Manager,
+    )
+
+    assert ARCHIVE_TRIM_ENABLED is True
+    messages = _conversation()
+    stats = AgentStats()
+    manager, _complete = _build_manager(
+        [mock_llm_chunk(content="<summary>all done</summary>")],
+        messages=messages,
+        stats=stats,
+    )
+    assert manager._trim_enabled() is True
+
+    with patch.object(_Manager, "_trim_archived_prefix", autospec=True) as trim_spy:
+        summary = await manager.compact()
+
+    assert summary == "all done"
+    trim_spy.assert_awaited_once()
+    # No sealing surface was wired, so nothing was sealed or marked; the
+    # boundary envelope is appended and the conversation is otherwise intact.
+    assert messages[-1].context_boundary == "compaction"
+    assert messages.archive_descriptor is None
+    assert all(archive_reference(m) is None for m in messages)
+    assert len(messages) == 5
+
+
+@pytest.mark.asyncio
+async def test_compaction_during_active_invocation_leaves_the_active_invocation_intact() -> (
+    None
+):
+    # Closed-prefix restriction, compaction-wiring side: an automatic
+    # compaction that fires during an active invocation leaves the active
+    # invocation intact until a subsequent compaction. Trimming is ACTIVE at
+    # P4d (the flag is on by default), so the active-turn guard is what must
+    # keep the sealing surface untouched and the list unmarked — finalization
+    # still mutates an earlier assistant's duration after this point.
+    from chartreux.core.agent_loop._transcript_integrity import archive_reference
+
+    messages = _conversation()
+    stats = AgentStats()
+    cfg = build_test_vibe_config(
+        models=make_test_models(auto_compact_threshold=999),
+        raise_on_compaction_failure=False,
+    )
+    complete = _FakeComplete(
+        [mock_llm_chunk(content="<summary>mid-run</summary>")], stats
+    )
+    fake_logger = Mock()
+    fake_logger.enabled = True
+    fake_logger.seal_archive = AsyncMock()
+    manager = CompactionManager(
+        messages=messages,
+        stats_getter=lambda: stats,
+        config_getter=lambda: cfg,
+        complete=complete,
+        available_tools=lambda: [],
+        tool_choice=lambda: "auto",
+        save=_noop,
+        session_logger_getter=lambda: fake_logger,
+        tool_manager_getter=lambda: Mock(),
+        has_active_turn=lambda: True,
+        trim_enabled_getter=lambda: True,
+    )
+
+    summary = await manager.compact()
+
+    assert summary == "mid-run"
+    # The compaction itself succeeded (boundary appended), but the trim path
+    # never reached the sealing surface: the active invocation is intact.
+    fake_logger.seal_archive.assert_not_called()
+    assert messages[-1].context_boundary == "compaction"
+    assert messages.archive_descriptor is None
+    assert all(archive_reference(m) is None for m in messages)
+    assert [m.content for m in messages if m.role is not Role.system] == [
+        "oldest ask",
+        "work",
+        "newest ask",
+        messages[-1].content,
+    ]

@@ -4,9 +4,15 @@ from __future__ import annotations
 
 from pathlib import Path
 import subprocess
+from types import SimpleNamespace
+from typing import cast
 
 import pytest
 
+from chartreux.core.agent_loop import (
+    _dangerous_command_grants as grants_module,
+    _tool_decisions as decisions_module,
+)
 from chartreux.core.agent_loop._dangerous_command_grants import (
     DANGEROUS_COMMAND_DECLINED_FEEDBACK,
     DANGEROUS_COMMAND_DENY_LABEL,
@@ -20,12 +26,18 @@ from chartreux.core.agent_loop._dangerous_command_grants import (
     derive_call_requirements,
     parse_dangerous_command_result,
 )
+from chartreux.core.agent_loop._request_broker import InteractionRequestBroker
+from chartreux.core.agent_loop._root_grants import SessionRootGrants
+from chartreux.core.agent_loop._tool_decisions import ToolDecisionCoordinator
+from chartreux.core.config._dangerous_command_persistence import SavedGrantsRead
+from chartreux.core.config._root_persistence import SavedRootsRead
 from chartreux.core.config.types import ConfigSaveResult
 from chartreux.core.dangerous_commands import (
     OPERATION_REGISTRY,
     DangerousCommandProposal,
     RepositoryScope,
 )
+from chartreux.core.tools.base import BaseTool, ToolPermission
 from chartreux.core.tools.builtins._shell_command_policy import (
     GitRepositoryRelocation,
     resolve_repository_scope,
@@ -33,7 +45,12 @@ from chartreux.core.tools.builtins._shell_command_policy import (
 from chartreux.core.tools.builtins._shell_permission_resolver import (
     _split_command_tokens,
 )
+from chartreux.core.tools.builtins.bash import BashArgs
+from chartreux.core.tools.manager import ToolManager
+from chartreux.core.tools.models import PermissionContext
 from chartreux.questions import UserAnswer, UserQuestionResult
+from tests.conftest import build_test_vibe_config
+from tests.stubs.fake_config_orchestrator import FakeConfigOrchestrator
 
 
 def make_repo(path: Path) -> Path:
@@ -566,3 +583,101 @@ class TestSaveNote:
         )
         assert "applies to this session" in note
         assert expected in note
+
+
+async def _never_read_grants(*_args: object) -> SavedGrantsRead:
+    raise AssertionError("no saved-grants read on this path")
+
+
+async def _never_read_roots(*_args: object) -> SavedRootsRead:
+    raise AssertionError("no saved-roots read on this path")
+
+
+async def _never_apply_root(*_args: object) -> None:
+    raise AssertionError("no root grant on this path")
+
+
+def _recording_derivation(seen: list[frozenset[Path]]):
+    """A derive_call_requirements stand-in that records the roots it receives."""
+    real = grants_module.derive_call_requirements
+
+    def recording(command, cwd, operations, *, scratchpad_roots=frozenset()):
+        seen.append(scratchpad_roots)
+        return real(command, cwd, operations, scratchpad_roots=scratchpad_roots)
+
+    return recording
+
+
+def _coordinator(roots: frozenset[Path], cwd: Path) -> ToolDecisionCoordinator:
+    """A coordinator whose child path resolves and denies without prompting."""
+    return ToolDecisionCoordinator(
+        grants_store=DangerousCommandGrantStore(),
+        request_broker=InteractionRequestBroker(),
+        user_input_capability_getter=lambda: False,
+        is_subagent_getter=lambda: True,
+        grant_port_getter=lambda: None,
+        tool_manager_getter=lambda: cast(
+            ToolManager, SimpleNamespace(scratchpad_roots=roots)
+        ),
+        session_id_getter=lambda: "session",
+        config_orchestrator_getter=lambda: FakeConfigOrchestrator(
+            build_test_vibe_config()
+        ),
+        read_saved_grants=_never_read_grants,
+        root_grants_store=SessionRootGrants(),
+        root_grant_port_getter=lambda: None,
+        cwd_getter=lambda: cwd,
+        read_saved_roots=_never_read_roots,
+        apply_approved_root_grant=_never_apply_root,
+    )
+
+
+class TestScratchpadRootsThreading:
+    """Both derivation call sites thread the live scratch roots (P8)."""
+
+    def test_question_derivation_threads_roots(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        repo = make_repo(tmp_path / "repo")
+        scratch = tmp_path / "scratch"
+        scratch.mkdir()
+        roots = frozenset({scratch})
+        seen: list[frozenset[Path]] = []
+        monkeypatch.setattr(
+            grants_module, "derive_call_requirements", _recording_derivation(seen)
+        )
+        dangerous_command_request(
+            proposal_for(repo, scope_of(repo), ("git", "push"), ("git.push",)),
+            scratchpad_roots=roots,
+        )
+        assert seen == [roots]
+
+    @pytest.mark.asyncio
+    async def test_grant_resolution_threads_roots(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        repo = make_repo(tmp_path / "repo")
+        scratch = tmp_path / "scratch"
+        scratch.mkdir()
+        roots = frozenset({scratch})
+        seen: list[frozenset[Path]] = []
+        monkeypatch.setattr(
+            decisions_module, "derive_call_requirements", _recording_derivation(seen)
+        )
+        proposal = proposal_for(repo, scope_of(repo), ("git", "push"), ("git.push",))
+        ctx = PermissionContext(
+            permission=ToolPermission.NEVER,
+            reason="requires approval for a dangerous git operation",
+            denial_kind="dangerous_command",
+            dangerous_command_proposal=proposal,
+        )
+        decision = await _coordinator(roots, repo).resolve_dangerous_command_grant(
+            # The child-denial path under test never touches the tool itself.
+            cast(BaseTool, None),
+            BashArgs(command="git push"),
+            ctx,
+            "bash",
+            "call-1",
+        )
+        assert decision is None
+        assert seen == [roots]

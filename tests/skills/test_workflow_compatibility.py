@@ -544,9 +544,9 @@ class TestShippedSkillRewrites:
     def test_supplementary_seats_are_reviewer_identities(self) -> None:
         review = skill_body("main-review")
 
-        assert "Supplementary seats" in review
-        assert "`luna`" in review
-        assert "`flash`" in review
+        assert "Supplementary seats, when the route configures them" in review
+        assert "`luna`" not in review
+        assert "`flash`" not in review
         assert (
             "bind the read-only `reviewer` identity, whose tool surface carries only the bash verification carve-out"
             in review
@@ -554,10 +554,10 @@ class TestShippedSkillRewrites:
         assert "intent, regression coverage, and evidence quality" in review
         assert "negative cases and boundary questions" in review
 
-    def test_flash_seat_final_message_is_report(self) -> None:
+    def test_probe_seat_final_message_is_report(self) -> None:
         review = skill_body("main-review")
 
-        assert "flash's final message must be the report itself" in review
+        assert "a probe seat's final message must be the report itself" in review
 
 
 class TestNoCeremonyInMinimalSessions:

@@ -10,6 +10,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from chartreux.app_server import _subagent_launch
 from chartreux.app_server._projection import project_launch_purposes
 from chartreux.app_server._runtime import AgentRuntimeFactory
 from chartreux.app_server._sessions import (
@@ -18,6 +19,7 @@ from chartreux.app_server._sessions import (
     SessionRuntimeRegistry,
     _AgentState,
 )
+from chartreux.app_server._subagent_launch import ChildLaunchAdmission
 from chartreux.app_server._turns import TurnController
 from chartreux.app_server.models import (
     PublicEffectEntry,
@@ -40,6 +42,7 @@ from chartreux.core.dispatch.route_models import (
     RouteTarget,
 )
 from chartreux.core.launch_types import DifficultyCategory
+from chartreux.core.llm_models import LLMMessage, Role
 from chartreux.core.message_list import MessageList
 from chartreux.core.model_catalog.loader import CatalogSnapshot
 from chartreux.core.recovery_models import PackageTier
@@ -62,6 +65,7 @@ from chartreux.core.tools.models import ToolPermission, ToolPermissionError
 from chartreux.utils.tool_presentation import ToolEffectKind
 from tests.app_server._subagent_test_support import (
     BlockingBackend,
+    GatedRegistryLock,
     GatedSequenceBackend,
     _background_result,
     _config,
@@ -920,8 +924,6 @@ async def test_prelaunch_registry_lock_cancellation_aborts_real_prepared_turn(
     root.turns._projector = MagicMock()
     root.turns.link_subagent = AsyncMock()
     prepared = asyncio.Event()
-    final_lock_entered = asyncio.Event()
-    release_final_lock = asyncio.Event()
     original_start_child_turn = SessionRuntimeRegistry._start_child_turn
 
     def signal_prepared(*values: Any, **kwargs: Any) -> tuple[str, Any]:
@@ -929,28 +931,12 @@ async def test_prelaunch_registry_lock_cancellation_aborts_real_prepared_turn(
         prepared.set()
         return result
 
-    class GatedRegistryLock:
-        def __init__(self, lock: asyncio.Lock) -> None:
-            self.lock = lock
-            self.entries = 0
-
-        async def __aenter__(self) -> None:
-            await self.lock.acquire()
-            self.entries += 1
-            if self.entries == 3:
-                final_lock_entered.set()
-                self.lock.release()
-                await release_final_lock.wait()
-                await self.lock.acquire()
-
-        async def __aexit__(self, *exc: object) -> None:
-            self.lock.release()
-
     monkeypatch.setattr(SessionRuntimeRegistry, "_start_child_turn", signal_prepared)
-    registry._registry_lock = GatedRegistryLock(registry._registry_lock)  # type: ignore[assignment]
+    final_lock = GatedRegistryLock(registry._registry_lock, gate_entry=3)
+    registry._registry_lock = final_lock  # type: ignore[assignment]
     launch = asyncio.create_task(_background_result(registry, args, context))
     try:
-        await final_lock_entered.wait()
+        await final_lock.entered.wait()
         assert prepared.is_set()
         if cancel_run:
             run = record.current_run
@@ -964,7 +950,7 @@ async def test_prelaunch_registry_lock_cancellation_aborts_real_prepared_turn(
                 requester_session_id=parent.session_id,
             )
             assert outcome.outcome is CancelOutcome.STOP_REQUESTED
-            release_final_lock.set()
+            final_lock.release.set()
             await asyncio.wait_for(launch, 2)
             result = await asyncio.wait_for(waiter, 2)
             assert result.stop_reason is RunStopReason.USER_CANCELLED
@@ -972,7 +958,7 @@ async def test_prelaunch_registry_lock_cancellation_aborts_real_prepared_turn(
             assert len(record.runtime.turns.completed_turns) == 1
         else:
             launch.cancel()
-            release_final_lock.set()
+            final_lock.release.set()
             with pytest.raises(asyncio.CancelledError):
                 await launch
             assert not record.runtime.turns.completed_turns
@@ -982,7 +968,7 @@ async def test_prelaunch_registry_lock_cancellation_aborts_real_prepared_turn(
         assert record.runtime.turns._active_task is None
         assert not registry._monitor_tasks
     finally:
-        release_final_lock.set()
+        final_lock.release.set()
         await registry.drain_children()
         await parent.aclose()
 
@@ -2507,6 +2493,79 @@ async def test_direct_runner_string_launches_resolve_canonically(
         if child is not None:
             await child.aclose()
         await parent.aclose()
+
+
+async def _retained_admission_history(
+    monkeypatch: pytest.MonkeyPatch, messages: list[Any]
+) -> tuple[Any, ...]:
+    """The ``history`` a retained re-task hands to launch admission."""
+    registry = _retention_registry()
+    parent = build_test_agent_loop(config=_config(), backend=FakeBackend())
+    root = registry._build_child_runtime(parent)
+    child_loop = await AgentRuntimeFactory().create_child(parent, "coder")
+    child = registry._build_child_runtime(child_loop)
+    captured: dict[str, Any] = {}
+    original = _subagent_launch.resolve_launch
+
+    def capture(*args: Any, **kwargs: Any) -> Any:
+        captured["history"] = kwargs["history"]
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr("chartreux.app_server._subagent_launch.resolve_launch", capture)
+    try:
+        child_loop.messages.reset(messages)
+        ChildLaunchAdmission(MagicMock()).resolve_candidate(
+            root, TaskArgs(task="continue", agent_id="agent-1"), runtime=child
+        )
+    finally:
+        await child_loop.aclose()
+        await parent.aclose()
+    return cast(tuple[Any, ...], captured["history"])
+
+
+@pytest.mark.asyncio
+async def test_retained_admission_passes_the_effective_model_context(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A retained re-task validates the context the continuation will send:
+    the messages from the newest compaction boundary onward. The archived
+    history before that boundary never reaches admission as trimmed copies.
+    """
+    history = await _retained_admission_history(
+        monkeypatch,
+        [
+            LLMMessage(role=Role.system, content="system"),
+            LLMMessage(role=Role.user, content="archived turn"),
+            LLMMessage(role=Role.assistant, content="archived answer"),
+            LLMMessage(
+                role=Role.user, content="boundary", context_boundary="compaction"
+            ),
+            LLMMessage(role=Role.user, content="live turn"),
+        ],
+    )
+
+    assert [message.content for message in history] == [
+        "system",
+        "boundary",
+        "live turn",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_retained_admission_without_a_boundary_passes_the_whole_history(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An uncompacted child keeps the unchanged whole-history admission input."""
+    history = await _retained_admission_history(
+        monkeypatch,
+        [
+            LLMMessage(role=Role.system, content="system"),
+            LLMMessage(role=Role.user, content="turn"),
+            LLMMessage(role=Role.assistant, content="answer"),
+        ],
+    )
+
+    assert [message.content for message in history] == ["system", "turn", "answer"]
 
 
 @pytest.mark.asyncio

@@ -9,7 +9,7 @@ allowed-tools:
 
 # Web Search
 
-Use this shared procedure for direct main-agent searches and delegated searches. It does not require interactive delegation and never calls the usage tool.
+Use this shared procedure for direct main-agent searches and delegated searches. It does not require interactive delegation, and `/usage` is a user slash command rather than a tool this procedure calls.
 
 ## Procedure
 

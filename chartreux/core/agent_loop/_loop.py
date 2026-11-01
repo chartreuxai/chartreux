@@ -1128,6 +1128,14 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
             file_state_getter=lambda: self.file_state_context.store,
             deferred_questions_getter=lambda: self.deferred_questions,
             bound_policy_getter=lambda: self._ensure_bound_policy(),
+            # M1 trim wiring (wired in P4b, ACTIVE since P4d behind
+            # ARCHIVE_TRIM_ENABLED): the sealing surface plus the closed-prefix
+            # guard — an automatic
+            # compaction that fires during an active invocation leaves that
+            # invocation intact until a subsequent compaction.
+            session_logger_getter=lambda: self.session_logger,
+            tool_manager_getter=lambda: self.tool_manager,
+            has_active_turn=lambda: self._active_turn is not None,
         )
 
         if defer_heavy_init:

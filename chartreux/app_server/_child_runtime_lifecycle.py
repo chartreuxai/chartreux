@@ -105,6 +105,10 @@ class ChildRuntimeAssemblyView(SubagentRunnerPort, SessionCoordinator, Protocol)
         self, session_id: str, project: Path, operation_id: str, expected_revision: str
     ) -> Awaitable[ConfigSaveResult]: ...
 
+    def _remote_exec_grant_save(
+        self, session_id: str, project: Path, destination: str, expected_revision: str
+    ) -> Awaitable[ConfigSaveResult]: ...
+
     def _capture_child_notification(
         self,
         runtime: SessionRuntime,
@@ -218,6 +222,7 @@ class ChildRuntimeAssembler:
             SessionDangerousCommandGrantPort(
                 self._view._resolve_session_loop,
                 self._view._dangerous_command_grant_save,
+                self._view._remote_exec_grant_save,
             )
         )
         execution = SessionExecution()
@@ -395,8 +400,10 @@ class ChildDrainView(Protocol):
     _eviction_tasks: set[asyncio.Task[bool]]
     _evicted_agents: dict[str, _AgentTombstone]
     _pending_evictions: dict[str, object]
+    _pending_agents_evictions: list[AgentEviction]
     _result_store: dict[tuple[str, str], StoredRunResult]
     _expired_results: set[tuple[str, str]]
+    _collected_results: set[tuple[str, str]]
     _latest_run_ids: dict[str, str]
     _wait_leases: dict[tuple[str, str], int]
     _pending_notifications: set[tuple[str, str]]
@@ -604,8 +611,15 @@ class ChildDrain:
             self._view._agent_records.clear()
             self._view._evicted_agents.clear()
             self._view._pending_evictions.clear()
+            # An eviction queued for delivery but never delivered belongs to
+            # the discarded inventory: the final payload is the empty one.
+            self._view._pending_agents_evictions = []
             self._view._result_store.clear()
             self._view._expired_results.clear()
+            # Collection markers die with the result state they annotate: the
+            # drain clears the store, so the markers go with it. Generation
+            # retirement preserves stored results and therefore keeps them.
+            self._view._collected_results.clear()
             self._view._latest_run_ids.clear()
             self._view._wait_leases.clear()
             self._view._pending_notifications.clear()

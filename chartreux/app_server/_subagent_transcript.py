@@ -5,10 +5,12 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import TYPE_CHECKING, Protocol
 
+from chartreux.app_server._agent_transcript import archive_transcript_source
 from chartreux.app_server._subagent_records import (
     AgentRecord,
     ResidentTranscriptReadSnapshot,
     StoredChildSession,
+    TranscriptMessageView,
     TranscriptReadSnapshot,
     _AgentState,
     _AgentTombstone,
@@ -162,6 +164,7 @@ class TranscriptReads:
                 or self._view._children.get(record.session_id) is not record.runtime
             ):
                 return None
+            child_loop = record.runtime.agent_loop
             return ResidentTranscriptReadSnapshot(
                 agent_id=agent_id,
                 child_session_id=record.session_id,
@@ -169,7 +172,12 @@ class TranscriptReads:
                 parent_runtime_token=id(root),
                 record_token=id(record),
                 runtime_token=id(record.runtime),
-                messages=list(record.runtime.agent_loop.messages),
+                # The view carries the sealed-prefix source when the child's
+                # list owns archive state, so paging reads the persisted
+                # originals instead of the payload-trimmed RAM copies.
+                messages=TranscriptMessageView(
+                    list(child_loop.messages), archive_transcript_source(child_loop)
+                ),
             )
 
     async def resident_transcript_read_is_current(

@@ -37,6 +37,7 @@ def parse_arguments() -> argparse.Namespace:
             "  doctor         Run read-only diagnostics (chartreux doctor --help).\n"
             "  mcp            Manage MCP server configuration (chartreux mcp --help).\n"
             "  models         Manage the model catalog (chartreux models --help).\n"
+            "  skills         Compare user skill copies with the shipped ones (chartreux skills --help).\n"
             "\n"
             "Environment variables:\n"
             "  CHARTREUX_HOME       Override the Chartreux home directory (default: ~/.chartreux)\n"
@@ -462,6 +463,12 @@ def main() -> None:
         from chartreux.cli.mcp_command import run_mcp_cli
 
         run_mcp_cli(sys.argv[2:])
+        return
+
+    if sys.argv[1:2] == ["skills"]:
+        from chartreux.cli.skills_command import run_skills_cli
+
+        run_skills_cli(sys.argv[2:])
         return
 
     args = parse_arguments()

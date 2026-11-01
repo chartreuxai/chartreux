@@ -285,20 +285,49 @@ _COMPOUND_NODES: dict[str, Diagnostic] = {
 }
 
 
-def _zsh_sensitive_word_reason(value: bytes) -> Diagnostic | None:
+# The remediation every equals-marker denial carries. An unquoted leading `=`
+# is live zsh equals expansion; quoting or escaping the marker keeps it one
+# literal word, which is the only form the analysis admits.
+_EQUALS_MARKER_ALTERNATIVE = (
+    "quote the marker so the word stays one literal argument; or drop the "
+    "leading equals sign and invoke the command by its name or absolute path"
+)
+
+
+def _equals_marker_proof(value: bytes) -> bool | None:
+    """Whether a non-live leading `=` word is provably one literal word.
+
+    Returns ``None`` when the value carries no leading `=` marker (or does not
+    tokenize), ``True`` when the marker is neutralized by quoting or escaping
+    and the word yields exactly one literal argv element, and ``False`` when
+    the marker is neutralized but the word can still expand into more — an
+    unquoted glob metacharacter pathname-expands, so the argument count would
+    not be knowable from the analysis.
+    """
+    try:
+        tokens = split_shell_tokens(value.decode("utf-8", errors="replace"))
+    except ValueError:
+        return None
+    if len(tokens) != 1 or not tokens[0].startswith("="):
+        return None
+    token = tokens[0]
+    return not (isinstance(token, ShellToken) and token.meta_unquoted)
+
+
+def _zsh_sensitive_word_reason(value: bytes) -> Diagnostic | None:  # noqa: PLR0911
     """Name Zsh word expansions that the Bash grammar treats as literals."""
     if value.startswith(b"="):
+        return _syntax_reason("Zsh equals expansion", _EQUALS_MARKER_ALTERNATIVE)
+    marker_proof = _equals_marker_proof(value)
+    if marker_proof is True:
+        return None
+    if marker_proof is False:
         return _syntax_reason(
-            "Zsh equals expansion",
-            "drop the leading equals sign and invoke the command by its name "
-            "or absolute path",
+            "an equals-marker word the shell can still expand",
+            "quote the whole word so it stays one literal argument",
         )
     if b"==" in value:
-        return _syntax_reason(
-            "Zsh magic-equals expansion",
-            "drop the leading equals signs and invoke the command by its "
-            "name or absolute path",
-        )
+        return _syntax_reason("Zsh magic-equals expansion", _EQUALS_MARKER_ALTERNATIVE)
     if value.startswith(b"~") and not (value == b"~" or value.startswith(b"~/")):
         return _syntax_reason(
             "shell-specific named-directory expansion",
@@ -313,9 +342,86 @@ def _zsh_sensitive_word_reason(value: bytes) -> Diagnostic | None:
 
 
 def _zsh_sensitive_node_reason(node: Node) -> Diagnostic | None:
-    if node.type not in {"command_name", "word"} or node.text is None:
+    if node.text is None:
         return None
-    return _zsh_sensitive_word_reason(node.text)
+    if node.type in {"command_name", "word"}:
+        return _zsh_sensitive_word_reason(node.text)
+    if node.type in {"string", "raw_string", "concatenation"}:
+        # Quoted and concatenated words carry only the equals-marker rule:
+        # a leading marker that is no longer one literal word keeps the
+        # expansion denial, and every other Zsh word expansion keeps its
+        # existing handling.
+        if _equals_marker_proof(node.text) is False:
+            return _zsh_sensitive_word_reason(node.text)
+    return None
+
+
+# --- same-invocation `$?` status probe ----------------------------------------
+#
+# A `$?` expansion is admitted only as the entire argument of a narrowly
+# recognized status-printing command that is the LAST statement of an
+# invocation of exactly the shape ``<simple-command>; <status-command> $?``.
+# The preceding statement must be one plain simple command (not a pipeline,
+# a conditional list, an assignment-only statement, a redirect, or a wrapper
+# whose own status the probe would report), the separator must be `;`, and no
+# statement may follow. The `$?` keeps its own source text as the emitted
+# argument: the shell substitutes the status number, so the analysis never
+# fabricates a literal that could diverge from what executes.
+
+_STATUS_PROBE_COMMANDS = frozenset({"echo", "printf"})
+# The admitted invocation's exact child count (command, `;`, probe command)
+# and the probe command's exact child count (command name, `$?` argument).
+_STATUS_PROBE_PROGRAM_CHILDREN = 3
+_STATUS_PROBE_COMMAND_CHILDREN = 2
+# Wrappers whose own invocation owns the exit status a probe would print.
+_STATUS_PROBE_WRAPPER_COMMANDS = frozenset({
+    "bash",
+    "busybox",
+    "command",
+    "dash",
+    "doas",
+    "env",
+    "exec",
+    "ionice",
+    "nice",
+    "nohup",
+    "sh",
+    "sudo",
+    "stdbuf",
+    "timeout",
+    "watch",
+    "xargs",
+    "zsh",
+})
+
+
+def _status_probe_replacements(  # noqa: PLR0911
+    root: Node,
+) -> dict[tuple[int, int], str]:
+    """The `$?` argument nodes the same-invocation status probe admits.
+
+    Maps each admitted argument node's byte range to its source text. Any
+    other shape yields no entry and keeps the ordinary expansion denial.
+    """
+    if root.type != "program" or len(root.children) != _STATUS_PROBE_PROGRAM_CHILDREN:
+        return {}
+    previous, separator, probe = root.children
+    if separator.type != ";" or previous.type != "command":
+        return {}
+    if probe.type != "command" or len(probe.children) != _STATUS_PROBE_COMMAND_CHILDREN:
+        return {}
+    name, argument = probe.children
+    if name.type != "command_name" or name.text is None:
+        return {}
+    if name.text.decode("utf-8", errors="replace") not in _STATUS_PROBE_COMMANDS:
+        return {}
+    if argument.type != "simple_expansion" or argument.text != b"$?":
+        return {}
+    executable = previous.children[0] if previous.children else None
+    token = _literal_token(executable) if executable is not None else None
+    if token is not None and token.rsplit("/", 1)[-1] in _STATUS_PROBE_WRAPPER_COMMANDS:
+        return {}
+    return {(argument.start_byte, argument.end_byte): argument.text.decode("utf-8")}
 
 
 # --- tier-2 static expansion wiring -------------------------------------------
@@ -690,6 +796,7 @@ def _static_expansion_replacements(
     add_reason: Callable[[Diagnostic], None],
     variables: dict[str, str],
     read_roots: frozenset[Path],
+    status_probes: dict[tuple[int, int], str] | None = None,
 ) -> dict[tuple[int, int], str]:
     """Literal replacements for this command's statically expanded constructs.
 
@@ -698,9 +805,11 @@ def _static_expansion_replacements(
     consumed by the replacement (suppressed only for expansion node types and
     ``=``-leading command names — never for redirects, braces, or heredocs).
     ``read_roots`` are the roots the sed simulation may read inside.
+    ``status_probes`` carries the admitted same-invocation ``$?`` arguments;
+    their replacement is the construct's own source text, not a literal.
     """
     text = (node.text or b"").decode("utf-8", errors="replace")
-    replacements: dict[tuple[int, int], str] = {}
+    replacements: dict[tuple[int, int], str] = dict(status_probes or {})
 
     # (a) sed locate-then-print: the expanded script goes through the normal
     # sed script policy exactly like a hand-written literal script.
@@ -1372,6 +1481,11 @@ def _analyze_shell_command(  # noqa: PLR0915, PLR0914
     # scratchpad roots plus the workspace roots (the ambient workspace when
     # the caller supplies none). The recognizer never reads outside them.
     read_roots = _simulation_read_roots(scratchpad_roots, workspace_roots)
+    # The same-invocation `$?` probe is decided from the whole tree before
+    # the walk: its admitted argument ranges are consumed here, so the walk's
+    # ordinary expansion denial never fires for exactly those nodes.
+    status_probes = _status_probe_replacements(tree.root_node)
+    authorized.extend(status_probes)
 
     def add_reason(diagnostic: Diagnostic) -> None:
         detail = diagnostic.detail or ""
@@ -1530,7 +1644,12 @@ def _analyze_shell_command(  # noqa: PLR0915, PLR0914
                     conditional=conditional,
                 )
             replacements = _static_expansion_replacements(
-                node, authorized, add_reason, invocation_variables, read_roots
+                node,
+                authorized,
+                add_reason,
+                invocation_variables,
+                read_roots,
+                status_probes,
             )
             parts: list[str] = []
             prefix_assignments: list[tuple[str, str]] = []

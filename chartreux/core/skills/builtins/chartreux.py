@@ -327,11 +327,23 @@ recursive `rm`) are never grantable — the user runs them. An explicit
 `denylist` entry is an absolute veto no grant overrides. Approval is permission
 authority, not standing intent to publish. Inspect and revoke dangerous-command
 authority in Settings > Shell Permissions; there is no public grant endpoint. Each
-model-facing call is finite: it
+model-facing `bash` call is finite: it
 starts a fresh shell, closes stdin so the command receives EOF, enforces a timeout,
-and returns separate stdout and stderr for local execution. Shell state and process
-handles do not persist across calls. Managed background sessions, polling, continued
-stdin, and cursor-based output access are intentionally not provided.
+and returns separate stdout and stderr for local execution. Shell state does not
+persist across calls.
+
+Long-running work uses the managed job surface. `bash_start` launches a
+session-owned job in the background and returns a summary with `next_cursor=0`;
+`bash_read` returns a bounded page of merged stdout and stderr from that cursor
+(`max_bytes` is 4096-64000, `lost_records` reports eviction, and
+`output_complete`/`output_incomplete` distinguish a clean end from capture loss);
+`bash_list` lists job summaries so handles can be recovered after compaction;
+`bash_stop` terminates the owned process group with a bounded grace before forced
+termination. Managed jobs have closed stdin and no PTY, so interactive programs are
+unsupported, and output is captured locally with stdout and stderr merged. Startup
+success is not readiness: inspect application output rather than assuming the job is
+serving. Jobs survive ordinary turns and compaction but are lost on session end or
+replacement, and retained output may be evicted.
 When an ACP client advertises terminal capability, retained client-terminal delegation
 is used instead; that client-produced output may be merged, so the local stream split
 does not apply to the delegated path.
@@ -781,6 +793,19 @@ The evidence is per-run and bounded: the chronology caps at 128 entries, and evi
   `d` for below-table Details, `F1` for help, and Escape to go back or close.
   The TOTAL row summarizes the window; clickable shortcuts offer the same actions.
   Recorded usage only: pre-ledger sessions are excluded; estimates are not provider invoices.
+- `/routes` - Browse this conversation's live purpose-route table:
+  `[orchestration.routes]` with each target's purpose, seat, configured model
+  binding, identity, tier, and overlay. A marker binding
+  (`$session`/`$cheapest-capable`) shows the canonical model it resolves to
+  today, labeled as a **preview, not a launch guarantee** — a launch resolves
+  it again. Each route reports its configured minimum beside the count a launch
+  would resolve (`UNKNOWN` when a target cannot resolve), and keeps reload
+  validation separate from launch-time diversity: reload validation can pass
+  while diversity fails, as with the shipped default route. Read-only and
+  available while a turn runs. Use `r` to Refresh and Escape to close. The
+  table is the conversation's live table: a reload that swaps it updates the
+  open browser. `chartreux doctor` reports the independently loaded
+  configuration's table instead, never a running conversation's state.
 - `/copy` - Copy the last agent message to the clipboard
 - `/paste-image` - Paste an image from the OS clipboard into the prompt.
   **macOS only** — the command is not registered on Linux.

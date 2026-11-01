@@ -8,6 +8,14 @@ from textual.widgets import Markdown
 from chartreux.cli.textual_ui.app import ChartreuxApp
 from chartreux.cli.textual_ui.widgets.chat_input.completion_popup import CompletionPopup
 from chartreux.cli.textual_ui.widgets.chat_input.container import ChatInputContainer
+from tests.conftest import build_test_chartreux_app
+
+
+@pytest.fixture()
+def chartreux_app(file_tree: Path) -> ChartreuxApp:
+    # The session workspace root is captured when the app is built, so it has
+    # to be built after the file tree (and its chdir) exists.
+    return build_test_chartreux_app()
 
 
 @pytest.mark.asyncio

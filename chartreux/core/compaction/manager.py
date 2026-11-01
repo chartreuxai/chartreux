@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Awaitable, Callable, Sequence
+import logging
 import time
 from typing import TYPE_CHECKING, Any, Literal, Protocol
 
@@ -19,8 +20,14 @@ from chartreux.core.deferred_questions import DeferredQuestionStore
 from chartreux.core.errors import ContextTooLongError
 from chartreux.core.file_state import FileStateStore
 from chartreux.core.llm.thinking_levels import get_thinking_levels
-from chartreux.core.llm_models import LLMMessage, PersistedToolResult, Role
+from chartreux.core.llm_models import (
+    LLMMessage,
+    PersistedToolResult,
+    Role,
+    archived_replacement,
+)
 from chartreux.core.prompts import UtilityPrompt
+from chartreux.core.session.transcript_archive import eligible_archive_prefix
 from chartreux.core.tools.builtins.todo import TodoState
 from chartreux.core.usage import UsagePurpose
 from chartreux.observability.logging import log_model_call_success
@@ -30,10 +37,21 @@ if TYPE_CHECKING:
     from chartreux.core.llm_models import AvailableTool, LLMChunk, StrToolChoice
     from chartreux.core.message_list import MessageList
     from chartreux.core.policy.bundle import ActivatedPolicy
+    from chartreux.core.session.session_logger import SessionLogger
     from chartreux.core.session_types import AgentStats
+    from chartreux.core.tools.manager import ToolManager
+
+logger = logging.getLogger(__name__)
 
 _COMPACTION_PTL_RETRIES = 3
 CompactionFailureReason = Literal["tool_call", "empty_summary"]
+
+#: P4d ACTIVATES the M1 payload-only trim: after a successful compaction the
+#: sealed prefix's ``reasoning_payloads`` are released from RAM. The flag stays
+#: a module-level switch so a package gate can prove the activation (P4b pinned
+#: it False; P4d's tests pin it True and prove the trim path runs). Structural
+#: tombstones remain out of scope.
+ARCHIVE_TRIM_ENABLED: bool = True
 
 
 class CompactionFailedError(Exception):
@@ -70,7 +88,7 @@ class CompactionManager:
     trimmed conversation behind.
     """
 
-    def __init__(
+    def __init__(  # noqa: PLR0913 - runtime-owned dependency injection
         self,
         *,
         messages: MessageList,
@@ -83,6 +101,10 @@ class CompactionManager:
         file_state_getter: Callable[[], FileStateStore] | None = None,
         deferred_questions_getter: Callable[[], DeferredQuestionStore] | None = None,
         bound_policy_getter: Callable[[], ActivatedPolicy] | None = None,
+        session_logger_getter: Callable[[], SessionLogger | None] | None = None,
+        tool_manager_getter: Callable[[], ToolManager | None] | None = None,
+        has_active_turn: Callable[[], bool] | None = None,
+        trim_enabled_getter: Callable[[], bool] | None = None,
     ) -> None:
         self._messages = messages
         self._stats = stats_getter
@@ -94,6 +116,13 @@ class CompactionManager:
         self._file_state_getter = file_state_getter
         self._deferred_questions_getter = deferred_questions_getter
         self._bound_policy_getter = bound_policy_getter
+        # M1 trim wiring (wired in P4b, ACTIVE since P4d behind
+        # ARCHIVE_TRIM_ENABLED): the sealing surface and the closed-prefix
+        # (active-invocation) guard.
+        self._session_logger_getter = session_logger_getter
+        self._tool_manager_getter = tool_manager_getter
+        self._has_active_turn = has_active_turn
+        self._trim_enabled_getter = trim_enabled_getter
 
     async def compact(self, extra_instructions: str = "") -> str:
         summary_prefix = UtilityPrompt.COMPACT_SUMMARY_PREFIX.read()
@@ -141,7 +170,79 @@ class CompactionManager:
         # recomputes it accurately from real usage.
         self._stats().context_tokens = -1
         await self._save()
+        if self._trim_enabled():
+            # P4d ACTIVATION SITE: the envelope above is persisted with the
+            # originals still in RAM, so the trim may now seal and evict the
+            # pre-boundary payloads. A failed trim always leaves the originals.
+            await self._trim_archived_prefix()
         return summary
+
+    def _trim_enabled(self) -> bool:
+        """Whether the sealed-prefix trim path may run (active since P4d)."""
+        if self._trim_enabled_getter is not None:
+            return self._trim_enabled_getter()
+        return ARCHIVE_TRIM_ENABLED
+
+    async def _trim_archived_prefix(self) -> None:
+        """Seal the eligible closed prefix and publish its RAM replacements (M1 §1).
+
+        ACTIVE since P4d. Exact procedure, each step owned by the merged
+        substrate: (1) the envelope is already appended and persisted with the
+        originals present (``compact`` saved before calling this); (2) the
+        eligible prefix is the closed, settled region strictly before the
+        newest boundary, system messages excluded; (3) sealing runs under the
+        logger's save lock and issues a durable receipt — a returned save call
+        is not authorization, the receipt is; (4) replacement copies are
+        prepared WITHOUT mutating the originals; (5) queued stale saves are
+        fenced and (6) replacements plus the descriptor are published
+        synchronously, with no intervening await, no ``reset()`` and no reset
+        hooks. Any sealing, persistence, or verification failure retains the
+        originals: compaction may succeed without RAM trimming. Closed-prefix
+        restriction (wiring side): an automatic compaction that fires during
+        an active invocation leaves the active invocation intact until a
+        subsequent compaction.
+        """
+        logger_ = self._session_logger_getter() if self._session_logger_getter else None
+        tool_manager = (
+            self._tool_manager_getter() if self._tool_manager_getter else None
+        )
+        if logger_ is None or tool_manager is None or not logger_.enabled:
+            return
+        if self._has_active_turn is not None and self._has_active_turn():
+            # The active invocation stays intact until a subsequent compaction.
+            return
+        try:
+            receipt = await logger_.seal_archive(
+                self._messages,
+                self._stats(),
+                self._config(),
+                tool_manager,
+                trim_mode="payloads",
+            )
+            eligible = eligible_archive_prefix(list(self._messages))
+            if (
+                eligible is None
+                or len(eligible.messages) != receipt.descriptor.archived_count
+            ):
+                # The list moved between sealing and publication; retain the
+                # originals (the fence would refuse a stale descriptor anyway).
+                return
+            replacements = [
+                archived_replacement(
+                    message, receipt.descriptor, trim_mode=receipt.descriptor.trim_mode
+                )
+                for message in eligible.messages
+            ]
+            logger_.fence_and_publish_archive_trim(
+                self._messages,
+                receipt.descriptor,
+                replacements,
+                save_generation=logger_.transcript_save_generation,
+                reset_generation=logger_.archive_reset_generation,
+            )
+        except Exception as exc:
+            # Compaction may succeed without RAM trimming: retain the originals.
+            logger.debug("archived-prefix trim skipped: %s", exc)
 
     async def _summarize(
         self, snapshot: list[LLMMessage], extra_instructions: str

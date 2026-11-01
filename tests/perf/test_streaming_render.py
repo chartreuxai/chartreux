@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncGenerator, Callable
+from collections.abc import AsyncGenerator, Callable, Generator
+import json
+import os
 import sys
 from time import perf_counter, perf_counter_ns
 from typing import Any
@@ -10,6 +12,9 @@ import pytest
 from textual.geometry import Size
 from textual.pilot import Pilot
 from textual.screen import Screen
+from textual.strip import Strip
+from textual.widget import Widget
+from textual.widgets import Markdown
 
 from chartreux.app_server.events import (
     AppServerEvent,
@@ -24,6 +29,7 @@ from chartreux.app_server.models import (
 from chartreux.cli.textual_ui.app import ChartreuxApp
 from chartreux.cli.textual_ui.widgets.chat_input.container import ChatInputContainer
 from chartreux.cli.textual_ui.widgets.messages import (
+    STREAM_WRITE_COUNTERS,
     STREAM_WRITE_FRAME_SECONDS_MAX,
     AssistantMessage,
     ReasoningMessage,
@@ -794,3 +800,504 @@ async def test_streaming_expanded_reasoning_frames(
             "machine": machine_context(),
         },
     )
+
+
+# ---------------------------------------------------------------------------
+# P5a — 400-item long-list fixture, measurement instrumentation, frozen ceilings.
+#
+# The 120-item fixture above stays the ENFORCED baseline. The 400-item fixture
+# below is the pathological long-list shape P5 targets. Phase 1 measured it
+# (one iteration, no ceiling asserted) so the orchestrator could freeze the
+# ceilings against a measured revision; phase 2 landed those ceilings as
+# xfail-marked assertions (strict), and P5b's acceptance flips them to enforced.
+# Both tests SHARE one measurement run (the memoised `_p5_long_list_measurement`
+# fixture): a 400-item turn costs 151.490 s at the freeze revision, and a second
+# run would double the serial perf duration for the same numbers.
+#
+# The design attributes the cost to layout reflow of a document that keeps
+# growing (whole-document re-render per streaming chunk). Textual reparses the
+# unparsed markdown tail on every append, the competing channel, so the
+# instrumentation times both and prints a verdict; the recorded measurement
+# REFUTED the reflow attribution on reparse volume, which re-plans P5b's
+# mechanism, while the 400-item ceiling stays the gate either way.
+# ---------------------------------------------------------------------------
+
+_P5_LONG_LIST_ITEM_COUNT = 400
+# FROZEN CEILINGS (P5a phase 2, never raised silently). Frozen from the
+# orchestrator-recorded measurement of instrumentation commit 3f180fda (LOCAL
+# TAG perf/p5a-baseline; commit never pushed), single iteration of the 400-item
+# turn on the quiet machine (AMD Ryzen 9 5900X, 24 cores, loadavg
+# 2.54/2.46/2.60): turn wall 151.490 s, frame interval p95 1070.5 ms
+# (p50 416.4 ms), loop-lag p50 45.2 ms, 306 buffered flushes / 66400 bytes,
+# flush-cost growth 24.27x. Phase shares: markdown reparse 78% of the wall
+# against 14% layout+paint — LAYOUT REFLOW REFUTED. The same record lives in
+# the v0.7.0 task state log under "P5a FREEZE RECORDED". Until that measurement
+# these were P5 design targets; from it they are constants. They land here as
+# EXPECTED-TO-FAIL assertions: the pre-change path measures ~151 s / ~1071 ms /
+# ~45 ms, far above every one of them, so the xfail is the honest state until
+# P5b's acceptance asserts them for real. A red unmarked perf test is never
+# merged.
+_P5_FROZEN_CEILING_TURN_WALL_S = 30.0
+_P5_FROZEN_CEILING_FRAME_P95_MS = 250.0
+_P5_FROZEN_CEILING_LOOP_LAG_P50_MS = 20.0
+# A smoke run may shrink the fixture; the measured item count is reported, so a
+# reduced run can never be mistaken for the freeze measurement.
+_P5_ITEM_COUNT_ENV_VAR = "CHARTREUX_P5_ITEM_COUNT"
+
+
+def _p5_item_count() -> int:
+    override = os.environ.get(_P5_ITEM_COUNT_ENV_VAR)
+    return int(override) if override else _P5_LONG_LIST_ITEM_COUNT
+
+
+def _long_list_400_texts(item_count: int) -> list[str]:
+    """The 400-item long-list fixture: a growing plan list, one bullet per chunk."""
+    texts = [f"Streaming a {item_count}-item plan under construction:\n\n"]
+    for index in range(item_count):
+        texts.append(
+            f"- Step {index:03d}: a streamed plan item whose text is long enough to "
+            "wrap at the transcript width, so every frame reflows list-aware "
+            "markdown layout over the whole document\n"
+        )
+    return texts
+
+
+def _least_squares_slope(xs: list[float], ys: list[float]) -> float:
+    """Return the least-squares slope of ``ys`` per unit of ``xs``."""
+    if len(xs) < 2:
+        return 0.0
+    mean_x = sum(xs) / len(xs)
+    mean_y = sum(ys) / len(ys)
+    variance_x = sum((x - mean_x) ** 2 for x in xs)
+    if variance_x <= 0:
+        return 0.0
+    covariance = sum((x - mean_x) * (y - mean_y) for x, y in zip(xs, ys, strict=True))
+    return covariance / variance_x
+
+
+def _window_means(values: list[float], windows: int = 10) -> list[float]:
+    """Return the means of ``windows`` equal consecutive slices of ``values``."""
+    window_count = max(1, min(windows, len(values)))
+    means: list[float] = []
+    for window in range(window_count):
+        start = window * len(values) // window_count
+        end = (window + 1) * len(values) // window_count
+        window_values = values[start:end]
+        means.append(round(sum(window_values) / len(window_values), 3))
+    return means
+
+
+def _growth_ratio(values: list[float]) -> float:
+    """Return the last-decile mean over the first-decile mean of ``values``."""
+    if not values:
+        return 0.0
+    window = max(1, len(values) // 10)
+    first = sum(values[:window]) / window
+    last = sum(values[-window:]) / window
+    return 0.0 if first <= 0 else last / first
+
+
+class StreamingPhaseObserver:
+    """Times the phases of one streaming turn on the real render path.
+
+    Flush cost and frame cadence come from the write-buffer flush; layout from
+    the screen's layout pass; paint from per-line widget rendering; parse from
+    the Markdown widget's append, where Textual re-tokenizes the unparsed tail.
+    """
+
+    def __init__(self, app: ChartreuxApp) -> None:
+        self._app = app
+        self.flush_costs_ms: list[float] = []
+        self.flush_bytes: list[int] = []
+        self.document_bytes_at_flush: list[int] = []
+        self.frame_intervals_ms: list[float] = []
+        self.layout_passes = 0
+        self.layout_cost_ms = 0.0
+        self.painted_lines = 0
+        self.paint_cost_ms = 0.0
+        self.append_calls = 0
+        self.appended_bytes = 0
+        self.parse_cost_ms = 0.0
+        self._last_flush_started: float | None = None
+
+    def install(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        observer = self
+        original_flush = StreamingMessageBase._flush_write_buffer
+        original_refresh_layout = Screen._refresh_layout
+        original_render_line = Widget.render_line
+        original_append = Markdown.append
+
+        async def timed_flush(stream_widget: StreamingMessageBase) -> None:
+            if not stream_widget._to_write_buffer:
+                await original_flush(stream_widget)
+                return
+            markdown = stream_widget._markdown
+            document_bytes = (
+                len(markdown._markdown.encode("utf-8")) if markdown is not None else 0
+            )
+            started = perf_counter()
+            if self._last_flush_started is not None:
+                self.frame_intervals_ms.append(
+                    (started - self._last_flush_started) * 1000
+                )
+            self._last_flush_started = started
+            self.flush_bytes.append(len(stream_widget._to_write_buffer.encode("utf-8")))
+            self.document_bytes_at_flush.append(document_bytes)
+            started_ns = perf_counter_ns()
+            try:
+                await original_flush(stream_widget)
+            finally:
+                self.flush_costs_ms.append((perf_counter_ns() - started_ns) / 1_000_000)
+
+        def timed_refresh_layout(
+            screen: Screen, size: Size | None = None, scroll: bool = False
+        ) -> None:
+            if screen.app is not self._app:
+                original_refresh_layout(screen, size, scroll)
+                return
+            started_ns = perf_counter_ns()
+            try:
+                original_refresh_layout(screen, size, scroll)
+            finally:
+                self.layout_passes += 1
+                self.layout_cost_ms += (perf_counter_ns() - started_ns) / 1_000_000
+
+        def timed_render_line(widget: Widget, y: int) -> Strip:
+            started_ns = perf_counter_ns()
+            try:
+                return original_render_line(widget, y)
+            finally:
+                self.painted_lines += 1
+                self.paint_cost_ms += (perf_counter_ns() - started_ns) / 1_000_000
+
+        class TimedAppend:
+            """Awaitable wrapper that times Markdown.append when it is awaited."""
+
+            def __init__(self, awaitable: Any, appended_bytes: int) -> None:
+                self._awaitable = awaitable
+                self._appended_bytes = appended_bytes
+
+            def __await__(self) -> Generator[Any, None, Any]:
+                return self._run().__await__()
+
+            async def _run(self) -> Any:
+                started_ns = perf_counter_ns()
+                try:
+                    return await self._awaitable
+                finally:
+                    observer.append_calls += 1
+                    observer.appended_bytes += self._appended_bytes
+                    observer.parse_cost_ms += (
+                        perf_counter_ns() - started_ns
+                    ) / 1_000_000
+
+        def timed_append(markdown_widget: Markdown, markdown: str) -> Any:
+            # Every Textual call site awaits this value; the wrapper only forwards
+            # that await so the append body itself can be timed.
+            return TimedAppend(
+                original_append(markdown_widget, markdown),
+                len(markdown.encode("utf-8")),
+            )
+
+        monkeypatch.setattr(StreamingMessageBase, "_flush_write_buffer", timed_flush)
+        monkeypatch.setattr(Screen, "_refresh_layout", timed_refresh_layout)
+        monkeypatch.setattr(Widget, "render_line", timed_render_line)
+        monkeypatch.setattr(Markdown, "append", timed_append)
+
+
+async def _measure_long_list_turn(
+    monkeypatch: pytest.MonkeyPatch, *, item_count: int
+) -> dict[str, Any]:
+    """Stream the long-list fixture once and return its measurements."""
+    texts = _long_list_400_texts(item_count)
+    chunks = _stream_chunks(texts)
+    backend = YieldingStreamingBackend(chunks)
+    app = _build_streaming_app(backend)
+    observer = StreamingPhaseObserver(app)
+    observer.install(monkeypatch)
+    turn_wall_ms: list[float] = []
+    markdown_block_count = [0]
+
+    async with app.run_test() as pilot:
+        await pilot.pause(0.1)
+
+        async def run_turn() -> None:
+            STREAM_WRITE_COUNTERS.reset()
+            submitted_at = perf_counter()
+            chat_input = app.query_one(ChatInputContainer)
+            chat_input.post_message(
+                ChatInputContainer.Submitted("streaming perf pilot")
+            )
+            await _wait_until(
+                pilot, lambda: backend.chunks_yielded == len(chunks), timeout=600.0
+            )
+            await _wait_until(pilot, lambda: not app._agent_job_active(), timeout=600.0)
+            turn_wall_ms.append((perf_counter() - submitted_at) * 1000)
+            assert app.query_one(AssistantMessage).get_content() == "".join(texts)
+            markdown = app.query_one(AssistantMessage)._markdown
+            markdown_block_count[0] = (
+                len(markdown.children) if markdown is not None else 0
+            )
+
+        lag = await measure_loop_lag(run_turn(), interval_s=0.005)
+
+    flush_costs = observer.flush_costs_ms
+    metrics: dict[str, Any] = {
+        "item_count": item_count,
+        "chunk_count": backend.chunks_yielded,
+        "document_bytes": len("".join(texts).encode("utf-8")),
+        "markdown_block_count": markdown_block_count[0],
+        "turn_wall_ms": round(turn_wall_ms[0], 3),
+        "frame_interval_ms": percentiles(observer.frame_intervals_ms),
+        "flush_cost_ms": percentiles(flush_costs),
+        "flush_bytes_per_frame": percentiles([
+            float(value) for value in observer.flush_bytes
+        ]),
+        "flush_cost_total_ms": round(sum(flush_costs), 3),
+        "flush_cost_growth_ratio": round(_growth_ratio(flush_costs), 3),
+        "flush_cost_slope_ms_per_kib": round(
+            _least_squares_slope(
+                [value / 1024 for value in observer.document_bytes_at_flush],
+                flush_costs,
+            ),
+            4,
+        ),
+        "flush_cost_windows_ms": _window_means(flush_costs),
+        "document_kib_windows": _window_means([
+            value / 1024 for value in observer.document_bytes_at_flush
+        ]),
+        "flush_count": STREAM_WRITE_COUNTERS.flush_count,
+        "flush_bytes": STREAM_WRITE_COUNTERS.flush_bytes,
+        "initial_write_count": STREAM_WRITE_COUNTERS.initial_write_count,
+        "initial_write_bytes": STREAM_WRITE_COUNTERS.initial_write_bytes,
+        "final_flush_count": STREAM_WRITE_COUNTERS.final_flush_count,
+        "final_flush_bytes": STREAM_WRITE_COUNTERS.final_flush_bytes,
+        "layout_passes": observer.layout_passes,
+        "layout_cost_ms": round(observer.layout_cost_ms, 3),
+        "painted_lines": observer.painted_lines,
+        "paint_cost_ms": round(observer.paint_cost_ms, 3),
+        "append_calls": observer.append_calls,
+        "appended_bytes": observer.appended_bytes,
+        "parse_cost_ms": round(observer.parse_cost_ms, 3),
+        "loop_lag_ms": lag,
+        "rss_current_mib": rss_mib(),
+        "rss_peak_mib": rss_peak_mib(),
+    }
+    metrics["attribution"] = _p5_attribution(metrics)
+    return metrics
+
+
+def _p5_attribution(metrics: dict[str, Any]) -> dict[str, Any]:
+    """Classify the dominant cost channel of the measured turn (no assertions).
+
+    P5's design hypothesis predicts BOTH a dominant layout+paint share of the
+    wall time AND per-flush cost rising with the growing document. Whole-document
+    markdown reparsing predicts a dominant parse share instead. A refutation
+    re-plans P5b's mechanism; the enforced 400-item ceiling gates either way.
+    """
+    wall_ms = float(metrics["turn_wall_ms"])
+    layout_ms = float(metrics["layout_cost_ms"])
+    paint_ms = float(metrics["paint_cost_ms"])
+    parse_ms = float(metrics["parse_cost_ms"])
+    growth = float(metrics["flush_cost_growth_ratio"])
+    layout_share = layout_ms / wall_ms if wall_ms else 0.0
+    paint_share = paint_ms / wall_ms if wall_ms else 0.0
+    parse_share = parse_ms / wall_ms if wall_ms else 0.0
+    flush_share = float(metrics["flush_cost_total_ms"]) / wall_ms if wall_ms else 0.0
+    render_share = layout_share + paint_share
+    if render_share >= 0.5 and growth >= 1.5:
+        verdict = "LAYOUT REFLOW CONFIRMED"
+        reason = (
+            f"layout+paint is {render_share:.0%} of the turn wall and per-flush "
+            f"cost grows {growth:.2f}x from the first decile to the last"
+        )
+    elif parse_share >= max(render_share, 0.4):
+        verdict = "LAYOUT REFLOW REFUTED (reparse dominates)"
+        reason = (
+            f"markdown reparse is {parse_share:.0%} of the turn wall against a "
+            f"{render_share:.0%} layout+paint share"
+        )
+    elif render_share < 0.5 and growth < 1.2:
+        verdict = "LAYOUT REFLOW REFUTED (cost does not grow with the document)"
+        reason = (
+            f"layout+paint is only {render_share:.0%} of the turn wall and "
+            f"per-flush cost grows {growth:.2f}x"
+        )
+    else:
+        verdict = "INCONCLUSIVE"
+        reason = (
+            f"layout+paint {render_share:.0%}, reparse {parse_share:.0%}, "
+            f"per-flush growth {growth:.2f}x"
+        )
+    return {
+        "verdict": verdict,
+        "reason": reason,
+        "layout_share": round(layout_share, 3),
+        "paint_share": round(paint_share, 3),
+        "parse_share": round(parse_share, 3),
+        "flush_share": round(flush_share, 3),
+    }
+
+
+def _print_p5_measurement(metrics: dict[str, Any]) -> None:
+    """Print the phase-1 measurement in human-readable form (no assertions)."""
+    frame = metrics["frame_interval_ms"]
+    lag = metrics["loop_lag_ms"]
+    attribution = metrics["attribution"]
+    lag_text = (
+        f"p50 {lag['p50']:.1f} ms, p95 {lag['p95']:.1f} ms"
+        if "p50" in lag
+        else "no samples"
+    )
+    print(
+        "\n=== P5a 400-item streaming measurement (single iteration, no ceilings) ==="
+    )
+    print(
+        f"fixture: {metrics['item_count']} items, {metrics['chunk_count']} chunks, "
+        f"{metrics['document_bytes']} bytes, "
+        f"{metrics['markdown_block_count']} markdown blocks"
+    )
+    print(
+        f"turn wall: {metrics['turn_wall_ms'] / 1000:.3f} s "
+        f"(frozen ceiling {_P5_FROZEN_CEILING_TURN_WALL_S:.1f} s)"
+    )
+    print(
+        f"frame interval: p50 {frame['p50']:.1f} ms, p95 {frame['p95']:.1f} ms, "
+        f"max {frame['max']:.1f} ms "
+        f"(frozen ceiling p95 {_P5_FROZEN_CEILING_FRAME_P95_MS:.0f} ms)"
+    )
+    print(
+        f"loop lag: {lag_text} "
+        f"(frozen ceiling p50 {_P5_FROZEN_CEILING_LOOP_LAG_P50_MS:.0f} ms)"
+    )
+    print(
+        f"flushes: {metrics['flush_count']} buffered "
+        f"({metrics['flush_bytes']} bytes), "
+        f"{metrics['initial_write_count']} initial "
+        f"({metrics['initial_write_bytes']} bytes), "
+        f"{metrics['final_flush_count']} final "
+        f"({metrics['final_flush_bytes']} bytes)"
+    )
+    print(
+        f"flush cost: total {metrics['flush_cost_total_ms']:.0f} ms, "
+        f"first->last decile growth {metrics['flush_cost_growth_ratio']:.2f}x, "
+        f"slope {metrics['flush_cost_slope_ms_per_kib']:.3f} ms/KiB of document"
+    )
+    print(f"flush cost per decile (ms): {metrics['flush_cost_windows_ms']}")
+    print(f"document size per decile (KiB): {metrics['document_kib_windows']}")
+    print(
+        f"phases: layout {metrics['layout_cost_ms']:.0f} ms "
+        f"({attribution['layout_share']:.0%}, {metrics['layout_passes']} passes), "
+        f"paint {metrics['paint_cost_ms']:.0f} ms "
+        f"({attribution['paint_share']:.0%}, {metrics['painted_lines']} lines), "
+        f"parse {metrics['parse_cost_ms']:.0f} ms "
+        f"({attribution['parse_share']:.0%}, {metrics['append_calls']} appends / "
+        f"{metrics['appended_bytes']} bytes), "
+        f"flush {metrics['flush_cost_total_ms']:.0f} ms "
+        f"({attribution['flush_share']:.0%})"
+    )
+    print(f"attribution: {attribution['verdict']}: {attribution['reason']}")
+    print(f"machine: {json.dumps(metrics['machine'], sort_keys=True)}")
+
+
+_P5_MEASUREMENT_CACHE: dict[str, Any] = {}
+
+
+@pytest.fixture
+def _p5_long_list_measurement(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
+    """One 400-item turn, shared by the measurement and ceiling tests.
+
+    A 400-item turn costs 151.490 s at the freeze revision, so the ceiling
+    assertions reuse phase 1's measured numbers instead of streaming the turn a
+    second time and doubling the serial perf duration. Function scope keeps
+    tests/conftest.py's autouse setup in effect (a module-scoped fixture runs
+    before it); the first requester measures, later requesters read the cache.
+    """
+    if "metrics" not in _P5_MEASUREMENT_CACHE:
+        _P5_MEASUREMENT_CACHE["metrics"] = asyncio.run(
+            _measure_long_list_turn(monkeypatch, item_count=_p5_item_count())
+        )
+    return _P5_MEASUREMENT_CACHE["metrics"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.perf
+@pytest.mark.timeout(900)
+async def test_streaming_long_list_400_measurement(
+    _p5_long_list_measurement: dict[str, Any],
+) -> None:
+    """P5a phase 1: measure one 400-item turn; assert no ceiling."""
+    metrics = _p5_long_list_measurement
+    metrics["machine"] = machine_context()
+    _print_p5_measurement(metrics)
+    record("streaming_long_list_400_measurement", metrics)
+
+
+def _assert_p5_frozen_ceilings(metrics: dict[str, Any]) -> None:
+    """P5a phase 2: print the measured values against the frozen ceilings, assert.
+
+    The prints run before the assertions so the frozen numbers and the measured
+    ones are both visible in the xfail report.
+    """
+    wall_s = float(metrics["turn_wall_ms"]) / 1000
+    frame = metrics["frame_interval_ms"]
+    lag = metrics["loop_lag_ms"]
+    frame_p95_ms = float(frame["p95"])
+    lag_p50_ms = float(lag["p50"]) if "p50" in lag else None
+    assert lag_p50_ms is not None, "the measurement recorded no loop-lag samples"
+    within_wall = wall_s <= _P5_FROZEN_CEILING_TURN_WALL_S
+    within_frame = frame_p95_ms <= _P5_FROZEN_CEILING_FRAME_P95_MS
+    within_lag = lag_p50_ms <= _P5_FROZEN_CEILING_LOOP_LAG_P50_MS
+    print("\n=== P5a 400-item frozen ceilings (single iteration) ===")
+    print(
+        f"turn wall:    measured {wall_s:.3f} s, "
+        f"ceiling {_P5_FROZEN_CEILING_TURN_WALL_S:.1f} s: "
+        f"{'PASS' if within_wall else 'FAIL'}"
+    )
+    print(
+        f"frame p95:    measured {frame_p95_ms:.1f} ms, "
+        f"ceiling {_P5_FROZEN_CEILING_FRAME_P95_MS:.1f} ms: "
+        f"{'PASS' if within_frame else 'FAIL'}"
+    )
+    print(
+        f"loop-lag p50: measured {lag_p50_ms:.1f} ms, "
+        f"ceiling {_P5_FROZEN_CEILING_LOOP_LAG_P50_MS:.1f} ms: "
+        f"{'PASS' if within_lag else 'FAIL'}"
+    )
+    print(f"frame p50 reference (no ceiling): {frame['p50']:.1f} ms")
+    assert within_wall, (
+        f"turn wall {wall_s:.3f} s exceeds the frozen ceiling "
+        f"{_P5_FROZEN_CEILING_TURN_WALL_S:.1f} s"
+    )
+    assert within_frame, (
+        f"frame-interval p95 {frame_p95_ms:.1f} ms exceeds the frozen ceiling "
+        f"{_P5_FROZEN_CEILING_FRAME_P95_MS:.1f} ms"
+    )
+    assert within_lag, (
+        f"loop-lag p50 {lag_p50_ms:.1f} ms exceeds the frozen ceiling "
+        f"{_P5_FROZEN_CEILING_LOOP_LAG_P50_MS:.1f} ms"
+    )
+
+
+# P5b: ENFORCED. Pre-change the 400-item path measured ~151 s wall / ~1071 ms
+# frame p95 / ~45 ms loop-lag p50 against the frozen 30 s / 250 ms / 20 ms
+# ceilings (revision 3f180fda) — far above every target — which is why P5a
+# landed them xfail-marked; the simple-list fast path now enforces them for
+# real. A red unmarked perf test is never merged.
+@pytest.mark.perf
+@pytest.mark.timeout(900)
+@pytest.mark.skipif(
+    _p5_item_count() != _P5_LONG_LIST_ITEM_COUNT,
+    reason=(
+        f"{_P5_ITEM_COUNT_ENV_VAR} shrinks the fixture, so the frozen 400-item "
+        "ceilings would not apply to the measured turn"
+    ),
+)
+def test_streaming_long_list_400_frozen_ceilings(
+    _p5_long_list_measurement: dict[str, Any],
+) -> None:
+    """P5b: the frozen 400-item ceilings, enforced and passing."""
+    metrics = _p5_long_list_measurement
+    metrics["machine"] = machine_context()
+    _assert_p5_frozen_ceilings(metrics)
+    record("streaming_long_list_400_frozen_ceilings", metrics)

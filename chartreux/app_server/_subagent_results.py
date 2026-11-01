@@ -45,6 +45,7 @@ class ResultsStateView(Protocol):
     _agent_records: dict[str, AgentRecord]
     _result_store: dict[tuple[str, str], StoredRunResult]
     _expired_results: set[tuple[str, str]]
+    _collected_results: set[tuple[str, str]]
     _latest_run_ids: dict[str, str]
     _wait_leases: dict[tuple[str, str], int]
     _pending_notifications: set[tuple[str, str]]
@@ -60,6 +61,8 @@ class ResultsStateView(Protocol):
     def _agent_turns_used(self, record: AgentRecord) -> int | None: ...
 
     def _generation_is_current(self, generation: int) -> bool: ...
+
+    def _note_uncollected_change_locked(self, agent_id: str) -> None: ...
 
 
 @dataclass
@@ -133,8 +136,15 @@ class RunResults:
                 unreferenced, key=lambda item: (item.completed_at, item.agent_id)
             )[:excess]:
                 key = (stored.agent_id, stored.run_id)
+                # U3b: an uncollected key leaves a visible agent's list here.
+                listed = key not in self._view._collected_results
                 self._view._result_store.pop(key, None)
                 self._view._expired_results.add(key)
+                # Marker lifetime never exceeds result lifetime: the run is
+                # no longer retrievable, so its collection marker dies here.
+                self._view._collected_results.discard(key)
+                if listed:
+                    self._view._note_uncollected_change_locked(stored.agent_id)
                 tombstone = self._view._evicted_agents.get(stored.agent_id)
                 if (
                     tombstone is not None
@@ -192,6 +202,47 @@ class RunResults:
             return key, stored
         return None
 
+    def uncollected_run_ids_locked(self, agent_id: str) -> list[str]:
+        """The agent's retrievable, uncollected run IDs, newest first (locked).
+
+        The universe is the SAME resolution space the collection paths read
+        (design B1): result-store keys UNION the resident record's current
+        and historical runs that still carry a result, minus expired keys,
+        minus collected markers. A result published only in the resident
+        record (assigned before the locked store write, or retained when the
+        store write is revoked) is therefore retrievable AND visible.
+
+        Ordering is descending ``completed_at`` — the finalization timestamp
+        stamped before publication, so newest publication first — with the
+        run ID as the deterministic tie-break for equal or missing
+        timestamps. The caller must hold the registry lock.
+        """
+        completed_at_by_run: dict[str, float] = {}
+        record = self._view._agent_records.get(agent_id)
+        if record is not None:
+            for run in [record.current_run, *record.run_history]:
+                if run is None or run.result is None:
+                    continue
+                timestamp = run.completed_at
+                if timestamp is None:
+                    timestamp = run.started_at
+                completed_at_by_run[run.run_id] = (
+                    float("-inf") if timestamp is None else timestamp
+                )
+        for (stored_agent_id, run_id), stored in self._view._result_store.items():
+            if stored_agent_id == agent_id:
+                completed_at_by_run[run_id] = stored.completed_at
+        return sorted(
+            (
+                run_id
+                for run_id in completed_at_by_run
+                if (agent_id, run_id) not in self._view._expired_results
+                and (agent_id, run_id) not in self._view._collected_results
+            ),
+            key=lambda run_id: (completed_at_by_run[run_id], run_id),
+            reverse=True,
+        )
+
     def register_writer_locked(self, agent_id: str, run_id: str, token: object) -> None:
         """Register the exact write token for one accepted run (locked).
 
@@ -233,7 +284,12 @@ class RunResults:
         Publication accepts the execution context's exact write token and
         record/run references; stale residency never forbids storing a
         result. The rollback consumes the same authority (the decision is
-        unused there). The caller must hold the registry lock.
+        unused there). A collection marker recorded by a read that raced
+        ahead of the result-store write is reconciled here: a permitted
+        write or a retained resident copy of the result keeps it, while a
+        revoked publication with no retrievable resident result drops it, so
+        no marker outlives its result. The caller must hold the registry
+        lock.
         """
         key = (context.agent_id, context.run_id)
         resident = (
@@ -252,11 +308,36 @@ class RunResults:
         )
         if write_permitted:
             self._view._result_write_tokens.pop(key, None)
+        self._reconcile_collection_locked(context, write_permitted=write_permitted)
         return PublicationDecision(
             resident=resident,
             write_permitted=write_permitted,
             notify_permitted=write_permitted and not suppress_notification,
         )
+
+    def _reconcile_collection_locked(
+        self, context: BackgroundExecutionContext, *, write_permitted: bool
+    ) -> None:
+        """Drop a collection marker whose result this publication revokes (locked).
+
+        A read can observe a resident run's result before the result-store
+        write (``RunRecord.result`` is assigned ahead of the locked write),
+        so its marker must survive exactly as long as a retrievable result
+        does: a permitted write or a resident record still holding the
+        result keeps it; a revoked publication with neither drops it.
+        """
+        key = (context.agent_id, context.run_id)
+        if key not in self._view._collected_results or write_permitted:
+            return
+        if key in self._view._result_store:
+            return
+        record = self._view._agent_records.get(context.agent_id)
+        if record is not None and any(
+            run is not None and run.run_id == context.run_id and run.result is not None
+            for run in [record.current_run, *record.run_history]
+        ):
+            return
+        self._view._collected_results.discard(key)
 
     def purge_agent_locked(self, agent_id: str) -> set[tuple[str, str]]:
         """Purge every result collection entry for one agent (locked).
@@ -264,13 +345,15 @@ class RunResults:
         The former release-transaction purge (ASC area 4, migration step 4;
         ASC area 6 calls this synchronous locked result purge from inside
         the release's one critical section): the result store, expiry
-        markers, pending notifications, wait leases, and write tokens are
-        purged for the exact agent key, the latest-run index entry is
-        removed, and the purged keys are returned so the release keeps its
-        unknown-handle check. The caller must hold the registry lock.
+        markers, collection markers, pending notifications, wait leases, and
+        write tokens are purged for the exact agent key, the latest-run index
+        entry is removed, and the purged keys are returned so the release
+        keeps its unknown-handle check. The caller must hold the registry
+        lock.
         """
         keys = {key for key in self._view._result_store if key[0] == agent_id}
         keys.update(key for key in self._view._expired_results if key[0] == agent_id)
+        keys.update(key for key in self._view._collected_results if key[0] == agent_id)
         keys.update(
             key for key in self._view._pending_notifications if key[0] == agent_id
         )
@@ -281,6 +364,7 @@ class RunResults:
         for key in keys:
             self._view._result_store.pop(key, None)
             self._view._expired_results.discard(key)
+            self._view._collected_results.discard(key)
             self._view._pending_notifications.discard(key)
             self._view._wait_leases.pop(key, None)
             self._view._result_write_tokens.pop(key, None)
@@ -290,22 +374,36 @@ class RunResults:
     async def get_result(
         self, agent_id: str, run_id: str | None = None
     ) -> TaskResult | None:
-        """Return the stored result for a run, expiring first (public read)."""
+        """Return the stored result for a run, expiring first (public read).
+
+        A resolved ``TaskResult`` is marked collected inside the same locked
+        block that resolves it (design B3): no suspension point separates the
+        mark from the return, so a cancellation cannot mark a run whose
+        result never reached the caller. The RUNNING -> ``None`` disposition
+        and the typed expiry/unknown errors never mark.
+        """
         async with self._view._registry_lock:
             self.expire_locked()
             resolved = self.resolve_locked(agent_id, run_id)
-        if resolved is None:
-            raise UnknownAgentError(f"Unknown run {run_id} for agent {agent_id}")
-        target = resolved[1]
-        if isinstance(target, RunRecord):
-            if target.status is RunStatus.RUNNING:
-                return None
-            if target.result is None:
-                raise AgentResultExpiredError(
-                    f"Result expired for run {target.run_id} on agent {agent_id}"
-                )
-            return target.result
-        return target.result
+            if resolved is None:
+                raise UnknownAgentError(f"Unknown run {run_id} for agent {agent_id}")
+            key, target = resolved
+            if isinstance(target, RunRecord):
+                if target.status is RunStatus.RUNNING:
+                    return None
+                if target.result is None:
+                    raise AgentResultExpiredError(
+                        f"Result expired for run {target.run_id} on agent {agent_id}"
+                    )
+                result = target.result
+            else:
+                result = target.result
+            # U3b: a first collection removes the run from a visible agent's
+            # list; a repeated collection changes nothing.
+            if key not in self._view._collected_results:
+                self._view._collected_results.add(key)
+                self._view._note_uncollected_change_locked(agent_id)
+            return result
 
     async def wait(
         self, agent_id: str, run_id: str | None = None, *, timeout: float | None = None
@@ -318,6 +416,11 @@ class RunResults:
         keeps the result protected from count expiry. Race rule: every
         disposition reports the run the caller pinned at wait start, never a
         newer run's progress.
+
+        Lease cleanup completes before the locked settle-and-mark commit
+        (design B3): a wait cancelled while that cleanup would have been
+        pending never marks, and no suspension point separates the
+        collection marker from the registry's return.
         """
         if timeout is not None and timeout <= 0:
             raise ValueError("timeout must be positive or None")
@@ -331,6 +434,7 @@ class RunResults:
         pinned = PinnedWait(
             key=key, target=target, run_id=run_id, started_at=wait_started_at
         )
+        settled = False
         try:
             if (
                 isinstance(pinned.target, RunRecord)
@@ -349,38 +453,63 @@ class RunResults:
                     if not released:
                         raise
                 except TimeoutError:
-                    return await self.still_running_disposition(
+                    disposition = await self.still_running_disposition(
                         agent_id,
                         pinned.key,
                         pinned.target,
                         run_id=pinned.run_id,
                         wait_started_at=pinned.started_at,
                     )
+                    settled = True
+                    return disposition
             async with self._view._registry_lock:
-                if pinned.key not in self._view._wait_leases:
-                    resolved = self.resolve_locked(agent_id, pinned.run_id)
-                    if resolved is None:
-                        raise UnknownAgentError(
-                            f"Unknown run {pinned.run_id} for agent {agent_id}"
-                        )
-                    raise AgentResultExpiredError(
-                        f"Result expired for run {pinned.key[1]} on agent {agent_id}"
-                    )
-                stored = self._view._result_store.get(pinned.key)
-                result = stored.result if stored is not None else pinned.target.result
-                if result is None:
-                    raise RuntimeError(
-                        f"Run {pinned.key[1]} completed without a result"
-                    )
-                return WaitForAgentResult(status=WaitStatus.COMPLETED, result=result)
+                disposition = self.settle_wait_locked(agent_id, pinned)
+            settled = True
+            return disposition
         finally:
-            async with self._view._registry_lock:
-                leases = self._view._wait_leases.get(pinned.key, 0)
-                if leases > 1:
-                    self._view._wait_leases[pinned.key] = leases - 1
-                else:
-                    self._view._wait_leases.pop(pinned.key, None)
-                self.expire_locked()
+            if not settled:
+                async with self._view._registry_lock:
+                    self.release_wait_lease_locked(pinned.key)
+                    self.expire_locked()
+
+    def settle_wait_locked(
+        self, agent_id: str, pinned: PinnedWait
+    ) -> WaitForAgentResult:
+        """Resolve, mark, and commit one completed wait (locked, never awaited).
+
+        Release fencing comes first (a released or expired pinned run keeps
+        its typed error), then the pinned result resolves, the wait lease is
+        released, the collection marker is recorded, and the disposition is
+        built — one locked block with no suspension point, so the mark and
+        the return commit together (design B3).
+        """
+        if pinned.key not in self._view._wait_leases:
+            resolved = self.resolve_locked(agent_id, pinned.run_id)
+            if resolved is None:
+                raise UnknownAgentError(
+                    f"Unknown run {pinned.run_id} for agent {agent_id}"
+                )
+            raise AgentResultExpiredError(
+                f"Result expired for run {pinned.key[1]} on agent {agent_id}"
+            )
+        stored = self._view._result_store.get(pinned.key)
+        result = stored.result if stored is not None else pinned.target.result
+        if result is None:
+            raise RuntimeError(f"Run {pinned.key[1]} completed without a result")
+        self.release_wait_lease_locked(pinned.key)
+        if pinned.key not in self._view._collected_results:
+            self._view._collected_results.add(pinned.key)
+            self._view._note_uncollected_change_locked(agent_id)
+        self.expire_locked()
+        return WaitForAgentResult(status=WaitStatus.COMPLETED, result=result)
+
+    def release_wait_lease_locked(self, key: tuple[str, str]) -> None:
+        """Release one wait lease (locked); other holders keep theirs."""
+        leases = self._view._wait_leases.get(key, 0)
+        if leases > 1:
+            self._view._wait_leases[key] = leases - 1
+        else:
+            self._view._wait_leases.pop(key, None)
 
     async def still_running_disposition(
         self,
@@ -397,7 +526,10 @@ class RunResults:
         races: the disposition reports the run this wait targeted. When the
         pinned run actually settled at the timeout boundary, the completed
         disposition is returned instead. A wait fenced by release keeps the
-        existing typed errors.
+        existing typed errors. The wait lease is released inside the same
+        locked block that builds the disposition, so a completed boundary
+        disposition is marked and returned with no suspension point between
+        (design B3).
         """
         async with self._view._registry_lock:
             if key not in self._view._wait_leases:
@@ -413,6 +545,11 @@ class RunResults:
             stored = self._view._result_store.get(key)
             result = stored.result if stored is not None else target.result
             if result is not None:
+                self.release_wait_lease_locked(key)
+                if key not in self._view._collected_results:
+                    self._view._collected_results.add(key)
+                    self._view._note_uncollected_change_locked(agent_id)
+                self.expire_locked()
                 return WaitForAgentResult(status=WaitStatus.COMPLETED, result=result)
             if target.status is not RunStatus.RUNNING:
                 raise RuntimeError(f"Run {key[1]} completed without a result")
@@ -424,7 +561,7 @@ class RunResults:
                 turns_used = self._view._agent_turns_used(record) or 0
             else:
                 turns_used = 0
-            return WaitForAgentResult(
+            disposition = WaitForAgentResult(
                 status=WaitStatus.STILL_RUNNING,
                 agent_id=agent_id,
                 run_id=key[1],
@@ -439,6 +576,9 @@ class RunResults:
                     turns_used=turns_used,
                 ),
             )
+            self.release_wait_lease_locked(key)
+            self.expire_locked()
+            return disposition
 
     async def cancel(  # noqa: PLR0911
         self,

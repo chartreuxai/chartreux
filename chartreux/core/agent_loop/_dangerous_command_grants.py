@@ -22,10 +22,12 @@ from pydantic import BaseModel
 from chartreux.core.config.types import ConfigSaveResult
 from chartreux.core.dangerous_commands import (
     OPERATION_REGISTRY,
+    REMOTE_EXEC_OPERATION_ID,
     DangerousCommandAuthority,
     DangerousCommandProposal,
     GitRepositoryRelocation,
     GrantChoice,
+    RemoteDestination,
     RepositoryScope,
     is_grant_choice_valid,
 )
@@ -55,6 +57,14 @@ DANGEROUS_COMMAND_SESSION_LABEL = "Allow this session"
 DANGEROUS_COMMAND_PROJECT_LABEL = "Always for this project"
 DANGEROUS_COMMAND_DECLINED_FEEDBACK = "user declined; do not retry this command"
 
+# Frozen honest-scope statement for a remote-exec approval. A destination
+# grant authorizes reaching a remote host; it does not contain or approve the
+# payload, because the remote command runs under the remote host's policy.
+REMOTE_EXEC_SCOPE_STATEMENT = (
+    "Remote commands and their effects are outside chartreux's local guards — "
+    "trusting the destination, not approving a contained payload."
+)
+
 _LABEL_TO_CHOICE: dict[str, GrantChoice] = {
     DANGEROUS_COMMAND_DENY_LABEL: "deny",
     DANGEROUS_COMMAND_ONCE_LABEL: "allow_once",
@@ -78,6 +88,21 @@ class DangerousCommandOncePermit:
     requirements: frozenset[tuple[str, RepositoryScope]]
 
 
+@dataclass(frozen=True)
+class RemoteExecGrantRequirement:
+    """One remote-exec authority requirement: one scope, one exact destination."""
+
+    scope: RepositoryScope
+    destination: RemoteDestination
+
+
+@dataclass(frozen=True)
+class RemoteExecOncePermit:
+    """Live once authority for remote-exec destinations of one invocation."""
+
+    requirements: frozenset[RemoteExecGrantRequirement]
+
+
 def _authorities_for(
     requirements: frozenset[tuple[str, RepositoryScope]],
 ) -> tuple[DangerousCommandAuthority, ...]:
@@ -99,6 +124,8 @@ class DangerousCommandGrantStore:
     def __init__(self) -> None:
         self._session: dict[RepositoryScope, set[str]] = {}
         self._once: list[DangerousCommandOncePermit] = []
+        self._remote_exec_session: dict[RepositoryScope, set[RemoteDestination]] = {}
+        self._remote_exec_once: list[RemoteExecOncePermit] = []
         self._refusals: set[DangerousCommandCallIdentity] = set()
         self._authority_generation = 0
 
@@ -131,7 +158,32 @@ class DangerousCommandGrantStore:
                 )
         for permit in self._once:
             authorities.extend(_authorities_for(permit.requirements))
+        authorities.extend(self._remote_exec_authorities())
         return tuple(authorities)
+
+    def _remote_exec_authorities(self) -> list[DangerousCommandAuthority]:
+        """Destination-keyed authority contributions from this store."""
+        authorities = [
+            DangerousCommandAuthority(
+                operations=frozenset({REMOTE_EXEC_OPERATION_ID}),
+                scope=scope,
+                source="runtime_grant",
+                destination=destination,
+            )
+            for scope, destinations in self._remote_exec_session.items()
+            for destination in destinations
+        ]
+        authorities.extend(
+            DangerousCommandAuthority(
+                operations=frozenset({REMOTE_EXEC_OPERATION_ID}),
+                scope=requirement.scope,
+                source="runtime_grant",
+                destination=requirement.destination,
+            )
+            for permit in self._remote_exec_once
+            for requirement in permit.requirements
+        )
+        return authorities
 
     def is_refused(self, identity: DangerousCommandCallIdentity) -> bool:
         return identity in self._refusals
@@ -158,9 +210,17 @@ class DangerousCommandGrantStore:
     def revoke_session(
         self, requirements: Iterable[tuple[str, RepositoryScope]]
     ) -> bool:
-        """Remove live session authority; True when anything was removed."""
+        """Remove live session authority; True when anything was removed.
+
+        Revoking ``network.remote-exec`` at a scope drops every destination
+        grant in that scope: a destination grant is authority for the one
+        operation, so there is no finer live unit to revoke by scope alone.
+        """
         changed = False
         for operation_id, scope in requirements:
+            if operation_id == REMOTE_EXEC_OPERATION_ID:
+                if self._remote_exec_session.pop(scope, None) is not None:
+                    changed = True
             operations = self._session.get(scope)
             if operations is not None and operation_id in operations:
                 operations.discard(operation_id)
@@ -170,6 +230,55 @@ class DangerousCommandGrantStore:
         if changed:
             self._bump_authority_generation()
         return changed
+
+    def grant_remote_exec_session(
+        self, requirements: Iterable[RemoteExecGrantRequirement]
+    ) -> bool:
+        """Install destination authority per (scope, exact destination)."""
+        changed = False
+        for requirement in requirements:
+            destinations = self._remote_exec_session.setdefault(
+                requirement.scope, set()
+            )
+            if requirement.destination not in destinations:
+                destinations.add(requirement.destination)
+                changed = True
+        if changed:
+            self._bump_authority_generation()
+        return changed
+
+    def revoke_remote_exec_session(
+        self, requirements: Iterable[RemoteExecGrantRequirement]
+    ) -> bool:
+        """Remove live destination authority; True when anything was removed."""
+        changed = False
+        for requirement in requirements:
+            destinations = self._remote_exec_session.get(requirement.scope)
+            if destinations is not None and requirement.destination in destinations:
+                destinations.discard(requirement.destination)
+                changed = True
+                if not destinations:
+                    del self._remote_exec_session[requirement.scope]
+        if changed:
+            self._bump_authority_generation()
+        return changed
+
+    def install_remote_exec_once(
+        self, requirements: frozenset[RemoteExecGrantRequirement]
+    ) -> RemoteExecOncePermit:
+        """Install a once permit bound to exactly one remote-exec invocation."""
+        permit = RemoteExecOncePermit(requirements=requirements)
+        self._remote_exec_once.append(permit)
+        self._bump_authority_generation()
+        return permit
+
+    def destroy_remote_exec_once(self, permit: RemoteExecOncePermit) -> None:
+        """Destroy a remote-exec once permit, used or unused."""
+        try:
+            self._remote_exec_once.remove(permit)
+        except ValueError:
+            return  # Already destroyed: a no-op, never an error.
+        self._bump_authority_generation()
 
     def install_once(
         self, requirements: frozenset[tuple[str, RepositoryScope]]
@@ -191,11 +300,32 @@ class DangerousCommandGrantStore:
     def invalidate_pending(
         self, requirements: Iterable[tuple[str, RepositoryScope]]
     ) -> int:
-        """Invalidate pending once permits matching *requirements*; returns the count."""
+        """Invalidate pending once permits matching *requirements*.
+
+        A ``network.remote-exec`` requirement invalidates every pending
+        destination permit in that scope, mirroring the scope-level
+        revocation rule.
+        """
         wanted = set(requirements)
         kept = [permit for permit in self._once if not (permit.requirements & wanted)]
         invalidated = len(self._once) - len(kept)
         self._once = kept
+        remote_exec_scopes = {
+            scope
+            for operation_id, scope in wanted
+            if operation_id == REMOTE_EXEC_OPERATION_ID
+        }
+        if remote_exec_scopes:
+            kept_permits = [
+                permit
+                for permit in self._remote_exec_once
+                if not any(
+                    requirement.scope in remote_exec_scopes
+                    for requirement in permit.requirements
+                )
+            ]
+            invalidated += len(self._remote_exec_once) - len(kept_permits)
+            self._remote_exec_once = kept_permits
         if invalidated:
             self._bump_authority_generation()
         return invalidated
@@ -212,9 +342,17 @@ class DangerousCommandGrantStore:
         always bumps, so consumers keying on it detect the boundary even
         when the store was already empty.
         """
-        cleared = bool(self._session or self._once or self._refusals)
+        cleared = bool(
+            self._session
+            or self._once
+            or self._remote_exec_session
+            or self._remote_exec_once
+            or self._refusals
+        )
         self._session = {}
         self._once = []
+        self._remote_exec_session = {}
+        self._remote_exec_once = []
         self._refusals = set()
         self._bump_authority_generation()
         return cleared
@@ -238,7 +376,11 @@ def _command_source(tokens: tuple[str, ...]) -> str:
     )
 
 
-def _proposal_repositories(proposal: DangerousCommandProposal) -> tuple[Path, ...]:
+def _proposal_repositories(
+    proposal: DangerousCommandProposal,
+    *,
+    scratchpad_roots: frozenset[Path] = frozenset(),
+) -> tuple[Path, ...]:
     """Every repository an approval of *proposal* grants authority in.
 
     The proposal's own scope is representative only: an approval installs
@@ -246,10 +388,15 @@ def _proposal_repositories(proposal: DangerousCommandProposal) -> tuple[Path, ..
     question shows every repository involved. The coverage is re-derived
     from the proposal's command; the representative scope always counts,
     and a coverage that can no longer be derived falls back to it alone.
+    The caller's live scratch roots are threaded into that re-derivation
+    so both derivation call sites mirror the resolver's own expansion.
     """
     scopes = {proposal.scope}
     requirements = derive_call_requirements(
-        _command_source(proposal.command), proposal.project, proposal.operations
+        _command_source(proposal.command),
+        proposal.project,
+        proposal.operations,
+        scratchpad_roots=scratchpad_roots,
     )
     if requirements:
         scopes.update(scope for _, scope in requirements)
@@ -261,20 +408,27 @@ def _proposal_repositories(proposal: DangerousCommandProposal) -> tuple[Path, ..
 
 def dangerous_command_request(
     proposal: DangerousCommandProposal,
+    *,
+    scratchpad_roots: frozenset[Path] = frozenset(),
 ) -> UserQuestionRequest:
-    """Build the mid-turn question asking the user to approve *proposal*."""
+    """Build the mid-turn question asking the user to approve *proposal*.
+
+    *scratchpad_roots* is the caller's live scratch authority, threaded into
+    the coverage re-derivation exactly as the approval-time recheck threads
+    it.
+    """
     operations = tuple(
         OPERATION_REGISTRY[operation_id]
         for operation_id in proposal.operations
         if operation_id in OPERATION_REGISTRY
     )
     # A persistent choice is offered only when every required operation is
-    # publication-class; a mixed or consequential call never offers it, and a
+    # persistable; a mixed or consequential call never offers it, and a
     # forged "always" answer is rejected at parse time.
     persistable_offer = bool(operations) and all(
-        operation.command_class == "publication" for operation in operations
+        operation.persistable for operation in operations
     )
-    repositories = _proposal_repositories(proposal)
+    repositories = _proposal_repositories(proposal, scratchpad_roots=scratchpad_roots)
     if len(repositories) == 1:
         repository_line = f"Repository: {repositories[0]}\n"
         session_scope = "in this repository"
@@ -283,6 +437,59 @@ def dangerous_command_request(
         # so the question names them all.
         repository_line = f"Repositories: {', '.join(str(repository) for repository in repositories)}\n"
         session_scope = "in these repositories"
+    if proposal.destination is not None:
+        # A remote-exec approval is a destination grant, and the wording must
+        # stay honest: the grant authorizes reaching the host, not containing
+        # the remote payload.
+        destination = proposal.destination
+        question = (
+            "Allow this remote command?\n\n"
+            f"{shlex.join(proposal.command)}\n\n"
+            f"Project: {proposal.project}\n"
+            f"{repository_line}"
+            f"Destination: {destination}\n"
+            f"Operations: {', '.join(proposal.operations)}\n"
+            f"Consequence: {proposal.consequence}\n\n"
+            f"{REMOTE_EXEC_SCOPE_STATEMENT}"
+        )
+        options = [
+            QuestionChoice(
+                label=DANGEROUS_COMMAND_DENY_LABEL,
+                description="Skip this command; it does not run",
+            ),
+            QuestionChoice(
+                label=DANGEROUS_COMMAND_ONCE_LABEL,
+                description="Run this exact command one time",
+            ),
+            QuestionChoice(
+                label=DANGEROUS_COMMAND_SESSION_LABEL,
+                description=(
+                    f"Allow remote commands to {destination} {session_scope} "
+                    "for this session"
+                ),
+            ),
+            QuestionChoice(
+                label=DANGEROUS_COMMAND_PROJECT_LABEL,
+                description=(
+                    "Allow for this session and save the destination to your "
+                    "user config for this project"
+                ),
+            ),
+        ]
+        return UserQuestionRequest(
+            questions=[
+                UserQuestion(
+                    question=question,
+                    header="Remote command",
+                    options=options,
+                    hide_other=True,
+                )
+            ],
+            footer_note=(
+                "Session grants stay in memory; only 'Always for this project' "
+                "writes the destination to your user config."
+            ),
+        )
     # The noun follows the operations: git calls keep the historical
     # wording; a non-git ask-class call (network.egress, v0.5.9 P2-a) is not
     # a git command and is not described as one.
@@ -390,13 +597,14 @@ def derive_call_requirements(
     expansion exactly, on the same raw command and working directory. Returns
     None when the call can no longer be derived, so callers fail closed.
 
-    The scratchpad-roots parameter is uniformity-only today: callers pass no
-    roots, and this re-derivation never reads approval_reasons — the only
-    roots-sensitive analysis output — so the missing roots cannot change the
-    derived requirements. Safety rests on the resolver's path layer, which
-    independently gates every literal redirect target as a WRITE against the
-    caller's own authority. A future refactor reading approval reasons here
-    must thread the roots first.
+    The scratchpad-roots parameter is the caller's live scratch authority,
+    threaded by both call sites so this traversal sees the same roots the
+    resolver did. The roots are uniformity-only for now: this re-derivation
+    never reads approval_reasons — the only roots-sensitive analysis output
+    — so they cannot change the derived requirements. Safety rests on the
+    resolver's path layer, which independently gates every literal redirect
+    target as a WRITE against the caller's own authority. A future refactor
+    reading approval reasons here already has the roots threaded.
     """
     wanted = set(operations)
     try:
@@ -511,3 +719,52 @@ def dangerous_command_grant_save_note(
                 f"{prefix} only; saving it to your user config was rejected."
             )
     return " ".join(sentences)
+
+
+def remote_exec_grant_save_note(
+    project: Path,
+    scope: RepositoryScope,
+    destination: RemoteDestination,
+    result: ConfigSaveResult | None,
+) -> str:
+    """Report a remote-exec destination persistence outcome honestly.
+
+    The live destination grant is already applied when this note is built;
+    the note carries only the persistence outcome.
+    """
+    repository = scope.work_tree or scope.git_dir
+    prefix = (
+        f"Remote-exec grant for {destination} in {repository} applies to this session"
+    )
+    if result is None or result.error == "write":
+        note = f"{prefix} only; saving it to your user config failed."
+    elif result.error == "cancelled":
+        note = (
+            f"{prefix}; the save to your user config was cancelled before it "
+            "could be confirmed, so treat the grant as session-only."
+        )
+    elif result.persistence == "durability_uncertain":
+        note = (
+            f"{prefix}; the save to your user config could not be confirmed, "
+            "so treat the grant as session-only."
+        )
+    elif result.persistence == "saved" and result.error is None:
+        note = (
+            f"{prefix} and is saved in your user config for project {project}. "
+            "The running session's config is unchanged; future sessions start "
+            "with the saved grant."
+        )
+    elif result.error == "conflict":
+        note = (
+            f"{prefix} only; saving it to your user config was rejected "
+            "because the config changed since it was read. You can retry "
+            "'Always for this project' to save it."
+        )
+    elif result.persistence == "not_saved" and result.error is None:
+        note = (
+            f"{prefix}; this session does not save remote-exec grants to your "
+            "user config."
+        )
+    else:
+        note = f"{prefix} only; saving it to your user config was rejected."
+    return note

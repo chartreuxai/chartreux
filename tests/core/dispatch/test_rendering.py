@@ -12,6 +12,7 @@ description that replaced it.
 from __future__ import annotations
 
 from datetime import date
+import json
 from pathlib import Path
 import re
 import tempfile
@@ -20,11 +21,12 @@ from unittest.mock import patch
 import pytest
 
 from chartreux.core.agents import AgentManager
-from chartreux.core.agents.identities import get_builtin_identity
+from chartreux.core.agents.identities import Delegation, get_builtin_identity
 from chartreux.core.config.agent_selection import AgentSelectionConfig
 from chartreux.core.dispatch.lint import lint_composed
 from chartreux.core.dispatch.renderer import (
     DispatchRenderError,
+    render_composition_regions,
     render_launch_target_region,
     render_task_description_for_composition,
     session_model_alias,
@@ -37,6 +39,8 @@ from chartreux.core.model_catalog.defaults import SHIPPED_CATALOG
 from chartreux.core.model_catalog.loader import CatalogSnapshot
 from chartreux.core.model_catalog.resolver import ModelResolver
 from chartreux.core.model_catalog.schema import ModelCatalog
+from chartreux.core.policy.bundle import BundleIntegrityError, load_and_activate
+from chartreux.core.policy.manifest import routes_from_snapshot
 from chartreux.core.skills.manager import SkillManager
 from chartreux.core.system_prompt import get_universal_system_prompt
 from chartreux.core.tools.manager import ToolManager
@@ -252,10 +256,11 @@ def test_orchestrated_multi_model_golden_supersedes_legacy_bytes() -> None:
     legacy_task = (FIXTURES / "legacy-orchestrated" / "task-routing.md").read_text()
     # The regenerated goldens pin the COMPOSED artifacts; the WP0 legacy bytes
     # no longer appear (G.1 superseded by the regenerated goldens), and the
-    # composed routing is the launch-target table.
+    # composed routing is the launch-target table — rendered only in the task
+    # description (v0.7.0 P3 dedup), never in the served prompt.
     assert legacy_cli.rstrip("\n") not in cli
     assert legacy_task.rstrip("\n") not in task
-    assert "### Launch targets" in cli
+    assert "### Launch targets" not in cli
     assert "### Launch targets" in task
     # The composed orchestrator prompt carries the delegation-posture regions.
     assert "never edit repo files yourself" in cli
@@ -453,6 +458,167 @@ def test_s8_rejects_orchestrator_without_delegation_obligation() -> None:
     assert any(item.id == "S8" for item in diagnostics)
 
 
+# --- Route-table payload dedup (v0.7.0 P3) ----------------------------------
+#
+# The launch-target table lives ONLY in the task tool description. The served
+# system prompt never carries it — a root's prompt plus the task description
+# therefore renders the table exactly once, and a bounded child (which cannot
+# launch agents) renders it zero times.
+
+_TABLE_HEADING = "### Launch targets"
+_TABLE_HEADER = "| Purpose | Identity | Tier | Seat | Model |"
+_PRE_CHANGE_PROMPT = FIXTURES / "pre-v0.7.0-orchestrated" / "cli.md"
+_PRE_CHANGE_BUNDLE = FIXTURES / "pre-v0.7.0-orchestrated-bundle.json"
+
+
+@pytest.mark.parametrize(
+    ("directory", "selection", "catalog"),
+    SCENARIOS,
+    ids=[name for name, _, _ in SCENARIOS],
+)
+def test_root_route_table_renders_exactly_once(
+    directory: str, selection: AgentSelectionConfig, catalog: ModelCatalog
+) -> None:
+    # Characterization: before the dedup the composed root prompt carried the
+    # table as well, so a root composed two copies. The served prompt now
+    # carries none, and the task tool description carries the single copy.
+    cli = _render_composed_cli(selection, catalog)
+    task = _render_composed_task(selection, catalog)
+    assert cli.count(_TABLE_HEADING) == 0
+    assert task.count(_TABLE_HEADING) == 1
+    assert (cli + task).count(_TABLE_HEADING) == 1
+    assert (cli + task).count(_TABLE_HEADER) == 1
+
+
+def test_bounded_child_prompt_renders_zero_route_tables() -> None:
+    # A bounded child composes the default coder/minimal selection (children
+    # never inherit the parent's identity or workflow) and gets no table.
+    config = _composed_config(AgentSelectionConfig(), multi_model_catalog())
+    prompt = str(
+        get_universal_system_prompt(
+            config,
+            SkillManager(lambda: config),
+            AgentManager(FakeConfigOrchestrator(config)),
+            is_subagent=True,
+        )
+    )
+    assert _TABLE_HEADING not in prompt
+    assert _TABLE_HEADER not in prompt
+    assert "### Purpose meanings" not in prompt
+
+
+def test_root_routing_guidance_points_at_the_task_description_table() -> None:
+    root = render_composition_regions(delegation=Delegation.REQUIRED)["routing"]
+    assert "launch-target table in the `task` tool's description" in root
+    # The table no longer rides the system prompt's shared references.
+    assert "shared references" not in root
+
+
+def test_child_routing_guidance_references_neither_delegation_nor_a_table() -> None:
+    child = render_composition_regions(
+        delegation=Delegation.REQUIRED, bounded_child=True
+    )["routing"]
+    lowered = child.lower()
+    assert "delegation" not in lowered
+    assert "table" not in lowered
+    assert "route" not in lowered
+    assert "bounded child" in lowered
+
+
+def test_custom_task_description_appends_the_live_route_table() -> None:
+    # A custom description without the placeholder contract cannot suppress
+    # the live table: it renders as its own appended section, after the
+    # user-owned text, which is preserved untouched.
+    custom = "# Custom prompt\n\nNothing to render here.\n"
+    rendered = render_task_description_for_composition(
+        routes=shipped_routes(), session_model="glm-5-3", skeleton=custom
+    )
+    assert rendered == (
+        custom.rstrip("\n")
+        + "\n\n"
+        + render_launch_target_region(shipped_routes(), "glm-5-3")
+    )
+    assert rendered.count(_TABLE_HEADING) == 1
+
+
+def test_pre_change_bundle_still_activates_with_its_frozen_table() -> None:
+    # The persisted launch_targets data and its integrity check survive the
+    # dedup: a bundle captured before the change activates, its frozen table
+    # is carried intact, and the integrity checks are exercised by activation.
+    activated = load_and_activate(_PRE_CHANGE_BUNDLE.read_bytes())
+    assert _TABLE_HEADING in activated.frozen.launch_targets
+    assert activated.manifest.route_snapshot
+    assert _TABLE_HEADING in activated.policy_text
+
+
+def test_resumed_pre_change_bundle_renders_without_the_route_table() -> None:
+    # A conversation resumed from a pre-change bundle serves the deduped
+    # prompt: the frozen table is EXCLUDED at the final rendering boundary,
+    # so the resumed root still renders the table exactly once overall.
+    activated = load_and_activate(_PRE_CHANGE_BUNDLE.read_bytes())
+    rendered = activated.render()
+    assert _TABLE_HEADING not in rendered.text
+    assert _TABLE_HEADER not in rendered.text
+    assert "### Purpose meanings" not in rendered.text
+    # The table is still carried by the bundle (data, not served text).
+    assert _TABLE_HEADING in rendered.policy_text
+    # Exactly once overall for the resumed root: the live task description,
+    # rendered from the same persisted route snapshot, carries the table.
+    resumed_task = render_task_description_for_composition(
+        routes=routes_from_snapshot(activated.manifest.route_snapshot),
+        session_model="beta-model",
+        skeleton=task_skeleton(),
+    )
+    assert resumed_task.count(_TABLE_HEADING) == 1
+
+
+def test_pre_change_bundle_tampered_launch_targets_are_rejected() -> None:
+    payload = json.loads(_PRE_CHANGE_BUNDLE.read_text(encoding="utf-8"))
+    tampered = payload["frozen"]["launch_targets"].replace("`researcher`", "`coder`", 1)
+    assert tampered != payload["frozen"]["launch_targets"]
+    payload["frozen"]["launch_targets"] = tampered
+    with pytest.raises(BundleIntegrityError):
+        load_and_activate(json.dumps(payload))
+
+
+# Pinned tokenizer baseline (design P3: a real token delta, never a byte
+# size). No tokenizer library ships with the harness, so the pinned baseline
+# is the GPT-2/cl100k pre-token segmentation pinned by name and version: it
+# is deterministic, monotone in text, and counts token-shaped pieces rather
+# than bytes. Re-pinning it would restate the baseline, not invalidate it.
+PINNED_TOKENIZER = "cl100k-pretoken/1"
+_PINNED_TOKEN_PATTERN = re.compile(
+    r"'(?:[sdmt]|ll|ve|re)| ?[A-Za-z]+| ?[0-9]+| ?[^\sA-Za-z0-9]+|\s+(?!\S)|\s+"
+)
+
+
+def pinned_token_count(text: str) -> int:
+    assert PINNED_TOKENIZER == "cl100k-pretoken/1"
+    return len(_PINNED_TOKEN_PATTERN.findall(text))
+
+
+def test_route_table_dedup_saves_tokens_against_the_pinned_baseline() -> None:
+    config = _composed_config(ORCHESTRATED_SELECTION, multi_model_catalog())
+    baseline = _PRE_CHANGE_PROMPT.read_text(encoding="utf-8")
+    deduped = _render_composed_cli(ORCHESTRATED_SELECTION, multi_model_catalog())
+    # The pinned baseline IS the pre-change prompt: it rendered the table in
+    # step 7 (before the communication section), the deduped prompt does not.
+    assert _TABLE_HEADING in baseline.split("## Communication")[0]
+    assert _TABLE_HEADING not in deduped
+    table = render_launch_target_region(
+        dict(config.purpose_routes.routes), session_model_alias(config)
+    )
+    baseline_tokens = pinned_token_count(baseline)
+    deduped_tokens = pinned_token_count(deduped)
+    delta = baseline_tokens - deduped_tokens
+    # Removing the section also merges its two separating blank-line runs
+    # into one, so the delta is the section itself less that one boundary
+    # piece.
+    assert pinned_token_count("\n\n") == 1
+    assert delta == pinned_token_count(table) - 1
+    assert delta > 0
+
+
 # --- Placeholder hygiene and custom prompts ---------------------------------
 
 
@@ -469,16 +635,6 @@ def test_unresolved_placeholder_is_rejected() -> None:
         render_task_description_for_composition(
             routes=shipped_routes(), session_model="glm-5-3", skeleton=skeleton
         )
-
-
-def test_custom_prompt_without_placeholders_passes_through() -> None:
-    custom = "# Custom prompt\n\nNothing to render here.\n"
-    assert (
-        render_task_description_for_composition(
-            routes=shipped_routes(), session_model="glm-5-3", skeleton=custom
-        )
-        == custom
-    )
 
 
 # --- Task tool description injection (contracts L) --------------------------
@@ -528,9 +684,12 @@ def test_tool_manager_serves_shipped_catalog_task_description() -> None:
 
 
 @pytest.mark.parametrize("runtime_description", [None, "Runtime-rendered description."])
-def test_custom_task_prompt_override_wins_over_the_rendered_default(
+def test_custom_task_prompt_keeps_its_text_and_appends_the_live_table(
     runtime_description,
 ) -> None:
+    # A user-owned prompts/task.md still wins over the rendered default, but
+    # it cannot suppress the live launch-target table (v0.7.0 P3): the table
+    # renders as its own appended section, and a re-install never stacks it.
     with tempfile.TemporaryDirectory() as tmp:
         tools = Path(tmp) / "tools"
         (tools / "prompts").mkdir(parents=True)
@@ -539,6 +698,13 @@ def test_custom_task_prompt_override_wins_over_the_rendered_default(
         )
         config = build_test_vibe_config(tool_paths=[str(tools)])
         manager = ToolManager(lambda: config, task_description=runtime_description)
-        assert _task_spec_description(manager) == "Custom task description."
+        expected = (
+            "Custom task description."
+            + "\n\n"
+            + render_launch_target_region(
+                dict(config.purpose_routes.routes), session_model_alias(config)
+            )
+        )
+        assert _task_spec_description(manager) == expected
         manager._install_task_description("Next runtime render.")
-        assert _task_spec_description(manager) == "Custom task description."
+        assert _task_spec_description(manager) == expected

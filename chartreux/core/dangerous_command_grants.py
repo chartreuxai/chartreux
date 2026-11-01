@@ -30,11 +30,27 @@ class DangerousCommandGrantPersistencePort(Protocol):
         """
         ...
 
+    async def save_remote_exec_grant(
+        self, session_id: str, project: Path, destination: str, expected_revision: str
+    ) -> ConfigSaveResult:
+        """Persist one approved remote-exec destination for the session's project.
+
+        Same routing and honors as the operation grant: the save goes to the
+        grant orchestrator keyed by the registered caller session's project,
+        and the result reports persistence honestly.
+        """
+        ...
+
 
 class NoOpDangerousCommandGrantPersistence:
     """Default port: this runtime persists no dangerous-command grants."""
 
     async def save_dangerous_command_grant(
         self, session_id: str, project: Path, operation_id: str, expected_revision: str
+    ) -> ConfigSaveResult:
+        return ConfigSaveResult("user", "not_saved", "unchanged")
+
+    async def save_remote_exec_grant(
+        self, session_id: str, project: Path, destination: str, expected_revision: str
     ) -> ConfigSaveResult:
         return ConfigSaveResult("user", "not_saved", "unchanged")

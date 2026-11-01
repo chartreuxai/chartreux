@@ -24,15 +24,17 @@ Provides systematic debugging assistance for code, following a structured 6-step
 
 ## Tools
 
-Available: `read_file`, `grep`, `bash`, `edit`, `write_file`, `task`, `ask_user_question`
+Available: `read_file`, `grep`, `bash`, `edit`, `write_file`, `task`, `ask_user_question`, `todo`
 
 **Usage Guidelines:**
 - `read_file`: Always for reading code
 - `grep`: Always for searching patterns
-- `bash`: Ask before running (allow: git commands, test runners, build tools)
+- `bash`: Ask before running (allow: git commands, test runners, build tools); each call is a fresh subprocess, so `cd` and exported variables do not persist — use absolute paths, pass a timeout, and do not start servers or watchers in the loop
 - `edit`: Ask before modifying files
 - `write_file`: Ask before creating files
 - `task`: Optional, for bounded delegation of isolated subtasks (e.g., a focused search or reproduction script) when it genuinely helps; not required for every debugging step
+- `ask_user_question`: Use for genuine decisions — missing reproduction details, scope choices, which hypothesis to pursue; structured options instead of free-text prompting, and the answer is required before continuing
+- `todo`: Track the debugging steps, hypotheses tested, and confirmed findings as a session task list; keep one item in progress at a time and mark items complete as they finish
 
 ## Triggering Conditions
 
@@ -59,12 +61,12 @@ Activates when user requests debugging:
 - If no changes: Check for recent errors in logs or ask user to specify
 
 **If description is missing:**
-- **Prompt user:** "What error or unexpected behavior are you seeing? (e.g., 'function returns wrong value', 'test is failing')"
-- Wait for user response before proceeding
+- **Ask via `ask_user_question`:** "What error or unexpected behavior are you seeing? (e.g., 'function returns wrong value', 'test is failing')"
+- Wait for the answer before proceeding
 
 **If scope is too broad (>1000 lines or multiple files):**
-- **Warn user:** "This scope is large. For better results, specify a file or function, or type 'continue' for full analysis."
-- Prompt: "Specify scope or type 'continue': "
+- **Warn user:** "This scope is large. For better results, specify a file or function, or choose 'continue' for full analysis."
+- **Ask via `ask_user_question`:** "Specify a file or function, or choose 'continue' for full analysis."
 
 ## Git Integration
 
@@ -400,7 +402,7 @@ Users can configure via AGENTS.md:
 ## Multi-Turn Debugging
 
 - Use `todo` tool to track: Hypotheses tested, confirmed findings, next steps
-- Store reproduction scripts in scratchpad (`/tmp/chartreux-scratchpad-*`)
+- Store reproduction scripts in the session scratchpad directory named in the session context (`You have a scratchpad directory at: <path>`); files there are automatically allowed with no permission prompts, and the directory is session-scoped and shared with subagents. Do not assume `/tmp` — the runtime picks the path.
 - Reference previous turns' findings in current analysis
 
 ## Verification

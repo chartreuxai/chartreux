@@ -4,12 +4,15 @@ from __future__ import annotations
 
 import asyncio
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
 from chartreux.app_server._sessions import (
+    AgentRecord,
+    BackgroundExecutionContext,
     RunRecord,
     SessionRuntime,
     SessionRuntimeRegistry,
@@ -35,10 +38,12 @@ from chartreux.core.subagents import (
     AgentIdentityMismatchError,
     AgentResultExpiredError,
     CancelOutcome,
+    ReleaseAgentOutcome,
     RetentionPolicy,
     RunStatus,
     RunStopReason,
     TaskArgs,
+    TaskResult,
     UnknownAgentError,
     WaitStatus,
 )
@@ -59,6 +64,7 @@ from tests.app_server._subagent_test_support import (
     _real_reused_background,
     _reaper_registry,
     _retention_registry,
+    _root_registry,
     _stored_result,
     _task_call,
     _todo_call,
@@ -943,6 +949,11 @@ async def test_background_agent_management_survives_wait_timeout(monkeypatch) ->
         runtime = registry._agent_records[summary.agent_id].runtime
         await registry.release_agent(summary.agent_id)
         released_update = await _wait_for_agents_update(session)
+        # U3b: collecting the run above (the completed wait) publishes its own
+        # refresh, so the release's empty inventory can arrive after an extra
+        # badge-free payload for the still-idle row.
+        while released_update.agents:
+            released_update = await _wait_for_agents_update(session)
         assert released_update.agents == []
         assert runtime._closed
         assert await registry.check_agents() == []
@@ -1317,3 +1328,420 @@ async def test_repeated_foreground_wait_cancellation_tracks_one_teardown(
         await asyncio.gather(task, return_exceptions=True)
         await registry.drain_children()
         await parent.aclose()
+
+
+# ---------------------------------------------------------------------------
+# v0.7.0 U3a: collection markers, the retrieval universe, and their cleanup
+# ---------------------------------------------------------------------------
+
+
+def _task_result(agent_id: str, run_id: str, *, completed: bool = True) -> TaskResult:
+    return TaskResult(
+        response=f"result for {run_id}",
+        turns_used=1,
+        completed=completed,
+        agent_id=agent_id,
+        run_id=run_id,
+    )
+
+
+def _settled_run(
+    agent_id: str,
+    run_id: str,
+    *,
+    status: RunStatus = RunStatus.COMPLETED,
+    completed_at: float | None = 1.0,
+) -> RunRecord:
+    future = asyncio.get_running_loop().create_future()
+    future.set_result(None)
+    return RunRecord(
+        run_id=run_id,
+        agent_id=agent_id,
+        identity="coder",
+        status=status,
+        completion_task=future,
+        result=_task_result(agent_id, run_id, completed=status is RunStatus.COMPLETED),
+        started_at=0.0,
+        completed_at=completed_at,
+    )
+
+
+def _running_run(agent_id: str, run_id: str) -> RunRecord:
+    return RunRecord(
+        run_id=run_id,
+        agent_id=agent_id,
+        identity="coder",
+        status=RunStatus.RUNNING,
+        completion_task=asyncio.get_running_loop().create_future(),
+        started_at=0.0,
+    )
+
+
+def _uncollected(registry: SessionRuntimeRegistry, agent_id: str) -> list[str]:
+    return registry._uncollected_run_ids(agent_id)
+
+
+def _publication_context(
+    agent_id: str, run_id: str, *, record: AgentRecord, run: RunRecord, token: object
+) -> BackgroundExecutionContext:
+    return cast(
+        BackgroundExecutionContext,
+        SimpleNamespace(
+            agent_id=agent_id,
+            run_id=run_id,
+            record=record,
+            runtime=record.runtime,
+            run_record=run,
+            publication_token=token,
+        ),
+    )
+
+
+@pytest.mark.asyncio
+async def test_published_result_starts_uncollected_and_one_collection_clears_it() -> (
+    None
+):
+    registry = _retention_registry()
+    stored = _stored_result("agent-1", "run-1")
+    registry._result_store[("agent-1", "run-1")] = stored
+
+    assert _uncollected(registry, "agent-1") == ["run-1"]
+
+    assert await registry.get_agent_result("agent-1", "run-1") == stored.result
+    assert ("agent-1", "run-1") in registry._collected_results
+    assert _uncollected(registry, "agent-1") == []
+
+    # Repeated collection is idempotent: the result stays retrievable and the
+    # collection marker stays off.
+    assert await registry.get_agent_result("agent-1", "run-1") == stored.result
+    assert _uncollected(registry, "agent-1") == []
+
+
+@pytest.mark.asyncio
+async def test_resident_result_before_store_publication_is_uncollected_and_collectable() -> (
+    None
+):
+    clock = _ManualClock()
+    registry = _retention_registry(clock)
+    run = _settled_run("agent-1", "run-1", completed_at=5.0)
+    record = _idle_record("agent-1", clock=clock)
+    record.current_run = run
+    registry._agent_records["agent-1"] = record
+    assert "run-1" not in registry._result_store
+
+    assert _uncollected(registry, "agent-1") == ["run-1"]
+    assert await registry.get_agent_result("agent-1", "run-1") == run.result
+    assert ("agent-1", "run-1") in registry._collected_results
+    assert _uncollected(registry, "agent-1") == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", [RunStatus.FAILED, RunStatus.CANCELLED])
+async def test_failed_and_cancelled_results_start_uncollected(
+    status: RunStatus,
+) -> None:
+    registry = _retention_registry()
+    run = _settled_run("agent-1", "run-1", status=status)
+    record = _idle_record("agent-1", clock=_ManualClock())
+    record.run_history.append(run)
+    registry._agent_records["agent-1"] = record
+
+    assert _uncollected(registry, "agent-1") == ["run-1"]
+    assert await registry.get_agent_result("agent-1", "run-1") == run.result
+    assert _uncollected(registry, "agent-1") == []
+
+
+@pytest.mark.asyncio
+async def test_in_flight_run_has_no_uncollected_entry() -> None:
+    clock = _ManualClock()
+    registry = _retention_registry(clock)
+    record = _idle_record("agent-1", clock=clock)
+    record.current_run = _running_run("agent-1", "run-1")
+    registry._agent_records["agent-1"] = record
+
+    assert _uncollected(registry, "agent-1") == []
+    assert registry._collected_results == set()
+
+
+@pytest.mark.asyncio
+async def test_pending_get_and_typed_errors_never_mark_collection() -> None:
+    clock = _ManualClock()
+    registry = _retention_registry(clock)
+    record = _idle_record("agent-1", clock=clock)
+    record.current_run = _running_run("agent-1", "run-1")
+    registry._agent_records["agent-1"] = record
+    registry._result_store[("agent-1", "run-2")] = _stored_result("agent-1", "run-2")
+    registry._expired_results.add(("agent-1", "run-2"))
+
+    assert await registry.get_agent_result("agent-1", "run-1") is None
+    with pytest.raises(AgentResultExpiredError):
+        await registry.get_agent_result("agent-1", "run-2")
+    with pytest.raises(UnknownAgentError):
+        await registry.get_agent_result("agent-1", "run-unknown")
+
+    assert registry._collected_results == set()
+    assert _uncollected(registry, "agent-1") == []
+
+
+@pytest.mark.asyncio
+async def test_repeated_and_concurrent_collection_is_idempotent() -> None:
+    registry = _retention_registry()
+    stored = _stored_result("agent-1", "run-1")
+    registry._result_store[("agent-1", "run-1")] = stored
+
+    collected = await asyncio.gather(
+        registry.get_agent_result("agent-1", "run-1"),
+        registry.get_agent_result("agent-1", "run-1"),
+        _wait_result(registry, "agent-1", "run-1"),
+        _wait_result(registry, "agent-1", "run-1"),
+    )
+
+    assert collected == [stored.result] * 4
+    assert registry._collected_results == {("agent-1", "run-1")}
+    assert registry._wait_leases == {}
+    assert _uncollected(registry, "agent-1") == []
+
+
+@pytest.mark.asyncio
+async def test_uncollected_list_is_newest_first_with_a_run_id_tie_break() -> None:
+    registry = _retention_registry()
+    for run_id, completed_at in (
+        ("run-a", 1.0),
+        ("run-b", 3.0),
+        ("run-c", 2.0),
+        ("run-d", 3.0),
+    ):
+        registry._result_store[("agent-1", run_id)] = _stored_result(
+            "agent-1", run_id, completed_at=completed_at
+        )
+
+    assert _uncollected(registry, "agent-1") == ["run-d", "run-b", "run-c", "run-a"]
+    assert _uncollected(registry, "agent-2") == []
+
+
+@pytest.mark.asyncio
+async def test_timestampless_resident_runs_order_last_deterministically() -> None:
+    clock = _ManualClock()
+    registry = _retention_registry(clock)
+    record = _idle_record("agent-1", clock=clock)
+    record.run_history.extend([
+        _settled_run("agent-1", "run-b", completed_at=None),
+        _settled_run("agent-1", "run-a", completed_at=None),
+        _settled_run("agent-1", "run-c", completed_at=4.0),
+    ])
+    registry._agent_records["agent-1"] = record
+
+    assert _uncollected(registry, "agent-1") == ["run-c", "run-b", "run-a"]
+
+
+@pytest.mark.asyncio
+async def test_pinned_older_collection_leaves_the_newer_result_uncollected() -> None:
+    registry = _retention_registry()
+    older = _stored_result("agent-1", "run-1", completed_at=1)
+    newer = _stored_result("agent-1", "run-2", completed_at=2)
+    registry._result_store[("agent-1", "run-1")] = older
+    registry._result_store[("agent-1", "run-2")] = newer
+    assert _uncollected(registry, "agent-1") == ["run-2", "run-1"]
+
+    assert await registry.get_agent_result("agent-1", "run-1") == older.result
+    assert _uncollected(registry, "agent-1") == ["run-2"]
+
+    assert await registry.get_agent_result("agent-1", "run-2") == newer.result
+    assert _uncollected(registry, "agent-1") == []
+
+
+@pytest.mark.asyncio
+async def test_expiry_purges_the_collection_marker_with_its_result() -> None:
+    registry = _retention_registry()
+    target = _stored_result("agent-0", "run-0")
+    survivor = _stored_result("agent-01", "run")
+    registry._result_store[(target.agent_id, target.run_id)] = target
+    for index in range(32):
+        stored = _stored_result(f"agent-{index + 1:02}", "run")
+        registry._result_store[(stored.agent_id, stored.run_id)] = stored
+    registry._collected_results.update({
+        (target.agent_id, target.run_id),
+        (survivor.agent_id, survivor.run_id),
+    })
+
+    registry._expire_results_locked()
+
+    assert (target.agent_id, target.run_id) in registry._expired_results
+    assert (target.agent_id, target.run_id) not in registry._collected_results
+    # A marker whose result survived expiry survives with it.
+    assert (survivor.agent_id, survivor.run_id) in registry._collected_results
+    assert _uncollected(registry, target.agent_id) == []
+
+
+@pytest.mark.asyncio
+async def test_successful_release_purges_markers_and_the_row() -> None:
+    registry = _retention_registry()
+    record = _idle_record("agent-1", clock=_ManualClock())
+    registry._agent_records[record.agent_id] = record
+    registry._children[record.session_id] = record.runtime
+    registry._result_store[(record.agent_id, "run-1")] = _stored_result(
+        record.agent_id, "run-1"
+    )
+    registry._collected_results.update({
+        (record.agent_id, "run-1"),
+        (record.agent_id, "run-0"),
+    })
+
+    await registry.release_agent(record.agent_id)
+
+    assert record.agent_id not in registry._agent_records
+    assert not [key for key in registry._result_store if key[0] == record.agent_id]
+    assert not [key for key in registry._collected_results if key[0] == record.agent_id]
+    assert _uncollected(registry, record.agent_id) == []
+
+
+@pytest.mark.asyncio
+async def test_conflicting_release_clears_neither_row_nor_markers() -> None:
+    clock = _ManualClock()
+    registry, _root = _root_registry(clock)
+    record = _idle_record("agent-1", clock=clock)
+    record.parent_session_id = "root"
+    record.latest_run_id = "run-2"
+    registry._agent_records[record.agent_id] = record
+    registry._children[record.session_id] = record.runtime
+    registry._result_store[(record.agent_id, "run-2")] = _stored_result(
+        record.agent_id, "run-2"
+    )
+    registry._collected_results.add((record.agent_id, "run-2"))
+
+    outcome = await registry.release_agent_guarded(record.agent_id, "run-1")
+
+    assert outcome is ReleaseAgentOutcome.CONFLICT
+    assert registry._agent_records[record.agent_id] is record
+    assert (record.agent_id, "run-2") in registry._result_store
+    assert (record.agent_id, "run-2") in registry._collected_results
+
+
+@pytest.mark.asyncio
+async def test_generation_retirement_preserves_markers_with_their_results() -> None:
+    registry, root = _reaper_registry(_ManualClock(), generation=1)
+    record = _idle_record("agent-1", clock=_ManualClock())
+    record.root_generation = 1
+    registry._agent_records[record.agent_id] = record
+    registry._children[record.session_id] = record.runtime
+    result = _stored_result(record.agent_id, "run-1", generation=1)
+    registry._result_store[(record.agent_id, result.run_id)] = result
+    registry._collected_results.add((record.agent_id, result.run_id))
+
+    root.agent_loop._session_generation = 2
+    registry.begin_root_generation()
+    await asyncio.gather(*registry._teardown_tasks)
+
+    assert record.agent_id not in registry._agent_records
+    assert (record.agent_id, result.run_id) in registry._result_store
+    assert (record.agent_id, result.run_id) in registry._collected_results
+
+
+@pytest.mark.asyncio
+async def test_drain_clears_collection_markers_with_the_result_store() -> None:
+    registry = _retention_registry()
+    registry._result_store[("agent-1", "run-1")] = _stored_result("agent-1", "run-1")
+    registry._collected_results.add(("agent-1", "run-1"))
+
+    await registry.drain_children()
+
+    assert registry._result_store == {}
+    assert registry._collected_results == set()
+
+
+@pytest.mark.asyncio
+async def test_permitted_publication_keeps_a_marker_recorded_before_the_store_write() -> (
+    None
+):
+    clock = _ManualClock()
+    registry = _retention_registry(clock)
+    run = _settled_run("agent-1", "run-1")
+    record = _idle_record("agent-1", clock=clock)
+    record.current_run = run
+    registry._agent_records["agent-1"] = record
+    registry._children[record.session_id] = record.runtime
+    token = object()
+    registry._result_write_tokens[("agent-1", "run-1")] = token
+
+    # The read observes the resident result before the locked store write.
+    assert await registry.get_agent_result("agent-1", "run-1") == run.result
+    assert ("agent-1", "run-1") in registry._collected_results
+
+    context = _publication_context(
+        "agent-1", "run-1", record=record, run=run, token=token
+    )
+    async with registry._registry_lock:
+        decision = registry._publish_locked(context)
+
+    assert decision.write_permitted is True
+    assert ("agent-1", "run-1") in registry._collected_results
+
+
+@pytest.mark.asyncio
+async def test_revoked_publication_keeps_the_marker_while_residency_retains_the_result() -> (
+    None
+):
+    clock = _ManualClock()
+    registry = _retention_registry(clock)
+    run = _settled_run("agent-1", "run-1")
+    record = _idle_record("agent-1", clock=clock)
+    record.current_run = run
+    registry._agent_records["agent-1"] = record
+    registry._children[record.session_id] = record.runtime
+
+    assert await registry.get_agent_result("agent-1", "run-1") == run.result
+    context = _publication_context(
+        "agent-1", "run-1", record=record, run=run, token=object()
+    )
+    async with registry._registry_lock:
+        decision = registry._publish_locked(context)
+
+    assert decision.write_permitted is False
+    assert decision.resident is True
+    assert ("agent-1", "run-1") in registry._collected_results
+    assert _uncollected(registry, "agent-1") == []
+
+
+@pytest.mark.asyncio
+async def test_revoked_publication_without_a_retrievable_result_drops_the_marker() -> (
+    None
+):
+    clock = _ManualClock()
+    registry = _retention_registry(clock)
+    run = _settled_run("agent-1", "run-1")
+    record = _idle_record("agent-1", clock=clock)
+    record.current_run = run
+    registry._agent_records["agent-1"] = record
+    registry._children[record.session_id] = record.runtime
+
+    assert await registry.get_agent_result("agent-1", "run-1") == run.result
+    # The agent was released/replaced before publication: the record copy is
+    # gone and the revoked write leaves nothing retrievable behind.
+    registry._agent_records.pop("agent-1")
+    context = _publication_context(
+        "agent-1", "run-1", record=record, run=run, token=object()
+    )
+    async with registry._registry_lock:
+        decision = registry._publish_locked(context)
+
+    assert decision.write_permitted is False
+    assert decision.resident is False
+    assert registry._collected_results == set()
+    assert _uncollected(registry, "agent-1") == []
+
+
+@pytest.mark.asyncio
+async def test_collection_marking_leaves_typed_errors_unchanged() -> None:
+    registry = _retention_registry()
+    registry._expired_results.add(("agent-1", "expired"))
+
+    with pytest.raises(AgentResultExpiredError):
+        await registry.get_agent_result("agent-1", "expired")
+    with pytest.raises(UnknownAgentError):
+        await registry.get_agent_result("agent-1", "unknown")
+    with pytest.raises(AgentResultExpiredError):
+        await registry.wait_for_agent("agent-1", "expired")
+    with pytest.raises(UnknownAgentError):
+        await registry.wait_for_agent("agent-1", "unknown")
+
+    assert registry._collected_results == set()

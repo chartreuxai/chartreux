@@ -9,7 +9,11 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from chartreux.app_server._sessions import SessionRuntimeRegistry, _AgentState
+from chartreux.app_server._sessions import (
+    RunRecord,
+    SessionRuntimeRegistry,
+    _AgentState,
+)
 from chartreux.app_server.server import AppServer
 from chartreux.core.agents.identity_launch import InvalidChildIdentityError
 from chartreux.core.config.models import RecoveryConfig
@@ -24,6 +28,7 @@ from chartreux.core.subagents import (
     LaunchOutcome,
     LaunchToolOverride,
     RetentionPolicy,
+    RunStatus,
     RunStopReason,
     TaskArgs,
     TaskResult,
@@ -39,9 +44,11 @@ from tests.app_server._subagent_test_support import (
     _consume,
     _dynamic_registry,
     _GatedWakeup,
+    _idle_record,
     _ManualClock,
     _persistent_dynamic_registry,
     _retention_registry,
+    _stored_result,
     _task_call,
     _wait_for_turn_completion,
     _wait_result,
@@ -1747,3 +1754,77 @@ async def test_valid_claim_supersedes_once_and_preserves_the_identity_binding(
     finally:
         await registry.drain_children()
         await parent.aclose()
+
+
+# ---------------------------------------------------------------------------
+# v0.7.0 U3a: uncollected lists across reuse and recovery
+# ---------------------------------------------------------------------------
+
+
+def _finished_run(
+    agent_id: str,
+    run_id: str,
+    *,
+    completed_at: float,
+    status: RunStatus = RunStatus.COMPLETED,
+    resumed_from_run_id: str | None = None,
+) -> RunRecord:
+    future = asyncio.get_running_loop().create_future()
+    future.set_result(None)
+    return RunRecord(
+        run_id=run_id,
+        agent_id=agent_id,
+        identity="coder",
+        status=status,
+        completion_task=future,
+        result=TaskResult(
+            response=f"result for {run_id}",
+            turns_used=1,
+            completed=status is RunStatus.COMPLETED,
+            agent_id=agent_id,
+            run_id=run_id,
+        ),
+        started_at=0.0,
+        completed_at=completed_at,
+        resumed_from_run_id=resumed_from_run_id,
+    )
+
+
+@pytest.mark.asyncio
+async def test_reuse_and_recovery_keep_exact_newest_first_uncollected_lists() -> None:
+    clock = _ManualClock()
+    registry = _retention_registry(clock)
+    record = _idle_record("agent-1", clock=clock)
+
+    # Recovery: the successor run resumes the failed run and must not hide it.
+    first = _finished_run("agent-1", "run-1", completed_at=1.0, status=RunStatus.FAILED)
+    recovery = _finished_run(
+        "agent-1", "run-2", completed_at=3.0, resumed_from_run_id="run-1"
+    )
+    record.run_history.append(first)
+    record.current_run = recovery
+    registry._agent_records[record.agent_id] = record
+    for run in (first, recovery):
+        assert run.completed_at is not None
+        registry._result_store[(record.agent_id, run.run_id)] = _stored_result(
+            record.agent_id, run.run_id, completed_at=run.completed_at
+        )
+
+    assert registry._uncollected_run_ids(record.agent_id) == ["run-2", "run-1"]
+
+    # Plain reuse: a newer run starts and completes; every earlier result stays.
+    record.current_run = None
+    record.run_history.extend([
+        recovery,
+        _finished_run("agent-1", "run-3", completed_at=6.0),
+    ])
+    record.latest_run_id = "run-3"
+    registry._result_store[(record.agent_id, "run-3")] = _stored_result(
+        record.agent_id, "run-3", completed_at=6.0
+    )
+
+    assert registry._uncollected_run_ids(record.agent_id) == ["run-3", "run-2", "run-1"]
+
+    # Pinned collection of the earliest run clears only that exact ID.
+    assert await registry.get_agent_result(record.agent_id, "run-1") is not None
+    assert registry._uncollected_run_ids(record.agent_id) == ["run-3", "run-2"]

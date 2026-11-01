@@ -34,12 +34,7 @@ _PINS: tuple[tuple[str, str, str], ...] = (
         "list the directory with ls to see the matching names, or write "
         "the exact paths instead of the glob",
     ),
-    (
-        "echo =ls",
-        "Zsh equals expansion",
-        "drop the leading equals sign and invoke the command by its "
-        "name or absolute path",
-    ),
+    ("echo =ls", "Zsh equals expansion", "quote the marker"),
     (
         "cat <<EOF\nhi\nEOF",
         "heredocs are unsupported in v0.1",
@@ -72,3 +67,15 @@ def test_syntax_denial_names_the_compliant_alternative(
     assert marker in reason, reason
     assert "Instead," in reason, reason
     assert alternative in reason, reason
+
+
+@pytest.mark.parametrize("command", ["echo =ls", "echo ===X==="])
+def test_unquoted_equals_marker_stays_denied_with_the_quoting_remediation(
+    tmp_path: Path, command: str
+) -> None:
+    # S1 admits the quoted and escaped marker only; the unquoted form keeps
+    # its denial and names the exact remediation (quote the marker).
+    reason = _denied_reason(tmp_path, command)
+    assert "Zsh equals expansion" in reason, reason
+    assert "quote the marker" in reason, reason
+    assert "Instead," in reason, reason

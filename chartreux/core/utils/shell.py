@@ -1,12 +1,39 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 import os
 from pathlib import Path
 
 from chartreux.core.tools.secret_redaction import scrub_child_env
 from chartreux.core.utils.async_subprocess import spawn_registered_process
+
+
+async def spawn_argv_command(
+    argv: Sequence[str],
+    *,
+    cwd: Path | None = None,
+    extra_env: Mapping[str, str] | None = None,
+) -> asyncio.subprocess.Process:
+    """Run one fully literal argv without any shell in between.
+
+    The same environment and output-stream contract as
+    :func:`spawn_shell_command`; nothing in ``argv`` is re-parsed, so a word
+    the caller bound cannot be re-expanded into different arguments.
+    """
+    env = _shell_environment(extra_env)
+    cwd = cwd or Path.cwd()
+    return await spawn_registered_process(
+        asyncio.create_subprocess_exec(
+            *argv,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            stdin=asyncio.subprocess.DEVNULL,
+            env=env,
+            cwd=cwd,
+            start_new_session=True,
+        )
+    )
 
 
 async def spawn_shell_command(
@@ -63,4 +90,4 @@ def _shell_environment(extra_env: Mapping[str, str] | None = None) -> dict[str, 
     return env
 
 
-__all__ = ["spawn_shell_command"]
+__all__ = ["spawn_argv_command", "spawn_shell_command"]

@@ -30,7 +30,10 @@ from chartreux.core.config.agent_selection import (
     AgentSelectionConfig as AgentSelectionConfig,
 )
 from chartreux.core.config.schema import WithDeepMerge
-from chartreux.core.dangerous_commands import OPERATION_REGISTRY
+from chartreux.core.dangerous_commands import (
+    OPERATION_REGISTRY,
+    canonical_remote_destination,
+)
 from chartreux.core.dispatch.route_models import PurposeRoute
 from chartreux.core.llm_models import Backend
 from chartreux.core.paths import SESSION_LOG_DIR
@@ -118,17 +121,63 @@ def normalize_dangerous_command_grants(
     return result
 
 
+def normalize_remote_exec_grants(value: dict[str, list[str]]) -> dict[str, list[str]]:
+    """Canonicalize saved remote-exec destinations without granting authority.
+
+    Each project maps to exact destination spellings. Every entry must
+    canonicalize to one ``user@host:port`` identity (explicit user, default
+    port 22, no wildcards, no alias groups); a malformed entry rejects the
+    whole field rather than being silently dropped.
+    """
+    result: dict[str, list[str]] = {}
+    try:
+        for project, destinations in value.items():
+            if not isinstance(project, str) or not isinstance(destinations, list):
+                raise ValueError
+            project_path = Path(project).expanduser()
+            if not project_path.is_absolute():
+                raise ValueError
+            key = str(project_path.resolve())
+            if key in result:
+                raise ValueError
+            canonical: list[str] = []
+            for destination in destinations:
+                if not isinstance(destination, str):
+                    raise ValueError
+                parsed = canonical_remote_destination(destination)
+                if parsed is None:
+                    raise ValueError
+                if parsed.key not in canonical:
+                    canonical.append(parsed.key)
+            result[key] = canonical
+    except (ValueError, TypeError, OSError, RuntimeError):
+        raise ValueError(
+            "Invalid remote_exec_grants_by_project: absolute project paths, "
+            "unique canonical project keys, and exact user@host:port "
+            "destinations required"
+        ) from None
+    return result
+
+
 class DangerousCommandGrantsInput(BaseModel):
     model_config = ConfigDict(extra="ignore", strict=True)
 
     dangerous_command_grants_by_project: dict[str, list[str]] = Field(
         default_factory=dict
     )
+    remote_exec_grants_by_project: dict[str, list[str]] = Field(default_factory=dict)
 
     @field_validator("dangerous_command_grants_by_project")
     @classmethod
     def canonical_grants(cls, value: dict[str, list[str]]) -> dict[str, list[str]]:
         return normalize_dangerous_command_grants(value)
+
+    @field_validator("remote_exec_grants_by_project")
+    @classmethod
+    def canonical_remote_exec_grants(
+        cls, value: dict[str, list[str]]
+    ) -> dict[str, list[str]]:
+        return normalize_remote_exec_grants(value)
 
 
 class ProjectContextConfig(BaseSettings):

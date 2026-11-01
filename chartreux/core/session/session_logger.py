@@ -16,6 +16,7 @@ import os
 from pathlib import Path
 import subprocess
 from threading import Lock
+import time
 from typing import TYPE_CHECKING, Any, Literal
 from uuid import uuid4
 import warnings
@@ -23,9 +24,11 @@ import warnings
 from chartreux.core.llm_models import (
     CONTEXT_INJECTION_ORIGIN_KEY,
     CONTEXT_INJECTION_TOOL_PAIR_V1,
+    AvailableFunction,
     LLMMessage,
     Role,
 )
+from chartreux.core.message_list import MessageList
 from chartreux.core.session.session_loader import (
     MESSAGES_FILENAME,
     METADATA_FILENAME,
@@ -35,6 +38,17 @@ from chartreux.core.session.session_permissions import (
     ensure_private_directory,
     restrict_private_file,
     restrict_session_permissions,
+)
+from chartreux.core.session.transcript_archive import (
+    ArchivedPrefixV1,
+    ArchiveIntegrityError,
+    ArchiveSaveSnapshot,
+    ArchiveSealError,
+    ArchiveSealReceipt,
+    archived_prefix_chunks,
+    eligible_archive_prefix,
+    iter_archived_records,
+    verify_archived_prefix_on_disk,
 )
 from chartreux.core.session_types import (
     AgentStats,
@@ -55,17 +69,36 @@ from chartreux.utils.platform import resolve_git_executable
 from chartreux.utils.session_id import shorten_session_id
 
 if TYPE_CHECKING:
+    from chartreux.core.agent_loop._transcript_integrity import ArchivedPrefixAuthority
     from chartreux.core.config import ChartreuxConfigSchema, SessionLoggingConfig
     from chartreux.core.tools.manager import ToolManager
 
 
 TMP_CLEANUP_INTERVAL = timedelta(seconds=5)
 TRANSCRIPT_VERIFY_INTERVAL = 64
+# Cooperative GIL release cadence for the persisted-transcript verification
+# (P6). The verify runs on the save worker thread while the event loop keeps
+# rendering the stream, so a 20k-record compare starves frame flushes unless
+# it hands the GIL back periodically. 128 is the measured optimum: tuning on
+# the P0d paired-trial harness recorded 64 -> 41.6% and 256 -> 41.7% median
+# flush-p95 degradation against 128's best point.
+PERSISTED_VERIFY_YIELD_INTERVAL = 128
 # Disk-full save failures are logged at most this often while the condition
 # persists; a successful save resets the rate limit so the next occurrence is
 # reported immediately.
 DISK_FULL_LOG_INTERVAL = timedelta(seconds=60)
 logger = logging.getLogger(__name__)
+# Fields a M1 tombstone retains in its serialized record: role, message_id
+# (None drops out of the record via exclude_none), injected. The private
+# archive reference never serializes, so it cannot appear in a record.
+_TOMBSTONE_RETAINED_KEYS: frozenset[str] = frozenset({"role", "message_id", "injected"})
+# The resolved archive-marker attribute NAME (P6). A module-level import of
+# ``chartreux.core.agent_loop._transcript_integrity`` would cycle
+# (agent_loop -> _loop -> this module), so the function-level import runs
+# ONCE per process and the resolved name is cached here; every per-record
+# ``_message_record`` call then probes ``getattr(message, name, None)``
+# directly instead of paying a function call per record on the save path.
+_archive_reference_attribute_name: str | None = None
 
 
 class SessionDiskFullError(RuntimeError):
@@ -87,6 +120,46 @@ def _is_enospc(exc: BaseException) -> bool:
     if isinstance(exc, BaseExceptionGroup):
         return any(_is_enospc(child) for child in exc.exceptions)
     return isinstance(exc, OSError) and exc.errno == errno.ENOSPC
+
+
+class ArchiveUnavailableError(RuntimeError):
+    """A retained archive descriptor could not be honored on the save path.
+
+    Raised on the save/verify path when an authoritative archive descriptor
+    is retained but its archived bytes cannot be proven on disk, or the
+    retained prefix does not match the declared trim (P4a3, M1 matrix row
+    "missing/truncated/changed archived bytes" and the authority-state
+    class). ``save_interaction``'s non-raising facade surfaces it as a
+    FAILED save with the diagnostic recorded (``last_save_diagnostic``);
+    while a descriptor is retained the session never re-enters the legacy
+    rewrite path. ``recoverable_by_restart`` splits the failure classes:
+    authority-state failures recover by SESSION RESTART; missing, truncated,
+    or changed archived bytes are UNRECOVERABLE in place — the archived
+    history is gone and a new conversation is required (never rebuilt from
+    trimmed messages or tombstones).
+    """
+
+    code = "archive_unavailable"
+
+    def __init__(
+        self, path: Path, reason: str, *, recoverable_by_restart: bool
+    ) -> None:
+        self.path = path
+        self.reason = reason
+        self.recoverable_by_restart = recoverable_by_restart
+        if recoverable_by_restart:
+            message = (
+                f"Archive authority failure at {path}: {reason}. The session "
+                "does not re-enter the legacy rewrite path while a descriptor "
+                "is retained; recover by session restart."
+            )
+        else:
+            message = (
+                f"Archived transcript prefix at {path} is missing, truncated, "
+                f"or changed: {reason}. The archived history is unrecoverable "
+                "in place; a new conversation is required."
+            )
+        super().__init__(message)
 
 
 class _PersistedTranscriptError(ValueError):
@@ -147,6 +220,20 @@ class _TranscriptCursor:
     metadata_published: bool
 
 
+@dataclass(frozen=True)
+class _PromptSerialization:
+    """The metadata blobs a content hash gates, cached in logger memory.
+
+    P2 keeps the previous hash of the system_prompt/tools_available inputs
+    here — in process memory only, never in persisted metadata — so a restarted
+    logger re-serializes once and then rebuilds the hash from that first save.
+    """
+
+    content_hash: bytes
+    system_prompt: dict[str, Any] | None
+    tools_available: list[dict[str, Any]]
+
+
 # Over the method limit, as AgentLoop and ChartreuxApp already are: most of thesethese
 # are one-line accessors onto the metadata record this owns, and hiding them
 # behind a second object would put a hop between the log and everything that
@@ -170,8 +257,24 @@ class SessionLogger:  # noqa: PLR0904
         self._transcript_cursor: _TranscriptCursor | None = None
         self._transcript_saves_since_verify = 0
         self._transcript_cursor_generation = 0
+        # M1 descriptor retention: the archive descriptor is retained
+        # independently of _TranscriptCursor — cursor invalidation discards
+        # append acceleration, never archive authority.
+        self._archive_descriptor: ArchivedPrefixV1 | None = None
+        self._last_save_archive_snapshot: ArchiveSaveSnapshot | None = None
+        # P4a4 reset generation: bumped by every logger rebind (reset_session /
+        # apply_resumed_session). A trim publication planned against an older
+        # reset generation is stale and never overwrites the current authority.
+        self._archive_generation = 0
+        # P4a3 rev J: the fail-closed diagnostic of the most recent failed
+        # save (an ArchiveUnavailableError surfaced through the non-raising
+        # save facade). Cleared by the next successful save.
+        self._last_save_diagnostic: ArchiveUnavailableError | None = None
         self._launch_config_dirty = False
         self._launch_config_generation = 0
+        # P2: the last prompt/tool serialization and the content hash it came
+        # from. Logger memory only, so a restart re-serializes once.
+        self._prompt_serialization: _PromptSerialization | None = None
         # Rate-limits repeated disk-full warnings so saves cannot spam the log.
         self._disk_full_last_logged_at: datetime | None = None
         # Serializes writes so concurrent saves cannot interleave appends to
@@ -222,10 +325,147 @@ class SessionLogger:  # noqa: PLR0904
         return self._persisted
 
     def invalidate_transcript_cursor(self) -> None:
-        """Force the next interaction save to verify the full transcript."""
+        """Force the next interaction save to verify the full transcript.
+
+        Discards append acceleration only: the retained archive descriptor
+        (M1) lives independently of the cursor and is NOT cleared here.
+        """
         self._transcript_cursor_generation += 1
         self._transcript_cursor = None
         self._transcript_saves_since_verify = 0
+
+    @property
+    def archive_descriptor(self) -> ArchivedPrefixV1 | None:
+        """The retained archive descriptor (M1), or None when unarchived."""
+        return self._archive_descriptor
+
+    @property
+    def transcript_save_generation(self) -> int:
+        """The current save generation; moves on every cursor invalidation.
+
+        Read by the trim wiring to plan a ``fence_and_publish_archive_trim``
+        call against the generations it validates.
+        """
+        return self._transcript_cursor_generation
+
+    @property
+    def archive_reset_generation(self) -> int:
+        """The current reset generation; moves on every logger rebind."""
+        return self._archive_generation
+
+    @property
+    def last_save_archive_snapshot(self) -> ArchiveSaveSnapshot | None:
+        """The archive side of the most recent accepted save snapshot (M1)."""
+        return self._last_save_archive_snapshot
+
+    @property
+    def last_save_diagnostic(self) -> ArchiveUnavailableError | None:
+        """The fail-closed diagnostic of the most recent failed save (P4a3).
+
+        ``save_interaction`` never raises an archive-unavailable diagnostic;
+        it records it here and reports a FAILED save instead.
+        """
+        return self._last_save_diagnostic
+
+    def _record_save_failure(self, diagnostic: ArchiveUnavailableError) -> None:
+        """Record a fail-closed save diagnostic on the non-raising facade."""
+        self._last_save_diagnostic = diagnostic
+        logger.warning(
+            "Session save failed closed (%s): %s", diagnostic.code, diagnostic
+        )
+
+    def _active_archive_snapshot(self) -> ArchiveSaveSnapshot:
+        """The archive side of the save the worker thread is executing.
+
+        Read under the save lock: ``save_interaction`` (and ``seal_archive``)
+        publish the snapshot before spawning the persist worker, so the
+        worker sees exactly the snapshot of the save it runs. With no
+        published snapshot a retained descriptor pairs with no epoch, which
+        is non-authoritative (P4a2: only sealing refuses that pairing).
+        """
+        snapshot = self._last_save_archive_snapshot
+        if snapshot is not None:
+            return snapshot
+        return ArchiveSaveSnapshot(
+            descriptor=self._archive_descriptor, message_epoch=None
+        )
+
+    def retain_archive_descriptor(self, descriptor: ArchivedPrefixV1) -> None:
+        """Retain the archive descriptor matching this session (M1).
+
+        Retention is independent of the transcript cursor: a later cursor
+        invalidation does not delete this authority. A descriptor naming a
+        different session is rejected fail-closed, and so is a STALE one: a
+        descriptor whose epoch is older than the retained one never overwrites
+        the current authority (P4a4).
+        """
+        if self.enabled and descriptor.session_id != self.session_id:
+            raise ValueError(
+                f"archive descriptor session_id {descriptor.session_id!r} does not "
+                f"match this logger's session {self.session_id!r}"
+            )
+        current = self._archive_descriptor
+        if current is not None and descriptor.message_epoch < current.message_epoch:
+            raise ValueError(
+                f"stale archive descriptor epoch {descriptor.message_epoch} would "
+                f"overwrite the retained epoch {current.message_epoch}; a stale "
+                "descriptor never overwrites the current one"
+            )
+        self._archive_descriptor = descriptor
+
+    def _drop_mismatched_archive_authority(self, session_id: str) -> None:
+        """Re-validate retained archive authority on a logger rebind (P4a2).
+
+        Retention is session-scoped: a rebind onto a different session drops a
+        retained descriptor naming the old one, fail-closed, while a matching
+        descriptor (a warm continuation onto the same session) is retained.
+        """
+        descriptor = self._archive_descriptor
+        if descriptor is not None and descriptor.session_id != session_id:
+            self._archive_descriptor = None
+
+    def _archive_authority_for(
+        self, messages: Sequence[LLMMessage]
+    ) -> ArchivedPrefixAuthority | None:
+        """The validation-side archive authority for the snapshot being saved.
+
+        Minted (P4a4, M1 §4) only when a retained descriptor's epoch matches
+        the saved list's epoch — the authoritative pairing. Without it the
+        validators get no authority, so any archive marker in the snapshot
+        fails closed there. Function-level import: a top-level import of the
+        agent_loop validator would cycle (agent_loop -> _loop -> this module).
+        """
+        descriptor = self._archive_descriptor
+        if descriptor is None:
+            return None
+        message_epoch = (
+            messages.message_epoch if isinstance(messages, MessageList) else None
+        )
+        if message_epoch is None or descriptor.message_epoch != message_epoch:
+            return None
+        return self._mint_archive_authority(descriptor)
+
+    @staticmethod
+    def _mint_archive_authority(
+        descriptor: ArchivedPrefixV1,
+    ) -> ArchivedPrefixAuthority:
+        """The validation token for an ALREADY authoritative descriptor.
+
+        Used by the save boundary (via ``_archive_authority_for``) and by the
+        sealing planner, which holds a plain message snapshot — no list epoch
+        to re-derive. Every caller must have established the authoritative
+        pairing first. Function-level import: a top-level import of the
+        agent_loop validator would cycle (agent_loop -> _loop -> this module).
+        """
+        from chartreux.core.agent_loop._transcript_integrity import (
+            ArchivedPrefixAuthority,
+        )
+
+        return ArchivedPrefixAuthority(
+            archived_count=descriptor.archived_count,
+            boundary_message_id=descriptor.boundary_message_id,
+            message_epoch=descriptor.message_epoch,
+        )
 
     @property
     def active_model(self) -> str | None:
@@ -563,7 +803,9 @@ class SessionLogger:  # noqa: PLR0904
             ) from e
 
     @staticmethod
-    def _message_record(message: LLMMessage) -> dict[str, Any]:
+    def _message_record(
+        message: LLMMessage, *, allow_archived: bool = False
+    ) -> dict[str, Any]:
         """The explicit session-transcript record for one message (round-5 Y).
 
         Starts with the ordinary ``model_dump`` (which NEVER emits the
@@ -576,7 +818,31 @@ class SessionLogger:  # noqa: PLR0904
         repaired-transcript serialization, the incremental boundary
         comparison and tail serialization, and the full-save
         serialization/comparison).
+
+        M1: a message carrying the private archive reference is an
+        archived/tombstone replacement, and that marker must never be
+        persisted — the archived bytes on disk are the only authoritative
+        record of a sealed slot. Persist-path calls therefore REJECT marked
+        messages fail-closed (the default); only the streaming
+        verify/comparison paths pass ``allow_archived=True``, because they
+        compare the retained trimmed record against disk and never write.
         """
+        global _archive_reference_attribute_name
+        if _archive_reference_attribute_name is None:
+            from chartreux.core.agent_loop._transcript_integrity import (
+                ARCHIVE_REFERENCE_ATTRIBUTE,
+            )
+
+            _archive_reference_attribute_name = ARCHIVE_REFERENCE_ATTRIBUTE
+        if (
+            not allow_archived
+            and getattr(message, _archive_reference_attribute_name, None) is not None
+        ):
+            raise ValueError(
+                "an archived/tombstone message marker must never be persisted "
+                "to the session transcript; the archived bytes on disk are the "
+                "only authoritative record of a sealed slot"
+            )
         record = message.model_dump(exclude_none=True, mode="json")
         if (
             message.role == Role.assistant
@@ -593,7 +859,7 @@ class SessionLogger:  # noqa: PLR0904
         return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
     # Keep cancellation draining and error handling in one lock scope.
-    async def save_interaction(  # noqa: PLR0915 - one serialized commit boundary
+    async def save_interaction(  # noqa: PLR0915, PLR0912 - one serialized commit boundary
         self,
         messages: Sequence[LLMMessage],
         stats: AgentStats,
@@ -620,11 +886,26 @@ class SessionLogger:  # noqa: PLR0904
         # persisted. The append/insert boundary already refuses to create one;
         # this backstop fails closed with the typed local diagnostic so no
         # unknown path can re-poison the log the load-time repair just healed.
-        self._check_transcript_persistence(non_system_messages)
+        # P4a4: with an authoritative retained descriptor the save recognizes
+        # its authorized archived prefix (M1 §4); without one, any archive
+        # marker in the snapshot fails closed.
+        self._check_transcript_persistence(
+            non_system_messages, archived_prefix=self._archive_authority_for(messages)
+        )
 
         # Serialization and fsync are too slow for the UI thread, so snapshot
         # here and hand off to a worker thread.
         messages_snapshot = list(messages)
+        # M1: the save snapshot captures the retained archive descriptor WITH
+        # the message epoch of the list being saved. Dormant until a later
+        # subwave seals an archive: with no retained descriptor this captures
+        # as ArchiveSaveSnapshot(None, <epoch>).
+        archive_snapshot = ArchiveSaveSnapshot(
+            descriptor=self._archive_descriptor,
+            message_epoch=(
+                messages.message_epoch if isinstance(messages, MessageList) else None
+            ),
+        )
         config_snapshot = config.model_dump(mode="json")
         async with self._save_lock:
             # Fence the entire write (transcript and metadata), not only the
@@ -637,6 +918,7 @@ class SessionLogger:  # noqa: PLR0904
             metadata_snapshot = session_metadata.model_copy(deep=True)
             cursor_snapshot = self._transcript_cursor
             saves_since_verify = self._transcript_saves_since_verify
+            self._last_save_archive_snapshot = archive_snapshot
 
             def persist() -> tuple[_TranscriptCursor | None, int] | None:
                 return self._save_interaction_sync(
@@ -660,6 +942,12 @@ class SessionLogger:  # noqa: PLR0904
                 # retries persistence.
                 self._note_disk_full(disk_full)
                 return
+            except ArchiveUnavailableError as unavailable:
+                # P4a3 rev J: fail closed through the non-raising facade — a
+                # FAILED save with the diagnostic recorded, never a legacy
+                # rewrite while a descriptor is retained.
+                self._record_save_failure(unavailable)
+                return
             except asyncio.CancelledError as cancellation:
                 # ``to_thread`` keeps running after its awaiter is cancelled. Keep
                 # the save lock until that worker has finished so a subsequent
@@ -677,6 +965,8 @@ class SessionLogger:  # noqa: PLR0904
                         save_result = persistence.result()
                     except SessionDiskFullError as disk_full:
                         self._note_disk_full(disk_full)
+                    except ArchiveUnavailableError as unavailable:
+                        self._record_save_failure(unavailable)
                     except Exception:
                         # The caller's cancellation remains the observable outcome,
                         # but retrieving the exception avoids abandoning the task.
@@ -701,16 +991,26 @@ class SessionLogger:  # noqa: PLR0904
                 )
             self._persisted = True
             # A successful save is a state change: report the next disk-full
-            # occurrence immediately instead of staying rate-limited.
+            # occurrence immediately instead of staying rate-limited, and
+            # clear any recorded fail-closed save diagnostic (P4a3).
             self._disk_full_last_logged_at = None
+            self._last_save_diagnostic = None
             if self._launch_config_generation == launch_config_generation:
                 self._launch_config_dirty = False
 
     @staticmethod
     def _check_transcript_persistence(
         non_system_messages: Sequence[LLMMessage],
+        *,
+        archived_prefix: ArchivedPrefixAuthority | None = None,
     ) -> None:
         """S1 save boundary: fail closed, never silently persist a defect.
+
+        ``archived_prefix`` (P4a4, M1 §4) is the authorized archived prefix of
+        the snapshot, minted by :meth:`_archive_authority_for` only for an
+        authoritative descriptor/epoch pairing: the validators recognize the
+        sealed head by that authority — never by a compaction marker alone —
+        and any archive marker without matching authority fails closed here.
 
         Function-level import: a top-level import of the agent_loop validator
         would cycle (agent_loop -> _loop -> this module).
@@ -720,7 +1020,9 @@ class SessionLogger:  # noqa: PLR0904
             find_persistence_violations,
         )
 
-        violations = find_persistence_violations(non_system_messages)
+        violations = find_persistence_violations(
+            non_system_messages, archived_prefix=archived_prefix
+        )
         if violations:
             raise TranscriptIntegrityError(violations, context="session save boundary")
 
@@ -735,6 +1037,425 @@ class SessionLogger:  # noqa: PLR0904
             "Session persistence failed: the disk is full (%s). The session "
             "continues in memory; persistence retries on the next save.",
             disk_full.path,
+        )
+
+    def _plan_archive_seal(
+        self,
+        messages_snapshot: list[LLMMessage],
+        message_epoch: int | None,
+        trim_mode: Literal["payloads", "tombstones"],
+        messages_path: Path,
+    ) -> ArchivedPrefixV1:
+        """Validate the closed prefix and build its descriptor (M1 §4 item 1).
+
+        Every refusal raises ``ArchiveSealError`` and issues no receipt: stale
+        retained authority, a missing message epoch, no eligible prefix, a
+        malformed assistant/tool structure in the closed prefix, or a retained
+        prefix whose disk bytes no longer verify. A RE-SEAL over an already
+        sealed prefix extends the descriptor from the OLD PREFIX DISK BYTES
+        plus the newly eligible records (see ``_extend_archive_descriptor``):
+        after a real trim the RAM copies no longer carry the original
+        payloads, so re-serializing them from RAM would desynchronize the
+        descriptor from the authoritative disk bytes.
+        """
+        retained = self._archive_descriptor
+        archive_snapshot = ArchiveSaveSnapshot(
+            descriptor=retained, message_epoch=message_epoch
+        )
+        # P4a2 open question (a): a retained descriptor paired with a different
+        # list epoch is stale authority. Ordinary saves do NOT hard-fail on it
+        # (the live-list save stays correct); sealing refuses — no receipt.
+        if retained is not None and not archive_snapshot.is_authoritative:
+            raise ArchiveSealError(
+                f"retained archive descriptor epoch {retained.message_epoch} does "
+                f"not match the saved list epoch {message_epoch}; sealing refused"
+            )
+        if message_epoch is None:
+            raise ArchiveSealError(
+                "cannot seal a plain message sequence: no message epoch to pin "
+                "the receipt to"
+            )
+        eligible = eligible_archive_prefix(messages_snapshot)
+        if eligible is None:
+            raise ArchiveSealError(
+                "no eligible archive prefix: no compaction boundary with a "
+                "complete settled round strictly before it"
+            )
+        prefix_messages = list(eligible.messages)
+        # M1 §4 required-contract item 1: strictly validate the closed prefix
+        # BEFORE sealing — a malformed assistant/tool structure yields no receipt.
+        from chartreux.core.agent_loop._transcript_integrity import validate_transcript
+
+        # A re-seal validates a prefix whose head is already sealed: the
+        # retained authority is the ONLY way the validators may recognize that
+        # contiguous archived head (M1 §4 — never skip everything before a
+        # marker). Without a retained descriptor this is None and any marker
+        # fails closed here. The stale-retained check above has already
+        # established the authoritative pairing, and ``messages_snapshot`` is a
+        # plain sequence (no list epoch to re-derive).
+        archived_prefix_authority = (
+            self._mint_archive_authority(retained) if retained is not None else None
+        )
+        violations = validate_transcript(
+            prefix_messages,
+            live_tail_exempt=False,
+            archived_prefix=archived_prefix_authority,
+        )
+        if violations:
+            raise ArchiveSealError(
+                "the closed prefix failed the strict settled-transcript "
+                "validation; no receipt",
+                violations=tuple(violations),
+            )
+        non_system_messages = [
+            message for message in messages_snapshot if message.role != Role.system
+        ]
+        # The sealing persist must not write a defect the save boundary would
+        # refuse: the same S1 check over the whole snapshot, recognizing the
+        # retained prefix's authority when the pairing is authoritative (P4a4).
+        self._check_transcript_persistence(
+            non_system_messages, archived_prefix=archived_prefix_authority
+        )
+        if retained is not None:
+            # A re-seal over the same (authoritative) list: the first
+            # ``retained.archived_count`` prefix slots are the payload-trimmed
+            # replacements, so their authoritative bytes are the OLD PREFIX
+            # DISK BYTES. Extend from those plus the newly eligible records
+            # instead of re-serializing the trimmed RAM copies.
+            return self._extend_archive_descriptor(
+                retained,
+                prefix_messages,
+                message_epoch,
+                trim_mode,
+                boundary_message_id=eligible.boundary_message_id,
+                messages_path=messages_path,
+            )
+        prefix_records = [SessionLogger._message_record(m) for m in prefix_messages]
+        archived_bytes = SessionLogger._transcript_bytes(prefix_records)
+        return ArchivedPrefixV1(
+            session_id=self.session_id,
+            message_epoch=message_epoch,
+            archived_count=len(prefix_records),
+            prefix_end_byte=len(archived_bytes),
+            prefix_sha256=hashlib.sha256(archived_bytes).hexdigest(),
+            boundary_message_id=eligible.boundary_message_id,
+            trim_mode=trim_mode,
+        )
+
+    def _extend_archive_descriptor(
+        self,
+        retained: ArchivedPrefixV1,
+        prefix_messages: Sequence[LLMMessage],
+        message_epoch: int,
+        trim_mode: Literal["payloads", "tombstones"],
+        *,
+        boundary_message_id: str | None,
+        messages_path: Path,
+    ) -> ArchivedPrefixV1:
+        """Extend an already sealed prefix's descriptor (P4d, P4b open item a).
+
+        The OLD PREFIX DISK BYTES are authoritative, so the extension is built
+        from exactly those bytes plus the newly eligible records' serialized
+        form — never from the trimmed RAM copies. The retained prefix is
+        re-verified against its descriptor in the SAME streaming read that
+        feeds the new hash: changed archived bytes are a refusal (no receipt),
+        so a re-seal can never re-anchor mutated history. A trim-mode change
+        is refused the same way, because the retained copies' declared
+        transformation would no longer describe the retained fields.
+        """
+        if trim_mode != retained.trim_mode:
+            raise ArchiveSealError(
+                f"cannot extend a {retained.trim_mode!r} archived prefix with a "
+                f"{trim_mode!r} trim; no receipt"
+            )
+        if len(prefix_messages) < retained.archived_count:
+            raise ArchiveSealError(
+                f"the eligible prefix holds {len(prefix_messages)} records but the "
+                f"retained archive already sealed {retained.archived_count}; no receipt"
+            )
+        hasher = hashlib.sha256()
+
+        def hashed_chunks() -> Iterator[bytes]:
+            # One read serves both proofs: iter_archived_records validates the
+            # exact chunks the extension hash is computed over.
+            for chunk in archived_prefix_chunks(
+                messages_path, retained.prefix_end_byte
+            ):
+                hasher.update(chunk)
+                yield chunk
+
+        try:
+            for _record in iter_archived_records(retained, hashed_chunks()):
+                pass
+        except ArchiveIntegrityError as exc:
+            raise ArchiveSealError(
+                "the retained archived prefix no longer verifies against its "
+                f"descriptor, so it cannot be extended: {exc}"
+            ) from exc
+        except OSError as exc:
+            raise ArchiveSealError(
+                f"cannot read the retained archived prefix at {messages_path}: {exc}"
+            ) from exc
+        extension_records = [
+            SessionLogger._message_record(message)
+            for message in prefix_messages[retained.archived_count :]
+        ]
+        extension_bytes = SessionLogger._transcript_bytes(extension_records)
+        hasher.update(extension_bytes)
+        return ArchivedPrefixV1(
+            session_id=self.session_id,
+            message_epoch=message_epoch,
+            archived_count=len(prefix_messages),
+            prefix_end_byte=retained.prefix_end_byte + len(extension_bytes),
+            prefix_sha256=hasher.hexdigest(),
+            boundary_message_id=boundary_message_id,
+            trim_mode=trim_mode,
+        )
+
+    def _seal_persist_sync(
+        self,
+        messages_snapshot: list[LLMMessage],
+        stats: AgentStats,
+        tool_manager: ToolManager,
+        session_dir: Path,
+        session_metadata: SessionMetadata,
+        config_snapshot: dict[str, Any],
+        launch_config_dirty: bool,
+        cursor: _TranscriptCursor | None,
+        saves_since_verify: int,
+    ) -> tuple[_TranscriptCursor | None, int]:
+        """The sealing durable persist (runs on a worker thread under the lock)."""
+        session_metadata.config = config_snapshot
+        metadata_snapshot = session_metadata.model_copy(deep=True)
+        return self._save_interaction_sync(
+            messages_snapshot,
+            stats,
+            tool_manager,
+            session_dir,
+            metadata_snapshot,
+            False,
+            launch_config_dirty,
+            cursor,
+            saves_since_verify,
+        )
+
+    async def seal_archive(
+        self,
+        messages: Sequence[LLMMessage],
+        stats: AgentStats,
+        config: ChartreuxConfigSchema,
+        tool_manager: ToolManager,
+        *,
+        trim_mode: Literal["payloads", "tombstones"] = "payloads",
+    ) -> ArchiveSealReceipt:
+        """Seal the eligible closed prefix and return its durable receipt (M1).
+
+        A returned save call is NOT authorization: this operation runs its own
+        durable persist under ``_save_lock`` and issues the receipt only after
+        that persist AND the on-disk verification of the sealed prefix bytes.
+        Every refusal raises and issues NO receipt: ``ArchiveSealError`` for an
+        ineligible or malformed prefix or stale retained authority,
+        ``TranscriptIntegrityError`` from the save boundary, and
+        ``SessionDiskFullError`` propagates from the persist itself — the
+        fail-soft catch-and-continue of ``save_interaction`` is deliberately
+        NOT applied here, which is exactly the gap the receipt closes.
+        """
+        session_info = self._get_session_info()
+        if session_info is None:
+            raise ArchiveSealError(
+                "session logging is disabled; no archive can be sealed"
+            )
+        session_dir, session_metadata = session_info
+        cursor_generation_snapshot = self._transcript_cursor_generation
+        messages_snapshot = list(messages)
+        message_epoch = (
+            messages.message_epoch if isinstance(messages, MessageList) else None
+        )
+        retained_before = self._archive_descriptor
+        # P4d: a re-seal reads the retained prefix's disk bytes, so the plan
+        # runs off the event loop (the first seal stays RAM-only).
+        descriptor = await asyncio.to_thread(
+            self._plan_archive_seal,
+            messages_snapshot,
+            message_epoch,
+            trim_mode,
+            session_dir / MESSAGES_FILENAME,
+        )
+        config_snapshot = config.model_dump(mode="json")
+        launch_config_generation = self._launch_config_generation
+        async with self._save_lock:
+            # A rewind/reset between the snapshot and the lock invalidates the
+            # sealing snapshot itself: refuse, no receipt.
+            if self._transcript_cursor_generation != cursor_generation_snapshot:
+                raise ArchiveSealError(
+                    "the transcript was rewound or reset while sealing; no receipt"
+                )
+            if self._archive_descriptor is not retained_before:
+                raise ArchiveSealError(
+                    "the retained archive authority changed while sealing; no receipt"
+                )
+            # P4a3: the sealing persist runs against the PRE-seal retained
+            # authority — publish its snapshot so the worker's save path
+            # verifies (and preserves) the old archived prefix on a re-seal.
+            # A refused seal restores the previous snapshot: no receipt, no
+            # visible save-snapshot change.
+            previous_snapshot = self._last_save_archive_snapshot
+            self._last_save_archive_snapshot = ArchiveSaveSnapshot(
+                descriptor=retained_before, message_epoch=message_epoch
+            )
+            try:
+                persistence = asyncio.create_task(
+                    asyncio.to_thread(
+                        self._seal_persist_sync,
+                        messages_snapshot,
+                        stats,
+                        tool_manager,
+                        session_dir,
+                        session_metadata,
+                        config_snapshot,
+                        self._launch_config_dirty,
+                        self._transcript_cursor,
+                        self._transcript_saves_since_verify,
+                    )
+                )
+                try:
+                    save_result = await asyncio.shield(persistence)
+                except asyncio.CancelledError as cancellation:
+                    # The filesystem worker outlives cancellation: keep the save
+                    # lock until it finishes so no later save interleaves. No
+                    # receipt is issued either way.
+                    while not persistence.done():
+                        try:
+                            await asyncio.shield(persistence)
+                        except asyncio.CancelledError:
+                            continue
+                        except Exception:
+                            break
+                    if not persistence.cancelled():
+                        with contextlib.suppress(Exception):
+                            persistence.result()
+                    raise cancellation
+                # SessionDiskFullError from the persist propagates: the sealing
+                # path is NOT fail-soft, and no receipt is issued.
+                if (
+                    save_result is not None
+                    and self._transcript_cursor_generation == cursor_generation_snapshot
+                ):
+                    self._transcript_cursor, self._transcript_saves_since_verify = (
+                        save_result
+                    )
+                messages_path = session_dir / MESSAGES_FILENAME
+                # The receipt is issued only after the durable persist AND the
+                # on-disk verification of the sealed prefix bytes.
+                await asyncio.to_thread(
+                    verify_archived_prefix_on_disk, descriptor, messages_path
+                )
+            except BaseException:
+                self._last_save_archive_snapshot = previous_snapshot
+                raise
+            receipt = ArchiveSealReceipt(
+                descriptor=descriptor, sealed_at=utc_now().isoformat()
+            )
+            self.retain_archive_descriptor(descriptor)
+            self._last_save_archive_snapshot = ArchiveSaveSnapshot(
+                descriptor=descriptor, message_epoch=message_epoch
+            )
+            self._persisted = True
+            self._disk_full_last_logged_at = None
+            if self._launch_config_generation == launch_config_generation:
+                self._launch_config_dirty = False
+            return receipt
+
+    def fence_and_publish_archive_trim(
+        self,
+        messages: MessageList,
+        descriptor: ArchivedPrefixV1,
+        replacements: Sequence[Any],
+        *,
+        save_generation: int,
+        reset_generation: int,
+    ) -> None:
+        """The P4a4 generation fence + synchronous trim publication (M1 §4 step 6).
+
+        Fences QUEUED STALE SAVES — the save generation moves, so every save
+        that snapshotted before this call discards itself under the save lock
+        before publishing anything (a cancelled in-flight save drains under the
+        lock and its post-drain publication is discarded by the same fence) —
+        then publishes the replacements and the DESCRIPTOR in ONE synchronous
+        block: this method is a plain ``def``, so no ``await`` can intervene
+        between the fence and the publish, and no ``reset()`` is called and no
+        reset hook fires.
+
+        ``replacements`` holds one replacement per sealed slot (TEST-DOUBLE
+        objects at P4a4 — the P4b replacement model lands later): exactly
+        ``descriptor.archived_count`` of them, applied same-slot by ABSOLUTE
+        index over the non-system sequence, so no slot is inserted or deleted
+        and system messages are preserved.
+
+        Save/reset/cancellation generations are all handled: a descriptor
+        planned against a departed ``save_generation`` or ``reset_generation``,
+        one whose epoch predates the retained authority, or one that does not
+        match the list's epoch is STALE — it raises fail-closed and never
+        overwrites the current descriptor.
+        """
+        if not self.enabled:
+            raise ValueError("session logging is disabled; no archive can be published")
+        if descriptor.session_id != self.session_id:
+            raise ValueError(
+                f"archive descriptor session_id {descriptor.session_id!r} does not "
+                f"match this logger's session {self.session_id!r}"
+            )
+        if reset_generation != self._archive_generation:
+            raise ValueError(
+                f"stale reset generation {reset_generation} != current "
+                f"{self._archive_generation}: the logger was rebound since this "
+                "descriptor was planned; a stale descriptor never overwrites"
+            )
+        if save_generation != self._transcript_cursor_generation:
+            raise ValueError(
+                f"stale save generation {save_generation} != current "
+                f"{self._transcript_cursor_generation}: the transcript was "
+                "invalidated since this descriptor was planned; a stale "
+                "descriptor never overwrites"
+            )
+        current = self._archive_descriptor
+        if current is not None and descriptor.message_epoch < current.message_epoch:
+            raise ValueError(
+                f"stale archive descriptor epoch {descriptor.message_epoch} would "
+                f"overwrite the retained epoch {current.message_epoch}; a stale "
+                "descriptor never overwrites the current one"
+            )
+        message_epoch = messages.message_epoch
+        if descriptor.message_epoch != message_epoch:
+            raise ValueError(
+                f"archive descriptor epoch {descriptor.message_epoch} does not "
+                f"match the list epoch {message_epoch}"
+            )
+        non_system_indexes = [
+            index
+            for index, message in enumerate(messages)
+            if message.role is not Role.system
+        ]
+        if descriptor.archived_count > len(non_system_indexes):
+            raise ValueError(
+                f"descriptor archives {descriptor.archived_count} records but the "
+                f"list holds only {len(non_system_indexes)} non-system messages"
+            )
+        if len(replacements) != descriptor.archived_count:
+            raise ValueError(
+                f"trim publication replaces exactly one slot per archived record: "
+                f"got {len(replacements)} replacements for "
+                f"{descriptor.archived_count} sealed slots"
+            )
+        # M1 §4 step 6: fence first, then publish — one synchronous block, no
+        # intervening await, no reset(), no reset hooks. The list applies the
+        # replacements same-slot over the non-system sequence and takes the
+        # descriptor in its own lock scope (P4b's MessageList publication).
+        self.invalidate_transcript_cursor()
+        messages.publish_archive_trim(descriptor, replacements)
+        self._archive_descriptor = descriptor
+        self._last_save_archive_snapshot = ArchiveSaveSnapshot(
+            descriptor=descriptor, message_epoch=message_epoch
         )
 
     @staticmethod
@@ -908,6 +1629,41 @@ class SessionLogger:  # noqa: PLR0904
             ) from exc
 
     @staticmethod
+    def _stream_persisted_records_from(
+        messages_path: Path, offset: int
+    ) -> Iterator[dict[str, Any]]:
+        """Stream persisted transcript records after ``offset`` bytes (P4a3).
+
+        Same contract as ``_stream_persisted_records`` — BOM-selected codec,
+        one parsed record at a time, ``_PersistedTranscriptError`` on a bad
+        line, a missing file yields nothing — but the stream starts at a
+        byte offset, so the archive-aware verify compares the live tail
+        without re-reading the archived prefix. The offset is a record
+        boundary (``prefix_end_byte`` sits immediately after a newline), so
+        the incremental decoder never starts inside a multi-byte sequence.
+        """
+        try:
+            if not messages_path.exists():
+                return
+            with messages_path.open("rb") as raw:
+                encoding = _transcript_encoding(raw.peek(4)[:4])
+                raw.seek(offset)
+                with io.TextIOWrapper(raw, encoding=encoding) as lines:
+                    for line in lines:
+                        message = json.loads(line)
+                        if not isinstance(message, dict):
+                            raise _PersistedTranscriptError(
+                                f"{messages_path}: transcript line is not a JSON object"
+                            )
+                        yield message
+        except _PersistedTranscriptError:
+            raise
+        except (OSError, ValueError) as exc:
+            raise _PersistedTranscriptError(
+                f"{messages_path}: unreadable transcript: {exc}"
+            ) from exc
+
+    @staticmethod
     def _transcript_line_digest(message_data: dict[str, Any]) -> str:
         line = json.dumps(message_data, ensure_ascii=False)
         return hashlib.sha256(line.encode("utf-8")).hexdigest()
@@ -954,6 +1710,7 @@ class SessionLogger:  # noqa: PLR0904
         tool_manager: ToolManager,
         session_metadata: SessionMetadata,
     ) -> dict[str, Any]:
+        """Serialize the prompt/tool blobs and assemble the metadata payload."""
         tools_available = [
             {"type": "function", "function": fn.model_dump()}
             for fn in tool_manager.available_tool_specs()
@@ -963,6 +1720,19 @@ class SessionLogger:  # noqa: PLR0904
             if messages and messages[0].role == Role.system
             else None
         )
+        return self._assemble_metadata_dump(
+            non_system_messages, stats, session_metadata, system_prompt, tools_available
+        )
+
+    def _assemble_metadata_dump(
+        self,
+        non_system_messages: list[LLMMessage],
+        stats: AgentStats,
+        session_metadata: SessionMetadata,
+        system_prompt: dict[str, Any] | None,
+        tools_available: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        """Assemble the metadata payload around already-serialized blobs."""
         last_message_fingerprint = (
             self._message_fingerprint(non_system_messages[-1])
             if non_system_messages
@@ -981,6 +1751,75 @@ class SessionLogger:  # noqa: PLR0904
             metadata_dump["launch_config"] = session_metadata.launch_config.model_dump(
                 mode="json"
             )
+        return metadata_dump
+
+    @staticmethod
+    def _prompt_content_hash(
+        system_message: LLMMessage | None, tool_specs: Sequence[AvailableFunction]
+    ) -> bytes:
+        """Content hash of the inputs the prompt/tool serialization renders.
+
+        Each input is rendered by pydantic's JSON encoder and folded in by its
+        Python content hash: a rendered blob is unchanged exactly when its hash
+        is, so a prompt edit, an added or dropped tool, a changed description,
+        and a changed parameter schema each change the digest. Rendering through
+        pydantic-core and hashing the rendered text in place (rather than
+        encoding a second bytes copy of it) is the cheapest faithful render
+        available — noticing that the content changed costs one pass over it.
+        The digest is compared only within this process, so per-process hash
+        seeding is harmless.
+        """
+        digest = hashlib.blake2b(digest_size=16)
+        if system_message is not None:
+            digest.update(b"+prompt")
+            digest.update(str(hash(system_message.model_dump_json())).encode())
+        for spec in tool_specs:
+            digest.update(b"\x00tool")
+            digest.update(str(hash(spec.model_dump_json())).encode())
+        return digest.digest()
+
+    def _gated_metadata_dump(
+        self,
+        messages: list[LLMMessage],
+        non_system_messages: list[LLMMessage],
+        stats: AgentStats,
+        tool_manager: ToolManager,
+        session_metadata: SessionMetadata,
+    ) -> dict[str, Any]:
+        """Serialize the metadata payload, gated by the prompt/tool content hash.
+
+        The system prompt and the tool roster change rarely, so their
+        serializations are reused while the hash of their inputs is unchanged;
+        the per-save fields (end time, stats, message count and fingerprint) are
+        always rebuilt. The hash lives in logger memory only (P2's hash storage
+        pin), so a restarted logger re-serializes once and then rebuilds it.
+        """
+        system_message = (
+            messages[0] if messages and messages[0].role == Role.system else None
+        )
+        content_hash = SessionLogger._prompt_content_hash(
+            system_message, tool_manager.available_tool_specs()
+        )
+        cached = self._prompt_serialization
+        if cached is not None and cached.content_hash == content_hash:
+            system_prompt = (
+                dict(cached.system_prompt) if cached.system_prompt is not None else None
+            )
+            return self._assemble_metadata_dump(
+                non_system_messages,
+                stats,
+                session_metadata,
+                system_prompt,
+                [dict(item) for item in cached.tools_available],
+            )
+        metadata_dump = self._interaction_metadata_dump(
+            messages, non_system_messages, stats, tool_manager, session_metadata
+        )
+        self._prompt_serialization = _PromptSerialization(
+            content_hash=content_hash,
+            system_prompt=metadata_dump["system_prompt"],
+            tools_available=list(metadata_dump["tools_available"]),
+        )
         return metadata_dump
 
     def _save_interaction_sync(
@@ -1071,7 +1910,7 @@ class SessionLogger:  # noqa: PLR0904
                 )
 
             if tail or not (cursor.metadata_published and not launch_config_dirty):
-                metadata_dump = self._interaction_metadata_dump(
+                metadata_dump = self._gated_metadata_dump(
                     messages, non_system_messages, stats, tool_manager, session_metadata
                 )
                 SessionLogger._persist_metadata_sync(metadata_dump, session_dir)
@@ -1140,6 +1979,12 @@ class SessionLogger:  # noqa: PLR0904
         materialized: the persisted records stream off disk and the live
         records dump one at a time, so the residency is one record pair
         (P4a).
+
+        Both phases — the comparison and the drain that follows it — release
+        the GIL every ``PERSISTED_VERIFY_YIELD_INTERVAL`` persisted records
+        (P6): the verify occupies the save worker thread while the event
+        loop keeps rendering the stream, and an uninterrupted 20k-record
+        pass starves that render.
         """
         persisted_count = 0
         transcript_valid = True
@@ -1147,13 +1992,21 @@ class SessionLogger:  # noqa: PLR0904
         last_live_message: LLMMessage | None = None
         try:
             persisted_records = SessionLogger._stream_persisted_records(messages_path)
+            comparison_count = 0
             for live_message in (
                 message for message in messages if message.role != Role.system
             ):
                 persisted_record = next(persisted_records, None)
                 if persisted_record is None:
                     break
-                if persisted_record != SessionLogger._message_record(live_message):
+                # The cadence counts records consumed, so it is identical in
+                # both phases and independent of the match outcome.
+                comparison_count += 1
+                if comparison_count % PERSISTED_VERIFY_YIELD_INTERVAL == 0:
+                    time.sleep(0)
+                if persisted_record != SessionLogger._message_record(
+                    live_message, allow_archived=True
+                ):
                     boundary_unchanged = False
                     break
                 persisted_count += 1
@@ -1166,12 +2019,204 @@ class SessionLogger:  # noqa: PLR0904
             # Drain the remainder: the comparison stops early, but a corrupt
             # line anywhere in the transcript must still quarantine it, so
             # every line is parsed exactly once across compare and drain.
+            drained_count = 0
             for _ in persisted_records:
-                pass
+                drained_count += 1
+                if drained_count % PERSISTED_VERIFY_YIELD_INTERVAL == 0:
+                    time.sleep(0)
         except _PersistedTranscriptError:
             transcript_valid = False
             boundary_unchanged = False
         return persisted_count, transcript_valid, boundary_unchanged, last_live_message
+
+    @staticmethod
+    def _retained_prefix_record_matches(
+        live_record: dict[str, Any],
+        archived_record: dict[str, Any],
+        trim_mode: Literal["payloads", "tombstones"],
+    ) -> bool:
+        """Whether a retained prefix record is the declared trim of the archived one.
+
+        M1's full verify compares the retained prefix FIELDS against the
+        declared trim transformation, never against the raw archived record:
+        an untrimmed retained message equals the archived record; ``payloads``
+        may only drop ``reasoning_payloads``; ``tombstones`` may only keep
+        role/message_id/injected (the private archive reference never
+        serializes). Every retained field must equal the archived value.
+        """
+        if live_record == archived_record:
+            return True
+        if trim_mode == "payloads":
+            dropped = set(archived_record) - set(live_record)
+            return dropped <= {"reasoning_payloads"} and all(
+                archived_record[key] == value for key, value in live_record.items()
+            )
+        if trim_mode == "tombstones":
+            return (
+                set(live_record) <= _TOMBSTONE_RETAINED_KEYS
+                and live_record.get("role") == archived_record.get("role")
+                and all(
+                    archived_record.get(key) == value
+                    for key, value in live_record.items()
+                    if key != "role"
+                )
+            )
+        return False
+
+    def _verify_archived_prefix(
+        self,
+        live_prefix: Sequence[LLMMessage],
+        messages_path: Path,
+        descriptor: ArchivedPrefixV1,
+    ) -> None:
+        """Phase A: stream-hash the archived bytes and check the retained fields.
+
+        Streams the archived byte prefix through the shared read interface
+        (``iter_archived_records`` over ``archived_prefix_chunks``) — byte
+        count, sha256, record count, and per-line structure all validated —
+        while comparing each retained prefix record against the declared trim
+        transformation. Byte-level integrity is proven FIRST (exhausting the
+        stream runs the descriptor's checks); only a hash-clean archive has
+        its retained fields compared, so a retained mismatch is raised after
+        the drain. Raises ``ArchiveUnavailableError`` fail-closed:
+        missing/truncated/changed archived bytes are unrecoverable in place;
+        a retained-field mismatch is an authority-state failure.
+        """
+        # A retained mismatch is recorded and raised after the drain, so the
+        # byte/hash validation always classifies a damaged prefix first.
+        prefix_mismatch: int | None = None
+        try:
+            archived_records = iter_archived_records(
+                descriptor,
+                archived_prefix_chunks(messages_path, descriptor.prefix_end_byte),
+            )
+            live_iter = iter(live_prefix)
+            index = 0
+            for archived_record in archived_records:
+                index += 1
+                if index % PERSISTED_VERIFY_YIELD_INTERVAL == 0:
+                    time.sleep(0)
+                live_message = next(live_iter, None)
+                if live_message is None:
+                    # The live list is shorter than the archived prefix: the
+                    # remaining archived records drain (and validate) below.
+                    break
+                if prefix_mismatch is None and not (
+                    SessionLogger._retained_prefix_record_matches(
+                        SessionLogger._message_record(
+                            live_message, allow_archived=True
+                        ),
+                        archived_record,
+                        descriptor.trim_mode,
+                    )
+                ):
+                    prefix_mismatch = index - 1
+            drained = 0
+            for _record in archived_records:
+                drained += 1
+                if drained % PERSISTED_VERIFY_YIELD_INTERVAL == 0:
+                    time.sleep(0)
+        except ArchiveIntegrityError as exc:
+            raise ArchiveUnavailableError(
+                messages_path, str(exc), recoverable_by_restart=False
+            ) from exc
+        except OSError as exc:
+            raise ArchiveUnavailableError(
+                messages_path,
+                f"cannot read the archived prefix: {exc}",
+                recoverable_by_restart=False,
+            ) from exc
+        if prefix_mismatch is not None:
+            raise ArchiveUnavailableError(
+                messages_path,
+                f"retained prefix record {prefix_mismatch} does not match the "
+                f"declared {descriptor.trim_mode!r} trim of its archived record",
+                recoverable_by_restart=True,
+            )
+
+    def _verify_archived_live_tail(
+        self,
+        live_tail: Sequence[LLMMessage],
+        messages_path: Path,
+        descriptor: ArchivedPrefixV1,
+    ) -> tuple[int, bool]:
+        """Phase B: compare the disk records after the prefix exactly against
+        the live tail (same pair-at-a-time contract and P6 yield cadence as
+        the legacy verify). Returns the matched tail count and whether the
+        tail boundary is unchanged. A corrupt tail line fails closed as an
+        authority-state ``ArchiveUnavailableError`` — never quarantined.
+        """
+        tail_persisted = 0
+        tail_boundary_unchanged = True
+        try:
+            tail_records = SessionLogger._stream_persisted_records_from(
+                messages_path, descriptor.prefix_end_byte
+            )
+            comparison = 0
+            for live_message in live_tail:
+                persisted_record = next(tail_records, None)
+                if persisted_record is None:
+                    break
+                comparison += 1
+                if comparison % PERSISTED_VERIFY_YIELD_INTERVAL == 0:
+                    time.sleep(0)
+                if persisted_record != SessionLogger._message_record(
+                    live_message, allow_archived=True
+                ):
+                    tail_boundary_unchanged = False
+                    break
+                tail_persisted += 1
+            else:
+                if next(tail_records, None) is not None:
+                    # The persisted tail is longer than the live one.
+                    tail_boundary_unchanged = False
+            drained = 0
+            for _record in tail_records:
+                drained += 1
+                if drained % PERSISTED_VERIFY_YIELD_INTERVAL == 0:
+                    time.sleep(0)
+        except _PersistedTranscriptError as exc:
+            raise ArchiveUnavailableError(
+                messages_path,
+                f"the transcript tail is unreadable with a retained archive "
+                f"descriptor: {exc}",
+                recoverable_by_restart=True,
+            ) from exc
+        return tail_persisted, tail_boundary_unchanged
+
+    def _verify_archived_prefix_and_tail(
+        self,
+        non_system_messages: Sequence[LLMMessage],
+        messages_path: Path,
+        descriptor: ArchivedPrefixV1,
+    ) -> tuple[int, bool, LLMMessage | None]:
+        """Archive-aware streaming verify (M1 full-verify row, P4a3).
+
+        Phase A stream-hashes the archived bytes and compares the retained
+        prefix fields against the declared trim transformation; phase B
+        compares the remaining disk records exactly against the live tail.
+        Returns the verified record count, whether the boundary is unchanged,
+        and the last verified live message. Neither side is materialized.
+
+        Raises ``ArchiveUnavailableError`` fail-closed — never a partial
+        result, never a quarantine: missing/truncated/changed archived bytes
+        are unrecoverable in place; a retained-prefix or live-tail defect is
+        an authority-state failure that recovers by session restart.
+        """
+        live_count = len(non_system_messages)
+        self._verify_archived_prefix(
+            non_system_messages[: descriptor.archived_count], messages_path, descriptor
+        )
+        tail_persisted, tail_boundary_unchanged = self._verify_archived_live_tail(
+            non_system_messages[descriptor.archived_count :], messages_path, descriptor
+        )
+        persisted_count = descriptor.archived_count + tail_persisted
+        boundary_unchanged = (
+            live_count >= descriptor.archived_count and tail_boundary_unchanged
+        )
+        verified = min(persisted_count, live_count)
+        last_live_message = non_system_messages[verified - 1] if verified else None
+        return persisted_count, boundary_unchanged, last_live_message
 
     def _save_full_verify(
         self,
@@ -1199,6 +2244,27 @@ class SessionLogger:  # noqa: PLR0904
         # messages.jsonl is authoritative for the persisted boundary. Metadata
         # is published separately and may lag after an interrupted save.
         messages_path = session_dir / MESSAGES_FILENAME
+
+        # P4a3: with an AUTHORITATIVE retained archive descriptor (the
+        # descriptor's epoch matches the saved list's) the archived byte
+        # prefix is authority — the verify goes archive-aware and never
+        # re-enters the legacy rewrite path. A retained but non-authoritative
+        # descriptor keeps the ordinary save on the legacy path (P4a2: only
+        # sealing refuses that pairing).
+        archive_snapshot = self._active_archive_snapshot()
+        if (
+            archive_snapshot.descriptor is not None
+            and archive_snapshot.is_authoritative
+        ):
+            return self._save_full_verify_archived(
+                messages,
+                stats,
+                tool_manager,
+                session_dir,
+                session_metadata,
+                launch_config_dirty,
+                archive_snapshot.descriptor,
+            )
 
         # P4a: the verification compares the persisted transcript against the
         # live records one PAIR at a time — neither side is materialized. The
@@ -1272,7 +2338,7 @@ class SessionLogger:  # noqa: PLR0904
             non_system_messages = [
                 message for message in messages if message.role != Role.system
             ]
-            metadata_dump = self._interaction_metadata_dump(
+            metadata_dump = self._gated_metadata_dump(
                 messages, non_system_messages, stats, tool_manager, session_metadata
             )
             SessionLogger._persist_metadata_sync(metadata_dump, session_dir)
@@ -1287,6 +2353,146 @@ class SessionLogger:  # noqa: PLR0904
             non_system_messages[-1] if non_system_messages else None,
             messages_path,
         )
+
+    def _save_full_verify_archived(
+        self,
+        messages: list[LLMMessage],
+        stats: AgentStats,
+        tool_manager: ToolManager,
+        session_dir: Path,
+        session_metadata: SessionMetadata,
+        launch_config_dirty: bool,
+        descriptor: ArchivedPrefixV1,
+    ) -> _TranscriptCursor:
+        """The archive-aware full verify (M1 save-behavior matrix, P4a3).
+
+        Stream-hashes the archived bytes, compares the retained prefix fields
+        against the declared trim transformation, and compares the remaining
+        disk records exactly against the live tail. A live-tail mismatch (or
+        intentional truncation) publishes a temporary replacement carrying
+        the ORIGINAL archived bytes plus the authoritative live suffix,
+        atomically, and the published file is BYTE-CHECKED to contain the
+        original archived prefix. Missing, truncated, or changed archived
+        bytes raise ``ArchiveUnavailableError`` fail-closed: the
+        corrupt-transcript quarantine is never reused for an
+        archive-descriptor session, and the prefix is never rebuilt from
+        trimmed messages or tombstones.
+        """
+        messages_path = session_dir / MESSAGES_FILENAME
+        non_system_messages = [
+            message for message in messages if message.role != Role.system
+        ]
+        live_count = len(non_system_messages)
+        persisted_count, boundary_unchanged, last_live_message = (
+            self._verify_archived_prefix_and_tail(
+                non_system_messages, messages_path, descriptor
+            )
+        )
+
+        # Same metadata-cache no-op contract as the legacy verify, over the
+        # total persisted count (archived prefix plus matched tail).
+        metadata_path = session_dir / METADATA_FILENAME
+        if (
+            not launch_config_dirty
+            and boundary_unchanged
+            and live_count == persisted_count
+        ):
+            try:
+                cached_metadata = json.loads(read_safe(metadata_path).text)
+                if cached_metadata.get(
+                    "total_messages"
+                ) == persisted_count and cached_metadata.get(
+                    "last_message_fingerprint"
+                ) == (
+                    self._message_fingerprint(last_live_message)
+                    if last_live_message is not None
+                    else None
+                ):
+                    return self._cursor_for_messages(
+                        live_count, last_live_message, messages_path
+                    )
+            except (OSError, json.JSONDecodeError):
+                pass
+
+        try:
+            if (
+                live_count > persisted_count
+                and boundary_unchanged
+                and messages_path.exists()
+            ):
+                # Append only the live tail; the archived prefix is untouched.
+                SessionLogger._persist_messages_sync(
+                    SessionLogger._tail_records(messages, persisted_count), session_dir
+                )
+            elif (
+                live_count != persisted_count
+                or not boundary_unchanged
+                or not messages_path.exists()
+            ):
+                SessionLogger._rewrite_messages_preserving_archive_sync(
+                    descriptor, messages, session_dir
+                )
+            metadata_dump = self._gated_metadata_dump(
+                messages, non_system_messages, stats, tool_manager, session_metadata
+            )
+            SessionLogger._persist_metadata_sync(metadata_dump, session_dir)
+        except SessionDiskFullError:
+            raise
+        except ArchiveUnavailableError:
+            raise
+        except Exception as e:
+            raise RuntimeError(f"Failed to save session to {session_dir}: {e}") from e
+        finally:
+            self.maybe_cleanup_tmp_files()
+        return self._cursor_for_messages(
+            live_count,
+            non_system_messages[-1] if non_system_messages else None,
+            messages_path,
+        )
+
+    @staticmethod
+    def _rewrite_messages_preserving_archive_sync(
+        descriptor: ArchivedPrefixV1, messages: Sequence[LLMMessage], session_dir: Path
+    ) -> None:
+        """Publish the archive-preserving replacement atomically (M1 row 3).
+
+        The temporary replacement carries the ORIGINAL archived bytes —
+        streamed off the live transcript through the shared read interface —
+        followed by the authoritative live suffix serialized one record at a
+        time; ``durable_replace_stream`` publishes it with the same
+        temp+fsync+rename+dirsync barriers as every durable write. The
+        published file is then BYTE-CHECKED through the shared read
+        interface: its first ``prefix_end_byte`` bytes must hash to
+        ``descriptor.prefix_sha256``, proving the replacement contains the
+        original archived prefix (a RAM-only rewrite cannot pass this check).
+        """
+        messages_path = session_dir / MESSAGES_FILENAME
+
+        def chunks() -> Iterator[bytes]:
+            yield from archived_prefix_chunks(messages_path, descriptor.prefix_end_byte)
+            yield from SessionLogger._transcript_chunks(
+                SessionLogger._tail_records(messages, descriptor.archived_count)
+            )
+
+        try:
+            durable_replace_stream(messages_path, chunks())
+        except Exception as e:
+            if _is_enospc(e):
+                raise SessionDiskFullError(
+                    messages_path, "rewrite session messages preserving the archive"
+                ) from e
+            raise RuntimeError(
+                f"Failed to rewrite session messages at {messages_path}: {e}"
+            ) from e
+        try:
+            verify_archived_prefix_on_disk(descriptor, messages_path)
+        except ArchiveIntegrityError as exc:
+            raise ArchiveUnavailableError(
+                messages_path,
+                f"the published replacement failed the archived-prefix byte "
+                f"check: {exc}",
+                recoverable_by_restart=True,
+            ) from exc
 
     def install_launch_config(self, launch_config: LaunchMetadata) -> int:
         """Synchronously make an accepted envelope authoritative for later saves."""
@@ -1469,6 +2675,13 @@ class SessionLogger:  # noqa: PLR0904
             return
 
         self.session_id = session_id
+        # P4a2 open question (b): the retained descriptor's session-id check is
+        # re-validated on the rebind — a descriptor naming the departed
+        # session is dropped fail-closed.
+        self._drop_mismatched_archive_authority(session_id)
+        # P4a4: every rebind starts a new reset generation — a trim publication
+        # planned before it is stale and never overwrites the current authority.
+        self._archive_generation += 1
         self.session_start_time = utc_now().isoformat()
         self.session_dir = self.save_folder
         self.session_metadata = self._initialize_session_metadata()
@@ -1496,6 +2709,13 @@ class SessionLogger:  # noqa: PLR0904
             return
 
         self.session_id = session_id
+        # P4a2 open question (b): re-validate the retained descriptor's
+        # session-id check on the rebind — a foreign descriptor is dropped
+        # fail-closed; a matching one (warm continuation) is retained.
+        self._drop_mismatched_archive_authority(session_id)
+        # P4a4: every rebind starts a new reset generation — a trim publication
+        # planned before it is stale and never overwrites the current authority.
+        self._archive_generation += 1
         self.session_dir = session_dir
         self.session_metadata = metadata
         self._title = metadata.title

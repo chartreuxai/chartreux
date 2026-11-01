@@ -10,8 +10,9 @@ import pytest
 from chartreux.app_server.events import HistoryEntryAdded
 from chartreux.app_server.models import PublicCheckpointEntry, PublicMessageEntry
 from chartreux.core.config import SessionLoggingConfig
-from chartreux.core.llm_models import Role
+from chartreux.core.llm_models import LLMMessage, Role
 from chartreux.core.session.session_loader import SessionLoader
+from tests.archive_history_support import descriptor_for_prefix, trim_prefix_payloads
 from tests.conftest import build_test_agent_loop, build_test_vibe_config
 from tests.mock.utils import mock_llm_chunk
 from tests.stubs.app_server import create_test_app_server_session
@@ -287,3 +288,133 @@ async def test_inplace_rewind_ignores_a_read_answered_before_the_truncation(
     assert [
         entry.text for entry in session.history if isinstance(entry, PublicMessageEntry)
     ] == ["first message", "First response"]
+
+
+def _sealed_loop(tmp_path: Path) -> Any:
+    """An agent loop whose first settled round is sealed (M1 §3).
+
+    [system?, first, first reply, boundary, second, second reply]: the first
+    round is the archived prefix and is payload-trimmed in RAM, the
+    compaction boundary that authorized the seal and the second round stay
+    live.
+    """
+    config = build_test_vibe_config(
+        session_logging=SessionLoggingConfig(enabled=True, save_dir=str(tmp_path))
+    )
+    agent_loop = build_test_agent_loop(config=config)
+    agent_loop.messages.extend([
+        LLMMessage(role=Role.user, content="First", message_id="user-1"),
+        LLMMessage(
+            role=Role.assistant,
+            content="First answer",
+            message_id="assistant-1",
+            reasoning_payloads=[{"opaque": "payload-1"}],
+        ),
+        LLMMessage(
+            role=Role.user,
+            content="Compacted context",
+            message_id="boundary-1",
+            injected=True,
+            context_boundary="compaction",
+        ),
+        LLMMessage(role=Role.user, content="Second", message_id="user-2"),
+        LLMMessage(
+            role=Role.assistant, content="Second answer", message_id="assistant-2"
+        ),
+    ])
+    return agent_loop, config
+
+
+async def _sealed_logged_loop(tmp_path: Path) -> Any:
+    agent_loop, config = _sealed_loop(tmp_path)
+    logger = agent_loop.session_logger
+    await logger.save_interaction(
+        agent_loop.messages,
+        agent_loop.stats,
+        agent_loop.config,
+        agent_loop.tool_manager,
+    )
+    descriptor = descriptor_for_prefix(
+        logger.messages_filepath,
+        2,
+        session_id=agent_loop.session_id,
+        message_epoch=agent_loop.messages.message_epoch,
+    )
+    agent_loop.messages.set_archive_descriptor(descriptor)
+    logger.retain_archive_descriptor(descriptor)
+    trim_prefix_payloads(agent_loop.messages, 2)
+    return agent_loop, config
+
+
+@pytest.mark.asyncio
+async def test_inplace_rewind_to_an_archived_turn_persists_complete_history(
+    tmp_path: Path,
+) -> None:
+    agent_loop, config = await _sealed_logged_loop(tmp_path)
+    original_session_id = agent_loop.session_id
+    session = await create_test_app_server_session(agent_loop)
+    try:
+        result = await session.resources.sessions.rewind(
+            "user-2", restore_files=False, inplace=True
+        )
+        hydrated = next(
+            message
+            for message in agent_loop.messages
+            if message.message_id == "assistant-1"
+        )
+        assert hydrated.reasoning_payloads == [{"opaque": "payload-1"}]
+    finally:
+        await session.close()
+        await agent_loop.aclose()
+
+    assert result.state.session.id == original_session_id
+    original_path = SessionLoader.find_session_by_id(
+        original_session_id, config.session_logging
+    )
+    assert original_path is not None
+    persisted, _ = SessionLoader.load_session(original_path)
+    archived = next(
+        message for message in persisted if message.message_id == "assistant-1"
+    )
+    assert archived.content == "First answer"
+    assert archived.reasoning_payloads == [{"opaque": "payload-1"}]
+
+
+@pytest.mark.asyncio
+async def test_branch_fork_materializes_the_archived_prefix_completely(
+    tmp_path: Path,
+) -> None:
+    agent_loop, config = await _sealed_logged_loop(tmp_path)
+    session = await create_test_app_server_session(agent_loop)
+    try:
+        response = await session.resources.sessions.fork("user-2", attach=False)
+    finally:
+        await session.close()
+        await agent_loop.aclose()
+
+    forked_path = SessionLoader.find_session_by_id(
+        response.state.session.id, config.session_logging
+    )
+    assert forked_path is not None
+    forked_messages, _ = SessionLoader.load_session(forked_path)
+    archived = next(
+        message for message in forked_messages if message.message_id == "assistant-1"
+    )
+    assert archived.content == "First answer"
+    assert archived.reasoning_payloads == [{"opaque": "payload-1"}]
+
+
+def test_app_server_archive_paths_use_the_rewind_package() -> None:
+    """One hydration implementation, one archive read interface (P4a1)."""
+    import chartreux.app_server._handler as handler
+    import chartreux.app_server._runtime as runtime
+    from chartreux.core.rewind import manager
+    from chartreux.core.session import transcript_archive
+
+    assert handler.archived_history_for is manager.archived_history_for
+    assert runtime.archived_history_for is manager.archived_history_for
+    assert runtime.complete_history is manager.complete_history
+    assert (
+        manager.hydrate_archived_messages
+        is transcript_archive.hydrate_archived_messages
+    )

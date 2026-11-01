@@ -33,7 +33,10 @@ from uuid import uuid4
 
 from pydantic import JsonValue
 
-from chartreux.core.agent_loop._transcript_integrity import check_tool_message_admission
+from chartreux.core.agent_loop._transcript_integrity import (
+    check_tool_message_admission,
+    live_archive_authority,
+)
 from chartreux.core.agent_loop._transcript_recorder import TranscriptRecorder
 from chartreux.core.agent_loop.errors import AgentLoopError
 from chartreux.core.autocompletion.path_prompt import build_path_prompt_payload
@@ -380,7 +383,10 @@ class ContextInjector:
         # result or an unrepairable [user, tool] adjacency (fail closed with
         # the typed local diagnostic).
         check_tool_message_admission(
-            self._messages, len(self._messages), skill_result_message
+            self._messages,
+            len(self._messages),
+            skill_result_message,
+            archived_prefix=live_archive_authority(self._messages),
         )
         self._messages.append(skill_result_message)
 

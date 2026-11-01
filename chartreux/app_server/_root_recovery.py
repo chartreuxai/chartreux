@@ -61,7 +61,10 @@ from chartreux.app_server.protocol import (
     RootRecoveryScheduleParams,
     RootRecoveryScheduleResponse,
 )
-from chartreux.core.agent_loop._transcript_integrity import validate_transcript
+from chartreux.core.agent_loop._transcript_integrity import (
+    live_archive_authority,
+    validate_transcript,
+)
 from chartreux.core.config.models import RecoveryEligibleClass, RootRecoveryConfig
 from chartreux.core.llm_models import LLMMessage
 from chartreux.core.model_catalog.availability import AvailabilitySnapshot
@@ -722,8 +725,14 @@ class RootRecoveryGate:
         if self._transcript_integrity is None:
             return None
         try:
+            live_messages = self._transcript_integrity()
             violations = validate_transcript(
-                self._transcript_integrity(), live_tail_exempt=True
+                live_messages,
+                live_tail_exempt=True,
+                # M1 (P4d): a live list owning a sealed prefix mints its
+                # authority here; a plain sequence yields None and markers
+                # stay fail-closed.
+                archived_prefix=live_archive_authority(live_messages),
             )
         except Exception:
             logger.exception("root recovery transcript integrity pre-check failed")

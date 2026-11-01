@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import AsyncGenerator
+import os
+from pathlib import Path
+import stat
 from typing import final
 
 from pydantic import BaseModel, Field, computed_field, model_validator
@@ -17,6 +20,8 @@ from chartreux.core.tools.base import (
     ToolPermission,
 )
 from chartreux.core.tools.builtins._shell_permission_resolver import (
+    GlobExecutionPlan,
+    GlobPlanDenial,
     ShellPermissionResolver,
     _analyze_guardrail_source as _analyze_guardrail_source,
     _collect_outside_dirs as _collect_outside_dirs,
@@ -35,6 +40,8 @@ from chartreux.core.tools.builtins._shell_permission_resolver import (
     _split_command_tokens as _split_command_tokens,
     _UnsafeShellSyntax as _UnsafeShellSyntax,
     _update_guardrail_cwds as _update_guardrail_cwds,
+    glob_execution_plan_for_command,
+    glob_plan_denial_text,
     shell_command_checkout_no_overwrite_ignore,
     shell_command_mutation_roots,
     shell_command_write_paths,
@@ -45,9 +52,10 @@ from chartreux.core.tools.ui import ToolCallDisplay, ToolResultDisplay, ToolUIDa
 from chartreux.core.tools.utils import (
     DEFAULT_SENSITIVE_PATTERNS,
     PathAuthority as PathAuthority,
+    effective_scratchpad_roots,
 )
 from chartreux.core.utils import kill_async_subprocess
-from chartreux.core.utils.shell import spawn_shell_command
+from chartreux.core.utils.shell import spawn_argv_command, spawn_shell_command
 from chartreux.utils.io import decode_console_safe
 from chartreux.utils.tool_presentation import ToolEffectKind
 
@@ -249,6 +257,90 @@ async def _drain_shell_stream(
     return bytes(collected)
 
 
+# The OS primitives the glob transport needs to enforce its file-open
+# containment boundary: a component-wise openat walk that refuses to follow a
+# symlink. A platform without them fails closed rather than running a plan it
+# cannot contain.
+_CONTAINMENT_OPEN_SUPPORTED = (
+    os.name == "posix"
+    and hasattr(os, "O_NOFOLLOW")
+    and hasattr(os, "O_DIRECTORY")
+    and hasattr(os, "O_CLOEXEC")
+    and os.open in os.supports_dir_fd
+)
+
+
+def _open_contained_operand(word: str, cwd: Path, opened: list[int]) -> int:
+    """Open one planned operand without following any symlink component.
+
+    Walks the operand's own components with ``O_NOFOLLOW`` relative to the
+    execution cwd (or to ``/`` for an absolute word), so neither the operand
+    itself nor any component beneath the anchor can be a symlink.
+    """
+    anchor = os.open(
+        "/" if word.startswith("/") else cwd,
+        os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+    )
+    opened.append(anchor)
+    parts = [part for part in word.split("/") if part not in {"", "."}]
+    if not parts:
+        raise OSError("empty glob operand")
+    directory = anchor
+    for part in parts[:-1]:
+        directory = os.open(
+            part,
+            os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+            dir_fd=directory,
+        )
+        opened.append(directory)
+    return os.open(
+        parts[-1],
+        os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK,
+        dir_fd=directory,
+    )
+
+
+def _require_glob_plan_containment(plan: GlobExecutionPlan) -> None:
+    """Re-open every planned operand through the OS containment boundary.
+
+    The plan is re-derived immediately before execution, so this open is the
+    execution-time binding: a component that became a symlink, a replaced
+    file (different device/inode), or a non-regular file fails closed. The
+    transport never falls back to the original command string.
+    """
+    if not _CONTAINMENT_OPEN_SUPPORTED:
+        raise ToolError(
+            "Command denied: the glob execution transport cannot enforce its "
+            "file-open containment boundary on this platform"
+        )
+    opened: list[int] = []
+    try:
+        for operand in plan.operands:
+            try:
+                descriptor = _open_contained_operand(operand.word, plan.cwd, opened)
+            except OSError as exc:
+                raise ToolError(
+                    "Command denied: a glob operand is no longer a symlink-free "
+                    f"path and cannot be read safely: {operand.word!r}"
+                ) from exc
+            opened.append(descriptor)
+            info = os.fstat(descriptor)
+            if not stat.S_ISREG(info.st_mode) or (info.st_dev, info.st_ino) != (
+                operand.device,
+                operand.inode,
+            ):
+                raise ToolError(
+                    "Command denied: a glob operand changed between the "
+                    f"permission check and execution: {operand.word!r}"
+                )
+    finally:
+        for descriptor in opened:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+
+
 class Bash(
     BaseTool[BashArgs, CapturedShellResult, BashToolConfig, BaseToolState],
     ToolUIData[BashArgs, CapturedShellResult],
@@ -294,6 +386,11 @@ class Bash(
             # subprocess; the egress rule consults it for injected
             # non-loopback proxies (v0.5.9 R1).
             injected_env=project_env_for_cwd(self.cwd),
+            # S2: this foreground transport consumes the literal argv plan.
+            # A caller that would hand the command string to a shell (the
+            # managed background launcher) does not advertise it and keeps
+            # the existing glob denials.
+            literal_glob_transport=True,
         ).resolve_permission(args)
 
     @final
@@ -318,7 +415,7 @@ class Bash(
             mutation_roots_unknown=mutation_roots_unknown,
         )
 
-    async def run(  # noqa: PLR0914 - the A2 executed-string rebinding adds one local
+    async def run(  # noqa: PLR0914, PLR0915 - the A2 rebinding and the S2 plan add locals
         self, args: BashArgs, ctx: InvokeContext | None = None
     ) -> AsyncGenerator[ToolStreamEvent | CapturedShellResult, None]:
         timeout = args.timeout or self.config.default_timeout
@@ -362,9 +459,26 @@ class Bash(
             workspace=self.workspace,
             authority=self.path_authority,
         )
+        # S2: a whitelist glob call binds to a literal argv plan re-derived at
+        # execution time (the same classifier the resolver admitted it with),
+        # so a mutation between the permission check and execution is seen and
+        # fails closed. A command that starts like the whitelist but cannot be
+        # planned raises here — it never falls back to the shell string.
+        try:
+            glob_plan = glob_execution_plan_for_command(
+                args.command,
+                cwd=self.cwd,
+                workspace=self.workspace,
+                authority=self.path_authority,
+                scratchpad_roots=effective_scratchpad_roots(self.path_authority),
+                workspace_roots=frozenset(self.workspace.authorized_roots),
+            )
+        except GlobPlanDenial as exc:
+            raise ToolError(glob_plan_denial_text(exc, args.command)) from exc
 
         if (
-            ctx is not None
+            glob_plan is None
+            and ctx is not None
             and ctx.tool_io is not None
             and ctx.tool_io.supports_terminal
             and ctx.session_id is not None
@@ -419,9 +533,18 @@ class Bash(
         proc = None
         completed = False
         try:
-            proc = await spawn_shell_command(
-                command, cwd=self.cwd, extra_env=project_env
-            )
+            if glob_plan is not None:
+                # The literal transport: the plan's words run unchanged, and
+                # every operand is re-opened through the OS containment
+                # boundary immediately before the spawn.
+                _require_glob_plan_containment(glob_plan)
+                proc = await spawn_argv_command(
+                    glob_plan.argv, cwd=self.cwd, extra_env=project_env
+                )
+            else:
+                proc = await spawn_shell_command(
+                    command, cwd=self.cwd, extra_env=project_env
+                )
 
             try:
                 stdout_bytes, stderr_bytes, _ = await asyncio.wait_for(

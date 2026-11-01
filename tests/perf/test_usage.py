@@ -10,6 +10,7 @@ import statistics
 import sys
 from threading import Event, get_ident
 from time import perf_counter
+from uuid import uuid4
 
 import pytest
 
@@ -475,4 +476,131 @@ def test_statusline_supplied_snapshot_formatting_has_no_io(
             "file_reads": reads,
             "machine": machine_context(),
         },
+    )
+
+
+# P1 FROZEN DENOMINATOR: 2472.73 ms median per 1000-record append burst.
+# Measured by the orchestrator on the pre-change instrumentation commit
+# c4f6797d (local tag perf/p1-baseline, never pushed), one fresh ledger per
+# trial, trials 2418.188 / 2410.802 / 2502.057 / 2480.862 / 2472.730 ms, no
+# outlier trials. Quiet machine: loadavg 2.19/3.78/5.25, 24 cores, Ryzen 9
+# 5900X. Recorded in the v0.7.0 task state log ("PERF SLOT ... P1 FREEZE
+# RECORDED"). The ceiling is 4x the frozen denominator; a miss is investigated
+# or the package descoped with evidence, never silently raised.
+_USAGE_APPEND_BURST_FROZEN_MEDIAN_MS = 2472.73
+_USAGE_APPEND_BURST_CEILING_MS = 4 * _USAGE_APPEND_BURST_FROZEN_MEDIAN_MS
+_USAGE_BURST_RECORDS = 1000
+_USAGE_BURST_TRIALS = 5
+_USAGE_BURST_OUTLIER_RATIO = 1.5
+
+
+def _burst_record(root: str) -> usage.UsageRecord:
+    """One realistic small ledger record; identity is unique per append."""
+    return usage.UsageRecord(
+        record_id=f"rec-{uuid4()}",
+        root_session_id=root,
+        session_id=root,
+        agent_role="root",
+        agent_profile="default",
+        model="gpt-5",
+        provider="openai",
+        wire_name="gpt-5-2026-01-01",
+        project_key="/home/user/code/project",
+        occurred_at=_AS_OF,
+        outcome=usage.UsageOutcome.COMPLETED,
+        usage_state=usage.UsageState.COMPLETE,
+        input_tokens=1200,
+        cached_input_tokens=340,
+        output_tokens=96,
+        prices_usd_per_million=usage.UsagePrices(
+            input=1.25, cached_input=0.125, output=10
+        ),
+        known_cost_usd=0.004201,
+        has_unknown_cost=False,
+    )
+
+
+def test_usage_append_burst_within_frozen_ceiling(tmp_path: Path) -> None:
+    """Gate the 1k-record append burst against the frozen pre-change ceiling.
+
+    Five trials, each appending 1000 records to a FRESH ledger through the
+    production writer facade, so no trial benefits from a warm file. Records
+    share one root session per trial: the measured cost is the per-append work
+    inside a single ledger (usage_dir + root_session_id), and every record id is
+    a fresh uuid so no append reconciles. The median of the trials must stay
+    within 4x the frozen denominator recorded above. This is a serial
+    measurement: run it with ``-n0`` on a quiet machine, never under xdist next
+    to other load.
+    """
+    elapsed: list[float] = []
+    ledger_bytes: list[int] = []
+    for trial in range(_USAGE_BURST_TRIALS):
+        root = f"root-{uuid4()}"
+        usage_dir = tmp_path / f"trial-{trial:02d}" / "usage"
+        writer = usage.UsageWriter(usage_dir)
+        ledger = usage_dir / root / "usage.jsonl"
+        entries = [_burst_record(root) for _ in range(_USAGE_BURST_RECORDS)]
+        started = perf_counter()
+        for entry in entries:
+            result = writer.append(entry)
+            assert result.disposition is usage.UsageWriteDisposition.APPENDED, (
+                f"trial {trial + 1}: unexpected disposition {result.disposition}"
+            )
+        seconds = perf_counter() - started
+        # Outside the timed region: guards against a silently deduplicated burst.
+        assert len(ledger.read_text(encoding="utf-8").splitlines()) == (
+            _USAGE_BURST_RECORDS
+        )
+        size = ledger.stat().st_size
+        elapsed.append(seconds)
+        ledger_bytes.append(size)
+        print(
+            f"usage-append-burst trial {trial + 1}/{_USAGE_BURST_TRIALS}: "
+            f"{seconds * 1000:.1f} ms for {_USAGE_BURST_RECORDS} appends "
+            f"({_USAGE_BURST_RECORDS / seconds:.0f} appends/s), "
+            f"ledger {size} bytes"
+        )
+    median_seconds = statistics.median(elapsed)
+    outliers = [
+        f"trial {index + 1} ({value * 1000:.1f} ms)"
+        for index, value in enumerate(elapsed)
+        if value > median_seconds * _USAGE_BURST_OUTLIER_RATIO
+        or value * _USAGE_BURST_OUTLIER_RATIO < median_seconds
+    ]
+    median_ms = median_seconds * 1000
+    print(
+        f"usage-append-burst MEDIAN of {_USAGE_BURST_TRIALS} trials: "
+        f"{median_ms:.1f} ms ({median_seconds:.4f} s) for 1000 appends; "
+        f"frozen denominator {_USAGE_APPEND_BURST_FROZEN_MEDIAN_MS:.2f} ms, "
+        f"ceiling {_USAGE_APPEND_BURST_CEILING_MS:.2f} ms "
+        f"({median_ms / _USAGE_APPEND_BURST_FROZEN_MEDIAN_MS:.2f}x)"
+    )
+    print(
+        f"usage-append-burst outlier trials (outside "
+        f"{_USAGE_BURST_OUTLIER_RATIO}x the median): "
+        + (", ".join(outliers) if outliers else "none")
+    )
+    machine = machine_context()
+    print(f"usage-append-burst machine context: {machine}")
+    record(
+        "usage_append_burst",
+        {
+            "setting": "P1 phase 2 (seen-set) against the frozen denominator",
+            "records_per_trial": _USAGE_BURST_RECORDS,
+            "trials": _USAGE_BURST_TRIALS,
+            "trial_ms": [round(value * 1000, 3) for value in elapsed],
+            "median_ms": round(median_ms, 3),
+            "frozen_denominator_ms": _USAGE_APPEND_BURST_FROZEN_MEDIAN_MS,
+            "ceiling_ms": _USAGE_APPEND_BURST_CEILING_MS,
+            "outlier_trials": outliers,
+            "ledger_bytes": ledger_bytes,
+            "root_sessions_per_trial": 1,
+            "machine": machine,
+        },
+    )
+    assert median_ms <= _USAGE_APPEND_BURST_CEILING_MS, (
+        f"1000-record append burst median {median_ms:.1f} ms exceeds the frozen "
+        f"ceiling {_USAGE_APPEND_BURST_CEILING_MS:.2f} ms "
+        f"(4x the {_USAGE_APPEND_BURST_FROZEN_MEDIAN_MS:.2f} ms pre-change "
+        "median); investigate or descope with evidence, never raise the constant"
     )

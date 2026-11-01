@@ -94,7 +94,7 @@ Tasks may specify:
 - **Key components**: Functions, macros, classes, packages
 - **Dependencies**: Required packages, ASDF systems
 - **Exports**: Exported symbols
-- **Notable patterns**: Macro usage, special forms, CLOSE
+- **Notable patterns**: Macro usage, special forms, CLOS
 
 ### Text Files
 - **Purpose**: General content, notes, documentation

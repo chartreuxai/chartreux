@@ -24,10 +24,13 @@ from chartreux.core.config._credential_authority import (
 from chartreux.core.config._dangerous_command_authority import (
     GRANTS_FIELD,
     validate_grant_source,
+    validate_remote_exec_grant_source,
 )
 from chartreux.core.config._dangerous_command_persistence import (
     persist_dangerous_command_grant,
+    persist_remote_exec_grant,
     remove_dangerous_command_grant,
+    remove_remote_exec_grant,
 )
 from chartreux.core.config._restrictions import ConfigCandidate, SourceRestrictions
 from chartreux.core.config._root_authority import ROOTS_FIELD, validate_root_source
@@ -764,6 +767,47 @@ class ConfigOrchestrator[S: ConfigSchema]:  # noqa: PLR0904
                 expected_revision=expected_revision,
             )
 
+    async def save_remote_exec_grant(
+        self, *, project: Path, destination: str, expected_revision: str
+    ) -> ConfigSaveResult:
+        """Persist one approved remote-exec destination to the user source only.
+
+        This dedicated path is the only sanctioned writer of
+        ``remote_exec_grants_by_project``. The merge reads a force-loaded copy
+        of the user layer, so unrelated projects and settings come from disk,
+        and the expected user revision is checked optimistically before an
+        atomic ``save_checked`` write. The exact canonical destination is
+        validated; wildcards and alias groups never persist. Runtime state is
+        never published: the caller applies the session grant itself.
+        """
+        async with self._mutation_lock:
+            if not self._can_persist or not expected_revision:
+                return ConfigSaveResult(
+                    "user", "not_saved", "unchanged", error="validation"
+                )
+            return await persist_remote_exec_grant(
+                self,
+                project=project,
+                destination=destination,
+                expected_revision=expected_revision,
+            )
+
+    async def remove_remote_exec_grant(
+        self, *, project: Path, destination: str, expected_revision: str
+    ) -> ConfigSaveResult:
+        """Remove one saved remote-exec destination from the user source only."""
+        async with self._mutation_lock:
+            if not self._can_persist or not expected_revision:
+                return ConfigSaveResult(
+                    "user", "not_saved", "unchanged", error="validation"
+                )
+            return await remove_remote_exec_grant(
+                self,
+                project=project,
+                destination=destination,
+                expected_revision=expected_revision,
+            )
+
     async def set_field(
         self,
         path: str,
@@ -1163,6 +1207,8 @@ class ConfigOrchestrator[S: ConfigSchema]:  # noqa: PLR0904
                     validate_root_source(patched, layer=layer)
                     validate_grant_source(raw, layer=layer)
                     validate_grant_source(patched, layer=layer)
+                    validate_remote_exec_grant_source(raw, layer=layer)
+                    validate_remote_exec_grant_source(patched, layer=layer)
                     validate_source(
                         type(self.config),
                         patched,

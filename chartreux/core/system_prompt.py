@@ -384,7 +384,8 @@ def _build_composition_inputs(  # noqa: PLR0914
     session_model = session_model_alias(config)
     routes = dict(config.purpose_routes.routes)
     regions = render_composition_regions(
-        delegation=facts.delegation if facts is not None else None
+        delegation=facts.delegation if facts is not None else None,
+        bounded_child=execution_context is ExecutionContext.BOUNDED_CHILD,
     )
     launch_targets = render_launch_target_region(routes, session_model)
 

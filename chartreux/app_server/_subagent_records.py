@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Sequence
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
 import enum
 from pathlib import Path
@@ -24,6 +24,7 @@ from chartreux.core.completion_contract import (
 from chartreux.core.dangerous_commands import DangerousCommandAuthority, RepositoryScope
 from chartreux.core.llm_models import LLMMessage
 from chartreux.core.recovery_models import FailureEnvelope, PackageTier
+from chartreux.core.session.transcript_archive import ArchivedPrefixV1
 from chartreux.core.session_types import ChildSessionLink
 from chartreux.core.subagents import (
     AgentAvailability,
@@ -505,8 +506,48 @@ class TranscriptReadSnapshot:
 
 
 @dataclass(frozen=True, slots=True)
+class ArchiveTranscriptSource:
+    """Where a resident transcript's sealed prefix can be re-read from disk.
+
+    ``descriptor`` is the archive descriptor the child's own message list
+    owns (M1); ``path`` is that child's persisted transcript, which stays
+    complete — the JSONL holds the originals the RAM trim replaced. Reads
+    go through the shared archive-read interface; nothing here reads bytes.
+    """
+
+    descriptor: ArchivedPrefixV1
+    path: Path
+
+
+class TranscriptMessageView(list[LLMMessage]):
+    """A resident message snapshot plus its sealed-prefix read source.
+
+    The registry snapshots a resident child's messages under its own lock.
+    When the child's list owns an archive descriptor the snapshot carries
+    the source of that sealed prefix too, so the paging path can combine the
+    archived disk records with the live tail instead of paging the
+    payload-trimmed RAM copies. A plain ``list`` pages exactly as before.
+    """
+
+    archive_source: ArchiveTranscriptSource | None
+
+    def __init__(
+        self,
+        messages: Iterable[LLMMessage],
+        archive_source: ArchiveTranscriptSource | None = None,
+    ) -> None:
+        super().__init__(messages)
+        self.archive_source = archive_source
+
+
+@dataclass(frozen=True, slots=True)
 class ResidentTranscriptReadSnapshot:
-    """An authorized immutable message snapshot from a resident child runtime."""
+    """An authorized immutable message snapshot from a resident child runtime.
+
+    ``messages`` is a :class:`TranscriptMessageView` when the child's list
+    owns archive state, so the read that consumes it can page the sealed
+    prefix from disk alongside the live tail.
+    """
 
     agent_id: str
     child_session_id: str
@@ -628,6 +669,11 @@ _DANGEROUS_COMMAND_DENYLIST_PROBES: tuple[tuple[str, tuple[str, ...]], ...] = (
     # probed through both modeled clients.
     ("network.egress", ("curl", "https://example.invalid/")),
     ("network.egress", ("wget", "https://example.invalid/")),
+    # v0.7.0 S4a: the remote-exec operation's representative form. Its
+    # classifier lands with the SSH admission (S4b1); until then the probe
+    # exists so a denylist pattern naming an SSH client still reports the
+    # operation it absolutely vetoes.
+    ("network.remote-exec", ("ssh", "deploy@example.com")),
 )
 
 

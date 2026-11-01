@@ -82,12 +82,23 @@ a runtime grant. See [dangerous git commands](../guides/tools-safety.md#dangerou
 
 `dangerous_command_grants_by_project` is a protected user-layer field (a map of
 project key to granted operation IDs) that persists "Always for this project"
-dangerous-command grants. Only the `git.push` operation is persistable, and only
-the runtime approval flow or the Settings > Shell Permissions panel manages it:
-programmatic or generic config writes to the field are rejected, and it is
-accepted only from an installed user source. Revocation reports live and on-disk
-outcomes separately through the app-server `policy/dangerous_commands/revoke`
-method.
+dangerous-command grants. Only the persistable operations (`git.push`,
+`network.egress`, and `network.remote-exec`) are accepted, and only the runtime
+approval flow or the Settings > Shell Permissions panel manages it: programmatic
+or generic config writes to the field are rejected, and it is accepted only from
+an installed user source. Revocation reports live and on-disk outcomes
+separately through the app-server `policy/dangerous_commands/revoke` method. A
+`network.remote-exec` entry alone never authorizes a remote command: remote-exec
+authority is a destination grant and lives in its own field.
+
+`remote_exec_grants_by_project` is the separate protected user-layer field for
+remote-exec destination grants: a map of project key to exact canonical
+`user@host:port` destinations. It persists "Always for this project" approvals
+for the `network.remote-exec` operation. The user is mandatory, the host is
+lowercased, a missing port canonicalizes to 22, and wildcards, ranges, and alias
+groups are rejected. Only the runtime approval flow (and the matching revocation
+path) writes it — programmatic or generic config writes are rejected, and it is
+accepted only from an installed user source.
 
 The built-in read/edit/write/image/grep configurations include sensitive patterns for `.env`-style files. Do not remove those protections casually.
 

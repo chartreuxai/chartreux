@@ -142,6 +142,12 @@ class CommandRegistry:
                 handler="_show_usage",
                 side_channel=True,
             ),
+            "routes": Command(
+                aliases=frozenset(["/routes"]),
+                description="Browse this conversation's live purpose-route table",
+                handler="_show_routes",
+                side_channel=True,
+            ),
             "settings": Command(
                 aliases=frozenset(["/settings"]),
                 description="Browse and edit curated user settings",

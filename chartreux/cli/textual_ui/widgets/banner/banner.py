@@ -11,6 +11,7 @@ from textual.widgets import Static
 from chartreux import __version__
 from chartreux.app_server.config import ConfigView
 from chartreux.app_server.models import MCPSourceStatus, MCPState
+from chartreux.cli.textual_ui.effective_thinking import banner_annotation
 from chartreux.cli.textual_ui.widgets.spinner_text import SpinnerText
 from chartreux.ui.widgets.no_markup_static import NoMarkupStatic
 from chartreux.ui.widgets.petit_chat import PetitChat
@@ -148,8 +149,11 @@ class Banner(Static):
             mcp_enabled = mcp_servers_enabled
             mcp_total = mcp_servers_total
         active_model = config.active_model
+        annotation = banner_annotation(config.effective_thinking)
         return BannerState(
-            active_model=f"{active_model.display_name}[{active_model.thinking}]",
+            active_model=(
+                f"{active_model.display_name}[{active_model.thinking}{annotation}]"
+            ),
             model_pending=model_pending,
             models_count=len(config.models),
             mcp_servers_enabled=mcp_enabled,

@@ -105,8 +105,9 @@ class TestBuiltinSkills:
             "nonzero completion surfaces as a ToolError containing the code" in prompt
         )
         assert (
-            "a later invocation cannot see the previous shell's status — "
-            "`$?` probes are unnecessary" in prompt
+            "a later invocation cannot see the previous shell's status; "
+            "when you need that status inline, probe it in the same invocation "
+            "(`<simple-command>; echo $?`)" in prompt
         )
         # A5 additive pins: the clean-tree checkout exemption documented in
         # the prompt (existing pins above are unchanged by the addition).
@@ -321,6 +322,34 @@ class TestBuiltinSkills:
             "no public grant endpoint",
         ):
             assert documented in prompt, documented
+
+    def test_chartreux_skill_documents_managed_bash_job_lifecycle(self) -> None:
+        prompt = BUILTIN_SKILLS["chartreux"].prompt
+        flattened = " ".join(prompt.split())
+
+        # The managed background-job tool names are real registered tools.
+        for tool in ("bash_start", "bash_read", "bash_stop", "bash_list"):
+            assert f"`{tool}`" in prompt, tool
+        # Lifecycle contract: cursor-based bounded reads, closed stdin, and
+        # startup-is-not-readiness. Whitespace-normalized so paragraph
+        # rewrapping does not break the pins.
+        for contract in (
+            "`next_cursor=0`",
+            "bounded page",
+            "`max_bytes` is 4096-64000",
+            "`lost_records` reports eviction",
+            "closed stdin",
+            "Startup success is not readiness",
+            "lost on session end or replacement",
+        ):
+            assert contract in flattened, contract
+        # Negative stale-claim pin: the old sentence must be absent even if
+        # the surrounding paragraph is re-wrapped.
+        assert (
+            "Managed background sessions, polling, continued stdin, and "
+            "cursor-based output access are intentionally not provided."
+            not in flattened
+        )
 
     def test_chartreux_skill_does_not_advertise_plugins(self) -> None:
         skill = BUILTIN_SKILLS["chartreux"]

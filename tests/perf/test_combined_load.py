@@ -5,6 +5,7 @@ from collections.abc import AsyncGenerator, Awaitable, Callable
 from dataclasses import dataclass, field
 import os
 from pathlib import Path
+import statistics
 import sys
 import time
 from time import perf_counter
@@ -539,6 +540,50 @@ _P0D_VERIFY_WORKER_P50_CEILING_MS = 728.0
 _P0D_VERIFY_WORKER_PEAK_CEILING_MIB = 120.7
 _P0D_COMBINED_LOOP_LAG_P50_CEILING_MS = 19.2
 
+# P6 ACCEPTANCE CEILING: the MEDIAN combined-phase flush-p95 degradation over
+# five paired alternating trials. The original converged-plan freeze was
+# 25.0%. The decisive quiet-machine five-trial run of the yield mechanism
+# measured 41.88% median degradation against a 77.4% pre-change baseline on
+# that tip: the cadence halves the verify/stream contention but cannot reach
+# 25%. THE CEILING WAS RE-ADJUDICATED FROM 50.0 TO 65.0 BY USER ADJUDICATION
+# (2026-11-01, for v0.7.0); it is a recorded descope, not a silent raise.
+# RESIDUAL ATTRIBUTION: the degradation above the pre-P4a4 regime (28.6-37.0%
+# degradation, 183-184 ms awaited) is dominated by
+# find_persistence_violations — the REQUIRED per-save archived-marker
+# admission scan and per-record marker probe added by the P4a4
+# archive-integrity chain, run on the event-loop thread once per save (~40
+# times per combined phase) via _check_transcript_persistence, S1's save
+# boundary. That is fail-closed semantics, not waste: the 3x scan
+# duplication, per-call imports, and per-message function-call overhead were
+# removed first, and what remains is the guard itself. That work is OUTSIDE
+# the verify loop, so no yield cadence inside P6's pinned scope can remove
+# it. The deeper redesign — incremental marker bookkeeping in MessageList, or
+# moving the scan off the render loop — is deferred to the 0.8.0 backlog.
+# ENVIRONMENT CONTEXT ONLY: the historical 51.885% combined flush-p95 figure
+# was recorded under loadavg 7.9-9.0, and the P0d metadata records the
+# combined flush p95 as deliberately NOT ceiled (it was that package's
+# comparison finding). No causal claim about machine load is made here.
+_P0D_MAX_FLUSH_P95_DEGRADATION_PCT = 65.0
+
+# P6 verify-latency envelope: the chunked verify may not cost more than 175%
+# of the pre-change verify-awaited p50. THE ENVELOPE WAS RE-ADJUDICATED FROM
+# 150% TO 175% BY USER ADJUDICATION (2026-11-01, for v0.7.0) on the same
+# evidence as the flush-p95 ceiling above: the residual above the pre-P4a4
+# regime (183-184 ms awaited) is the required per-save archived-marker
+# admission scan and per-record marker probe of the P4a4 archive-integrity
+# chain — fail-closed semantics, not waste — and the deeper redesign
+# (incremental marker bookkeeping in MessageList, or moving the scan off the
+# render loop) is deferred to the 0.8.0 backlog. 175% of this baseline is
+# 236.614 ms. BASELINE PROVENANCE: 135.208 ms is the median of five
+# pre-change single-pair trials recorded by the first P6 attempt on this same
+# harness (same test, same instrumentation the phase runners below are
+# extracted from), so it was not re-derived here. A re-measurement on a
+# loaded machine (five single-pair runs, loadavg 6.0-8.5, same tip) gave a
+# 161.724 ms median; that is environment context only.
+_P0D_VERIFY_AWAITED_P50_BASELINE_MS = 135.208
+_P0D_VERIFY_AWAITED_P50_ENVELOPE_PCT = 175.0
+_P0D_TRIAL_COUNT = 5
+
 
 @dataclass
 class _VerifyMeasurements:
@@ -666,6 +711,89 @@ async def _run_duration_invalidated_verifies(
     return count
 
 
+@dataclass(slots=True)
+class _StreamOnlyPhase:
+    measurement: StreamMeasurement
+    loop_lag: dict[str, float]
+
+
+@dataclass(slots=True)
+class _CombinedPhase:
+    measurement: StreamMeasurement
+    verify_awaited_ms: list[float]
+    verify_count: int
+    loop_lag: dict[str, float]
+
+
+async def _measure_stream_only_phase(
+    monkeypatch: pytest.MonkeyPatch,
+) -> _StreamOnlyPhase:
+    """The streaming turn alone (no persistence load) — the comparison base."""
+    loop_lag_ms: list[float] = []
+    stop_heartbeat = asyncio.Event()
+    heartbeat = asyncio.create_task(_heartbeat(stop_heartbeat, loop_lag_ms))
+    try:
+        measurement = await _measure_stream(
+            MidStreamGatedBackend(_chunks(), pause_at_midpoint=False), monkeypatch
+        )
+    finally:
+        stop_heartbeat.set()
+        heartbeat_results = await asyncio.gather(heartbeat, return_exceptions=True)
+    assert all(
+        result is None or isinstance(result, asyncio.CancelledError)
+        for result in heartbeat_results
+    ), f"stream-only heartbeat failed: {heartbeat_results}"
+    return _StreamOnlyPhase(measurement, percentiles(loop_lag_ms))
+
+
+async def _measure_combined_phase(
+    logger: SessionLogger,
+    messages: list[LLMMessage],
+    config: ChartreuxConfigSchema,
+    tool_manager: ToolManager,
+    stats: AgentStats,
+    monkeypatch: pytest.MonkeyPatch,
+) -> _CombinedPhase:
+    """The same streaming turn plus repeated duration-invalidated full verifies.
+
+    Both run on the same event loop; the save's sync worker runs in a thread,
+    so the verify contends on CPU, GIL, and disk with the render loop — the
+    real combined-load shape.
+    """
+    verify_awaited_ms: list[float] = []
+    loop_lag_ms: list[float] = []
+    stop_verifies = asyncio.Event()
+    stop_heartbeat = asyncio.Event()
+    verify_task = asyncio.create_task(
+        _run_duration_invalidated_verifies(
+            logger,
+            messages,
+            config,
+            tool_manager,
+            stats,
+            stop_verifies,
+            verify_awaited_ms,
+        )
+    )
+    heartbeat = asyncio.create_task(_heartbeat(stop_heartbeat, loop_lag_ms))
+    try:
+        measurement = await _measure_stream(
+            MidStreamGatedBackend(_chunks(), pause_at_midpoint=False), monkeypatch
+        )
+    finally:
+        stop_verifies.set()
+        stop_heartbeat.set()
+        verify_count = await verify_task
+        heartbeat_results = await asyncio.gather(heartbeat, return_exceptions=True)
+    assert all(
+        result is None or isinstance(result, asyncio.CancelledError)
+        for result in heartbeat_results
+    ), f"combined heartbeat failed: {heartbeat_results}"
+    return _CombinedPhase(
+        measurement, verify_awaited_ms, verify_count, percentiles(loop_lag_ms)
+    )
+
+
 @pytest.mark.asyncio
 @pytest.mark.perf
 @pytest.mark.timeout(600)
@@ -700,58 +828,17 @@ async def test_combined_load_streaming_plus_full_verify(
     rss_before_mb = _rss_mb()
 
     # Phase A: the streaming turn alone (no persistence load) — comparison base.
-    only_lag_ms: list[float] = []
-    stop_only_heartbeat = asyncio.Event()
-    only_heartbeat = asyncio.create_task(_heartbeat(stop_only_heartbeat, only_lag_ms))
-    try:
-        stream_only = await _measure_stream(
-            MidStreamGatedBackend(_chunks(), pause_at_midpoint=False), monkeypatch
-        )
-    finally:
-        stop_only_heartbeat.set()
-        heartbeat_results = await asyncio.gather(only_heartbeat, return_exceptions=True)
-    assert all(
-        result is None or isinstance(result, asyncio.CancelledError)
-        for result in heartbeat_results
-    ), f"stream-only heartbeat failed: {heartbeat_results}"
+    stream_only_phase = await _measure_stream_only_phase(monkeypatch)
 
     # Phase B: the same streaming turn plus repeated duration-invalidated full
-    # verifies issued concurrently on the same event loop. The save's sync
-    # worker runs in a thread, so this contends on CPU, GIL, and disk with the
-    # render loop — the real combined-load shape.
-    verify_awaited_ms: list[float] = []
-    combined_lag_ms: list[float] = []
-    stop_verifies = asyncio.Event()
-    stop_combined_heartbeat = asyncio.Event()
-    verify_task = asyncio.create_task(
-        _run_duration_invalidated_verifies(
-            logger,
-            messages,
-            config,
-            tool_manager,
-            stats,
-            stop_verifies,
-            verify_awaited_ms,
-        )
+    # verifies issued concurrently on the same event loop.
+    combined_phase = await _measure_combined_phase(
+        logger, messages, config, tool_manager, stats, monkeypatch
     )
-    combined_heartbeat = asyncio.create_task(
-        _heartbeat(stop_combined_heartbeat, combined_lag_ms)
-    )
-    try:
-        combined = await _measure_stream(
-            MidStreamGatedBackend(_chunks(), pause_at_midpoint=False), monkeypatch
-        )
-    finally:
-        stop_verifies.set()
-        stop_combined_heartbeat.set()
-        verify_count = await verify_task
-        heartbeat_results = await asyncio.gather(
-            combined_heartbeat, return_exceptions=True
-        )
-    assert all(
-        result is None or isinstance(result, asyncio.CancelledError)
-        for result in heartbeat_results
-    ), f"combined heartbeat failed: {heartbeat_results}"
+    stream_only = stream_only_phase.measurement
+    combined = combined_phase.measurement
+    verify_awaited_ms = combined_phase.verify_awaited_ms
+    verify_count = combined_phase.verify_count
     assert verify_count >= 3, f"only {verify_count} verifies ran under the stream"
     assert len(verify_awaited_ms) == verify_count
     assert len(measurements.sync_worker_ms) == verify_count
@@ -788,7 +875,7 @@ async def test_combined_load_streaming_plus_full_verify(
     assert verify_awaited["p50"] <= _P0D_VERIFY_AWAITED_P50_CEILING_MS
     assert verify_worker["p50"] <= _P0D_VERIFY_WORKER_P50_CEILING_MS
     assert verify_worker_peak_mb <= _P0D_VERIFY_WORKER_PEAK_CEILING_MIB
-    combined_lag = percentiles(combined_lag_ms)
+    combined_lag = combined_phase.loop_lag
     assert combined_lag["p50"] <= _P0D_COMBINED_LOOP_LAG_P50_CEILING_MS
 
     degradation_pct = (
@@ -810,11 +897,11 @@ async def test_combined_load_streaming_plus_full_verify(
             "combined_flush_delay_p95_ms": combined_flush["p95"],
             "flush_delay_p95_degradation_pct": round(degradation_pct, 3),
             "loop_lag_p50_ms": {
-                "stream_only": percentiles(only_lag_ms)["p50"],
+                "stream_only": stream_only_phase.loop_lag["p50"],
                 "combined": combined_lag["p50"],
             },
             "loop_lag_p99_ms": {
-                "stream_only": percentiles(only_lag_ms)["p99"],
+                "stream_only": stream_only_phase.loop_lag["p99"],
                 "combined": combined_lag["p99"],
             },
             "verify_awaited_ms": verify_awaited,
@@ -841,4 +928,144 @@ async def test_combined_load_streaming_plus_full_verify(
             ),
             "machine": machine_context(),
         },
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.perf
+@pytest.mark.timeout(900)
+async def test_combined_load_verify_chunking_within_frozen_ceiling(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """P6 acceptance: five paired alternating trials under the frozen ceilings.
+
+    Each trial pairs a stream-only phase with a combined phase on the same
+    20k-record transcript and the same logger state, and the phase order
+    alternates between trials so a warm-up or drift bias cannot accumulate
+    into the median in one direction. Both statistics are MEDIANS over the
+    five trials: the combined-phase flush-p95 degradation against the 65.0%
+    ceiling (re-adjudicated for v0.7.0; see the constant's comment) and the
+    verify-awaited p50 against 175% of the recorded pre-change baseline.
+    """
+    config: ChartreuxConfigSchema = build_test_vibe_config()
+    stats = AgentStats()
+    tool_manager = _perf_tool_manager()
+
+    messages = synthetic_messages(20_000, _P0D_VERIFY_RECORD_COUNT)
+    session_config = SessionLoggingConfig(
+        save_dir=str(tmp_path / "sessions-verify-chunking"),
+        session_prefix="perf",
+        enabled=True,
+    )
+    logger = SessionLogger(session_config, "verify-chunking")
+
+    # The initial full save establishes the cursor and the populated
+    # transcript; it sits outside the trials and is not part of the load.
+    await logger.save_interaction(
+        messages, stats=stats, config=config, tool_manager=tool_manager
+    )
+    assert logger._transcript_cursor is not None
+    messages_path = logger.messages_filepath
+    transcript_file_bytes = messages_path.stat().st_size
+
+    _instrument_verify_logger(logger, monkeypatch)
+
+    degradations: list[float] = []
+    verify_p50s: list[float] = []
+    trials: list[dict[str, object]] = []
+    for trial in range(_P0D_TRIAL_COUNT):
+        combined_first = trial % 2 == 1
+        if combined_first:
+            combined_phase = await _measure_combined_phase(
+                logger, messages, config, tool_manager, stats, monkeypatch
+            )
+            stream_only_phase = await _measure_stream_only_phase(monkeypatch)
+        else:
+            stream_only_phase = await _measure_stream_only_phase(monkeypatch)
+            combined_phase = await _measure_combined_phase(
+                logger, messages, config, tool_manager, stats, monkeypatch
+            )
+
+        assert combined_phase.verify_count >= 3, (
+            f"trial {trial}: only {combined_phase.verify_count} verifies ran "
+            "under the stream"
+        )
+        assert len(combined_phase.verify_awaited_ms) == combined_phase.verify_count
+        assert (
+            combined_phase.measurement.chunk_count
+            == stream_only_phase.measurement.chunk_count
+            == ASSISTANT_CHUNK_COUNT
+        )
+        assert (
+            combined_phase.measurement.total_bytes
+            == stream_only_phase.measurement.total_bytes
+        )
+
+        stream_only_p95 = percentiles(stream_only_phase.measurement.flush_delay_ms)[
+            "p95"
+        ]
+        combined_p95 = percentiles(combined_phase.measurement.flush_delay_ms)["p95"]
+        degradation_pct = (combined_p95 - stream_only_p95) / stream_only_p95 * 100
+        verify_p50 = percentiles(combined_phase.verify_awaited_ms)["p50"]
+        degradations.append(degradation_pct)
+        verify_p50s.append(verify_p50)
+        trials.append({
+            "trial": trial,
+            "order": "combined-first" if combined_first else "stream-only-first",
+            "stream_only_flush_delay_p95_ms": stream_only_p95,
+            "combined_flush_delay_p95_ms": combined_p95,
+            "flush_delay_p95_degradation_pct": round(degradation_pct, 3),
+            "verify_awaited_p50_ms": verify_p50,
+            "verify_repeats_under_stream": combined_phase.verify_count,
+            "loop_lag_p50_ms": combined_phase.loop_lag["p50"],
+        })
+
+    # Preserved behavior: none of the trials rewrote or appended to the
+    # transcript, and the cursor still matches the file on disk.
+    cursor = logger._transcript_cursor
+    assert cursor is not None
+    assert cursor.file_size == messages_path.stat().st_size == transcript_file_bytes
+    assert (
+        len(messages_path.read_text(encoding="utf-8").splitlines())
+        == _P0D_VERIFY_RECORD_COUNT
+    )
+
+    median_degradation_pct = statistics.median(degradations)
+    median_verify_p50_ms = statistics.median(verify_p50s)
+    verify_envelope_ms = (
+        _P0D_VERIFY_AWAITED_P50_BASELINE_MS * _P0D_VERIFY_AWAITED_P50_ENVELOPE_PCT / 100
+    )
+    # Recorded before the assertions so a ceiling miss still reports its
+    # numbers: a failed run must carry the same evidence a passing one does.
+    record(
+        "combined_load_verify_chunking_within_frozen_ceiling",
+        {
+            "package": "P6",
+            "record_count": _P0D_VERIFY_RECORD_COUNT,
+            "trial_count": _P0D_TRIAL_COUNT,
+            "transcript_file_bytes": transcript_file_bytes,
+            "trials": trials,
+            "median_flush_p95_degradation_pct": round(median_degradation_pct, 3),
+            "max_flush_p95_degradation_pct_ceiling": (
+                _P0D_MAX_FLUSH_P95_DEGRADATION_PCT
+            ),
+            "median_verify_awaited_p50_ms": round(median_verify_p50_ms, 3),
+            "verify_awaited_p50_baseline_ms": _P0D_VERIFY_AWAITED_P50_BASELINE_MS,
+            "verify_awaited_p50_envelope_pct": (_P0D_VERIFY_AWAITED_P50_ENVELOPE_PCT),
+            "verify_awaited_p50_envelope_ms": round(verify_envelope_ms, 3),
+            "machine": machine_context(),
+        },
+    )
+
+    assert median_degradation_pct <= _P0D_MAX_FLUSH_P95_DEGRADATION_PCT, (
+        f"median flush-p95 degradation {median_degradation_pct:.3f}% exceeds the "
+        f"frozen {_P0D_MAX_FLUSH_P95_DEGRADATION_PCT}% ceiling "
+        f"(per-trial {[round(value, 3) for value in degradations]})"
+    )
+    assert median_verify_p50_ms <= verify_envelope_ms, (
+        f"median verify-awaited p50 {median_verify_p50_ms:.3f} ms exceeds "
+        f"{_P0D_VERIFY_AWAITED_P50_ENVELOPE_PCT}% of the "
+        f"{_P0D_VERIFY_AWAITED_P50_BASELINE_MS} ms baseline "
+        f"({verify_envelope_ms:.3f} ms); per-trial "
+        f"{[round(value, 3) for value in verify_p50s]}"
     )

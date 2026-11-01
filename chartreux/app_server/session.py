@@ -22,6 +22,7 @@ from chartreux.app_server.connection import (
 from chartreux.app_server.events import (
     AppServerEvent,
     CallbackRequested,
+    ChildCallbackClosed,
     EventSequenceError,
     HistoryEntryAdded,
     SessionCompacted,
@@ -71,6 +72,7 @@ from chartreux.app_server.protocol import (
     CallbackResultError,
     CallbackResultParams,
     CallbackResultResponse,
+    ChildCallbackClosedParams,
     ClientCapabilities,
     ClientInfo,
     ClientToolMethod,
@@ -826,12 +828,46 @@ class AppServerSession:  # noqa: PLR0904
             return False
         return error.message in {"No active turn", "No matching active turn"}
 
+    def _callback_owner(self, callback_id: str) -> str:
+        """Resolve the session that owns a callback id, or fail locally.
+
+        Never falls back to this session: an id with no registered owner is a
+        dead callback (its turn closed, its child was torn down, or a session
+        generation advanced). Sending it against the parent's registry
+        silently misroutes it. The raise mirrors the server's own
+        ``CallbackNotFoundError`` shape — same type and NOT_FOUND code — so a
+        client branches on ``error.code``, and it is raised without a request.
+        """
+        session_id = self._callback_sessions.get(callback_id)
+        if session_id is None:
+            raise AppServerResponseError(
+                ProtocolError(
+                    code=ProtocolErrorCode.NOT_FOUND,
+                    message=f"Callback not found: {callback_id}",
+                )
+            )
+        return session_id
+
+    def _forget_child_callback(self, params: ChildCallbackClosedParams) -> None:
+        """Forget a child-owned callback the server reported terminal.
+
+        Identity-matched: only the registered owner is dropped, and the root
+        session is never touched — a stale or foreign closure leaves this
+        client's ownership map alone. The published event still carries both
+        ids, so a consumer dismisses only the widget it opened for them.
+        """
+        if params.session_id == self.session_id:
+            return
+        if self._callback_sessions.get(params.callback_id) == params.session_id:
+            self._callback_sessions.pop(params.callback_id, None)
+
     async def respond_to_callback(
         self, callback_id: str, output: CallbackOutput
     ) -> None:
+        session_id = self._callback_owner(callback_id)
         client = await self._ensure_attached()
         params = CallbackResultParams(
-            session_id=self._callback_sessions.get(callback_id, self.session_id),
+            session_id=session_id,
             result=CallbackResult(
                 callback_id=callback_id,
                 output=output.model_dump(mode="json", by_alias=True),
@@ -844,9 +880,10 @@ class AppServerSession:  # noqa: PLR0904
     async def reject_callback(
         self, callback_id: str, error: CallbackResultError
     ) -> None:
+        session_id = self._callback_owner(callback_id)
         client = await self._ensure_attached()
         params = CallbackResultParams(
-            session_id=self._callback_sessions.get(callback_id, self.session_id),
+            session_id=session_id,
             result=CallbackResult(callback_id=callback_id, error=error),
         )
         validate_wire(
@@ -865,10 +902,10 @@ class AppServerSession:  # noqa: PLR0904
         Returns "kept" (the question stays open without a deadline),
         "already_terminal", or "no_deadline".
         """
+        session_id = self._callback_owner(callback_id)
         client = await self._ensure_attached()
         params = CallbackKeepWaitingParams(
-            session_id=self._callback_sessions.get(callback_id, self.session_id),
-            callback_id=callback_id,
+            session_id=session_id, callback_id=callback_id
         )
         response = validate_wire(
             CallbackKeepWaitingResponse,
@@ -1225,6 +1262,7 @@ class AppServerSession:  # noqa: PLR0904
                 "error",
                 "turn/retrying",
                 "mcp_catalog/authRequired",
+                "callback/childClosed",
             }:
                 raise
             logger.warning(
@@ -1234,6 +1272,8 @@ class AppServerSession:  # noqa: PLR0904
             return True
         if server_event is None:
             return False
+        if isinstance(server_event, ChildCallbackClosed):
+            self._forget_child_callback(server_event.params)
         await self._publish_event(server_event)
         return True
 

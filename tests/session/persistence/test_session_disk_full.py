@@ -12,7 +12,8 @@ import pytest
 
 from chartreux.core.agent_loop._transcript_integrity import TranscriptIntegrityError
 from chartreux.core.config import SessionLoggingConfig
-from chartreux.core.llm_models import LLMMessage, Role
+from chartreux.core.llm_models import FunctionCall, LLMMessage, Role, ToolCall
+from chartreux.core.message_list import MessageList
 from chartreux.core.session.session_logger import (
     SessionDiskFullError,
     SessionLogger,
@@ -371,4 +372,95 @@ class TestRepairRewriteDiskFull:
         # The temp file is gone: nothing partial is published or left behind.
         assert [path.name for path in session_dir.iterdir()] == [quarantined[0].name]
         assert _disk_full_warnings(caplog)
+        assert not logger.persisted
+
+
+def _seal_messages() -> MessageList:
+    """A settled round, a compaction boundary, and a live tail."""
+    return MessageList([
+        LLMMessage(role=Role.user, content="u1"),
+        LLMMessage(
+            role=Role.assistant,
+            content="working",
+            tool_calls=[
+                ToolCall(
+                    id="c1",
+                    index=0,
+                    function=FunctionCall(name="read_file", arguments="{}"),
+                )
+            ],
+        ),
+        LLMMessage(
+            role=Role.tool, tool_call_id="c1", name="read_file", content="result for c1"
+        ),
+        LLMMessage(
+            role=Role.user,
+            content="compaction boundary",
+            injected=True,
+            context_boundary="compaction",
+        ),
+        LLMMessage(role=Role.user, content="u2"),
+        LLMMessage(role=Role.assistant, content="done"),
+    ])
+
+
+async def _seal(logger: SessionLogger, messages: MessageList) -> None:
+    await logger.seal_archive(
+        messages,
+        AgentStats(steps=1),
+        build_test_vibe_config(),
+        MagicMock(spec=ToolManager),
+    )
+
+
+class TestSealDiskFullNoReceipt:
+    """P4a2: the sealing operation closes the disk-full authorization gap.
+
+    A returned (fail-soft) save call is NOT authorization: sealing runs its
+    own durable persist, SessionDiskFullError propagates (never
+    caught-and-continued on this path), and NO receipt is issued or retained.
+    """
+
+    @pytest.mark.asyncio
+    async def test_seal_enospc_propagates_and_issues_no_receipt(
+        self, session_config: SessionLoggingConfig, monkeypatch, caplog
+    ) -> None:
+        logger = SessionLogger(session_config, "seal-disk-full")
+        _patch_replace(monkeypatch, _enospc)
+        with caplog.at_level(logging.WARNING, logger=LOGGER_NAME):
+            with pytest.raises(SessionDiskFullError):
+                await _seal(logger, _seal_messages())
+
+        assert logger.archive_descriptor is None
+        assert logger.last_save_archive_snapshot is None
+        assert not logger.persisted
+
+    @pytest.mark.asyncio
+    async def test_fail_soft_save_return_is_not_sealing_authorization(
+        self, session_config: SessionLoggingConfig, monkeypatch, caplog
+    ) -> None:
+        logger = SessionLogger(session_config, "seal-after-fail-soft")
+        _patch_replace(monkeypatch, _enospc)
+        with caplog.at_level(logging.WARNING, logger=LOGGER_NAME):
+            # The ordinary save fails soft and returns normally...
+            await _save(logger)
+            assert not logger.persisted
+            # ...but that returned save call is NOT authorization: sealing
+            # still runs its own persist, which raises, and no receipt exists.
+            with pytest.raises(SessionDiskFullError):
+                await _seal(logger, _seal_messages())
+
+        assert logger.archive_descriptor is None
+        assert not logger.persisted
+
+    @pytest.mark.asyncio
+    async def test_seal_mkdir_enospc_issues_no_receipt(
+        self, session_config: SessionLoggingConfig, monkeypatch
+    ) -> None:
+        logger = SessionLogger(session_config, "seal-mkdir-full")
+        monkeypatch.setattr(Path, "mkdir", _enospc)
+        with pytest.raises(SessionDiskFullError):
+            await _seal(logger, _seal_messages())
+
+        assert logger.archive_descriptor is None
         assert not logger.persisted

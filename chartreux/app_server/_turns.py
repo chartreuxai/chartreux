@@ -66,6 +66,7 @@ from chartreux.app_server.models import (
 )
 from chartreux.app_server.protocol import (
     CallbackResultError,
+    ChildCallbackClosedParams,
     ContextInjectParams,
     ContextInjectResponse,
     JsonPatchOperation,
@@ -91,6 +92,7 @@ from chartreux.app_server.protocol import (
 from chartreux.core.agent_loop import AgentLoop, AgentTurnOptions
 from chartreux.core.agent_loop._transcript_integrity import (
     TranscriptIntegrityError,
+    live_archive_authority,
     validate_transcript,
 )
 from chartreux.core.compaction import reorder_for_tool_adjacency
@@ -460,9 +462,14 @@ class TurnController:  # noqa: PLR0904
         # appending — a poisoned transcript would fail the same way at the
         # provider. Typed local diagnostic: never transient, never retried,
         # never scheduled; projected through public_error as an internal
-        # error carrying category=transcript_integrity.
+        # error carrying category=transcript_integrity. M1 (P4d): a live
+        # list that owns a sealed prefix mints its authority here, so the
+        # trimmed head is recognized instead of rejected as unauthorized.
+        live_messages = self._agent_loop.messages
         integrity_violations = validate_transcript(
-            self._agent_loop.messages, live_tail_exempt=True
+            live_messages,
+            live_tail_exempt=True,
+            archived_prefix=live_archive_authority(live_messages),
         )
         if integrity_violations:
             raise TranscriptIntegrityError(
@@ -1167,7 +1174,7 @@ class TurnController:  # noqa: PLR0904
             self._execution.finish(self._session_execution)
             self._session_execution = None
         self._scheduled_loop_id = None
-        self._cancel_callbacks("App server closed")
+        await self._cancel_callbacks("App server closed")
         if len(errors) == 1:
             raise errors[0]
         if errors:
@@ -1346,7 +1353,7 @@ class TurnController:  # noqa: PLR0904
         # Cleanup may itself be the failing operation. Never let a second
         # projector/callback failure prevent the promised terminal notification.
         with suppress(Exception):
-            self._cancel_callbacks("Turn ended")
+            await self._cancel_callbacks("Turn ended")
         projector = self._projector
         if projector is not None:
             with suppress(Exception):
@@ -1739,7 +1746,7 @@ class TurnController:  # noqa: PLR0904
         # successor recovers the episode; an INTERRUPTED one is a user
         # takeover; a FAILED one keeps the episode for the next schedule).
         await self._observe_root_turn_finished(turn.id, status)
-        self._cancel_callbacks("Turn ended")
+        await self._cancel_callbacks("Turn ended")
         completed = turn.model_copy(
             update={
                 "status": status,
@@ -2350,9 +2357,51 @@ class TurnController:  # noqa: PLR0904
             raise ValueError(f"Harness effect not found: {entry_id}")
         return projector
 
-    def _cancel_callbacks(self, reason: str) -> None:
-        for record in self._callbacks.values():
+    async def _cancel_callbacks(self, reason: str) -> None:
+        for record in list(self._callbacks.values()):
+            # Terminal projection BEFORE the future resolves (mirrors
+            # _expire_callback): a reconnect, or a client answering a dead
+            # callback, must see a closed entry, never a ghost open callback.
+            was_open = not record.core_resolved
+            await self._publish_callback_closed(record.event.request_id, reason)
+            if was_open:
+                await self._publish_child_callback_closed(
+                    record.event.request_id, reason
+                )
             self._reject_callback_record(record, CallbackRejectedError(reason))
+
+    async def _publish_callback_closed(self, callback_id: str, reason: str) -> None:
+        projector = self._projector
+        if projector is None:
+            return
+        for update in projector.close_callback(callback_id, reason):
+            await self._emit_projected(update)
+
+    async def _publish_child_callback_closed(
+        self, callback_id: str, reason: str
+    ) -> None:
+        """Tell the parent client that a child-owned callback closed.
+
+        Child callbacks never enter the ROOT projection, so the terminal
+        history patch stays in the child session and the parent cannot learn
+        the closure any other way. Gated on the live callback record (the
+        caller's ``was_open``), not on the projector: a normal turn-end
+        finalizes the child projection first, and an already-answered or
+        expired callback must not be reported closed. After Q1 no shipped
+        producer can mint a child question; the channel is defense-in-depth
+        for pre-Q1 callbacks in running sessions and future child-askable
+        callback kinds.
+        """
+        if not self._agent_loop.is_subagent:
+            return
+        await self._notify(
+            ChildCallbackClosedParams.NOTIFICATION_METHOD,
+            ChildCallbackClosedParams(
+                session_id=self._agent_loop.session_id,
+                callback_id=callback_id,
+                reason=reason,
+            ),
+        )
 
     def _reject_callback_record(
         self, record: CallbackRecord, error: BaseException

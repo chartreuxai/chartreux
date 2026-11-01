@@ -61,7 +61,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import ClassVar, Literal
+from typing import Any, ClassVar, Literal
 
 from chartreux.core.compaction.context import (
     is_synthetic_tool_placeholder,
@@ -69,24 +69,31 @@ from chartreux.core.compaction.context import (
     shadowed_placeholder_positions,
 )
 from chartreux.core.llm_models import CONTEXT_INJECTION_TOOL_PAIR_V1, LLMMessage, Role
+from chartreux.core.session.transcript_archive import ArchivedPrefixV1
 
 __all__ = [
+    "ARCHIVE_REFERENCE_ATTRIBUTE",
     "TRANSCRIPT_INTEGRITY_CATEGORY",
     "TRANSCRIPT_INTEGRITY_METADATA_KEY",
+    "ArchivedPrefixAuthority",
     "TranscriptIntegrityError",
     "TranscriptIntegrityReport",
     "TranscriptIntegrityViolation",
     "ViolationKind",
+    "archive_reference",
+    "archived_prefix_violations",
     "check_tool_message_admission",
     "dedupe_shadowed_placeholders",
     "find_duplicate_tool_results",
     "find_persistence_violations",
     "has_structured_tool_result",
     "is_synthetic_tool_placeholder",
+    "live_archive_authority",
     "pop_report_from_metadata",
     "repair_transcript",
     "report_from_metadata",
     "report_to_metadata",
+    "sealed_prefix_indexes",
     "validate_live_prefix",
     "validate_provider_ready",
     "validate_settled_history",
@@ -112,6 +119,7 @@ ViolationKind = Literal[
     "unresolved_tool_call",
     "misordered_tool_result",
     "transcript_repair_failed",
+    "unauthorized_archived_prefix",
 ]
 
 
@@ -200,6 +208,198 @@ class TranscriptIntegrityReport:
 def has_structured_tool_result(message: LLMMessage) -> bool:
     """Whether a tool message carries the structured ``tool_result`` payload."""
     return message.role == Role.tool and message.tool_result is not None
+
+
+#: The per-message private archive reference (M1). P4b's replacement model adds
+#: it as a ``PrivateAttr`` on ``LLMMessage``; until then it is read duck-typed,
+#: so test doubles carrying the same attribute are recognized. Private
+#: attributes never serialize, so disk records never carry the marker — the
+#: load-time validation of complete disk history is unaffected.
+ARCHIVE_REFERENCE_ATTRIBUTE = "_archive_reference"
+
+
+def archive_reference(message: LLMMessage) -> Any:
+    """The message's private archive reference, or None when the slot is unmarked."""
+    return getattr(message, ARCHIVE_REFERENCE_ATTRIBUTE, None)
+
+
+@dataclass(frozen=True, slots=True)
+class ArchivedPrefixAuthority:
+    """Validation-side proof that a leading prefix is sealed (M1 §4).
+
+    ``archived_count`` non-system records at the head of the transcript are
+    archived on disk under the descriptor this authority summarizes;
+    ``boundary_message_id`` is the compaction envelope that authorized the seal
+    (the newest boundary stays live, so it must still be in the tail);
+    ``message_epoch`` pins the authority to the list epoch it was sealed
+    against. Only the session logger mints this token, and only for a retained
+    descriptor whose epoch matches the saved list's.
+    """
+
+    archived_count: int
+    boundary_message_id: str | None
+    message_epoch: int
+
+
+def live_archive_authority(messages: object) -> ArchivedPrefixAuthority | None:
+    """The authority a LIVE list mints for the sealed prefix it owns (M1 §4).
+
+    Duck-typed over the list's own archive state — ``MessageList`` owns the
+    live descriptor and its ``message_epoch`` (which moves on reset/rebind).
+    Only a descriptor whose epoch still matches the list's current epoch is
+    authoritative; a plain sequence, an unarchived list, or a stale descriptor
+    yields None, so an archive marker without matching authority still fails
+    closed everywhere (the per-message marker is never the authority).
+
+    This is the admission-side counterpart of the session logger's
+    ``_archive_authority_for`` (which pairs the logger's retained descriptor
+    with the saved list's epoch) — used by the turn-start admission, the
+    append boundary and the root-recovery pre-check, all of which hold the
+    live list but not the logger.
+    """
+    descriptor = getattr(messages, "archive_descriptor", None)
+    if not isinstance(descriptor, ArchivedPrefixV1):
+        return None
+    message_epoch = getattr(messages, "message_epoch", None)
+    if type(message_epoch) is not int or descriptor.message_epoch != message_epoch:
+        return None
+    return ArchivedPrefixAuthority(
+        archived_count=descriptor.archived_count,
+        boundary_message_id=descriptor.boundary_message_id,
+        message_epoch=descriptor.message_epoch,
+    )
+
+
+def sealed_prefix_indexes(
+    messages: Sequence[LLMMessage], authority: ArchivedPrefixAuthority
+) -> list[int]:
+    """Absolute indexes of the sealed prefix: the first ``archived_count``
+    non-system messages. System messages interleave and are never sealed, so
+    absolute positions — and therefore owner scoping and violation indices —
+    stay translated across the sealed/live boundary.
+    """
+    indexes: list[int] = []
+    sealed = 0
+    for index, message in enumerate(messages):
+        if message.role is Role.system:
+            continue
+        if sealed < authority.archived_count:
+            indexes.append(index)
+        sealed += 1
+    return indexes
+
+
+def _archived_marker_indexes(messages: Sequence[LLMMessage]) -> list[int]:
+    """Absolute indexes of the messages carrying a private archive marker.
+
+    The single full-list marker scan (M1): the top-level entry points compute
+    it ONCE and thread it through the forwarding sub-validators (P6), so the
+    marker probe is not repeated once per sub-validator on the per-save path.
+    ``archive_reference`` remains the semantic definition of marker presence;
+    the comprehension below INLINES its attribute probe
+    (``getattr(message, ARCHIVE_REFERENCE_ATTRIBUTE, None) is not None``) to
+    skip the per-message function call on this per-save hot path — the two
+    must agree, pinned by TestP6InlinedMarkerProbeEquivalence.
+    """
+    return [
+        index
+        for index, message in enumerate(messages)
+        if getattr(message, ARCHIVE_REFERENCE_ATTRIBUTE, None) is not None
+    ]
+
+
+def archived_prefix_violations(
+    messages: Sequence[LLMMessage],
+    authority: ArchivedPrefixAuthority | None,
+    *,
+    _marker_scan: list[int] | None = None,
+) -> list[TranscriptIntegrityViolation]:
+    """M1 §4 admission: recognize ONLY a properly authorized, contiguous
+    archived prefix — never skip everything before a compaction marker.
+
+    Without ``authority``, any message carrying an archive marker is a
+    violation: a snapshot with archived markers but no matching authority
+    fails closed and is never mistaken for legacy complete history. With
+    ``authority``, the sealed prefix must be the contiguous head of the
+    non-system sequence: when markers are present they must sit exactly on the
+    sealed slots (a marker anywhere else, or a partially marked prefix, is a
+    mutation inside or across the sealed prefix and is rejected), and the live
+    tail must still carry the authorizing compaction boundary. The structural
+    contracts themselves run over the WHOLE sequence unchanged — absolute
+    indices are preserved because the sequence is never re-sliced.
+
+    ``_marker_scan`` (private): a precomputed :func:`_archived_marker_indexes`
+    result for ``messages``, threaded by the top-level entry points so the
+    marker scan runs once per check (P6); when omitted it is computed here.
+    """
+    marked = (
+        _marker_scan if _marker_scan is not None else _archived_marker_indexes(messages)
+    )
+    if authority is None:
+        if marked:
+            return [
+                TranscriptIntegrityViolation(
+                    kind="unauthorized_archived_prefix",
+                    tool_call_id=None,
+                    detail=(
+                        f"{len(marked)} message(s) carry an archive marker but "
+                        "no authorized archived prefix was supplied; a snapshot "
+                        "with archived markers without matching authority fails "
+                        "closed"
+                    ),
+                )
+            ]
+        return []
+    sealed = sealed_prefix_indexes(messages, authority)
+    sealed_set = set(sealed)
+    marked_set = set(marked)
+    violations: list[TranscriptIntegrityViolation] = []
+    if marked:
+        if marked_set != sealed_set:
+            violations.append(
+                TranscriptIntegrityViolation(
+                    kind="unauthorized_archived_prefix",
+                    tool_call_id=None,
+                    detail=(
+                        "the archived markers do not form the authorized "
+                        "contiguous prefix (a slot inside the sealed prefix was "
+                        "mutated, or a marker sits outside it); rejected"
+                    ),
+                )
+            )
+    non_system_count = sum(1 for message in messages if message.role is not Role.system)
+    if non_system_count > authority.archived_count:
+        tail_boundaries = [
+            message
+            for index, message in enumerate(messages)
+            if index not in sealed_set and message.context_boundary == "compaction"
+        ]
+        if not tail_boundaries:
+            violations.append(
+                TranscriptIntegrityViolation(
+                    kind="unauthorized_archived_prefix",
+                    tool_call_id=None,
+                    detail=(
+                        "the live tail no longer carries the compaction boundary "
+                        "that authorized the archived prefix"
+                    ),
+                )
+            )
+        elif authority.boundary_message_id is not None and not any(
+            message.message_id == authority.boundary_message_id
+            for message in tail_boundaries
+        ):
+            violations.append(
+                TranscriptIntegrityViolation(
+                    kind="unauthorized_archived_prefix",
+                    tool_call_id=None,
+                    detail=(
+                        f"the live tail carries a compaction boundary but not "
+                        f"the authorizing one ({authority.boundary_message_id!r})"
+                    ),
+                )
+            )
+    return violations
 
 
 def _call_ids(message: LLMMessage) -> set[str]:
@@ -650,6 +850,8 @@ def validate_provider_ready(
     *,
     live_tail_exempt: bool = True,
     staged_call_ids: frozenset[str] = frozenset(),
+    archived_prefix: ArchivedPrefixAuthority | None = None,
+    _marker_scan: list[int] | None = None,
 ) -> list[TranscriptIntegrityViolation]:
     """PROVIDER-READY contract: the order request build produces is safe.
 
@@ -695,7 +897,11 @@ def validate_provider_ready(
             messages, staged_call_ids=staged_call_ids
         ),
     )
-    violations: list[TranscriptIntegrityViolation] = []
+    if _marker_scan is None:
+        _marker_scan = _archived_marker_indexes(messages)
+    violations: list[TranscriptIntegrityViolation] = archived_prefix_violations(
+        messages, archived_prefix, _marker_scan=_marker_scan
+    )
     open_calls: set[str] | None = None
     answered: set[str] = set()
     owner_identity: int | None = None
@@ -769,7 +975,11 @@ def validate_provider_ready(
 
 
 def validate_settled_history(
-    messages: Sequence[LLMMessage], *, staged_call_ids: frozenset[str] = frozenset()
+    messages: Sequence[LLMMessage],
+    *,
+    staged_call_ids: frozenset[str] = frozenset(),
+    archived_prefix: ArchivedPrefixAuthority | None = None,
+    _marker_scan: list[int] | None = None,
 ) -> list[TranscriptIntegrityViolation]:
     """SETTLED-HISTORY contract over the whole transcript.
 
@@ -778,7 +988,12 @@ def validate_settled_history(
     result may be unclaimed. Calls whose results are staged in an active tool
     batch are legitimate (counted as satisfied).
     """
-    violations = find_duplicate_tool_results(messages)
+    if _marker_scan is None:
+        _marker_scan = _archived_marker_indexes(messages)
+    violations = archived_prefix_violations(
+        messages, archived_prefix, _marker_scan=_marker_scan
+    )
+    violations.extend(find_duplicate_tool_results(messages))
     violations.extend(_unclaimed_tool_results(messages))
     # Answered is scoped per originating assistant call: a result recorded for
     # a reused call id under a LATER assistant call satisfies that later call,
@@ -801,7 +1016,11 @@ def validate_settled_history(
 
 
 def validate_live_prefix(
-    messages: Sequence[LLMMessage], *, staged_call_ids: frozenset[str] = frozenset()
+    messages: Sequence[LLMMessage],
+    *,
+    staged_call_ids: frozenset[str] = frozenset(),
+    archived_prefix: ArchivedPrefixAuthority | None = None,
+    _marker_scan: list[int] | None = None,
 ) -> list[TranscriptIntegrityViolation]:
     """LIVE-PREFIX contract: the live tail is legitimate.
 
@@ -819,7 +1038,12 @@ def validate_live_prefix(
     settled provider response ends the tail whatever the format of its
     call ids.
     """
-    violations = find_duplicate_tool_results(messages)
+    if _marker_scan is None:
+        _marker_scan = _archived_marker_indexes(messages)
+    violations = archived_prefix_violations(
+        messages, archived_prefix, _marker_scan=_marker_scan
+    )
+    violations.extend(find_duplicate_tool_results(messages))
     violations.extend(_unclaimed_tool_results(messages))
     return _dedupe_violations(violations)
 
@@ -829,6 +1053,8 @@ def validate_transcript(
     *,
     staged_call_ids: frozenset[str] = frozenset(),
     live_tail_exempt: bool = True,
+    archived_prefix: ArchivedPrefixAuthority | None = None,
+    _marker_scan: list[int] | None = None,
 ) -> list[TranscriptIntegrityViolation]:
     """The composite admission check: LIVE-PREFIX + SETTLED-HISTORY + PROVIDER-READY.
 
@@ -849,14 +1075,30 @@ def validate_transcript(
     (``staged_call_ids``) count as satisfied in every sub-check, mirroring
     the SETTLED-HISTORY staged-result contract (round-2 V2).
     """
-    violations = validate_live_prefix(messages, staged_call_ids=staged_call_ids)
+    if _marker_scan is None:
+        _marker_scan = _archived_marker_indexes(messages)
+    violations = validate_live_prefix(
+        messages,
+        staged_call_ids=staged_call_ids,
+        archived_prefix=archived_prefix,
+        _marker_scan=_marker_scan,
+    )
     if not live_tail_exempt:
         violations.extend(
-            validate_settled_history(messages, staged_call_ids=staged_call_ids)
+            validate_settled_history(
+                messages,
+                staged_call_ids=staged_call_ids,
+                archived_prefix=archived_prefix,
+                _marker_scan=_marker_scan,
+            )
         )
     violations.extend(
         validate_provider_ready(
-            messages, live_tail_exempt=live_tail_exempt, staged_call_ids=staged_call_ids
+            messages,
+            live_tail_exempt=live_tail_exempt,
+            staged_call_ids=staged_call_ids,
+            archived_prefix=archived_prefix,
+            _marker_scan=_marker_scan,
         )
     )
     return _dedupe_violations(violations)
@@ -898,6 +1140,8 @@ def repair_transcript(
 
 def find_persistence_violations(
     messages: Sequence[LLMMessage],
+    *,
+    archived_prefix: ArchivedPrefixAuthority | None = None,
 ) -> list[TranscriptIntegrityViolation]:
     """S1 persistence-boundary check: nothing that would (re)poison the log.
 
@@ -909,8 +1153,17 @@ def find_persistence_violations(
     the live tail exempt (unresolved calls are legitimate mid-turn: the
     designed backfill repairs them before any request). Duplicates are scoped
     per originating assistant call (call-id reuse across turns is legitimate).
+
+    ``archived_prefix`` (M1 §4) is the authorized archived prefix of the
+    snapshot being saved, minted by the session logger only for an
+    authoritative descriptor/epoch pairing: the sealed head is recognized by
+    that authority — never by a compaction marker alone — and any archive
+    marker without a matching authority fails closed here.
     """
-    violations: list[TranscriptIntegrityViolation] = []
+    marker_scan = _archived_marker_indexes(messages)
+    violations: list[TranscriptIntegrityViolation] = archived_prefix_violations(
+        messages, archived_prefix, _marker_scan=marker_scan
+    )
     for (_, call_id), indexes in _result_groups(messages).items():
         if len(indexes) < _MIN_RESULTS_FOR_DUPLICATE:
             continue
@@ -924,12 +1177,23 @@ def find_persistence_violations(
                 ),
             )
         )
-    violations.extend(validate_transcript(messages, live_tail_exempt=True))
+    violations.extend(
+        validate_transcript(
+            messages,
+            live_tail_exempt=True,
+            archived_prefix=archived_prefix,
+            _marker_scan=marker_scan,
+        )
+    )
     return _dedupe_violations(violations)
 
 
 def check_tool_message_admission(
-    messages: Sequence[LLMMessage], index: int, message: LLMMessage
+    messages: Sequence[LLMMessage],
+    index: int,
+    message: LLMMessage,
+    *,
+    archived_prefix: ArchivedPrefixAuthority | None = None,
 ) -> None:
     """S1 append-boundary check for one tool message about to enter the list.
 
@@ -951,6 +1215,29 @@ def check_tool_message_admission(
     load, and admission seams, which fail closed on the resulting
     transcript.
     """
+    if archived_prefix is not None and index < len(messages):
+        non_system_before = sum(
+            1 for scanned in messages[:index] if scanned.role is not Role.system
+        )
+        if non_system_before < archived_prefix.archived_count:
+            # M1 §4: a mutation inside the sealed archived prefix is rejected —
+            # the sealed slots are disk-authoritative and never rewritten in
+            # place by an append/insert/replace at their position.
+            raise TranscriptIntegrityError(
+                [
+                    TranscriptIntegrityViolation(
+                        kind="unauthorized_archived_prefix",
+                        tool_call_id=message.tool_call_id,
+                        detail=(
+                            f"admission point {index} lies inside the sealed "
+                            f"archived prefix ({archived_prefix.archived_count} "
+                            "sealed records); mutations inside the sealed prefix "
+                            "are rejected"
+                        ),
+                    )
+                ],
+                context="transcript append boundary",
+            )
     if message.role != Role.tool or not message.tool_call_id:
         return
     call_id = message.tool_call_id

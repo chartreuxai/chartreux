@@ -1,13 +1,17 @@
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Iterable, Iterator, Mapping, Sequence
 import hashlib
 import json
 from pathlib import Path
-from typing import Protocol, TypedDict
+from typing import TYPE_CHECKING, Protocol, TypedDict, cast
 
 from pydantic import JsonValue
 
+from chartreux.app_server._agent_transcript import (
+    archive_transcript_source,
+    iter_archived_messages,
+)
 from chartreux.app_server._session_model import active_model_is_pinned
 from chartreux.app_server._shell import restored_shell_effect_state, shell_effect_detail
 from chartreux.app_server._tool_projection import (
@@ -18,7 +22,10 @@ from chartreux.app_server._utils import now_ms
 from chartreux.app_server._worktree_effects import WorktreeEffect
 from chartreux.app_server.config import (
     ConfigView,
+    EffectiveThinkingView,
     ModelConfigView,
+    RouteTargetView,
+    RouteView,
     StatusLineConfigView,
 )
 from chartreux.app_server.models import (
@@ -57,6 +64,10 @@ from chartreux.app_server.models import (
 )
 from chartreux.core.agent_loop import AgentLoop
 from chartreux.core.config import ChartreuxConfigSchema, ModelConfig
+from chartreux.core.llm.thinking_levels import (
+    get_thinking_levels,
+    get_thinking_wire_value,
+)
 from chartreux.core.llm_models import (
     ImageAttachment as CoreImageAttachment,
     LLMMessage,
@@ -64,12 +75,17 @@ from chartreux.core.llm_models import (
 )
 from chartreux.core.log_reader import PaginatedLogs
 from chartreux.core.model_catalog.resolver import ModelResolutionError
+from chartreux.core.session.transcript_archive import (
+    ArchiveIntegrityError,
+    verify_archived_prefix_on_disk,
+)
 from chartreux.core.session_types import (
     LaunchMetadataV2,
     SessionMetadata,
     WorktreeContext,
 )
 from chartreux.core.skills.models import SkillInfo, SkillSource
+from chartreux.core.subagents import InvalidLaunchThinkingError
 from chartreux.core.tools.base import ToolPermission
 from chartreux.core.tools.builtins.web_search import (
     SearchProviderDiagnostic,
@@ -80,9 +96,13 @@ from chartreux.core.tools.remote import AuthStatus, MCPTool
 from chartreux.core.utils import CANCELLATION_TAG, TOOL_ERROR_TAG, TaggedText
 from chartreux.core.utils.matching import name_matches
 from chartreux.model_display import format_model_display_name
+from chartreux.observability.logging import logger
 from chartreux.user_content import UserResource
 from chartreux.utils.mcp import format_tool_display_description
 from chartreux.utils.tool_presentation import ToolCallPresentation
+
+if TYPE_CHECKING:
+    from chartreux.app_server._subagent_records import ArchiveTranscriptSource
 
 
 def project_launch_purposes(agent_loop: AgentLoop) -> list[str]:
@@ -103,17 +123,73 @@ def project_config(agent_loop: AgentLoop) -> ConfigView:
     return project_config_view(
         agent_loop.config,
         active_model_pinned=active_model_is_pinned(agent_loop.config_orchestrator),
+        effective_thinking=project_effective_thinking(agent_loop),
+    )
+
+
+def project_effective_thinking(agent_loop: AgentLoop) -> EffectiveThinkingView:
+    """The next request's thinking estimate on the committed deployment.
+
+    Computed from the committed identity and the loop's current message
+    history — the same inputs the next request resolves against — so a
+    history-dependent coercion appears as soon as the entry lands. An
+    unresolvable deployment reports unknown instead of claiming the
+    requested level is effective.
+    """
+    config = agent_loop.config
+    model = config.get_active_model()
+    requested = model.thinking
+    if agent_loop.committed_model is None:
+        return EffectiveThinkingView(requested=requested)
+    try:
+        provider = config.get_provider_for_model(model)
+    except ValueError:
+        return EffectiveThinkingView(requested=requested)
+    levels = get_thinking_levels(str(provider.backend), provider.api_style, model.name)
+    if levels is None:
+        # The provider cannot encode thinking at all, so only "off" resolves.
+        disabled = requested == "off"
+        return EffectiveThinkingView(
+            requested=requested,
+            semantic="off" if disabled else None,
+            api_effort=None,
+            known=disabled,
+            matches_requested=True if disabled else None,
+        )
+    # One coercion rule, shared with launch admission: retained Anthropic
+    # thinking forces a level even when the session asked for "off".
+    from chartreux.core.agents.launch import _effective_thinking
+
+    semantic = _effective_thinking(config, model, requested, agent_loop.messages)
+    try:
+        api_effort = get_thinking_wire_value(levels, semantic)
+    except InvalidLaunchThinkingError:
+        return EffectiveThinkingView(requested=requested)
+    return EffectiveThinkingView(
+        requested=requested,
+        semantic=semantic,
+        api_effort=api_effort,
+        known=True,
+        matches_requested=(
+            semantic == requested
+            and (api_effort == requested or (requested == "off" and api_effort is None))
+        ),
     )
 
 
 def project_config_view(
-    config: ChartreuxConfigSchema, *, active_model_pinned: bool = False
+    config: ChartreuxConfigSchema,
+    *,
+    active_model_pinned: bool = False,
+    effective_thinking: EffectiveThinkingView | None = None,
 ) -> ConfigView:
+    routes, routes_error = _project_routes(config)
     return ConfigView(
         active_model=_project_model_config(config.get_active_model()),
         active_model_expression=config.active_model,
         allowed_models=list(config.allowed_models),
         active_model_pinned=active_model_pinned,
+        effective_thinking=effective_thinking,
         # The configured default, never the active model: clients render it as
         # the "Default (currently X)" hint, which must stay stable while a pin
         # is in effect.
@@ -143,6 +219,50 @@ def project_config_view(
             *config.validation_warnings,
             *_web_search_validation_warnings(config),
         ],
+        routes=routes,
+        routes_error=routes_error,
+    )
+
+
+def _project_routes(
+    config: ChartreuxConfigSchema,
+) -> tuple[list[RouteView], str | None]:
+    """The conversation's live purpose-route table, inspected side-effect-free.
+
+    The projection is the wire form of the SAME inspection doctor renders, so
+    the browser and the diagnostic can never disagree about a route. An
+    inspection that cannot start reports why instead of fabricating rows.
+    """
+    from chartreux.core.dispatch.route_inspection import inspect_config_routes
+
+    report = inspect_config_routes(config)
+    return (
+        [
+            RouteView(
+                purpose=route.purpose,
+                requires_distinct_models=route.requires_distinct_models,
+                resolved_distinct_models=route.resolved_distinct_models,
+                reload_status=route.reload_status,
+                reload_detail=route.reload_detail,
+                launch_status=route.launch_status,
+                launch_detail=route.launch_detail,
+                targets=[
+                    RouteTargetView(
+                        seat=target.seat,
+                        identity=target.identity,
+                        tier=target.tier,
+                        overlay=target.overlay,
+                        binding=target.binding,
+                        marker=target.marker,
+                        preview=target.preview,
+                        error=target.error,
+                    )
+                    for target in route.targets
+                ],
+            )
+            for route in report.routes
+        ],
+        report.error,
     )
 
 
@@ -378,10 +498,93 @@ def project_debug_logs(logs: PaginatedLogs) -> DebugLogPage:
 
 
 def project_history(agent_loop: AgentLoop) -> list[PublicHistoryEntry]:
+    """The visible conversation, reconstructed from disk when a prefix is sealed.
+
+    Without authoritative archive state the projection walks the live
+    message list exactly as before. With it, the sealed prefix streams from
+    the transcript through the shared archive-read interface one record at
+    a time and is interleaved slot-for-slot with the live list, so trimming
+    the RAM copies never hides or discards an old turn. Display keeps the
+    complete conversation — nothing is paged out of it or lazily loaded.
+    """
     return project_message_history(
         agent_loop.session_id,
-        agent_loop.messages,
+        history_messages(agent_loop),
         agent_loop.session_logger.session_metadata,
+    )
+
+
+def history_messages(agent_loop: AgentLoop) -> Iterable[LLMMessage]:
+    """The message view the visible conversation is reconstructed from.
+
+    A sealed prefix is read back from the persisted transcript so the
+    originals, not the payload-trimmed RAM copies, drive the projection. The
+    prefix is verified against its descriptor BEFORE any of it is projected,
+    and a prefix that cannot be verified degrades to the live view: display
+    never shows bytes the archive authority does not vouch for, and the
+    fallback loses no turn the live copies still carry.
+    """
+    source = archive_transcript_source(agent_loop)
+    if source is None:
+        return agent_loop.messages
+    try:
+        verify_archived_prefix_on_disk(source.descriptor, source.path)
+    except ArchiveIntegrityError as exc:
+        _warn_unreadable_prefix(exc)
+        return agent_loop.messages
+    return _archived_then_live(agent_loop.messages, source)
+
+
+_MISSING = object()
+
+
+def _archived_then_live(
+    messages: Iterable[LLMMessage], source: ArchiveTranscriptSource
+) -> Iterator[LLMMessage]:
+    """Interleave the sealed disk prefix with the live tail, slot for slot.
+
+    The descriptor's ``archived_count`` counts the persisted non-system
+    records, so every non-system position before it is replaced by the
+    streamed original and every position after it yields the live message
+    unchanged. Sealed turns the live list no longer holds are still yielded
+    (the disk is the record of what the conversation contained), and the
+    closing drain forces the prefix's hash and count verification.
+    """
+    archived = iter_archived_messages(source)
+    remaining = source.descriptor.archived_count
+    readable = True
+    for message in messages:
+        if message.role is Role.system:
+            yield message
+            continue
+        if remaining and readable:
+            try:
+                hydrated = next(archived, _MISSING)
+            except ArchiveIntegrityError as exc:
+                _warn_unreadable_prefix(exc)
+                readable = False
+                hydrated = _MISSING
+            if hydrated is not _MISSING:
+                remaining -= 1
+                yield cast(LLMMessage, hydrated)
+                continue
+            readable = False
+        yield message
+    if not readable:
+        return
+    try:
+        for leftover in archived:
+            if remaining == 0:
+                continue
+            remaining -= 1
+            yield leftover
+    except ArchiveIntegrityError as exc:
+        _warn_unreadable_prefix(exc)
+
+
+def _warn_unreadable_prefix(exc: ArchiveIntegrityError) -> None:
+    logger.warning(
+        "Sealed transcript prefix is unreadable; projecting the live view: %s", exc
     )
 
 
@@ -406,7 +609,7 @@ def project_message_content(
 
 
 def project_message_history(
-    session_id: str, messages: Sequence[LLMMessage], metadata: SessionMetadata | None
+    session_id: str, messages: Iterable[LLMMessage], metadata: SessionMetadata | None
 ) -> list[PublicHistoryEntry]:
     timestamp = now_ms()
     entries: list[PublicHistoryEntry] = []

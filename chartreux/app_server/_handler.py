@@ -179,6 +179,7 @@ from chartreux.core.git.worktree import (
 )
 from chartreux.core.git.worktree.record import OwnershipToken, release_holder
 from chartreux.core.llm_models import LLMMessage
+from chartreux.core.rewind import ArchivedHistorySource, archived_history_for
 from chartreux.core.session.image_snapshot import ImageSnapshotError
 from chartreux.core.session.session_loader import (
     SessionFileContainmentError,
@@ -1231,7 +1232,10 @@ class CoreRequestHandler:
                 restore_errors,
                 restored_paths,
             ) = await self._agent_loop.rewind_manager.rewind_to_message(
-                index, restore_files=params.restore_files, inplace=params.inplace
+                index,
+                restore_files=params.restore_files,
+                inplace=params.inplace,
+                archive=self._rewind_archive(),
             )
             after_response = await self._turns.reset()
             handoff = self._root_session.replace_idle_with_history(
@@ -1254,6 +1258,18 @@ class CoreRequestHandler:
                 session_log=handoff.session_log,
             ),
             after_response,
+        )
+
+    def _rewind_archive(self) -> ArchivedHistorySource | None:
+        """The sealed prefix this rewind operation hydrates from (M1 §3).
+
+        Operation-scoped by construction: the source is resolved from the
+        live message list and transcript at the moment of the rewind, so a
+        rewind targeting an archived turn reads complete records while
+        ordinary saves never hydrate.
+        """
+        return archived_history_for(
+            self._agent_loop.messages, self._agent_loop.session_logger
         )
 
     def _rewind_index(self, entry_id: str) -> int:

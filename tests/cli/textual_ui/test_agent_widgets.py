@@ -68,11 +68,13 @@ async def test_snapshot_receipt_precedes_delayed_close_and_reactive_render(
 
         # Controller stand-in: top-level controller state plus a nested _app
         # namespace for the late-bound host calls. _refresh_status_for_event
-        # stays top-level for _handle_turn_event, which remains on
-        # ChartreuxApp; _track_turn_outcome moved to the turn supervisor.
+        # and _refresh_effective_thinking_for stay top-level for
+        # _handle_turn_event, which remains on ChartreuxApp;
+        # _track_turn_outcome moved to the turn supervisor.
         target = SimpleNamespace(
             _turn_supervisor=SimpleNamespace(_track_turn_outcome=Mock()),
             _refresh_status_for_event=Mock(),
+            _refresh_effective_thinking_for=AsyncMock(),
             agent_transcript_viewer=None,
             selection_target="removed",
             agent_summaries=[],
@@ -1742,3 +1744,153 @@ async def test_browser_is_keyboard_complete_at_and_below_80(width: int) -> None:
         assert app.selections == ["run", "closed"]
         await pilot.press("escape")
         assert not app.bar.expanded
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("width", [80, 25])
+async def test_uncollected_badge_locus_by_width(width: int) -> None:
+    app = _BrowserApp()
+    async with app.run_test(size=(width, 12)) as pilot:
+        agent = _agent(
+            "agent-1",
+            availability="evicted",
+            uncollected_run_ids=["run-new", "run-old"],
+        )
+        app.bar.update_agents((agent,))
+        app.bar.open_browser()
+        await pilot.pause()
+        await pilot.press("right", "right", "right")  # recent filter
+        await pilot.pause()
+        app.bar.action_cursor_down()
+        rows = _content(app.bar).splitlines()
+        row = rows[2]
+        # The outcome stays load-bearing and the badge is a separate segment.
+        assert "Evicted" in row
+        assert cell_len(row) <= app.bar.query_one("#agent-bar-content").size.width
+        if width >= 80:
+            assert "uncollected: 2" in row
+        else:
+            assert "unc: 2" in row
+            assert "uncollected: 2" not in row
+        # The unclipped fallback keeps every run ID, newest first.
+        metadata = app.bar.full_metadata(agent)
+        assert "Uncollected runs: run-new, run-old" in metadata
+        assert "Result expired: False" in metadata
+        detail = str(app.bar.query_one("#agent-bar-detail", Static).render())
+        assert all(
+            cell_len(line) <= app.bar.query_one("#agent-bar-detail").size.width
+            for line in detail.splitlines()
+        )
+        if width >= 80:
+            assert "Uncollected runs: run-new, run-old" in detail
+
+
+@pytest.mark.asyncio
+async def test_uncollected_badge_never_joins_the_state_abbreviation_ladder() -> None:
+    app = _BrowserApp()
+    async with app.run_test(size=(25, 12)) as pilot:
+        agent = _agent(
+            "agent-1",
+            availability="finalizing",
+            stop_reason="budget_exceeded",
+            uncollected_run_ids=["run-b", "run-a"],
+        )
+        app.bar.update_agents((agent,))
+        app.bar.open_browser()
+        await pilot.pause()
+        row = _content(app.bar).splitlines()[2]
+        # The narrow ladder collapses the state label to "Fin:B"; the badge
+        # survives as its own suffix segment instead of collapsing with it.
+        assert "Fin:B" in row
+        assert "unc: 2" in row
+        assert "uncollected" not in row
+        assert cell_len(row) <= app.bar.query_one("#agent-bar-content").size.width
+
+
+@pytest.mark.asyncio
+async def test_uncollected_badge_yields_to_the_outcome_when_both_cannot_fit() -> None:
+    app = _BrowserApp()
+    app.config = SimpleNamespace(ascii_chrome=True)
+    async with app.run_test(size=(20, 12)) as pilot:
+        agent = _agent(
+            "agent-1", availability="failed", uncollected_run_ids=["run-new", "run-old"]
+        )
+        app.bar.update_agents((agent,))
+        app.bar.open_browser()
+        await pilot.pause()
+        app.bar.action_cursor_down()
+        row = _content(app.bar).splitlines()[2]
+        # Priority: the outcome survives, the badge drops, details keep the IDs.
+        assert "Failed" in row
+        assert "uncollected" not in row
+        assert "unc:" not in row
+        assert cell_len(row) <= app.bar.query_one("#agent-bar-content").size.width
+        assert "Uncollected runs: run-new, run-old" in app.bar.full_metadata(agent)
+
+
+@pytest.mark.asyncio
+async def test_uncollected_badge_clears_when_a_later_update_reports_none() -> None:
+    app = _BrowserApp()
+    async with app.run_test(size=(80, 24)) as pilot:
+        agent = _agent(
+            "agent-1",
+            availability="closed",
+            latest_run_id="run-1",
+            uncollected_run_ids=["run-1"],
+        )
+        app.bar.update_agents((agent,))
+        app.bar.open_browser()
+        await pilot.pause()
+        await pilot.press("right", "right", "right")  # recent filter
+        await pilot.pause()
+        app.bar.action_cursor_down()
+        row = _content(app.bar).splitlines()[2]
+        assert "uncollected: 1" in row
+        detail = str(app.bar.query_one("#agent-bar-detail", Static).render())
+        assert "result preserved" in detail
+        assert "Uncollected runs: run-1" in detail
+        # Collection (or expiry) arrives as a fresh snapshot carrying [].
+        app.bar.update_agents((agent.model_copy(update={"uncollected_run_ids": []}),))
+        row = _content(app.bar).splitlines()[2]
+        assert "uncollected" not in row
+        assert "unc:" not in row
+        detail = str(app.bar.query_one("#agent-bar-detail", Static).render())
+        assert "Uncollected runs" not in detail
+        assert "result preserved" in detail
+
+
+@pytest.mark.asyncio
+async def test_uncollected_badge_is_absent_for_the_default_empty_list() -> None:
+    app = _BrowserApp()
+    async with app.run_test(size=(80, 24)) as pilot:
+        agent = _agent("agent-1")
+        app.bar.update_agents((agent,))
+        app.bar.open_browser()
+        await pilot.pause()
+        app.bar.action_cursor_down()
+        rows = _content(app.bar)
+        assert "uncollected" not in rows
+        assert "unc:" not in rows
+        assert "Uncollected runs" not in str(
+            app.bar.query_one("#agent-bar-detail", Static).render()
+        )
+        assert "Uncollected runs" not in app.bar.full_metadata(agent)
+
+
+@pytest.mark.asyncio
+async def test_uncollected_runs_label_stays_distinct_from_result_status() -> None:
+    app = _BrowserApp()
+    async with app.run_test(size=(100, 24)):
+        agent = _agent(
+            "agent-1", availability="closed", uncollected_run_ids=["older-run"]
+        )
+        details = app.bar._agent_details(agent)
+        assert "result preserved" in details
+        assert "Uncollected runs: older-run" in details
+        metadata = app.bar.full_metadata(agent)
+        assert "Result expired: False" in metadata
+        assert "Uncollected runs: older-run" in metadata
+        expired = agent.model_copy(update={"result_expired": True})
+        expired_details = app.bar._agent_details(expired)
+        assert "result expired" in expired_details
+        assert "Uncollected runs: older-run" in expired_details

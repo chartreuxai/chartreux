@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+from collections.abc import Sequence
 from pathlib import Path
-from typing import NamedTuple
+from types import SimpleNamespace
+from typing import NamedTuple, cast
 from unittest.mock import patch
 
 import pytest
@@ -15,7 +17,19 @@ from chartreux.core.checkpoints import (
 from chartreux.core.compaction import select_model_context
 from chartreux.core.llm_models import LLMMessage, Role
 from chartreux.core.message_list import MessageList
-from chartreux.core.rewind import RewindError, RewindManager
+from chartreux.core.rewind import (
+    ArchivedHistorySource,
+    RewindArchiveError,
+    RewindError,
+    RewindManager,
+    complete_history,
+)
+from tests.archive_history_support import (
+    descriptor_for_prefix,
+    tombstone_prefix,
+    trim_prefix_payloads,
+    write_transcript,
+)
 
 
 def _make_messages(*contents: str) -> MessageList:
@@ -889,3 +903,293 @@ class TestRewindScenarios:
         assert restored_paths == []
         assert "Failed to delete file" in errors[0]
         assert "locked.txt" in errors[0]
+
+
+_SEALED_SESSION = "rewind-archive-session"
+
+
+def _archived_turns() -> list[LLMMessage]:
+    """The sealed round, the authorizing boundary, and the live round."""
+    return [
+        LLMMessage(role=Role.user, content="first", message_id="u1"),
+        LLMMessage(
+            role=Role.assistant,
+            content="first reply",
+            message_id="a1",
+            reasoning_payloads=[{"opaque": "payload-1"}],
+        ),
+        LLMMessage(
+            role=Role.user,
+            content="compacted context",
+            message_id="b1",
+            injected=True,
+            context_boundary="compaction",
+        ),
+        LLMMessage(role=Role.user, content="second", message_id="u2"),
+        LLMMessage(role=Role.assistant, content="second reply", message_id="a2"),
+    ]
+
+
+def _seal(
+    messages: MessageList, transcript: Path, *, tombstones: bool = False
+) -> ArchivedHistorySource:
+    """Inject the sealed prefix of the first two records into a live list."""
+    write_transcript(transcript, [m for m in messages if m.role is not Role.system])
+    descriptor = descriptor_for_prefix(
+        transcript, 2, session_id=_SEALED_SESSION, message_epoch=messages.message_epoch
+    )
+    if tombstones:
+        tombstone_prefix(messages, 2)
+    else:
+        trim_prefix_payloads(messages, 2)
+    messages.set_archive_descriptor(descriptor)
+    return ArchivedHistorySource(descriptor=descriptor, transcript_path=transcript)
+
+
+def _sealed_session(
+    tmp_path: Path, *, tombstones: bool = False
+) -> tuple[_Shells, MessageList, ArchivedHistorySource]:
+    """A live list whose first settled round is sealed in ``messages.jsonl``.
+
+    [system, first, first reply, boundary, second, second reply]: records 1-2
+    are the archived prefix, the boundary and the second round stay live.
+    """
+    messages = MessageList([
+        LLMMessage(role=Role.system, content="system"),
+        *[message.model_copy(deep=True) for message in _archived_turns()],
+    ])
+    source = _seal(messages, tmp_path / "messages.jsonl", tombstones=tombstones)
+    return _shells(messages), messages, source
+
+
+class TestArchivedPrefixReads:
+    """M1 §3: an archived turn stays enumerated, resolvable and previewable."""
+
+    def test_get_rewindable_messages_hydrates_a_tombstoned_archived_turn(
+        self, tmp_path: Path
+    ) -> None:
+        sh, _, source = _sealed_session(tmp_path, tombstones=True)
+
+        # The tombstoned archived turn carries no content in RAM...
+        assert sh.rewind.get_rewindable_messages() == [(4, "second")]
+        # ...and stays enumerable through the hydration snapshot.
+        assert sh.rewind.get_rewindable_messages(archive=source) == [
+            (1, "first"),
+            (4, "second"),
+        ]
+
+    def test_index_for_message_id_resolves_an_archived_turn(
+        self, tmp_path: Path
+    ) -> None:
+        sh, _, source = _sealed_session(tmp_path, tombstones=True)
+
+        assert sh.rewind.index_for_message_id("u1", archive=source) == 1
+        with pytest.raises(RewindError, match="No rewindable user message"):
+            sh.rewind.index_for_message_id("ghost", archive=source)
+
+    def test_complete_history_hydrates_the_sealed_prefix_only(
+        self, tmp_path: Path
+    ) -> None:
+        _, messages, source = _sealed_session(tmp_path)
+        assert messages[2].reasoning_payloads is None
+
+        snapshot = complete_history(messages, source)
+
+        assert snapshot[2].reasoning_payloads == [{"opaque": "payload-1"}]
+        assert len(snapshot) == len(messages)
+        # The live tail is carried, not re-read, and the list is untouched.
+        assert snapshot[4] is messages[4]
+        assert messages[2].reasoning_payloads is None
+
+    @pytest.mark.asyncio
+    async def test_preview_and_inplace_rewind_reach_an_archived_turn(
+        self, tmp_path: Path
+    ) -> None:
+        target = tmp_path / "app.py"
+        target.write_text("v0", encoding="utf-8")
+        messages = MessageList([LLMMessage(role=Role.system, content="system")])
+        sh = _shells(messages)
+        # Turn mark 1 addresses the archived user turn: create_checkpoint
+        # stamps len(messages), exactly as agent_loop.act() does.
+        sh.recorder.create_checkpoint()
+        sh.recorder.add_snapshot(_snap(target))
+        target.write_text("v1", encoding="utf-8")
+        messages.extend([
+            message.model_copy(deep=True) for message in _archived_turns()
+        ])
+        source = _seal(messages, tmp_path / "messages.jsonl")
+
+        assert sh.rewind.has_file_changes_at(1)
+        content, errors, restored = await sh.rewind.rewind_to_message(
+            1, restore_files=True, inplace=True, archive=source
+        )
+
+        assert (content, errors) == ("first", [])
+        assert restored == [str(target.resolve())]
+        assert target.read_text(encoding="utf-8") == "v0"
+
+
+class TestArchivedPrefixRewind:
+    """M1 §3: hydration happens before history reaches model context."""
+
+    @pytest.mark.asyncio
+    async def test_inplace_rewind_installs_the_hydrated_history(
+        self, tmp_path: Path
+    ) -> None:
+        sh, messages, source = _sealed_session(tmp_path)
+
+        content, errors, restored = await sh.rewind.rewind_to_message(
+            4, restore_files=False, inplace=True, archive=source
+        )
+
+        assert (content, errors, restored) == ("second", [], [])
+        assert [message.content for message in messages] == [
+            "system",
+            "first",
+            "first reply",
+            "compacted context",
+        ]
+        assert messages[2].reasoning_payloads == [{"opaque": "payload-1"}]
+        # A reset rebinds the list to complete messages: no archive authority
+        # (and no tombstone) survives into the truncated conversation.
+        assert messages.archive_descriptor is None
+
+    @pytest.mark.asyncio
+    async def test_fork_rewind_never_hands_on_a_tombstone(self, tmp_path: Path) -> None:
+        saved: list[list[LLMMessage]] = []
+        reset_calls: list[bool] = []
+        messages = MessageList([
+            LLMMessage(role=Role.system, content="system"),
+            *[message.model_copy(deep=True) for message in _archived_turns()],
+        ])
+        source = _seal(messages, tmp_path / "messages.jsonl", tombstones=True)
+
+        async def save_messages(*, allow_empty: bool = False) -> None:
+            saved.append(list(messages))
+
+        async def reset_session() -> None:
+            reset_calls.append(True)
+
+        rewind = RewindManager(
+            Checkpointer(),
+            messages=messages,
+            save_messages=save_messages,
+            reset_session=reset_session,
+        )
+
+        await rewind.rewind_to_message(4, restore_files=False, archive=source)
+
+        # The fresh session receives the hydrated prefix, never the tombstones.
+        assert reset_calls == [True]
+        assert [message.content for message in messages] == [
+            "system",
+            "first",
+            "first reply",
+            "compacted context",
+        ]
+        assert messages[2].reasoning_payloads == [{"opaque": "payload-1"}]
+        assert messages.archive_descriptor is None
+        assert len(saved) == 1
+
+    @pytest.mark.asyncio
+    async def test_rewind_never_mutates_a_sealed_message_object(
+        self, tmp_path: Path
+    ) -> None:
+        sh, messages, source = _sealed_session(tmp_path)
+        sealed = (messages[1], messages[2])
+        before = [message.model_dump(mode="json") for message in sealed]
+
+        await sh.rewind.rewind_to_message(
+            4, restore_files=False, inplace=True, archive=source
+        )
+
+        assert messages[1] is not sealed[0]
+        assert messages[2] is not sealed[1]
+        assert [message.model_dump(mode="json") for message in sealed] == before
+
+
+class TestArchiveHydrationFailsClosed:
+    """A rewind/fork never runs on a partial or mismatched archive read."""
+
+    @pytest.mark.asyncio
+    async def test_corrupt_archived_bytes(self, tmp_path: Path) -> None:
+        sh, messages, source = _sealed_session(tmp_path)
+        source.transcript_path.write_bytes(b'{"role": "user", "content": "x"}\n')
+
+        with pytest.raises(RewindArchiveError, match="could not be hydrated"):
+            await sh.rewind.rewind_to_message(
+                1, restore_files=False, inplace=True, archive=source
+            )
+
+        assert len(messages) == 6
+
+    @pytest.mark.asyncio
+    async def test_missing_transcript(self, tmp_path: Path) -> None:
+        sh, messages, source = _sealed_session(tmp_path)
+        source.transcript_path.unlink()
+
+        with pytest.raises(RewindArchiveError, match="could not be hydrated"):
+            await sh.rewind.rewind_to_message(
+                1, restore_files=False, inplace=True, archive=source
+            )
+
+        assert len(messages) == 6
+
+    @pytest.mark.asyncio
+    async def test_list_shorter_than_the_archived_prefix(self, tmp_path: Path) -> None:
+        sh, messages, source = _sealed_session(tmp_path)
+        messages.reset([messages[0], messages[1]])
+
+        with pytest.raises(RewindArchiveError, match="only 1 non-system"):
+            await sh.rewind.rewind_to_message(
+                1, restore_files=False, inplace=True, archive=source
+            )
+
+    @pytest.mark.asyncio
+    async def test_archived_record_does_not_match_its_slot(
+        self, tmp_path: Path
+    ) -> None:
+        sh, messages, source = _sealed_session(tmp_path)
+        messages.replace(
+            1, LLMMessage(role=Role.user, content="first", message_id="other")
+        )
+
+        with pytest.raises(RewindArchiveError, match="does not match the sealed slot"):
+            await sh.rewind.rewind_to_message(
+                4, restore_files=False, inplace=True, archive=source
+            )
+
+    def test_stale_descriptor_and_missing_transcript(self, tmp_path: Path) -> None:
+        _, messages, source = _sealed_session(tmp_path)
+        stale = cast(
+            Sequence[LLMMessage],
+            SimpleNamespace(
+                archive_descriptor=source.descriptor,
+                message_epoch=source.descriptor.message_epoch + 1,
+            ),
+        )
+
+        with pytest.raises(RewindArchiveError, match="epoch"):
+            ArchivedHistorySource.for_messages(
+                stale, transcript_path=source.transcript_path
+            )
+        with pytest.raises(RewindArchiveError, match="no transcript"):
+            ArchivedHistorySource.for_messages(messages, transcript_path=None)
+
+
+def test_archive_reads_go_through_the_shared_read_interface() -> None:
+    """P4a1 owns archive reading; the rewind package only consumes it."""
+    import chartreux.core.rewind.manager as rewind_manager
+    from chartreux.core.session import transcript_archive
+
+    assert (
+        rewind_manager.hydrate_archived_messages
+        is transcript_archive.hydrate_archived_messages
+    )
+    assert (
+        rewind_manager.archived_prefix_chunks
+        is transcript_archive.archived_prefix_chunks
+    )
+    # No local re-implementation: no JSONL parsing and no hashing here.
+    assert not hasattr(rewind_manager, "hashlib")
+    assert not hasattr(rewind_manager, "json")

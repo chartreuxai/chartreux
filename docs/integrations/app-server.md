@@ -188,6 +188,49 @@ rejected while a root lifecycle transition is active, while attachment and
 shutdown fences still apply. The model tool `release_agent(agent_id)` stays
 unguarded and may still release an active instance.
 
+## Agent inventory updates
+
+`agents/update` is the server's inventory event: it carries one
+`AgentSummaryModel` per visible agent plus any evictions, and each summary
+describes that agent's LATEST run. Two fields added in this release carry the
+run-collection and audit facts, and the stamp is what lets a client show a
+completed verdict without claiming more than the audit says:
+
+| Field | Contract |
+| --- | --- |
+| `completionAudit` | The typed completion-audit stamp of the latest run, resolved against that run's retained result. `null` when the latest run has no retained result, has not finished, or its result expired, so a previous run's stamp never rides a new run's summary. A stamp means the claim matched evidence; it never means the task is correct, and an unsupported audit version is neutral rather than a verdict. |
+| `uncollectedRunIds` | Always present, `[]` included: the runs whose results are still retrievable but were never returned by a successful collection call, newest first. `get_agent_result` returning a result and a `wait_for_agent` that returns one mark a run collected; `check_agents`, transcript reads, a still-running wait, and a cancelled or errored wait do not. Because the key's presence is part of the contract, a client must not read an empty list as an absent field. |
+
+Deliveries are serialized and coalesced: at most one `agents/update` is in
+flight per registry, the payload is projected immediately before it is sent
+rather than from an older snapshot, and a caller that arrives during a suspended
+delivery queues its eviction data for the next pass. A client can apply each
+payload as the current inventory, and `check_agents` stays the authoritative
+read for an agent that has just changed.
+
+### Child callback closure
+
+`callback/childClosed` (`sessionId`, `callbackId`, `reason`) reports that a
+callback opened by a CHILD session reached a terminal state. Child callbacks
+never enter the root projection, so their history entries stay in the child
+session and this event is the parent client's only route to the closure: on
+receipt the client dismisses the question widget it opened for that
+`callbackId`. Ids are matched exactly on `callbackId` — a root callback id, or a
+closure naming a different owner, is ignored, a duplicate closure is a no-op,
+and a late closure never dismisses a newer widget or clears its input.
+
+### Next-request thinking estimate
+
+The effective-thinking estimate rides the configuration view, not the inventory:
+`ConfigView.effectiveThinking` carries `requested`, `semantic`, `apiEffort`,
+`known`, and `matchesRequested`, computed server-side from the committed
+deployment and the message context the next request resolves against. When
+`known` is false a client shows `unknown` instead of implying that the requested
+level is effective, and when `matchesRequested` is false it should show both
+values with the second labeled as the API effort. The estimate describes the
+next request only: an in-flight call keeps the encoding it started with, and a
+failover may pick another deployment.
+
 ## Subagent resume and reconciliation
 
 A recoverably failed background agent is suspended (warm, non-terminal; see

@@ -11,7 +11,8 @@ from textual.message import Message
 from textual.widgets import OptionList
 from textual.widgets.option_list import Option
 
-from chartreux.app_server.config import ThinkingLevel
+from chartreux.app_server.config import EffectiveThinkingView, ThinkingLevel
+from chartreux.cli.textual_ui.effective_thinking import picker_explanation
 from chartreux.ui.shortcut_hints import rich_theme_style, shortcut, shortcut_hint
 from chartreux.ui.widgets.navigable_option_list import NavigableOptionList
 from chartreux.ui.widgets.no_markup_static import NoMarkupStatic
@@ -47,11 +48,14 @@ class ThinkingPickerApp(Container):
         self,
         thinking_levels: Sequence[ThinkingLevel],
         current_thinking: ThinkingLevel,
+        *,
+        effective: EffectiveThinkingView | None = None,
         **kwargs: Any,
     ) -> None:
         super().__init__(id="thinkingpicker-app", **kwargs)
         self._thinking_levels = thinking_levels
         self._current_thinking = current_thinking
+        self._effective = effective
         self._selection_pending = False
 
     def compose(self) -> ComposeResult:
@@ -70,6 +74,13 @@ class ThinkingPickerApp(Container):
             yield NoMarkupStatic(
                 "Thinking level for this session", classes="thinkingpicker-title"
             )
+            explanation = picker_explanation(self._effective)
+            if explanation is not None:
+                yield NoMarkupStatic(
+                    explanation,
+                    id="thinkingpicker-effect",
+                    classes="thinkingpicker-help",
+                )
             yield NavigableOptionList(*options, id="thinkingpicker-options")
             error = NoMarkupStatic(
                 "", id="thinkingpicker-error", classes="thinkingpicker-help"

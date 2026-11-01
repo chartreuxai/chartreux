@@ -63,15 +63,22 @@ from chartreux.app_server.protocol import (
     RootRecoveryScheduleParams,
     TurnStartParams,
 )
-from chartreux.core.agent_loop import AgentLoop
+from chartreux.core.agent_loop import (
+    AgentLoop,
+    _transcript_integrity as _integrity_module,
+)
 from chartreux.core.agent_loop._transcript_integrity import (
+    ARCHIVE_REFERENCE_ATTRIBUTE,
     TRANSCRIPT_INTEGRITY_CATEGORY,
     TRANSCRIPT_INTEGRITY_METADATA_KEY,
+    ArchivedPrefixAuthority,
     TranscriptIntegrityError,
     TranscriptIntegrityReport,
     TranscriptIntegrityViolation,
     ViolationKind,
     _live_tail_region_identities,
+    archive_reference,
+    archived_prefix_violations,
     check_tool_message_admission,
     dedupe_shadowed_placeholders,
     find_duplicate_tool_results,
@@ -81,6 +88,7 @@ from chartreux.core.agent_loop._transcript_integrity import (
     repair_transcript,
     report_from_metadata,
     report_to_metadata,
+    sealed_prefix_indexes,
     validate_live_prefix,
     validate_provider_ready,
     validate_settled_history,
@@ -124,6 +132,7 @@ from chartreux.core.llm_models import (
     PersistedToolResult,
     Role,
     ToolCall,
+    archived_replacement,
 )
 from chartreux.core.message_list import MessageList
 from chartreux.core.model_catalog.availability import AvailabilitySnapshot
@@ -4072,3 +4081,400 @@ class TestRound5YCompactionProvenance:
         assert _live_tail_region_identities(selected) == {id(anchor), id(pair)}
         assert validate_transcript(selected, live_tail_exempt=True) == []
         assert validate_provider_ready(selected) == []
+
+
+# ---------------------------------------------------------------------------
+# P4a4: admission/save validators recognize ONLY a properly authorized,
+# contiguous archived prefix (M1 §4) — never skip everything before a
+# compaction marker. The per-message archive marker is read duck-typed
+# (P4b's replacement model lands later); test doubles set the attribute.
+# ---------------------------------------------------------------------------
+
+
+def _mark(message: LLMMessage, reference: str = "archive-ref") -> LLMMessage:
+    object.__setattr__(message, ARCHIVE_REFERENCE_ATTRIBUTE, reference)
+    return message
+
+
+def _compaction_boundary(message_id: str = "boundary-1") -> LLMMessage:
+    return LLMMessage(
+        role=Role.user,
+        content="compaction boundary",
+        injected=True,
+        context_boundary="compaction",
+        message_id=message_id,
+    )
+
+
+def _sealed_shape() -> tuple[list[LLMMessage], ArchivedPrefixAuthority]:
+    """[u1, a1(c1), r1(c1)] sealed under the authority; the newest compaction
+    boundary and the live tail (u2, a2(c2), r2(c2)) stay live.
+    """
+    boundary = _compaction_boundary()
+    messages = [
+        _user("u1"),
+        _assistant("c1"),
+        _genuine_result("c1"),
+        boundary,
+        _user("u2"),
+        _assistant("c2"),
+        _genuine_result("c2"),
+    ]
+    authority = ArchivedPrefixAuthority(
+        archived_count=3, boundary_message_id=boundary.message_id, message_epoch=0
+    )
+    return messages, authority
+
+
+class TestP4a4ArchivedPrefixAdmission:
+    def test_authorized_contiguous_prefix_is_recognized_and_the_tail_validated(
+        self,
+    ) -> None:
+        messages, authority = _sealed_shape()
+        marked = [_mark(message) for message in messages[:3]] + messages[3:]
+        assert archived_prefix_violations(marked, authority) == []
+        assert find_persistence_violations(marked, archived_prefix=authority) == []
+        assert (
+            validate_transcript(
+                marked, live_tail_exempt=False, archived_prefix=authority
+            )
+            == []
+        )
+        # A defect in the LIVE tail is still caught under the authority.
+        defective = marked + [_genuine_result("c2")]
+        kinds = {
+            violation.kind
+            for violation in find_persistence_violations(
+                defective, archived_prefix=authority
+            )
+        }
+        assert "duplicate_tool_result" in kinds
+
+    def test_unmarked_prefix_is_recognized_by_authority_alone(self) -> None:
+        # Pre-P4b snapshots carry no per-message marker: the authority token
+        # (minted by the logger only for an authoritative descriptor/epoch
+        # pairing) is the recognition — not a compaction marker.
+        messages, authority = _sealed_shape()
+        assert archive_reference(messages[0]) is None
+        assert archived_prefix_violations(messages, authority) == []
+        assert find_persistence_violations(messages, archived_prefix=authority) == []
+
+    def test_archive_marker_without_authority_fails_closed(self) -> None:
+        messages, _authority = _sealed_shape()
+        marked = [_mark(messages[0])] + messages[1:]
+        violations = find_persistence_violations(marked)
+        assert any(
+            violation.kind == "unauthorized_archived_prefix" for violation in violations
+        )
+        violations = validate_transcript(marked, live_tail_exempt=True)
+        assert any(
+            violation.kind == "unauthorized_archived_prefix" for violation in violations
+        )
+
+    def test_marker_outside_the_authorized_prefix_fails_closed(self) -> None:
+        messages, authority = _sealed_shape()
+        marked = (
+            [_mark(message) for message in messages[:3]]
+            + messages[3:4]
+            + [_mark(messages[4])]
+            + messages[5:]
+        )
+        violations = archived_prefix_violations(marked, authority)
+        assert any(
+            violation.kind == "unauthorized_archived_prefix" for violation in violations
+        )
+
+    def test_partially_marked_sealed_prefix_fails_closed(self) -> None:
+        # A sealed slot mutated to an unmarked object breaks contiguity: the
+        # mutation inside the sealed prefix is rejected.
+        messages, authority = _sealed_shape()
+        marked = [_mark(messages[0]), _mark(messages[1])] + messages[2:]
+        violations = archived_prefix_violations(marked, authority)
+        assert any(
+            violation.kind == "unauthorized_archived_prefix" for violation in violations
+        )
+
+    def test_compaction_marker_alone_exempts_nothing(self) -> None:
+        # Anti-pattern pin: do NOT skip everything before a compaction marker —
+        # a defect BEFORE the marker is reported, with and without authority.
+        boundary = _compaction_boundary()
+        messages = [
+            _assistant("c9"),
+            _genuine_result("c9"),
+            _genuine_result("c9"),  # duplicate BEFORE the marker
+            boundary,
+            _user("u2"),
+            _assistant("c2"),
+            _genuine_result("c2"),
+        ]
+        violations = find_persistence_violations(messages)
+        assert any(
+            violation.kind == "duplicate_tool_result" and violation.tool_call_id == "c9"
+            for violation in violations
+        )
+        authority = ArchivedPrefixAuthority(
+            archived_count=3, boundary_message_id=boundary.message_id, message_epoch=0
+        )
+        violations = find_persistence_violations(messages, archived_prefix=authority)
+        assert any(
+            violation.kind == "duplicate_tool_result" and violation.tool_call_id == "c9"
+            for violation in violations
+        )
+
+    def test_authority_requires_the_authorizing_boundary_in_the_live_tail(self) -> None:
+        messages, authority = _sealed_shape()
+        no_boundary = messages[:3] + messages[4:]
+        assert any(
+            violation.kind == "unauthorized_archived_prefix"
+            for violation in archived_prefix_violations(no_boundary, authority)
+        )
+        wrong_boundary = (
+            messages[:3] + [_compaction_boundary("other-id")] + messages[4:]
+        )
+        assert any(
+            violation.kind == "unauthorized_archived_prefix"
+            for violation in archived_prefix_violations(wrong_boundary, authority)
+        )
+
+    def test_authority_with_a_list_shorter_than_the_prefix_is_recognized(self) -> None:
+        # The mid-conversation clear shape: the whole live list sits inside
+        # the sealed region, so there is no live tail to boundary-check.
+        messages, authority = _sealed_shape()
+        short = [_mark(messages[0])]
+        assert archived_prefix_violations(short, authority) == []
+        assert find_persistence_violations(short, archived_prefix=authority) == []
+
+    def test_absolute_index_owner_translation_across_the_sealed_boundary(self) -> None:
+        messages, authority = _sealed_shape()
+        # A second genuine result for the SEALED call c1 appended at the end:
+        # the owner lookup must resolve the sealed assistant at ABSOLUTE index
+        # 1 (a tail-relative re-slice would report unclaimed instead).
+        appended = messages + [_genuine_result("c1")]
+        violations = find_persistence_violations(appended, archived_prefix=authority)
+        assert any(
+            violation.kind == "duplicate_tool_result" and violation.tool_call_id == "c1"
+            for violation in violations
+        )
+        assert not any(
+            violation.kind == "unclaimed_tool_result" for violation in violations
+        )
+
+    def test_sealed_prefix_indexes_skip_interleaved_system_messages(self) -> None:
+        system = LLMMessage(role=Role.system, content="prompt")
+        messages, authority = _sealed_shape()
+        with_system = [system, *messages]
+        # System messages are never sealed; absolute indexes are preserved.
+        assert sealed_prefix_indexes(with_system, authority) == [1, 2, 3]
+        assert with_system[0] is system
+
+
+class TestP6MarkerScanRunsOncePerCheck:
+    """P6 regression pin: the full-list archive-marker scan
+    (``_archived_marker_indexes``) executes EXACTLY ONCE per top-level
+    check — the result is threaded through the internal forwarding
+    (``validate_transcript`` -> sub-validators) instead of being recomputed
+    per sub-validator on the per-save persistence path.
+    """
+
+    @staticmethod
+    def _counting_scan(monkeypatch: pytest.MonkeyPatch) -> list[int]:
+        calls: list[int] = []
+        real = _integrity_module._archived_marker_indexes
+
+        def spy(messages: Sequence[LLMMessage]) -> list[int]:
+            calls.append(len(messages))
+            return real(messages)
+
+        monkeypatch.setattr(_integrity_module, "_archived_marker_indexes", spy)
+        return calls
+
+    def test_persistence_check_scans_once_for_a_clean_list_without_descriptor(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        messages = [_user("hi"), _assistant("c1"), _genuine_result("c1")]
+        calls = self._counting_scan(monkeypatch)
+        assert find_persistence_violations(messages) == []
+        assert calls == [len(messages)]
+
+    def test_persistence_check_scans_once_for_a_marked_list_without_descriptor(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        marked = [_mark(_user("hi")), _assistant("c1"), _genuine_result("c1")]
+        calls = self._counting_scan(monkeypatch)
+        violations = find_persistence_violations(marked)
+        assert calls == [len(marked)]
+        # Frozen pre-refactor output (byte-identical pin): same kind, detail
+        # and order — markers without authority still fail closed.
+        assert [(v.kind, v.tool_call_id, v.detail) for v in violations] == [
+            (
+                "unauthorized_archived_prefix",
+                None,
+                "1 message(s) carry an archive marker but no authorized archived "
+                "prefix was supplied; a snapshot with archived markers without "
+                "matching authority fails closed",
+            )
+        ]
+
+    def test_persistence_check_scans_once_for_a_descriptor_carrying_list(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        messages, authority = _sealed_shape()
+        marked = [_mark(message) for message in messages[:3]] + messages[3:]
+        calls = self._counting_scan(monkeypatch)
+        assert find_persistence_violations(marked, archived_prefix=authority) == []
+        assert calls == [len(marked)]
+
+    def test_validate_transcript_scans_once_in_both_modes(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        messages, authority = _sealed_shape()
+        marked = [_mark(message) for message in messages[:3]] + messages[3:]
+        calls = self._counting_scan(monkeypatch)
+        assert (
+            validate_transcript(
+                marked, live_tail_exempt=True, archived_prefix=authority
+            )
+            == []
+        )
+        assert calls == [len(marked)]
+        calls.clear()
+        assert (
+            validate_transcript(
+                marked, live_tail_exempt=False, archived_prefix=authority
+            )
+            == []
+        )
+        assert calls == [len(marked)]
+
+
+class TestP6InlinedMarkerProbeEquivalence:
+    """P6 pass-2 pin: the attribute probe INLINED on the per-save hot paths
+    (``_archived_marker_indexes`` and ``SessionLogger._message_record``)
+    agrees with ``archive_reference`` — the semantic definition of marker
+    presence — for every message shape, and the inlined scan selects exactly
+    the indexes an ``archive_reference`` scan would.
+    """
+
+    @staticmethod
+    def _assert_probes_agree(message: LLMMessage) -> None:
+        assert (archive_reference(message) is not None) == (
+            getattr(message, ARCHIVE_REFERENCE_ATTRIBUTE, None) is not None
+        )
+
+    def test_marker_free_message_probes_agree(self) -> None:
+        message = _user("hi")
+        assert archive_reference(message) is None
+        self._assert_probes_agree(message)
+
+    def test_private_attr_archive_reference_probes_agree(self) -> None:
+        message = _mark(_user("hi"), "archive-ref")
+        assert archive_reference(message) == "archive-ref"
+        self._assert_probes_agree(message)
+
+    def test_tombstone_replacement_probes_agree(self) -> None:
+        tombstone = archived_replacement(
+            _assistant("c1"), "descriptor-ref", trim_mode="tombstones"
+        )
+        assert archive_reference(tombstone) == "descriptor-ref"
+        self._assert_probes_agree(tombstone)
+
+    def test_inlined_scan_matches_archive_reference_scan(self) -> None:
+        messages = [
+            _user("u1"),
+            _mark(_assistant("c1")),
+            _genuine_result("c1"),
+            archived_replacement(_user("u2"), "descriptor-ref", trim_mode="tombstones"),
+        ]
+        expected = [
+            index
+            for index, message in enumerate(messages)
+            if archive_reference(message) is not None
+        ]
+        assert expected == [1, 3]
+        assert _integrity_module._archived_marker_indexes(messages) == expected
+
+    def test_message_record_inlined_probe_keeps_the_admission_error_identical(
+        self,
+    ) -> None:
+        from chartreux.core.session import session_logger as session_logger_module
+
+        marked = _mark(_user("hi"), "archive-ref")
+        with pytest.raises(ValueError) as excinfo:
+            SessionLogger._message_record(marked)
+        assert str(excinfo.value) == (
+            "an archived/tombstone message marker must never be persisted "
+            "to the session transcript; the archived bytes on disk are the "
+            "only authoritative record of a sealed slot"
+        )
+        assert (
+            session_logger_module._archive_reference_attribute_name
+            == ARCHIVE_REFERENCE_ATTRIBUTE
+        )
+        # The verify/comparison path still accepts the marked record.
+        record = SessionLogger._message_record(marked, allow_archived=True)
+        assert ARCHIVE_REFERENCE_ATTRIBUTE not in record
+
+
+class TestP4a4AdmissionRejectsSealedPrefixMutations:
+    def test_append_inside_the_sealed_prefix_is_rejected(self) -> None:
+        messages, authority = _sealed_shape()
+        with pytest.raises(TranscriptIntegrityError) as exc_info:
+            check_tool_message_admission(
+                messages, 2, _genuine_result("c1"), archived_prefix=authority
+            )
+        assert any(
+            violation.kind == "unauthorized_archived_prefix"
+            for violation in exc_info.value.violations
+        )
+
+    def test_live_tail_admission_still_works_under_authority(self) -> None:
+        messages, authority = _sealed_shape()
+        # Append at the end is outside the sealed prefix.
+        check_tool_message_admission(
+            messages, len(messages), _genuine_result("c9"), archived_prefix=authority
+        )
+        # A replacement point in the live tail is admitted too.
+        check_tool_message_admission(
+            messages, 6, _genuine_result("c9"), archived_prefix=authority
+        )
+
+    def test_without_authority_the_same_points_are_admitted(self) -> None:
+        messages, _authority = _sealed_shape()
+        check_tool_message_admission(messages, 2, _genuine_result("c9"))
+        check_tool_message_admission(messages, len(messages), _genuine_result("c9"))
+
+
+class TestP4a4LoadTimeValidatesCompleteDiskHistory:
+    def test_load_repair_checks_records_before_a_compaction_marker(
+        self, tmp_path: Path
+    ) -> None:
+        # A poison pair BEFORE a compaction boundary in the disk transcript is
+        # still repaired at load: load-time validation checks the COMPLETE
+        # disk history — nothing is skipped at the marker.
+        boundary = _compaction_boundary("disk-boundary")
+        history = [
+            _assistant("call_pre"),
+            _placeholder("call_pre"),
+            _user("steered"),
+            _genuine_result("call_pre"),
+            boundary,
+            _user("u2"),
+            _assistant("c2"),
+            _genuine_result("c2"),
+        ]
+        session_dir = _write_session(tmp_path / "session_p4a4", history)
+        messages, metadata = SessionLoader.load_session(session_dir)
+        report = report_from_metadata(metadata[TRANSCRIPT_INTEGRITY_METADATA_KEY])
+        assert report is not None
+        assert report.repaired is True
+        assert report.dropped_placeholder_call_ids == ("call_pre",)
+        assert [message.role for message in messages] == [
+            Role.assistant,
+            Role.user,
+            Role.tool,
+            Role.user,
+            Role.user,
+            Role.assistant,
+            Role.tool,
+        ]
+        assert validate_transcript(messages, live_tail_exempt=True) == []

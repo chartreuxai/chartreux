@@ -21,6 +21,7 @@ from chartreux.core.agents.manager import (
     requested_identity_reference,
     resolve_identity_candidate,
 )
+from chartreux.core.compaction.context import select_model_context
 from chartreux.core.dispatch.renderer import session_model_alias
 from chartreux.core.dispatch.route_models import ReplacementCapability
 from chartreux.core.model_catalog.resolver import ModelResolutionError, resolver_for
@@ -360,7 +361,11 @@ class ChildLaunchAdmission:
         is the canonical model selection (the schema promotes a legacy
         nested config.model), and a supplied purpose/seat binding is
         validated through the route grammar — never copied from the previous
-        run, never accepted unvalidated.
+        run, never accepted unvalidated. The retained admission input is the
+        child's EFFECTIVE MODEL CONTEXT (``select_model_context``), not its
+        whole history: the sealed archive prefix sits before the newest
+        compaction boundary, so its payload-trimmed RAM copies never reach
+        the compatibility and thinking checks as if they were real history.
 
         ``override_permit``/``override_ledger`` (C4): the minted forced-
         attempt binding for an explicit ``override_cooldown`` task request,
@@ -465,7 +470,14 @@ class ChildLaunchAdmission:
             authorized_tool_names=frozenset(
                 parent.agent_loop.tool_manager.delegable_tools
             ),
-            history=tuple(child.messages),
+            # Admission validates the EFFECTIVE model context: the messages
+            # the continuation will actually send (everything from the newest
+            # compaction boundary onward, plus the system prompts before it).
+            # The archived history before that boundary is excluded because
+            # M1 replaced exactly those RAM copies with payload-trimmed ones —
+            # admission must never read that trimmed view as if it were the
+            # child's real history.
+            history=tuple(select_model_context(child.messages)),
             accumulated_overrides=child.launch_overrides,
             committed_model=child.committed_model,
             frozen_persona=(

@@ -28,6 +28,7 @@ from chartreux.app_server.protocol import (
     AgentEvictionModel,
     AgentSummaryModel,
     AgentsUpdateParams,
+    ChildCallbackClosedParams,
     HistoryEntryAddedParams,
     HistoryEntryUpdatedParams,
     JsonValue,
@@ -138,6 +139,13 @@ class MCPAuthorizationRequiredEvent:
     params: MCPAuthRequiredParams
 
 
+@dataclass(frozen=True, slots=True)
+class ChildCallbackClosed:
+    """A child-owned callback became terminal (never part of root history)."""
+
+    params: ChildCallbackClosedParams
+
+
 type AppServerEvent = (
     HistoryEntryAdded
     | HistoryEntryUpdated
@@ -156,6 +164,7 @@ type AppServerEvent = (
     | ServerWarning
     | ServerError
     | MCPAuthorizationRequiredEvent
+    | ChildCallbackClosed
 )
 
 _STREAMING_TEXT_PATHS = {"/content/0/text", "/text", "/state/outputText"}
@@ -310,17 +319,28 @@ def _parse_mcp_auth_required(
     )
 
 
+def _parse_child_callback_closed(notification: Notification) -> ChildCallbackClosed:
+    return ChildCallbackClosed(
+        validate_wire(ChildCallbackClosedParams, notification.params)
+    )
+
+
 _SERVER_EVENT_DISPATCH: dict[
     str,
     Callable[
         [Notification],
-        ServerWarning | ServerError | TurnRetrying | MCPAuthorizationRequiredEvent,
+        ServerWarning
+        | ServerError
+        | TurnRetrying
+        | MCPAuthorizationRequiredEvent
+        | ChildCallbackClosed,
     ],
 ] = {
     "warning": _parse_server_warning,
     "error": _parse_server_error,
     "turn/retrying": _parse_turn_retrying,
     "mcp_catalog/authRequired": _parse_mcp_auth_required,
+    "callback/childClosed": _parse_child_callback_closed,
 }
 
 
@@ -330,7 +350,14 @@ def server_event_notification_methods() -> frozenset[str]:
 
 def parse_server_event(
     notification: Notification,
-) -> ServerWarning | ServerError | TurnRetrying | MCPAuthorizationRequiredEvent | None:
+) -> (
+    ServerWarning
+    | ServerError
+    | TurnRetrying
+    | MCPAuthorizationRequiredEvent
+    | ChildCallbackClosed
+    | None
+):
     parser = _SERVER_EVENT_DISPATCH.get(notification.method)
     if parser is None:
         return None

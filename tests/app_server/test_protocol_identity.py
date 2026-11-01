@@ -13,13 +13,22 @@ from __future__ import annotations
 import importlib
 from pathlib import Path
 
+from pydantic import Field, ValidationError
 import pytest
 
-from chartreux.app_server._model import ProtocolModel
+from chartreux.app_server._model import ProtocolModel, validate_wire
+from chartreux.app_server.models import (
+    PublicCompletionAudit,
+    PublicFailureEnvelope,
+    PublicRecoveryEligibility,
+    RunStopReason,
+)
 import chartreux.app_server.protocol
+from chartreux.app_server.protocol import AgentSummaryModel
 
 PRE_SPLIT_NOTIFICATION_METHODS = frozenset({
     "agents/update",
+    "callback/childClosed",
     "error",
     "history/entryAdded",
     "history/entryUpdated",
@@ -473,3 +482,73 @@ def test_no_stale_protocol_module_corpse() -> None:
     """The package conversion was a rename: no dead protocol.py may remain."""
     stale = Path(__file__).parents[2] / "chartreux" / "app_server" / "protocol.py"
     assert not stale.exists()
+
+
+class _PreChangeAgentSummaryModel(ProtocolModel):
+    """The full pre-U2 ``AgentSummaryModel``, frozen field for field.
+
+    pydantic cannot drop an inherited field, so the freeze is a standalone
+    mirror rather than a live subclass: every pre-change field is declared
+    and ``extra="forbid"`` is inherited, which makes the old-client rejection
+    below non-vacuous.
+    """
+
+    agent_id: str
+    identity: str | None = None
+    identity_revision: str | None = None
+    name: str
+    launch_purposes: list[str] = Field(default_factory=list)
+    availability: str
+    current_run_id: str | None = None
+    current_run_status: str | None = None
+    turns_used: int | None = None
+    last_run_status: str | None = None
+    stop_reason: RunStopReason | None = None
+    context_tokens: int | None = None
+    context_window: int | None = None
+    compacting: bool = False
+    initial_task_summary: str | None = None
+    current_task_summary: str | None = None
+    idle_seconds: float | None = None
+    run_elapsed_seconds: float | None = None
+    latest_run_id: str | None = None
+    ttl_remaining_seconds: float | None = None
+    effective_model: str | None = None
+    base_model: str | None = None
+    active_provider: str | None = None
+    effective_thinking: str | None = None
+    result_expired: bool = False
+    last_failure: PublicFailureEnvelope | None = None
+    recovery_chain_id: str | None = None
+    same_agent_resumes_used: int | None = None
+    resumed_from_run_id: str | None = None
+    recovery_eligibility: PublicRecoveryEligibility | None = None
+    work_package_id: str | None = None
+    predecessor_agent_id: str | None = None
+    completion_audit: PublicCompletionAudit | None = None
+
+
+def test_frozen_pre_change_model_mirrors_the_current_field_set() -> None:
+    """U2/A3: the frozen model is the live model minus exactly the new field.
+
+    This guards the freeze against drift: a later field added to the live
+    model without updating the mirror fails here instead of silently
+    weakening the old-client rejection test.
+    """
+    current = set(AgentSummaryModel.model_fields) - {"uncollected_run_ids"}
+
+    assert set(_PreChangeAgentSummaryModel.model_fields) == current
+
+
+def test_pre_change_client_rejects_uncollected_run_ids() -> None:
+    """U2/A3: a strict pre-U2 client rejects the always-emitted new key."""
+    payload = {"agentId": "agent-1", "name": "worker-base-1", "availability": "idle"}
+
+    # Positive control: the same payload minus the new key validates against
+    # the frozen pre-change model, so the rejection below is about the key.
+    assert validate_wire(_PreChangeAgentSummaryModel, payload)
+
+    with pytest.raises(ValidationError) as excinfo:
+        validate_wire(_PreChangeAgentSummaryModel, payload | {"uncollectedRunIds": []})
+
+    assert excinfo.value.errors()[0]["loc"] == ("uncollectedRunIds",)

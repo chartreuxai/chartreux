@@ -61,11 +61,18 @@ class _StubGrantPort:
     def __init__(self, result: ConfigSaveResult) -> None:
         self._result = result
         self.saves: list[tuple[str, Path, str, str]] = []
+        self.remote_saves: list[tuple[str, Path, str, str]] = []
 
     async def save_dangerous_command_grant(
         self, session_id: str, project: Path, operation_id: str, expected_revision: str
     ) -> ConfigSaveResult:
         self.saves.append((session_id, project, operation_id, expected_revision))
+        return self._result
+
+    async def save_remote_exec_grant(
+        self, session_id: str, project: Path, destination: str, expected_revision: str
+    ) -> ConfigSaveResult:
+        self.remote_saves.append((session_id, project, destination, expected_revision))
         return self._result
 
 
@@ -76,11 +83,19 @@ class _WorldMutatingGrantPort:
         self._agent = agent
         self._mutate = mutate
         self.saves: list[tuple[str, Path, str, str]] = []
+        self.remote_saves: list[tuple[str, Path, str, str]] = []
 
     async def save_dangerous_command_grant(
         self, session_id: str, project: Path, operation_id: str, expected_revision: str
     ) -> ConfigSaveResult:
         self.saves.append((session_id, project, operation_id, expected_revision))
+        self._mutate(self._agent)
+        return ConfigSaveResult("user", "saved", "unchanged", "rev-2")
+
+    async def save_remote_exec_grant(
+        self, session_id: str, project: Path, destination: str, expected_revision: str
+    ) -> ConfigSaveResult:
+        self.remote_saves.append((session_id, project, destination, expected_revision))
         self._mutate(self._agent)
         return ConfigSaveResult("user", "saved", "unchanged", "rev-2")
 
@@ -92,11 +107,20 @@ class _BlockingGrantPort:
         self._entered = entered
         self._release = release
         self.saves: list[tuple[str, Path, str, str]] = []
+        self.remote_saves: list[tuple[str, Path, str, str]] = []
 
     async def save_dangerous_command_grant(
         self, session_id: str, project: Path, operation_id: str, expected_revision: str
     ) -> ConfigSaveResult:
         self.saves.append((session_id, project, operation_id, expected_revision))
+        self._entered.set()
+        await self._release.wait()
+        return ConfigSaveResult("user", "saved", "unchanged", "rev-2")
+
+    async def save_remote_exec_grant(
+        self, session_id: str, project: Path, destination: str, expected_revision: str
+    ) -> ConfigSaveResult:
+        self.remote_saves.append((session_id, project, destination, expected_revision))
         self._entered.set()
         await self._release.wait()
         return ConfigSaveResult("user", "saved", "unchanged", "rev-2")

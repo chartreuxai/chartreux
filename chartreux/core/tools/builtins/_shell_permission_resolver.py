@@ -11,6 +11,7 @@ import os
 from pathlib import Path
 import re
 import shlex
+import stat
 from typing import TYPE_CHECKING, Protocol
 
 from tree_sitter import Language, Parser
@@ -500,6 +501,18 @@ _SHELL_GLOB_CHARACTERS = frozenset("*?[")
 _MAX_EXPANSION_ENTRIES = 4096
 _MAX_EXPANSION_MATCH_STATES = 1 << 19
 
+# The glob-execution whitelist (S2). Only a standalone ``cat``/``wc`` with no
+# options and path operands that are each literal or one single-component glob
+# binds to a literal argv plan; every other glob-bearing operand keeps the
+# existing path-glob denial. The per-call budgets are the four design caps.
+_GLOB_WHITELIST_COMMANDS = frozenset({"cat", "wc"})
+_MAX_GLOB_OPERANDS = 256
+_MAX_GLOB_ARGV_BYTES = 64 * 1024
+_GLOB_METACHARACTERS = frozenset("*?[")
+# Shapes the whitelist rejects outright, whatever the quoting: brackets and
+# braces change the expansion model, and a tilde is expanded before globbing.
+_GLOB_REJECTED_CHARACTERS = frozenset("[]{}~")
+
 
 class ExpansionFailure(StrEnum):
     """Why pathname-expansion inspection failed closed (provenance only).
@@ -518,6 +531,9 @@ class ExpansionFailure(StrEnum):
 
     ENTRY_BUDGET = "entry budget"
     MATCH_STATE_BUDGET = "match-state budget"
+    OPERAND_BUDGET = "operand budget"
+    ARGV_BUDGET = "encoded-argv budget"
+    ENUMERATION_ERROR = "enumeration error"
     UNSUPPORTED_SYNTAX = "unsupported glob syntax"
     CALLER_DENIED = "denied outside the expansion inspection"
     NOT_INSPECTED = "never pathname-expanded"
@@ -529,6 +545,15 @@ _EXPANSION_FAILURE_DETAIL = {
     ),
     ExpansionFailure.MATCH_STATE_BUDGET: (
         "the pathname expansion exceeded its match-state budget"
+    ),
+    ExpansionFailure.OPERAND_BUDGET: (
+        "the pathname expansion exceeded its operand budget"
+    ),
+    ExpansionFailure.ARGV_BUDGET: (
+        "the pathname expansion exceeded its encoded-argv budget"
+    ),
+    ExpansionFailure.ENUMERATION_ERROR: (
+        "the pathname expansion could not enumerate the directory"
     ),
     ExpansionFailure.UNSUPPORTED_SYNTAX: (
         "the pathname expansion uses glob syntax this inspector cannot expand"
@@ -848,6 +873,389 @@ def _pattern_expansion(
     return items
 
 
+# --- glob execution binding (S2) ---------------------------------------------
+#
+# A glob-bearing command operand is normally denied: the resolver models the
+# shell's pathname expansion, but the shell still executes the ORIGINAL command
+# string, so the inspected match set is only a preflight superset. The
+# whitelist below binds an admitted glob call to an immutable, fully literal
+# argv plan: the same classifier produces the plan at permission time and the
+# execution transport consumes it — never the original command string — so the
+# words that run are exactly the words that were authorized.
+
+
+class GlobPlanDenial(Exception):
+    """A whitelist-shaped glob call the literal transport must not run.
+
+    ``token`` is the offending command-line word and ``failure`` its
+    expansion-failure provenance. The permission layer renders it as a
+    path-glob denial; the execution transport fails closed on it. Neither ever
+    falls back to the original command string.
+    """
+
+    def __init__(self, token: str, failure: ExpansionFailure) -> None:
+        super().__init__(token)
+        self.token = token
+        self.failure = failure
+
+
+@dataclass(frozen=True)
+class GlobOperand:
+    """One literal operand word bound to the regular file it names."""
+
+    word: str
+    path: Path
+    device: int
+    inode: int
+
+
+@dataclass(frozen=True)
+class GlobExecutionPlan:
+    """An immutable literal argv plan for one admitted glob call.
+
+    ``argv`` executes without shell re-expansion. ``operands`` pins each
+    planned file's identity so the execution transport can re-open it through
+    its file-open containment boundary and refuse a mutated operand.
+    """
+
+    argv: tuple[str, ...]
+    cwd: Path
+    operands: tuple[GlobOperand, ...]
+
+
+def _glob_word_is_expansion(token: object) -> bool:
+    """Whether a token is an unquoted single-component glob expansion.
+
+    Only an UNQUOTED metacharacter pathname-expands. A fully quoted word is
+    literal data, and a mixed word (``'*'a*``) has ambiguous provenance, so
+    neither is treated as an expansion here.
+    """
+    text = str(token)
+    if not any(character in text for character in _GLOB_METACHARACTERS):
+        return False
+    return (
+        isinstance(token, ShellToken) and token.meta_unquoted and not token.meta_quoted
+    )
+
+
+def _operand_symlink_free(path: Path, anchor: Path) -> bool:
+    """Whether every component the operand introduces is a non-symlink.
+
+    Only the components the operand names are checked — the anchor (the
+    execution cwd, or ``/`` for an absolute word) is trusted as given.
+    """
+    try:
+        relative = path.relative_to(anchor)
+    except ValueError:
+        return False
+    current = anchor
+    for part in relative.parts:
+        if part in {"", "."}:
+            continue
+        current /= part
+        if part == "..":
+            continue
+        try:
+            if stat.S_ISLNK(os.lstat(current).st_mode):
+                return False
+        except OSError:
+            return False
+    return True
+
+
+def _literal_glob_operand(
+    text: str, *, cwd: Path, workspace: Workspace, authority: PathAuthority
+) -> GlobOperand:
+    """Bind one literal (non-expanding) operand word to its regular file."""
+    if not text or "\x00" in text:
+        raise GlobPlanDenial(text, ExpansionFailure.CALLER_DENIED)
+    if any(character in text for character in _GLOB_REJECTED_CHARACTERS):
+        raise GlobPlanDenial(text, ExpansionFailure.CALLER_DENIED)
+    anchor = Path("/") if text.startswith("/") else cwd
+    path = Path(text) if text.startswith("/") else cwd / text
+    if not _operand_symlink_free(path, anchor):
+        raise GlobPlanDenial(text, ExpansionFailure.CALLER_DENIED)
+    try:
+        info = os.lstat(path)
+    except OSError as exc:
+        raise GlobPlanDenial(text, ExpansionFailure.CALLER_DENIED) from exc
+    if not stat.S_ISREG(info.st_mode):
+        raise GlobPlanDenial(text, ExpansionFailure.CALLER_DENIED)
+    resolved = path.resolve()
+    if not workspace.allows(resolved) or not authority.allows(
+        resolved, PathAccess.READ
+    ):
+        raise GlobPlanDenial(text, ExpansionFailure.CALLER_DENIED)
+    return GlobOperand(text, path, info.st_dev, info.st_ino)
+
+
+def _glob_operand_matches(  # noqa: PLR0912, PLR0914, PLR0915
+    token: object,
+    *,
+    cwd: Path,
+    workspace: Workspace,
+    authority: PathAuthority,
+    enumerated: list[int],
+    match_states: list[int],
+) -> list[GlobOperand]:
+    """The literal words one eligible single-component glob expands to.
+
+    The parent is anchored literally and must be an authorized directory with
+    no symlink component; the final component may use only ``*``/``?`` (no
+    brackets, no ``**``, no dot-leading pattern). Every match must be a
+    regular file reached without following a symlink and authorized for read,
+    and no match may begin with ``-`` (option-like results stay rejected even
+    after an option terminator). Budgets are per call: the caller's
+    ``enumerated`` and ``match_states`` counters thread across operands.
+    """
+    text = str(token)
+    if any(character in text for character in _GLOB_REJECTED_CHARACTERS):
+        raise GlobPlanDenial(text, ExpansionFailure.CALLER_DENIED)
+    head, separator, final = text.rpartition("/")
+    prefix = f"{head}/" if separator else ""
+    parent_text = (head or "/") if separator else ""
+    if not final or final in {".", ".."}:
+        raise GlobPlanDenial(text, ExpansionFailure.CALLER_DENIED)
+    if any(character in parent_text for character in _GLOB_METACHARACTERS):
+        # An unquoted wildcard in a middle component is not the whitelist.
+        raise GlobPlanDenial(text, ExpansionFailure.CALLER_DENIED)
+    if final.startswith("."):
+        raise GlobPlanDenial(text, ExpansionFailure.CALLER_DENIED)
+    atoms = _parse_glob_component(final)
+    if atoms is None or any(atom[0] == "set" for atom in atoms):
+        raise GlobPlanDenial(text, ExpansionFailure.UNSUPPORTED_SYNTAX)
+    anchor = Path("/") if text.startswith("/") else cwd
+    base = (
+        (Path(parent_text) if parent_text.startswith("/") else cwd / parent_text)
+        if parent_text
+        else cwd
+    )
+    if not base.is_dir() or not _operand_symlink_free(base, anchor):
+        raise GlobPlanDenial(text, ExpansionFailure.CALLER_DENIED)
+    resolved_base = base.resolve()
+    if not workspace.allows(resolved_base) or not authority.allows(
+        resolved_base, PathAccess.READ
+    ):
+        raise GlobPlanDenial(text, ExpansionFailure.CALLER_DENIED)
+    try:
+        names = sorted(os.listdir(base))
+    except OSError as exc:
+        raise GlobPlanDenial(text, ExpansionFailure.ENUMERATION_ERROR) from exc
+    enumerated[0] += len(names)
+    if enumerated[0] > _MAX_EXPANSION_ENTRIES:
+        raise GlobPlanDenial(text, ExpansionFailure.ENTRY_BUDGET)
+    matches: list[GlobOperand] = []
+    for name in names:
+        if name.startswith("."):
+            continue
+        match_states[0] += (len(atoms) + 1) * (len(name) + 1)
+        if match_states[0] > _MAX_EXPANSION_MATCH_STATES:
+            raise GlobPlanDenial(text, ExpansionFailure.MATCH_STATE_BUDGET)
+        if not _match_glob_atoms(name, atoms):
+            continue
+        if name.startswith("-"):
+            raise GlobPlanDenial(text, ExpansionFailure.CALLER_DENIED)
+        word = f"{prefix}{name}"
+        path = base / name
+        if not _operand_symlink_free(path, anchor):
+            raise GlobPlanDenial(text, ExpansionFailure.CALLER_DENIED)
+        try:
+            info = os.lstat(path)
+        except OSError as exc:
+            raise GlobPlanDenial(text, ExpansionFailure.CALLER_DENIED) from exc
+        if not stat.S_ISREG(info.st_mode):
+            raise GlobPlanDenial(text, ExpansionFailure.CALLER_DENIED)
+        resolved = path.resolve()
+        if not workspace.allows(resolved) or not authority.allows(
+            resolved, PathAccess.READ
+        ):
+            raise GlobPlanDenial(text, ExpansionFailure.CALLER_DENIED)
+        matches.append(GlobOperand(word, path, info.st_dev, info.st_ino))
+    if not matches:
+        # A no-match glob is passed through literally by the shell, so the
+        # command would receive the pattern as a filename: deny it.
+        raise GlobPlanDenial(text, ExpansionFailure.CALLER_DENIED)
+    return matches
+
+
+def _glob_execution_plan(
+    tokens: list[str], *, cwd: Path, workspace: Workspace, authority: PathAuthority
+) -> GlobExecutionPlan | None:
+    """The literal argv plan for one command, or None when not a glob call.
+
+    None means the command is not the whitelist (its shell path is
+    unaffected); every whitelist-shaped failure raises
+    :class:`GlobPlanDenial`. The whitelist is exactly: standalone ``cat`` or
+    ``wc``, no options (an optional ``--`` terminator only), at least one
+    eligible glob, and every operand either literal or eligible.
+    """
+    if not tokens:
+        return None
+    command = Path(str(tokens[0])).name or str(tokens[0])
+    if command not in _GLOB_WHITELIST_COMMANDS:
+        return None
+    operands = list(tokens[1:])
+    if operands and str(operands[0]) == "--":
+        operands = operands[1:]
+    for token in operands:
+        if str(token).startswith("-"):
+            raise GlobPlanDenial(str(token), ExpansionFailure.CALLER_DENIED)
+    if not any(_glob_word_is_expansion(token) for token in operands):
+        # No eligible glob: this is an ordinary literal call, not the
+        # literal-argv transport (its shell execution is unchanged).
+        return None
+    words: list[str] = [str(tokens[0])]
+    planned: list[GlobOperand] = []
+    enumerated = [0]
+    match_states = [0]
+
+    def append(operand: GlobOperand) -> None:
+        words.append(operand.word)
+        planned.append(operand)
+        if len(planned) > _MAX_GLOB_OPERANDS:
+            raise GlobPlanDenial(operand.word, ExpansionFailure.OPERAND_BUDGET)
+
+    for token in operands:
+        if _glob_word_is_expansion(token):
+            for operand in _glob_operand_matches(
+                token,
+                cwd=cwd,
+                workspace=workspace,
+                authority=authority,
+                enumerated=enumerated,
+                match_states=match_states,
+            ):
+                append(operand)
+            continue
+        if (
+            isinstance(token, ShellToken)
+            and token.meta_quoted
+            and token.meta_unquoted
+            and any(character in str(token) for character in _GLOB_METACHARACTERS)
+        ):
+            # Mixed quoting: the metacharacter's expansion provenance is not
+            # one literal word, so the whitelist refuses the operand.
+            raise GlobPlanDenial(str(token), ExpansionFailure.CALLER_DENIED)
+        append(
+            _literal_glob_operand(
+                str(token), cwd=cwd, workspace=workspace, authority=authority
+            )
+        )
+    argv = tuple(words)
+    if (
+        sum(len(word.encode("utf-8", errors="surrogatepass")) + 1 for word in argv)
+        > _MAX_GLOB_ARGV_BYTES
+    ):
+        raise GlobPlanDenial(str(tokens[0]), ExpansionFailure.ARGV_BUDGET)
+    return GlobExecutionPlan(argv=argv, cwd=cwd, operands=tuple(planned))
+
+
+def glob_execution_plan_for_command(
+    command: str,
+    *,
+    cwd: Path,
+    workspace: Workspace,
+    authority: PathAuthority,
+    scratchpad_roots: frozenset[Path] = frozenset(),
+    workspace_roots: frozenset[Path] | None = None,
+) -> GlobExecutionPlan | None:
+    """The literal argv plan one raw command must execute through, else None.
+
+    None is returned only for a command that is not a whitelist glob call (the
+    shell transport is correct for it). A command that starts like the
+    whitelist yet cannot be bound to a plan raises :class:`GlobPlanDenial`:
+    the execution transport must fail closed, never fall back to the original
+    command string.
+    """
+    try:
+        tokens = split_shell_tokens(command)
+    except ValueError:
+        return None
+    if (
+        not tokens
+        or (Path(str(tokens[0])).name or str(tokens[0])) not in _GLOB_WHITELIST_COMMANDS
+    ):
+        return None
+    try:
+        analysis = _analyze_guardrail_source(
+            command, scratchpad_roots=scratchpad_roots, workspace_roots=workspace_roots
+        )
+        expanded, inner_redirects, errors = _expand_guardrail_parts(
+            list(analysis.command_parts),
+            scratchpad_roots=scratchpad_roots,
+            redirect_operands=analysis.redirect_operands,
+            workspace_roots=workspace_roots,
+            command_assignments=analysis.command_assignments,
+        )
+        standalone = (
+            not inner_redirects
+            and not errors
+            and not any(analysis.redirect_operands)
+            and len(expanded) == 1
+            and expanded[0].access is None
+            and expanded[0].tokens is None
+        )
+        part_tokens = _visit_tokens(expanded[0].text, None) if standalone else []
+    except _UnsafeShellSyntax as exc:
+        raise GlobPlanDenial(command, ExpansionFailure.NOT_INSPECTED) from exc
+    if not standalone:
+        # The whole invocation is not the standalone whitelist shape (a
+        # pipeline, a command list, a redirect, or a wrapper). It was never
+        # admitted; only a whitelist-command part that really carries an
+        # expandable glob operand is refused here, so an ordinary follow-up
+        # statement (``cat a.txt; echo $?``) keeps its shell execution.
+        if any(_whitelist_part_glob_intent(part) for part in analysis.command_parts):
+            raise GlobPlanDenial(command, ExpansionFailure.NOT_INSPECTED)
+        return None
+    plan = _glob_execution_plan(
+        part_tokens, cwd=cwd, workspace=workspace, authority=authority
+    )
+    if plan is None and any(_glob_intent_token(token) for token in part_tokens):
+        # A glob-shaped operand the whitelist refused (mixed quoting, an
+        # ineligible expansion): it was never admitted, so the shell must not
+        # run it either.
+        raise GlobPlanDenial(command, ExpansionFailure.NOT_INSPECTED)
+    return plan
+
+
+def _glob_intent_token(token: object) -> bool:
+    """Whether a token carries an UNQUOTED glob metacharacter.
+
+    Unlike :func:`_glob_word_is_expansion`, mixed quoting counts: such a word
+    really pathname-expands, so the transport must refuse to fall back to the
+    shell for it.
+    """
+    return (
+        isinstance(token, ShellToken)
+        and token.meta_unquoted
+        and any(character in str(token) for character in _GLOB_METACHARACTERS)
+    )
+
+
+def _whitelist_part_glob_intent(part: str) -> bool:
+    """Whether one command part is a whitelist call with a glob operand."""
+    try:
+        tokens = split_shell_tokens(part)
+    except ValueError:
+        return False
+    if not tokens:
+        return False
+    name = Path(str(tokens[0])).name or str(tokens[0])
+    if name not in _GLOB_WHITELIST_COMMANDS:
+        return False
+    operands = [token for token in tokens[1:] if str(token) != "--"]
+    return any(_glob_intent_token(token) for token in operands)
+
+
+def _glob_plan_denial(error: GlobPlanDenial, command_part: str) -> PermissionContext:
+    return _expansion_denial(error.token, error.failure, command_part)
+
+
+def glob_plan_denial_text(error: GlobPlanDenial, command_part: str) -> str:
+    """The rendered denial for a plan the execution transport cannot consume."""
+    return _glob_plan_denial(error, command_part).reason or ""
+
+
 def _scoped_guardrail_cwds(
     expanded: list[_GuardrailPart], cwd: Path
 ) -> Iterator[tuple[_GuardrailPart, list[str], set[Path], bool]]:
@@ -933,15 +1341,24 @@ def _get_default_denylist() -> list[str]:
         "dash -i",
         "screen",
         "tmux",
-        # Modeled network clients (v0.5.9 P2-a): curl and wget left this
-        # denylist — their DESTINATIONS decide run vs ask under the
-        # destination-aware egress rule (see _destination.py), and their
-        # local-file operands are path-inspected by their command policy.
-        # Every other egress client stays denied fail-closed until modeled:
-        # denylist and path policy control known network exfiltration
-        # routes (redaction cannot observe pipe/socket transit). These
-        # controls harden against known payload shapes, not complete egress
-        # containment.
+        # Modeled network clients: curl and wget left this denylist in
+        # v0.5.9 P2-a and http (HTTPie's request client) in v0.7.0 S3 —
+        # their DESTINATIONS decide run vs ask under the destination-aware
+        # egress rule (see _destination.py), and curl/wget's local-file
+        # operands are path-inspected by their command policy. Every other
+        # egress client stays denied fail-closed until modeled: denylist and
+        # path policy control known network exfiltration routes (redaction
+        # cannot observe pipe/socket transit). These controls harden against
+        # known payload shapes, not complete egress containment.
+        #
+        # wget2 (v0.7.0 S3) keeps its entry under the "keep denylist entries
+        # until the prerequisites are established" rule: loopback auto-allow
+        # requires a documented, corpus-tested EFFECTIVE redirect-disable for
+        # wget2, and no such redirect-disable is established (the binary is
+        # not installed here and the design names no version-verified flag),
+        # so every wget2 spelling — explicit http(s):// URL operands
+        # included — stays denied rather than inheriting wget's redirect
+        # default and FTP PASV residual silently.
         "wget2",
         "nc",
         "ncat",
@@ -949,14 +1366,30 @@ def _get_default_denylist() -> list[str]:
         # Probed egress clients and the watch repeater: resolved ALWAYS for
         # arbitrary payloads, so denied fail-closed as the interim until each
         # is modeled (v0.5.9 P1-e2). They stay denied under the
-        # destination-aware egress rule until modeled there.
+        # destination-aware egress rule until modeled there. The v0.7.0 S3
+        # model keeps all eight denied because destination parsing cannot
+        # bound remote command execution, secondary connections, or
+        # scripting: ssh/scp/rsync stay egress-denied here so S4b's
+        # network.remote-exec path can model them as a SEPARATE operation,
+        # and watch is a command repeater, not an egress client.
         "ssh",
         "scp",
         "rsync",
         "ftp",
         "telnet",
-        "http",
+        # httpie: HTTPie 3.x installs its plugin/CLI manager under this name,
+        # not the request grammar. Admission is gated on a test confirming the
+        # installed entry point carries HTTPie's request grammar; that
+        # confirmation does not hold, so the entry stays (v0.7.0 S3).
         "httpie",
+        # https: HTTPie's https entry point is the same request client with
+        # the https scheme defaulted. It never had a modeled grammar, and the
+        # `http` model is admitted only for HTTPie's documented+corpus-tested
+        # request grammar; this twin has no such documented grammar to
+        # confirm, so it is denied fail-closed rather than resolved beside
+        # the modeled `http` (user-adjudicated, v0.7.0). Grammar modeling is
+        # deferred to the v0.8.0 backlog.
+        "https",
         "aria2c",
         "lftp",
         "watch",
@@ -1534,11 +1967,18 @@ class ShellPermissionResolver:
         ]
         | None = None,
         injected_env: Mapping[str, str] | None = None,
+        literal_glob_transport: bool = False,
     ) -> None:
         self.config = config
         self.cwd = cwd
         self.workspace = workspace
         self.path_authority = path_authority
+        # S2 capability declaration: only a caller whose execution path can
+        # consume the literal argv plan may admit the glob whitelist. The
+        # foreground Bash tool sets this; a caller that would hand the
+        # original string to a shell (the managed background launcher, a
+        # permission-only probe) keeps the existing glob denials.
+        self.literal_glob_transport = literal_glob_transport
         # Live getter: authority changes must invalidate cached decisions, so
         # the snapshot is read per resolution, never captured at construction.
         self._dangerous_command_authorities = dangerous_command_authorities or (
@@ -2269,7 +2709,10 @@ class ShellPermissionResolver:
         return _denied(Diagnostic("path_glob", token, entry.text))
 
     def _resolve_path_permission(
-        self, path_parts: list[_GuardrailPart]
+        self,
+        path_parts: list[_GuardrailPart],
+        *,
+        glob_authorized: _GuardrailPart | None = None,
     ) -> PermissionContext | None:
         authority = self.path_authority
         metadata_guard: _MetadataGuard | None = None
@@ -2278,6 +2721,11 @@ class ShellPermissionResolver:
             path_parts, self.cwd
         ):
             if not tokens:
+                continue
+            if entry is glob_authorized:
+                # The whole entry was authorized as one literal argv plan; its
+                # operands are already resolved and file-checked against the
+                # same authority and workspace.
                 continue
             command = _part_command(tokens)
             access = entry.access or _operand_access(command)
@@ -2646,14 +3094,20 @@ class ShellPermissionResolver:
         destination as a URL, so the push would run the destination's
         receive-pack and hooks.
 
-        The modeled network clients (v0.5.9 P2-a) classify here too: a
-        curl/wget invocation whose destination is not literal loopback (or
-        whose recognizer cannot parse it — fail-closed, never loopback) or
-        whose destination-changing behavior gate fired resolves ask-class as
-        the network.egress operation, the same grantable class as git push,
-        so the runtime approval flow (dialog in interactive main sessions,
+        The modeled network clients classify here too: a curl/wget
+        invocation (v0.5.9 P2-a) or an HTTPie ``http`` invocation (v0.7.0 S3)
+        whose destination is not literal loopback (or whose recognizer cannot
+        parse it — fail-closed, never loopback) or whose
+        destination-changing behavior gate fired resolves ask-class as the
+        network.egress operation, the same grantable class as git push, so
+        the runtime approval flow (dialog in interactive main sessions,
         denial with remediation in headless and child sessions) composes
-        unchanged.
+        unchanged. An ``http`` invocation outside the restricted grammar — any
+        option, a request item that reads a local file, a non-http(s) scheme,
+        a missing destination, or a startup-config indirection — is instead a
+        hard denial with no operation ID and no approval path, exactly like an
+        unmodeled git form, because a grant must never make an unbounded
+        spelling approvable.
         """
         authorities = self._authorities()
         missing: dict[str, RepositoryScope] = {}
@@ -2675,6 +3129,19 @@ class ShellPermissionResolver:
                 self._injected_env,
                 command_env=dict(entry.assignments) if entry.assignments else None,
             )
+            if egress.kind == "deny":
+                # v0.7.0 S3: an unrecognized client grammar, or an effect the
+                # client's model cannot bound, is a hard denial — no
+                # operation ID, no proposal, no approval path. It is decided
+                # here, after every path, sensitivity, and metadata check, so
+                # the local reads and writes the call already names are
+                # collected and gated BEFORE any egress authority is
+                # considered.
+                return _denied(
+                    Diagnostic(
+                        "dangerous_guard", detail=egress.reason, command_part=entry.text
+                    )
+                )
             if egress.kind == "ask":
                 if cwd_unknown:
                     return _denied(
@@ -2832,7 +3299,30 @@ class ShellPermissionResolver:
             dangerous_command_proposal=proposal,
         )
 
-    def resolve_permission(self, args: ShellCommandArgs) -> PermissionContext | None:  # noqa: PLR0911
+    def _standalone_glob_entry(
+        self,
+        analysis: ShellPermissionAnalysis,
+        expanded: list[_GuardrailPart],
+        inner_redirects: list[str],
+    ) -> _GuardrailPart | None:
+        """The single entry the S2 literal transport may plan, else None.
+
+        Requires the caller's capability declaration (an execution path that
+        consumes the literal plan), exactly one read-context command entry,
+        and no redirect anywhere in the invocation.
+        """
+        if not self.literal_glob_transport:
+            return None
+        if inner_redirects or any(analysis.redirect_operands):
+            return None
+        if len(expanded) != 1:
+            return None
+        entry = expanded[0]
+        if entry.access is not None or entry.tokens is not None:
+            return None
+        return entry
+
+    def resolve_permission(self, args: ShellCommandArgs) -> PermissionContext | None:  # noqa: PLR0911, PLR0912, PLR0914
         precondition = self._resolve_preconditions()
         if precondition is not None:
             return precondition
@@ -2906,10 +3396,41 @@ class ShellPermissionResolver:
             redirect_paths, expanded
         ):
             return metadata_permission
+        # S2: a standalone whitelist-shaped glob call binds to one literal
+        # argv plan. The plan's operands are fully resolved and file-checked
+        # here, so the path loop skips exactly this entry; every other glob
+        # keeps the existing path-glob denial.
+        glob_authorized: _GuardrailPart | None = None
+        glob_entry = self._standalone_glob_entry(analysis, expanded, inner_redirects)
+        if glob_entry is not None:
+            entry = glob_entry
+            try:
+                glob_plan = _glob_execution_plan(
+                    _visit_tokens(entry.text, None),
+                    cwd=self.cwd,
+                    workspace=self.workspace,
+                    authority=self.path_authority,
+                )
+            except GlobPlanDenial as exc:
+                return _glob_plan_denial(exc, entry.text)
+            except _UnsafeShellSyntax as exc:
+                return _denied(
+                    Diagnostic(
+                        "command",
+                        detail=str(exc),
+                        command_part=entry.text,
+                        denial_class=exc.denial_class,
+                        alternative=exc.alternative,
+                    )
+                )
+            if glob_plan is not None:
+                glob_authorized = entry
         # Redirect destinations already became synthetic WRITE operands at
         # their occurrence positions inside `expanded`; each resolves against
         # the working directory tracked at that point in the chain.
-        path_permission = self._resolve_path_permission(expanded)
+        path_permission = self._resolve_path_permission(
+            expanded, glob_authorized=glob_authorized
+        )
         if path_permission is not None:
             return path_permission
 

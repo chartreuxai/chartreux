@@ -1,0 +1,30 @@
+#routes-screen { align: center middle; }
+#routes-content {
+    width: 92; height: 100%; padding: 0 1;
+    background: $surface; border: solid $foreground-muted;
+    border-title-color: $foreground; border-title-style: bold;
+}
+#routes-content.fullscreen { background: $background; border: none; }
+#routes-title { display: none; height: 1; text-style: bold; }
+#routes-content.fullscreen #routes-title { display: block; }
+#routes-heading, #routes-status, #routes-hint {
+    height: 1; text-wrap: nowrap; text-overflow: ellipsis;
+}
+#routes-heading, #routes-hint { color: $text-muted; }
+#routes-list { height: 1fr; border: none; padding: 0; text-wrap: nowrap; }
+#routes-list > .option-list--option-highlighted {
+    color: $foreground; background: transparent; text-style: none;
+}
+#routes-list:focus > .option-list--option-highlighted {
+    color: $surface; background: $foreground; text-style: bold;
+}
+#routes-content.fullscreen #routes-list:focus > .option-list--option-highlighted {
+    color: $background;
+}
+#routes-list > .option-list--option-hover { background: transparent; }
+#routes-details { height: auto; max-height: 60%; color: $text-muted; overflow-y: auto; }
+#routes-detail-text { height: auto; text-wrap: wrap; }
+#routes-hint { dock: bottom; }
+#routes-list:ansi:focus > .option-list--option-highlighted {
+    color: $ansi-background; background: $ansi-foreground;
+}

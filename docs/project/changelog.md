@@ -2,6 +2,311 @@
 
 All notable changes to Chartreux are documented in this file.
 
+## 0.7.0 (2026-11-01)
+
+Everything shipped since v0.6.1: the skills and route inspection tooling, the
+completion-audit and effective-thinking displays, a smaller composed prompt and
+a faster streaming transcript, the shell-policy admission work, payload-only
+history trimming, and the question-widget fixes.
+
+### Added
+
+- `chartreux skills diff [NAME] [--json]` compares the user copies of a skill
+  under `~/.chartreux/skills` and `~/.agents/skills` with the shipped copy of the
+  same name and renders deterministic sorted unified diffs from the one skill
+  inventory `chartreux doctor` also reads. Each case is named plainly: an
+  identical copy could be removed after reviewing support files — never
+  automatically; a diverged copy; an inactive copy, naming the path and source
+  of the copy that wins; or unverified, when the comparison itself fails.
+  `NAME` narrows the report to one skill and an unknown name is an error;
+  `--json` emits `entries` and `exit_code`. Exit codes are `0` nothing differs,
+  `1` a loaded user copy differs, `2` operational error (invalid UTF-8
+  included).
+
+- Broken skills are now visible instead of silent. That same inventory records
+  typed load failures; `chartreux doctor` prints one `warn` per failure with the
+  remediation "fix the file and rerun chartreux doctor", and the interactive
+  interface lists the same records as configuration issues. Diagnostics are
+  sanitized — no frontmatter values, and no parsed name is needed for the
+  message — both surfaces project one list instead of building their own, a
+  broken skill never blocks startup, and `/reload` clears the warning once the
+  file parses again.
+
+- `/routes` browses the conversation's live `[orchestration.routes]` table, and
+  the doctor route section reports the independently loaded configuration of
+  the same table. A row names the purpose, seat, configured binding, identity,
+  tier, and overlay, the model a marker binding resolves to today (labeled a
+  preview, never a launch guarantee), and `requires_distinct_models` beside the
+  resolved distinct-model count. Reload validation and launch-time diversity
+  stay separate facts, so an all-marker route shows a passing reload beside a
+  failing launch-time diversity check, and one unresolvable target keeps the
+  other rows intact. A reload that swaps the table updates the open browser.
+
+- The agent transcript's metadata pane carries the completion audit stamp of the
+  selected agent's latest run: the audit version, the worker's claim class, its
+  satisfied mandates, its declared lines, a runtime-failure line only when the
+  run is not healthy, and a rejection reason only when one exists. The wording
+  is "Claims matched" and never "Task verified" — a stamp means the claim
+  matched evidence, not that the task is correct. The stamp resolves against the
+  latest retained run, so a previous run's stamp never rides a new one, and the
+  section disappears on re-task, release, expiry, or a missing result; an
+  unsupported audit version renders as unsupported, not as a verdict.
+
+- Effective-thinking display. The banner annotates the model as
+  `model[medium; API: high]` when the selected level and the provider's API
+  effort differ, and shows `API: unknown` when the estimate cannot be resolved
+  rather than implying that the requested level is effective. The thinking
+  picker explains the difference, and `/status` shows requested, semantic, and
+  API effort as three labeled values. The projection is computed server-side
+  from the committed deployment and the same message context the next request
+  resolves against — the interface keeps no mapping table of its own — and it
+  refreshes after completed reasoning, compaction, and rewind. It describes the
+  next request: an in-flight call keeps the encoding it started with, and a
+  failover may pick another deployment.
+
+- Uncollected background results stay visible. A completed run whose result is
+  still retrievable but was never returned by a successful collection call is
+  marked uncollected per `(agent, run)`: `get_agent_result` with a result and a
+  `wait_for_agent` that returns one count as collection; `check_agents`, the
+  browser, a still-running wait, and a cancelled or errored wait do not. The
+  agents browser gains an `uncollected: N` row suffix that abbreviates and then
+  drops before it can squeeze the state label, `/status` lists the runs in a
+  Background Agent Results section, and `check_agents` carries the same run ids.
+  The list covers every retrievable uncollected result for that agent, newest
+  first, so an earlier result survives reuse and replacement and can be
+  collected by pinning its run id; collecting one run clears only that run, and
+  the marker expires, releases, or drains with its result.
+
+- Path completions resolve against the session's workspace root rather than the
+  process working directory, so a completion stays correct when the two differ.
+
+- Remote command execution is now its own dangerous-command operation,
+  `network.remote-exec`, granted by destination rather than in general: an
+  approval authorizes one exact `user@host:port` (the user is mandatory, the
+  host is lowercased, a missing port canonicalizes to 22, and wildcards,
+  ranges, and alias groups never parse). Deny, allow once, allow this session,
+  and always for this project all apply; the persisted form is the protected
+  user-layer `remote_exec_grants_by_project` field. An egress grant never admits
+  a remote command and a remote-exec grant never admits egress or publication;
+  session grants do not propagate to children, a persisted destination grant
+  authorizes the parent and its children, and children never prompt. The
+  approval states its honest scope: remote commands and their effects are
+  outside Chartreux's local guards, so the grant trusts the destination, not a
+  contained payload. The approval path, the four-choice lifecycle, the
+  persistence field, and the child semantics are all in place, but no shipped
+  client classifies a destination yet, so the authority is groundwork until the
+  remote-command admission lands (see the retained limitations below).
+
+- Two previously denied shell shapes are admitted with guards. A word whose
+  leading `=` is neutralized by quoting or escaping and which proves exactly one
+  literal argument is admitted as written (`echo '=ls'`, `echo \=ls`), while an
+  unquoted `echo ===X===` keeps its equals-expansion denial and its "quote the
+  marker" remediation. One same-invocation status probe is admitted — a plain
+  simple command, `;`, then `echo $?` or `printf $?` as the entire last
+  statement (`ls; echo $?`) — keeping the `$?` source token so the analyzed argv
+  never diverges from the executed command. Pipelines, conditionals,
+  assignment-only statements, redirects, wrapper payloads, and any statement
+  after the probe stay denied.
+
+- Egress modeling for HTTPie's `http` entry point. It leaves the denylist under
+  a restricted positional grammar — verb, literal `http(s)` URL, literal request
+  items, quoted `==` items — where a loopback destination runs, a non-loopback
+  or unparseable destination resolves ask-class `network.egress`, and any
+  option, local-file item, non-`http(s)` scheme, missing destination, or
+  startup-config indirection is a hard denial with no approval path. Local reads
+  and writes are collected and gated before egress authority.
+
+- Public protocol additions: `AgentSummaryModel` gains `completionAudit` (the
+  typed audit stamp of the latest retained run) and `uncollectedRunIds` (always
+  serialized, `[]` included); `ConfigView` gains `effectiveThinking` and the
+  route-inspection fields `routes` and `routesError`; and one server event,
+  `callback/childClosed` (`sessionId`, `callbackId`, `reason`), reports a child
+  callback's closure to the parent client. Both wire models are strict
+  (`extra="forbid"`), so the additions are forward-compatible only: a new client
+  accepts payloads from an older app server, while an older strict client
+  rejects the new keys and the new event method. Clients and the app server must
+  run the same version.
+
+### Changed
+
+- The launch-target route table now renders exactly once, in the `task` tool
+  description, instead of in the composed system prompt. Root guidance points at
+  that table, and bounded-child guidance names neither delegation nor a table.
+  Measured against the pinned tokenizer baseline, the dedup removes 854 tokens —
+  about 15% of the fixture prompt. A custom task description receives the live
+  table as its own appended section, so a custom skeleton cannot zero it out,
+  and a resumed conversation whose persisted bundle predates the change serves
+  the deduped prompt.
+
+- Compaction trims the in-memory history it no longer needs to replay: after the
+  envelope is saved with the originals present, the pre-boundary prefix is
+  sealed under the save lock with a durable receipt, and the reasoning payloads
+  of those messages are dropped while text, tool structure, image references,
+  and display fields stay. The transcript's own leading bytes — the full
+  records, byte for byte — are the archive the descriptor pins, ordinary saves
+  rewrite only the live tail, rewind and `/branch` hydrate the archive into a
+  complete operation-scoped snapshot before crossing into a new session, and the
+  read paths stay display-identical. A failed trim keeps the originals:
+  compaction succeeds either way.
+
+- `cat` and `wc` calls whose operands include eligible globs now bind to a
+  literal argv plan re-derived at execution time and run through a no-shell
+  transport, with every planned operand re-opened through a component-wise
+  `O_NOFOLLOW` walk and its device and inode re-checked. The shell cannot expand
+  an operand between the permission check and the read: mutation, symlinks,
+  non-regular files, enumeration errors, and platforms without those primitives
+  fail closed, and the plan never falls back to the command string. The
+  transport is scoped to that glob whitelist — `ls` listing globs, `grep`
+  pattern globs, and every admission above keep shell execution.
+
+- `ask_user_question` is denied in a bounded child and withheld from the child
+  tool catalog, so a child returns a blocker naming what it needs instead of
+  opening a question nobody can answer. Root behavior, runtime approvals, and
+  the parent's own question flow are unchanged.
+
+- The shipped skills were corrected against the runtime they describe: route
+  terminology in the design, plan, and review skills; the sub-agent skills'
+  assigned-root search boundary; the sub-implementor's bounded-read and
+  edit-recovery guidance; the sub-verifier's runtime corrections; the
+  sub-summarizer's Common Lisp typo; the git-workflow skill's clean-tree
+  checkout exemption; the test generator's optional verification dispatch; the
+  debugging skill's runtime sync; the web-search usage wording; and the builtin
+  command skill's managed-job claim.
+
+### Performance
+
+- Streaming a long bullet-list answer no longer grows the widget tree with the
+  list: completed items become cached strips served by one canvas widget keyed
+  by effective width and style generation, only the active item stays a live
+  widget subtree, and any document that is not a simple shape keeps the
+  whole-document path (rendered-text equivalence is asserted at every prefix).
+  On the 400-item fixture the frozen ceilings — 30 s wall, 250 ms frame p95,
+  20 ms loop-lag p50 — are now enforced and measure 1.9 s, 64 ms, and 1.5 ms.
+
+- Persisted-transcript verification releases the GIL every 128 records in both
+  its comparison phase and the drain that follows, so a full verify no longer
+  starves the render loop. The release ceiling on combined-phase flush-p95
+  degradation was set at 65% by user adjudication: every save now also runs the
+  archived-marker admission scan of the history-trimming chain — required
+  fail-closed work on the same measured window, not removable by the verify
+  cadence — and the redesign that would move that guard off the render loop is
+  deferred to the next release.
+
+- Session metadata is serialized once per content: a process-lifetime content
+  hash gates the prompt and tool metadata dump, so repeated saves with unchanged
+  metadata stop re-serializing it, a changed hash still rewrites, and a restart
+  re-serializes once before the hash rebuilds.
+
+- Usage-ledger appends stop rescanning the ledger: a per-ledger attempted set
+  and a confirmed-durable seen set make a first append read nothing and a
+  confirmed retry short-circuit, while a retry after an unconfirmed append keeps
+  the full-scan path (a landed record is reported as already present, never
+  duplicated). The 1k-record burst drops from 2472.73 ms to 134.85 ms.
+
+### Fixed
+
+- A question widget whose callback died on the server is dismissed instead of
+  trapping the pending queue: `NOT_FOUND` and `CALLBACK_CLOSED` close the
+  widget, advance the queue, and offer no resend hint, while `INVALID_PARAMS`
+  keeps the draft-and-retry branch and `CONFLICT` keeps its own boundary (now
+  pinned). The interface also unmounts question widgets on any non-open
+  projected status, not on an expired one only, and consumes the new
+  child-closure event identity-matched on `callbackId` — root ids and mismatched
+  owners are ignored, a duplicate closure is idempotent, and a late closure
+  never dismisses a newer widget or clears its input.
+
+- Agent inventory updates are serialized and coalesced: one delivery is in
+  flight per registry, the payload is projected immediately before it is sent
+  rather than from an older snapshot, and a caller that arrives during a
+  suspended delivery queues its eviction data for the next pass, so an
+  `agents/update` can no longer publish a stale inventory or drop an eviction.
+
+### Breaking
+
+- HTTPie's `https` entry point is denied fail-closed by the shipped
+  `[tools.bash]` denylist. It is the request client with the https scheme
+  defaulted — an unmodeled twin beside the now-modeled `http` — and it has no
+  documented, corpus-tested grammar to admit under, so a plain remote
+  destination such as `https http://attacker.example/` resolves denied with
+  "matches denylist pattern 'https'" instead of resolving beside the `http`
+  destination model. Loopback destinations are denied too: no auto-allow rides
+  beside the modeled client. Grammar modeling is deferred to the v0.8.0
+  backlog; removing the entry re-enables the client as an ordinary denylist
+  edit.
+
+- The composed system prompt no longer carries the launch-target route table; it
+  lives in the `task` tool description. Anything that compared, pinned, or
+  patched the prompt text must read the table there, and a conversation resumed
+  from a bundle composed before this change serves the deduped prompt.
+
+Pre-release alpha: there is no migration path, and this release carries no
+separate upgrade guide. The user-visible narrowing is described in this section
+and in the retained limitations below.
+
+### Retained limitations
+
+- Egress narrowing stays where it was: `httpie`, `wget2`, `https`, `ftp`,
+  `telnet`, `aria2c`, `lftp`, `watch`, `ssh`, `scp`, and `rsync` are all denied,
+  loopback destinations included. `wget2` stays denied because no documented,
+  corpus-tested redirect-disable exists for it, and its recursive retrieval,
+  input and config files, and output paths are pinned as denials rather than
+  admitted. The FTP PASV residual stays disclosed for the modeled `wget` rather
+  than gated.
+
+- Remote-exec authority is a destination grant, not a payload guarantee: the
+  prompt says so, and the grant trusts the destination. No remote-command client
+  is admitted under it in this release — `ssh`, `scp`, and `rsync` remain
+  denied, so no grant can be exercised yet — and the hostname-destination
+  admission with its resolve-validate-pin guarantee is not shipped, so nothing
+  may be assumed about hostname pinning. Loopback and local-machine destinations
+  cannot be reached through this path because every spelling is denied.
+
+- The admission boundaries are exact. S1 admits only the quoted or escaped `=`
+  marker that proves one literal word, and one same-invocation `$?` probe with
+  nothing after it. Glob execution admits only `cat` and `wc` with no options and
+  an operand that is either literal or an eligible glob — an unquoted `*` or `?`
+  only in the final component under a literal authorized parent — and it denies
+  brackets, `**`, braces, tilde, mixed quoting, a no-match, option-like results,
+  matches beginning with `-`, directories, non-regular files, and symlinks. The
+  work budgets stay frozen at 4096 directory entries, 524,288 match states, 256
+  operands, and 64 KiB of argv, and exhaustion denies instead of truncating.
+  `ls` listing globs and `grep` pattern globs keep their existing shell
+  execution.
+
+- Structural tombstones are deferred: this release trims only the pre-boundary
+  `reasoning_payloads`. Dropping text, tool structure, or image references from
+  old messages waits until the retained-memory benefit is measured and the loss
+  of pre-boundary conversation rewind is a deliberate product decision.
+
+- File-only restore does not exist. Historical checkpoints are memory-only and
+  the restore operation is coupled to conversation rewind; trimming keeps the
+  checkpoint data but ships no separate file-only restore command or UI.
+
+- Cold-resume memory peaks are unchanged: a cold resume loads the complete
+  records through the unchanged legacy path, so a resumed session's peak is its
+  full history's. Trimming reduces what the running session holds, not what a
+  resume loads.
+
+- No process-wide memory bound is claimed. The trim releases the payloads of the
+  sealed prefix; it is not a statement that a session's or the process's total
+  memory is bounded.
+
+- Trim savings are unmeasured and workload-dependent, and they come only from
+  the reasoning payloads: tool outputs and visible text remain retained.
+
+- Archive unavailability is classified, and one class is terminal. An
+  authority-state failure — a descriptor whose epoch, prefix length, or retained
+  fields no longer match — fails the save with a typed diagnostic and recovers
+  by restarting the session. Missing, truncated, or changed archived bytes are
+  unrecoverable in place: the history is not rebuilt from the trimmed messages,
+  the diagnostic says so, and a new conversation is required.
+
+- Two accepted behaviors of trimming in this release: it re-arms only after a
+  cold resume or a new session, because a warm in-process resume keeps the
+  old-epoch descriptor and the next seal refuses as stale with the originals
+  retained; and only the manual `/compact` trims, because an automatic mid-turn
+  compaction never does.
+
 ## 0.6.1 (2026-10-31)
 
 ### Added
@@ -1178,8 +1483,6 @@ completion audit — ships together as v0.6.0.
   existing shipped provider persists nothing, so `overlaid_providers`
   provenance stays clean and first-run materialization of the default template
   is not blocked.
-
-## Unreleased
 
 ## 0.5.0 (2026-10-07)
 

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from concurrent.futures import Future
 from pathlib import Path
+import threading
 
 import pytest
 from textual import events
@@ -289,3 +291,54 @@ def test_respects_target_matches_limit_for_fuzzy_search(file_tree: Path) -> None
 
     suggestions, _ = view.suggestions[-1]
     assert len(suggestions) <= 5
+
+
+class _AlreadyDoneExecutor:
+    """Hands back a finished future, like a query that wins the race to the lock."""
+
+    def __init__(self, results: list[CompletionEntry]) -> None:
+        self._results = results
+
+    def submit(
+        self, fn: Callable[..., object], *args: object
+    ) -> Future[list[CompletionEntry]]:
+        future: Future[list[CompletionEntry]] = Future()
+        future.set_result(self._results)
+        return future
+
+
+class _AppStub:
+    def call_after_refresh(
+        self, callback: Callable[..., object], *args: object
+    ) -> None:
+        callback(*args)
+
+
+class _AppStubView(StubView):
+    def __init__(self) -> None:
+        super().__init__()
+        self.app = _AppStub()
+
+
+def test_query_finishing_before_callback_registration_does_not_deadlock(
+    file_tree: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    controller = PathCompletionController(PathCompleter(), _AppStubView())
+    monkeypatch.setattr(
+        controller,
+        "_executor",
+        _AlreadyDoneExecutor([CompletionEntry("@src/main.py", "")]),
+    )
+
+    finished = threading.Event()
+
+    def drive_completion() -> None:
+        controller.on_text_changed("@src", cursor_index=4)
+        finished.set()
+
+    thread = threading.Thread(target=drive_completion, daemon=True)
+    thread.start()
+
+    assert finished.wait(5), "on_text_changed deadlocked on its own query lock"
+    thread.join(5)
+    assert controller.is_showing()

@@ -11,16 +11,24 @@ from typing import TYPE_CHECKING, Any, Literal, Protocol
 
 from chartreux.core.config._dangerous_command_authority import (
     GRANTS_FIELD,
+    REMOTE_EXEC_GRANTS_FIELD,
     validate_grant_source,
+    validate_remote_exec_grant_source,
 )
 from chartreux.core.config._root_persistence import select_actual_user_layer
-from chartreux.core.config.models import normalize_dangerous_command_grants
+from chartreux.core.config.models import (
+    normalize_dangerous_command_grants,
+    normalize_remote_exec_grants,
+)
 from chartreux.core.config.types import (
     ConcurrencyConflictError,
     ConfigDurabilityError,
     ConfigSaveResult,
 )
-from chartreux.core.dangerous_commands import OPERATION_REGISTRY
+from chartreux.core.dangerous_commands import (
+    OPERATION_REGISTRY,
+    canonical_remote_destination,
+)
 
 if TYPE_CHECKING:
     from chartreux.core.config.orchestrator import ConfigOrchestrator
@@ -39,13 +47,14 @@ class SavedGrantsRead:
     """
 
     operations: tuple[str, ...] = ()
+    destinations: tuple[str, ...] = ()
     user_revision: str | None = None
     unavailable: Literal["no_user_source", "read"] | None = None
 
 
 class _GrantEdit(Protocol):
     def __call__(
-        self, raw: Mapping[str, Any], *, project: Path, operation_id: str
+        self, raw: Mapping[str, Any], *, project: Path, value: str
     ) -> dict[str, Any]: ...
 
 
@@ -55,26 +64,28 @@ def _require_persistable_operation(operation_id: str) -> None:
         raise ValueError(f"Invalid {GRANTS_FIELD} operation (source: user)")
 
 
-def _canonical_saved_entries(saved: Any) -> dict[str, list[str]]:
+def _canonical_saved_entries(
+    saved: Any, *, field: str = GRANTS_FIELD
+) -> dict[str, list[str]]:
     if not isinstance(saved, dict) or not all(
         isinstance(key, str)
         and isinstance(operations, list)
         and all(isinstance(item, str) for item in operations)
         for key, operations in saved.items()
     ):
-        raise ValueError(f"Invalid {GRANTS_FIELD} definition (source: user)")
+        raise ValueError(f"Invalid {field} definition (source: user)")
     return dict(saved)
 
 
-def _canonical_project_key(project: Path) -> str:
+def _canonical_project_key(project: Path, *, field: str = GRANTS_FIELD) -> str:
     project_path = Path(project).expanduser()
     if not project_path.is_absolute():
-        raise ValueError(f"Invalid {GRANTS_FIELD} project key (source: user)")
+        raise ValueError(f"Invalid {field} project key (source: user)")
     return str(project_path.resolve())
 
 
 def merge_project_dangerous_command_grant(
-    raw: Mapping[str, Any], *, project: Path, operation_id: str
+    raw: Mapping[str, Any], *, project: Path, value: str
 ) -> dict[str, Any]:
     """Merge one approved grant into one project's entry of a disk document.
 
@@ -83,19 +94,19 @@ def merge_project_dangerous_command_grant(
     ``normalize_dangerous_command_grants``, so a duplicate canonical grant merges
     as a no-op and relative or malformed definitions raise ``ValueError``.
     """
-    _require_persistable_operation(operation_id)
+    _require_persistable_operation(value)
     merged = dict(raw)
     saved = merged.get(GRANTS_FIELD)
     entries = {} if saved is None else _canonical_saved_entries(saved)
     canonical = normalize_dangerous_command_grants(entries)
     key = _canonical_project_key(project)
-    canonical[key] = [*canonical.get(key, []), operation_id]
+    canonical[key] = [*canonical.get(key, []), value]
     merged[GRANTS_FIELD] = normalize_dangerous_command_grants(canonical)
     return merged
 
 
 def remove_project_dangerous_command_grant(
-    raw: Mapping[str, Any], *, project: Path, operation_id: str
+    raw: Mapping[str, Any], *, project: Path, value: str
 ) -> dict[str, Any]:
     """Remove one saved grant from one project's entry of a disk document.
 
@@ -104,14 +115,14 @@ def remove_project_dangerous_command_grant(
     and all unrelated settings are preserved from *raw*. Removing an absent
     grant leaves the document's grant state unchanged.
     """
-    _require_persistable_operation(operation_id)
+    _require_persistable_operation(value)
     merged = dict(raw)
     saved = merged.get(GRANTS_FIELD)
     if saved is None:
         return merged
     canonical = normalize_dangerous_command_grants(_canonical_saved_entries(saved))
     key = _canonical_project_key(project)
-    operations = [item for item in canonical.get(key, []) if item != operation_id]
+    operations = [item for item in canonical.get(key, []) if item != value]
     if operations:
         canonical[key] = operations
     else:
@@ -127,7 +138,7 @@ async def _persist_grant_edit[S: ConfigSchema](
     orchestrator: ConfigOrchestrator[S],
     *,
     project: Path,
-    operation_id: str,
+    value: str,
     expected_revision: str,
     edit: _GrantEdit,
 ) -> ConfigSaveResult:
@@ -149,8 +160,9 @@ async def _persist_grant_edit[S: ConfigSchema](
         disk_revision = staged.fingerprint
         if disk_revision is None or disk_revision != expected_revision:
             return ConfigSaveResult("user", "not_saved", "unchanged", error="conflict")
-        merged = edit(loaded.model_dump(), project=project, operation_id=operation_id)
+        merged = edit(loaded.model_dump(), project=project, value=value)
         validate_grant_source(merged, layer=staged)
+        validate_remote_exec_grant_source(merged, layer=staged)
         patched = staged.validate_output(merged)
     except Exception:
         return ConfigSaveResult("user", "not_saved", "unchanged", error="validation")
@@ -196,7 +208,7 @@ async def persist_dangerous_command_grant[S: ConfigSchema](
     return await _persist_grant_edit(
         orchestrator,
         project=project,
-        operation_id=operation_id,
+        value=operation_id,
         expected_revision=expected_revision,
         edit=merge_project_dangerous_command_grant,
     )
@@ -213,9 +225,107 @@ async def remove_dangerous_command_grant[S: ConfigSchema](
     return await _persist_grant_edit(
         orchestrator,
         project=project,
-        operation_id=operation_id,
+        value=operation_id,
         expected_revision=expected_revision,
         edit=remove_project_dangerous_command_grant,
+    )
+
+
+def merge_project_remote_exec_grant(
+    raw: Mapping[str, Any], *, project: Path, value: str
+) -> dict[str, Any]:
+    """Merge one approved remote-exec destination into a disk document.
+
+    Only the target project's saved entry changes; every other entry and all
+    unrelated settings are preserved from *raw*. The destination is
+    canonicalized first, so a duplicate merges as a no-op and a wildcard,
+    alias group, or missing user raises ``ValueError``.
+    """
+    destination = canonical_remote_destination(value)
+    if destination is None:
+        raise ValueError(
+            f"Invalid {REMOTE_EXEC_GRANTS_FIELD} destination (source: user)"
+        )
+    merged = dict(raw)
+    saved = merged.get(REMOTE_EXEC_GRANTS_FIELD)
+    entries = (
+        {}
+        if saved is None
+        else _canonical_saved_entries(saved, field=REMOTE_EXEC_GRANTS_FIELD)
+    )
+    canonical = normalize_remote_exec_grants(entries)
+    key = _canonical_project_key(project, field=REMOTE_EXEC_GRANTS_FIELD)
+    canonical[key] = [*canonical.get(key, []), destination.key]
+    merged[REMOTE_EXEC_GRANTS_FIELD] = normalize_remote_exec_grants(canonical)
+    return merged
+
+
+def remove_project_remote_exec_grant(
+    raw: Mapping[str, Any], *, project: Path, value: str
+) -> dict[str, Any]:
+    """Remove one saved destination from one project's entry.
+
+    The project's entry is dropped once its last destination is removed, and
+    the field itself is dropped when no project entries remain; every other
+    entry and all unrelated settings are preserved from *raw*. Removing an
+    absent destination leaves the document's grant state unchanged.
+    """
+    destination = canonical_remote_destination(value)
+    if destination is None:
+        raise ValueError(
+            f"Invalid {REMOTE_EXEC_GRANTS_FIELD} destination (source: user)"
+        )
+    merged = dict(raw)
+    saved = merged.get(REMOTE_EXEC_GRANTS_FIELD)
+    if saved is None:
+        return merged
+    canonical = normalize_remote_exec_grants(
+        _canonical_saved_entries(saved, field=REMOTE_EXEC_GRANTS_FIELD)
+    )
+    key = _canonical_project_key(project, field=REMOTE_EXEC_GRANTS_FIELD)
+    destinations = [item for item in canonical.get(key, []) if item != destination.key]
+    if destinations:
+        canonical[key] = destinations
+    else:
+        canonical.pop(key, None)
+    if canonical:
+        merged[REMOTE_EXEC_GRANTS_FIELD] = canonical
+    else:
+        merged.pop(REMOTE_EXEC_GRANTS_FIELD, None)
+    return merged
+
+
+async def persist_remote_exec_grant[S: ConfigSchema](
+    orchestrator: ConfigOrchestrator[S],
+    *,
+    project: Path,
+    destination: str,
+    expected_revision: str,
+) -> ConfigSaveResult:
+    """Save one approved remote-exec destination without publishing runtime state."""
+    return await _persist_grant_edit(
+        orchestrator,
+        project=project,
+        value=destination,
+        expected_revision=expected_revision,
+        edit=merge_project_remote_exec_grant,
+    )
+
+
+async def remove_remote_exec_grant[S: ConfigSchema](
+    orchestrator: ConfigOrchestrator[S],
+    *,
+    project: Path,
+    destination: str,
+    expected_revision: str,
+) -> ConfigSaveResult:
+    """Remove one saved remote-exec destination without publishing state."""
+    return await _persist_grant_edit(
+        orchestrator,
+        project=project,
+        value=destination,
+        expected_revision=expected_revision,
+        edit=remove_project_remote_exec_grant,
     )
 
 
@@ -242,10 +352,21 @@ async def read_saved_dangerous_command_grants[S: ConfigSchema](
         revision = staged.fingerprint
         if revision is None:
             return SavedGrantsRead(unavailable="read")
-        authorities = validate_grant_source(loaded.model_dump(), layer=staged)
+        raw = loaded.model_dump()
+        authorities = validate_grant_source(raw, layer=staged)
+        destinations = next(
+            (
+                tuple(destination.key for destination in grant.destinations)
+                for grant in validate_remote_exec_grant_source(raw, layer=staged)
+                if str(grant.project) == key
+            ),
+            (),
+        )
     except Exception:
         return SavedGrantsRead(unavailable="read")
     operations = next(
         (item.operations for item in authorities if str(item.project) == key), ()
     )
-    return SavedGrantsRead(operations=operations, user_revision=revision)
+    return SavedGrantsRead(
+        operations=operations, destinations=destinations, user_revision=revision
+    )
