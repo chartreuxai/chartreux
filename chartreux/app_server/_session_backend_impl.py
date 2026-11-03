@@ -1075,6 +1075,7 @@ class SessionBackendImpl:
                 method, params.model_dump(mode="json", by_alias=True)
             )
         except RequestFailure as exc:
+            self._adopt_compaction_failure_state(exc)
             raise SessionBackendError(exc.code, str(exc), exc.data) from exc
         response = dispatched.response
         if not isinstance(response, response_type):
@@ -1086,6 +1087,29 @@ class SessionBackendImpl:
         return SessionBackendResult(
             response=cast(ResponseT, response), after_response=dispatched.after_response
         )
+
+    def _adopt_compaction_failure_state(self, exc: RequestFailure) -> None:
+        """Adopt state a failed compaction still published.
+
+        A persistence failure is reported after the boundary was published, so
+        the conversation *is* compacted; forwarding the error without that state
+        would leave the client projecting a conversation that no longer exists.
+        Only a well-formed state is adopted, so a malformed one cannot mask the
+        typed failure it arrived with.
+        """
+        if exc.code != ProtocolErrorCode.COMPACTION_FAILED:
+            return
+        data = exc.data
+        if not isinstance(data, dict) or "state" not in data:
+            return
+        try:
+            state = PublicSessionState.model_validate(data["state"])
+        except Exception as exc_validation:
+            logger.warning(
+                "Ignoring malformed compaction failure state", exc_info=exc_validation
+            )
+            return
+        self.adopt_state(state)
 
     async def _resource_request[ResponseT: ProtocolModel](
         self, method: str, params: ProtocolModel, response_type: type[ResponseT]

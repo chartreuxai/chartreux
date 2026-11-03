@@ -105,7 +105,7 @@ from chartreux.core.compaction import (
     CompactionManager,
 )
 from chartreux.core.compaction.context import select_model_context
-from chartreux.core.compaction.manager import PendingPostTurnTrim
+from chartreux.core.compaction.manager import CompactionOutcome, PendingPostTurnTrim
 from chartreux.core.config import ChartreuxConfigSchema, ModelConfig
 from chartreux.core.config._dangerous_command_persistence import (
     read_saved_dangerous_command_grants,
@@ -1121,6 +1121,10 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
             files=file_store,
             fence_transcript=self._fence_rewind_transcript,
         )
+        # Manual-compaction publication carrier: the manager resets it at entry
+        # and marks publication at the boundary append, so a cancelled manual
+        # call still reports whether a boundary was published.
+        self._compaction_outcome = CompactionOutcome()
         self.compaction_manager = CompactionManager(
             messages=self.messages,
             stats_getter=lambda: self.stats,
@@ -3381,21 +3385,46 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
         # the instance attribute (tests/app_server/test_subagents.py:5854).
         await self._session_transitions.clear_history()
 
+    @property
+    def compaction_outcome(self) -> CompactionOutcome:
+        """Publication/cancellation carrier of the most recent compaction.
+
+        A manual caller that observes a cancellation reads ``published`` here:
+        a boundary that was published is settled (or typed as a persistence
+        failure) instead of being reported as an unpublished compaction.
+        """
+        return self._compaction_outcome
+
     @requires_init
-    async def compact(self, extra_instructions: str = "") -> str:
+    async def compact(
+        self, extra_instructions: str = "", *, manual: bool = False
+    ) -> str:
         # Summary generation and the context boundary live in the manager; the loop
         # keeps the surrounding lifecycle (clean history, save, middleware).
+        # A stale publication from a previous attempt must never be read as this
+        # one's, so the carrier starts this attempt unpublished.
+        self._compaction_outcome.published = False
+        self._compaction_outcome.cancellation_observed = False
         try:
             self._clean_message_history()
             await self._save_messages()
-            summary = await self.compaction_manager.compact(extra_instructions)
+            summary = await self.compaction_manager.compact(
+                extra_instructions,
+                manual=manual,
+                outcome=self._compaction_outcome if manual else None,
+            )
             self.middleware_pipeline.reset(reset_reason=ResetReason.COMPACT)
             # A compacted conversation reads very differently from its first
             # turn; force a title refresh at the next scheduling point.
             self._title_controller.mark_compaction()
             return summary
         except Exception:
-            await self._save_messages()
+            try:
+                await self._save_messages()
+            except Exception as save_error:
+                # The original failure is the outcome the caller reports; a
+                # failed retry save must not mask it.
+                logger.debug("compaction settlement retry save failed: %s", save_error)
             raise
 
     async def _request_clear_context(self) -> None:

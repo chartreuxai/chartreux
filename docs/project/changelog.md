@@ -2,6 +2,54 @@
 
 All notable changes to Chartreux are documented in this file.
 
+## 0.7.2 (2026-11-03)
+
+Reliability and workflow follow-ups: a manual `/compact` can no longer wedge a
+session behind a timed-out lifecycle transition, and the orchestrator identity
+and review workflow are tightened against unbounded review loops.
+
+### Fixed
+
+- Manual `/compact` no longer leaves the session permanently locked. The
+  `session/compact` deadline now runs inside the server-side LIFECYCLE reserve
+  (720 s) instead of the generic request timeout, and the client sends a
+  validated 750 s per-request override, so a slow compaction ends in a typed
+  `COMPACTION_FAILED` (`reason=timeout`) instead of a bare "App server request
+  timed out" that left `Session lifecycle transition is active: compact:<id>`
+  stuck with no retry possible. Post-publication handoff failures (turn reset,
+  replacement, reset callback) are classified `reason=persistence` with the
+  settlement error kept as `__cause__`; the reset callback is guarded so it can
+  no longer mask the typed error; replacement state is adopted only when
+  settled; the lifecycle reserve is released and the next admission starts
+  clean.
+
+### Changed
+
+- The orchestrator identity delegates reading, exploration, search, and
+  verification to subagents instead of doing them inline; its direct tools are
+  read-only probes, orchestration metadata, and persistence/bookkeeping edits.
+- The review workflow (main-review, main-design, and main-plan skills, the
+  reviewer and review-execution identities, and the ceremony workflow) now
+  carries a predeclared convergence protocol: one complete clean panel on the
+  exact current revision grants convergence; the round cap is the initial panel
+  plus at most two refinements; the convergence-granting panel full-reads the
+  exact candidate; every panel is consolidated into one authoritative artifact
+  with a stable-ID adjudication ledger and a neutral reviewer-visible ledger
+  projection; incomplete seats are recorded and replaced only by an authorized
+  fresh seat within the same pinned panel; at the cap the review reports NOT
+  CONVERGED instead of implying a pass. Shipped-text drift guards pin these
+  contracts in `tests/skills/`, and the two orchestrated CLI golden fixtures
+  were regenerated for the new orchestrator prose.
+- AGENTS.md keeps `mkdocs build --strict` in the release procedure only, not in
+  the verification instructions.
+
+### Retained limitations
+
+- A `CancelledError` arriving inside the post-publication compaction handoff
+  window still escapes untyped (accepted plan residual), and a partial
+  turn-reset failure leaves replacement state to be reconciled through session
+  resume.
+
 ## 0.7.1 (2026-11-03)
 
 Follow-up completion of the 0.7.0 surface rather than a new headline feature:

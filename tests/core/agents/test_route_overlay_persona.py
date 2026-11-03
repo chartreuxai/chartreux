@@ -186,8 +186,8 @@ def test_shipped_overlay_body_is_reviewer_derived_and_grants_nothing() -> None:
         "check-only verification commands",
         "not run, never implied",
         "do not hide failed checks",
-        "`file:line` citation",
-        "read it in full rather than only its diff",
+        "cite each finding with file:line",
+        "full-read the initial artifact and criteria",
         "grants no new permissions",
         "widens no tool authority",
     ):

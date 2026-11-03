@@ -1230,6 +1230,46 @@ def test_orchestrator_identity_carries_the_failure_time_replacement_paragraph() 
     assert "park it and continue independent work" in prompt
 
 
+def test_composed_orchestrator_prompt_narrows_the_first_hand_check_exceptions(
+    build_config: ConfigBuilder,
+    load_orchestrator: OrchestratorLoader[ChartreuxConfigSchema],
+) -> None:
+    """P2: the first-hand check exception reaches the composed prompt with its
+    exact operative limits — a higher-priority gate requirement, claim-linked
+    recorded signals, a discriminating observed check, and a one-line state
+    note — while the delegation mandate it narrows and the safety boundaries
+    that outrank it stay in the same prompt.
+    """
+    prompt = _compose_orchestrator_prompt(build_config, load_orchestrator)
+
+    assert "**First-hand check exceptions.**" in prompt
+    assert (
+        "When a higher-priority instruction requires it, personally re-run the "
+        "discriminating check before relying on a subagent claim that gates a "
+        "commit, merge, or publish" in prompt
+    )
+    assert (
+        "specific recorded signal casts doubt on a specific claim needed for "
+        "the next decision" in prompt
+    )
+    assert "A normal wait timeout alone is not such a signal" in prompt
+    assert "First collect an available result by its run ID" in prompt
+    assert "do not invent a claim or race the worker" in prompt
+    assert (
+        "a proportionate, sufficiently discriminating command and observed result"
+        in prompt
+    )
+    assert (
+        "Record one line in the workspace state note: claim, signal, check, result."
+        in prompt
+    )
+    # The exception narrows the mandate; it never replaces or licenses it.
+    assert "Delegation is required, not optional" in prompt
+    assert "not permission for general investigation or routine verification" in prompt
+    assert "bypass higher-priority instructions or runtime permissions" in prompt
+    assert "When in doubt, dispatch" in prompt
+
+
 def test_task_prompt_documents_replacement_claim() -> None:
     """WP5: the task tool prompt documents the cross-model replacement claim
     shape (NEW agent_id + config lineage) next to the replace_run paragraph.

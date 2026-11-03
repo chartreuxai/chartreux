@@ -174,6 +174,26 @@ class TestBuiltinSkills:
         for skill in (design, plan):
             assert "wait for the user to react" not in skill.lower()
 
+        # Additive pins (v0.7.2 package D): both skills apply main-review's
+        # protocol to their own artifact, own the ledger after every panel and
+        # link it from task state — without displacing the acceptance gate
+        # asserted above.
+        for skill, artifact in ((design, "design"), (plan, "plan")):
+            assert (
+                f"When reviewing a {artifact}, apply main-review's predeclared "
+                "convergence rule, cap, fresh-seat scopes, completeness checks, and "
+                "consolidation." in skill
+            )
+            assert (
+                "After each panel the main agent updates the artifact-local "
+                "adjudication ledger before any further dispatch" in skill
+            )
+            assert f"for an inline {artifact} keep the ledger inline" in skill
+            assert (
+                "Link the ledger from task state rather than duplicating it." in skill
+            )
+            assert f"A clean review is not {artifact} acceptance." in skill
+
     def test_chartreux_skill_is_standalone_reference(self) -> None:
         prompt = BUILTIN_SKILLS["chartreux"].prompt
         assert "standalone reference for the running Chartreux version" in prompt

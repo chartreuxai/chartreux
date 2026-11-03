@@ -400,6 +400,11 @@ class TestShippedSkillRewrites:
     """Acceptance: main-design/plan/review use purpose/seat canonical calls
     (package 8's grammar); execution review resolves the coder identity and
     the analysis seats stay read-only.
+
+    The convergence-protocol checks below are text contracts over the shipped
+    skill body: each one pins required wording and the absence of wording that
+    would contradict it. They are not behavioral tests of model obedience, and
+    prompt prose does not itself create a deterministic review state machine.
     """
 
     def test_design_and_plan_use_purpose_canonical_calls(self) -> None:
@@ -558,6 +563,335 @@ class TestShippedSkillRewrites:
         review = skill_body("main-review")
 
         assert "a probe seat's final message must be the report itself" in review
+
+    def test_review_predeclares_rule_cap_and_full_read_convergence_scope(self) -> None:
+        review = skill_body("main-review")
+
+        assert "Before round 1 the main agent records the artifact set" in review
+        assert "content-based baseline and target revision pins" in review
+        assert (
+            "one complete clean panel on the exact current revision, with all prior "
+            "blockers independently verified resolved or explicitly user-accepted and "
+            "no unresolved in-scope blockers" in review
+        )
+        assert "any artifact edit after that panel invalidates convergence" in review
+        assert (
+            "The convergence-granting panel scope is a full read of the exact "
+            "candidate revision." in review
+        )
+        assert "one initial panel and at most two refinement panels" in review
+        assert "any larger cap needs explicit user authorization" in review
+        assert "An initial clean full-read panel may itself grant convergence" in review
+        assert "Do not change these retrospectively to claim a pass." in review
+        # Negative: the rule is fixed up front and the cap is not implicitly
+        # extensible.
+        assert "unlimited" not in review
+        assert "extend the cap automatically" not in review
+        assert "change the rule after a panel to claim a pass" not in review
+
+    def test_review_counts_incomplete_panels_and_replaces_seats_in_place(self) -> None:
+        review = skill_body("main-review")
+
+        assert (
+            "A panel dispatched with an incomplete seat counts toward the cap" in review
+        )
+        assert "does not consume another round" in review
+        assert "Replace a missing seat only within the same pinned panel" in review
+        assert (
+            "an authorized fresh independent seat on the same route, model, and "
+            "identity" in review
+        )
+        assert "record the failed launch and the replacement" in review
+        assert "never silently substitute" in review
+        # Negative: a lost seat is neither dropped nor quietly swapped.
+        assert "an incomplete seat may be dropped" not in review
+        assert "silently substitute a different identity" not in review
+
+    def test_review_pins_content_and_treats_a_stale_target_as_not_converged(
+        self,
+    ) -> None:
+        review = skill_body("main-review")
+
+        assert "Pin content rather than a branch name" in review
+        assert "canonical ordered artifact paths and content hashes" in review
+        assert "the exact last-reviewed baseline and target hashes" in review
+        assert "the immutable reviewer-visible ledger projection" in review
+        assert "The mutable ledger stays outside the target digest" in review
+        assert "Freeze the target while a panel runs" in review
+        assert (
+            "recompute the pins at synthesis and before any convergence claim" in review
+        )
+        assert "a changed artifact or criterion leaves the target stale" in review
+        assert "ledger-only status updates change nothing" in review
+        assert (
+            "A missing or stale baseline, target, ledger, required seat, or panel "
+            "makes the review INCOMPLETE, never converged" in review
+        )
+        # Negative: a branch name or a stale pin never stands in for the reviewed
+        # content.
+        assert "pinning Git HEAD is sufficient" not in review
+        assert "the current branch is the baseline" not in review
+        assert "a stale target may still converge" not in review
+
+    def test_review_ledger_schema_and_dispositions_are_pinned(self) -> None:
+        review = skill_body("main-review")
+
+        assert "artifact-local adjudication ledger" in review
+        assert "for an inline artifact retain an inline record" in review
+        assert (
+            "ID | round/seat | severity | claim+source | disposition | decision "
+            "evidence | amendment/verification" in review
+        )
+        for disposition in (
+            "open",
+            "accepted-for-fix",
+            "resolved",
+            "rejected-needs-contrary-evidence",
+            "deferred",
+            "user-accepted",
+        ):
+            assert disposition in review
+        assert (
+            "Rejection requires cited contrary evidence, not a majority vote." in review
+        )
+        assert (
+            "preserve IDs across consolidation, mapping split and merged claims"
+            in review
+        )
+        # Negative: no invented disposition labels.
+        assert "rejected-without-evidence" not in review
+        assert "consensus disposition" not in review
+
+    def test_review_refinement_briefs_carry_only_a_neutral_projection(self) -> None:
+        review = skill_body("main-review")
+
+        assert "without earlier reviewers' conclusions or votes" in review
+        assert "include only the neutral ledger projection specified below" in review
+        assert "A refinement brief gives the round number" in review
+        assert "pinned baseline and target, exact delta, criteria" in review
+        assert (
+            "a neutral ledger projection containing only IDs, claims, disposition "
+            "labels and references" in review
+        )
+        assert "never prior reports, counts, votes or reviewer conclusions" in review
+        # Negative: the projection never carries conclusions or a vote count.
+        assert "share earlier reviewers' conclusions" not in review
+        assert "include prior votes" not in review
+
+    def test_review_repeated_settled_claim_needs_cited_new_evidence(self) -> None:
+        review = skill_body("main-review")
+
+        assert (
+            "Repetition of an adjudicated claim without cited new evidence is "
+            "advisory" in review
+        )
+        assert "cited material new evidence can reopen it" in review
+        assert "Reopen only with cited material new evidence" in review
+        assert "recording the old and new state" in review
+        assert (
+            "a fresh independent seat may find that evidence on its own judgment"
+            in review
+        )
+        # Negative: repetition alone neither reopens nor blocks.
+        assert "a repeated claim reopens" not in review
+        assert "repetition is blocking on its own" not in review
+
+    def test_review_unverified_fix_is_not_resolved(self) -> None:
+        review = skill_body("main-review")
+
+        assert (
+            "A fix remains accepted-for-fix until independently verified on the "
+            "target revision" in review
+        )
+        assert "sufficiently discriminating observed check" in review
+        assert "Deferred blockers remain blocking" in review
+        assert "only explicit user acceptance records a risk as user-accepted" in review
+        # Negative: an applied or planned fix is not a resolution.
+        assert "is resolved once the fix is applied" not in review
+        assert "a planned fix counts as resolved" not in review
+
+    def test_review_delta_scope_covers_regressions_and_acceptance_contradictions(
+        self,
+    ) -> None:
+        review = skill_body("main-review")
+
+        assert (
+            "The initial panel and the convergence-granting panel full-read the "
+            "complete target and acceptance criteria." in review
+        )
+        assert "Refinement panels are delta-scoped" in review
+        assert "they inspect prior blocker fixes" in review
+        assert (
+            "regressions and interactions introduced by the exact effective delta"
+            in review
+        )
+        assert "evidenced acceptance-criterion contradictions anywhere" in review
+        assert "with relevant surrounding context" in review
+        # Negative: a delta round is not a licence to ignore acceptance criteria
+        # outside the delta.
+        assert "acceptance criteria apply only inside the delta" not in review
+        assert "delta rounds ignore interactions" not in review
+
+    def test_review_records_every_seat_disposition_and_never_drops_a_garbled_one(
+        self,
+    ) -> None:
+        review = skill_body("main-review")
+
+        assert (
+            "collected, incomplete, garbled, submission-blocked, or cancelled" in review
+        )
+        assert "Assess the actual report for completeness, intelligibility" in review
+        assert "a completion-audit stamp is not a substitute" in review
+        assert "a failed launch is recorded as incomplete with its reason" in review
+        assert "an honest incomplete report is not a zero-finding seat" in review
+        assert "actual seat identities and models" in review
+        assert "run IDs or timestamps, evidence pointers" in review
+        # Negative: an audit stamp or a garbled report is not a collected seat.
+        assert "a completion-audit stamp is sufficient" not in review
+        assert "garbled reports may be discarded" not in review
+
+    def test_review_exhausted_cap_reports_not_converged(self) -> None:
+        review = skill_body("main-review")
+
+        assert (
+            "When the cap is reached, report NOT CONVERGED with the consolidated "
+            "ledger" in review
+        )
+        assert "remaining blockers, missing evidence, seat states" in review
+        assert "do not auto-extend and do not imply a pass" in review
+        assert (
+            "A stale or incomplete panel cannot be retroactively made converged."
+            in review
+        )
+        assert (
+            "At the cap, consolidate for reporting and claim no convergence." in review
+        )
+        # Negative: cap exhaustion never becomes a pass or an extension.
+        assert "at the cap the panel passes by default" not in review
+        assert "extend the cap when blockers remain" not in review
+
+    def test_review_artifact_edit_after_a_clean_panel_invalidates_convergence(
+        self,
+    ) -> None:
+        review = skill_body("main-review")
+
+        assert "any artifact edit after that panel invalidates convergence" in review
+        assert (
+            "a consolidation that keeps the reviewed normative content byte-for-byte "
+            "may rely on that panel by updating only the separately pinned ledger"
+            in review
+        )
+        assert (
+            "any normative edit makes a new candidate needing a new qualifying "
+            "full-read panel within the budget" in review
+        )
+        # Negative: an edit cannot ride on the earlier clean panel.
+        assert (
+            "edits after a clean panel keep the earlier convergence claim" not in review
+        )
+        assert "a post-panel edit may be passed without review" not in review
+
+    def test_review_consolidates_the_artifact_after_every_round(self) -> None:
+        review = skill_body("main-review")
+
+        assert (
+            "After every panel consolidate accepted amendments into the one "
+            "authoritative artifact" in review
+        )
+        assert "preserving ledger IDs and history by reference" in review
+        assert (
+            "consolidation creates a new target that needs the review the selected "
+            "rule requires" in review
+        )
+        # Negative: consolidation is not deferred to a single final round.
+        assert "consolidate only after the final round" not in review
+        assert "defer consolidation" not in review
+
+    def test_review_records_warnings_without_amending_them(self) -> None:
+        review = skill_body("main-review")
+
+        assert "Amend accepted blockers only" in review
+        assert (
+            "record warnings without amendment unless new evidence shows one meets "
+            "the declared blocker rule or the user directs the change" in review
+        )
+        # Negative: warnings do not become amendments by default.
+        assert "amend every warning" not in review
+        assert "warnings are accepted for fix" not in review
+
+    def test_review_briefs_require_direct_report_and_full_disclosure(self) -> None:
+        review = skill_body("main-review")
+
+        assert "return the report directly without file writes" in review
+        assert "authorized scratchpad-only test outputs and probes" in review
+        assert "Never copy the whole repository with cp -r" in review
+        assert "use git archive for a necessary tracked-tree copy" in review
+        assert "disclose any omitted untracked inputs" in review
+        assert "complete denial record with runtime reasons" in review
+        assert "cumulative touched-path disclosure, including reverted paths" in review
+        assert "an honest empty set stays explicit" in review
+        # Negative: reviewers do not write into the repository.
+        assert "reviewers may write" not in review
+        assert "cp -r is acceptable" not in review
+
+    def test_review_clean_panel_is_not_user_acceptance(self) -> None:
+        review = skill_body("main-review")
+
+        assert "A finding from two or more reviewers is consensus, not proof." in review
+        assert "Apply the selected convergence rule" in review
+        assert "a clean review is not user acceptance" in review
+        assert (
+            "A blocker remains open until independently verified resolved, rejected "
+            "on cited contrary evidence, or explicitly accepted by the user." in review
+        )
+        # Negative: consensus or a clean panel never substitutes for acceptance.
+        assert "consensus is proof" not in review
+        assert "a clean review is user acceptance" not in review
+
+    def test_design_and_plan_apply_the_review_protocol_to_their_artifact(self) -> None:
+        for name, artifact in (("main-design", "design"), ("main-plan", "plan")):
+            body = skill_body(name)
+
+            assert (
+                f"When reviewing a {artifact}, apply main-review's predeclared "
+                "convergence rule, cap, fresh-seat scopes, completeness checks, and "
+                "consolidation." in body
+            )
+            assert (
+                "After each panel the main agent updates the artifact-local "
+                "adjudication ledger before any further dispatch" in body
+            )
+            assert f"for an inline {artifact} keep the ledger inline" in body
+            assert "Link the ledger from task state rather than duplicating it." in body
+            # Negative: the ledger is neither copied into task state nor written
+            # once for the whole review chain.
+            assert f"copy the {artifact} ledger into task state" not in body
+            assert "update the ledger once after the review chain" not in body
+
+    def test_design_and_plan_ledger_does_not_replace_explicit_acceptance(self) -> None:
+        for name, artifact, gate in (
+            (
+                "main-design",
+                "design",
+                "Obtain the user's explicit design acceptance before proceeding; "
+                "continued discussion, questions, or silence are not acceptance.",
+            ),
+            (
+                "main-plan",
+                "plan",
+                "Obtain the user's explicit plan acceptance before proceeding to "
+                "implementation; continued discussion, questions, or silence are "
+                "not acceptance.",
+            ),
+        ):
+            body = skill_body(name)
+
+            assert gate in body
+            assert f"A clean review is not {artifact} acceptance." in body
+            # Negative: neither a clean panel nor a converged ledger grants the
+            # acceptance only the user gives.
+            assert f"a clean review is {artifact} acceptance" not in body
+            assert "the ledger replaces the approval gate" not in body
 
 
 class TestNoCeremonyInMinimalSessions:

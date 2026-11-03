@@ -846,7 +846,7 @@ async def test_compaction_reserves_session_before_awaiting_core(
     entered = asyncio.Event()
     release = asyncio.Event()
 
-    async def compact(_instructions: str = "") -> str:
+    async def compact(_instructions: str = "", *, manual: bool = False) -> str:
         entered.set()
         await release.wait()
         return "summary"

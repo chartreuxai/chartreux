@@ -56,12 +56,56 @@ CompactionFailureReason = Literal["tool_call", "empty_summary"]
 ARCHIVE_TRIM_ENABLED: bool = True
 
 
+def _pending_cancellation() -> bool:
+    """True when the running task has a cancellation request outstanding.
+
+    ``Task.cancelling()`` keeps counting after a provider (or any other
+    awaiter) swallowed the delivered ``CancelledError``. That is exactly the
+    state a cancelled manual compaction must not publish through: the summary
+    may be complete while the request it was computed for is already gone.
+    """
+    task = asyncio.current_task()
+    return task is not None and task.cancelling() > 0
+
+
 class CompactionFailedError(Exception):
     """Raised when a compaction turn did not produce a usable summary."""
 
     def __init__(self, reason: str) -> None:
         self.reason = reason  # a CompactionFailureReason
         super().__init__(f"Compaction did not produce a summary (reason={reason}).")
+
+
+class CompactionSettlementError(Exception):
+    """Raised when a published compaction boundary could not be settled.
+
+    The boundary — and with it the summary — is already in the live message
+    list; what failed is the persistence and the archive trim behind it. A
+    published boundary that failed to settle is a persistence failure, never a
+    compaction failure, so the caller classifies on ``published``.
+    """
+
+    def __init__(self, published: bool, summary_length: int) -> None:
+        self.published = published
+        self.summary_length = summary_length
+        super().__init__(
+            "Compaction summary was published but could not be settled "
+            f"(summary_length={summary_length})."
+        )
+
+
+@dataclass(slots=True)
+class CompactionOutcome:
+    """Publication/settlement carrier of the most recent manual compaction.
+
+    The manager resets it at entry, marks ``published`` at the boundary append
+    and records an observed cancellation instead of abandoning an
+    already-published boundary. The summary itself travels through
+    ``compact``'s return value, so the ``str`` contract is unchanged.
+    """
+
+    published: bool = False
+    cancellation_observed: bool = False
 
 
 class CompletionFn(Protocol):
@@ -151,12 +195,43 @@ class CompactionManager:
         self._pending_trim_getter = pending_trim_getter
         self._pending_trim_recorder = pending_trim_recorder
 
-    async def compact(self, extra_instructions: str = "") -> str:
+    async def compact(
+        self,
+        extra_instructions: str = "",
+        *,
+        manual: bool = False,
+        outcome: CompactionOutcome | None = None,
+    ) -> str:
+        """Summarize the conversation and publish the compaction boundary.
+
+        ``manual`` selects the request-driven path (a manual compaction whose
+        request can be cancelled by the server's own deadline) and defaults
+        off, so the automatic caller is unchanged; ``outcome`` is the carrier
+        that path reads after a cancellation and is reset here at entry.
+        """
+        if outcome is not None:
+            outcome.published = False
+            outcome.cancellation_observed = False
         summary_prefix = UtilityPrompt.COMPACT_SUMMARY_PREFIX.read()
         snapshot = select_model_context(self._messages)
         prior_user_messages = collect_prior_user_messages(snapshot, summary_prefix)
 
-        summary = await self._summarize(snapshot, extra_instructions)
+        try:
+            summary = await self._summarize(snapshot, extra_instructions)
+        except asyncio.CancelledError:
+            if outcome is not None:
+                outcome.cancellation_observed = True
+            raise
+        if manual and _pending_cancellation():
+            # The summarizer may have swallowed the cancellation and returned a
+            # usable summary, so the finished summary proves nothing about the
+            # request. No await follows until after the append, which means this
+            # synchronous check is the only place a manual compaction can still
+            # observe the cancellation: nothing below it may evict file state or
+            # append a boundary.
+            if outcome is not None:
+                outcome.cancellation_observed = True
+            raise asyncio.CancelledError
         todo_state = TodoState.replay(self._messages).model_dump(mode="json")
         output: dict[str, Any] = {"todo_state": todo_state}
         file_state_section: str | None = None
@@ -193,16 +268,59 @@ class CompactionManager:
             tool_result=PersistedToolResult(output=output),
         )
         self._messages.append(envelope)
+        if outcome is not None:
+            # Publication happens here and nowhere else, so the carrier is the
+            # single source a cancelled caller classifies on.
+            outcome.published = True
         # Context size is unknown without an API call; the next LLM turn
         # recomputes it accurately from real usage.
         self._stats().context_tokens = -1
+        if manual:
+            await self._settle_manual(summary, outcome)
+        else:
+            await self._settle_published()
+        return summary
+
+    async def _settle_published(self) -> None:
+        """Persist the published boundary, then run the optional archive trim."""
         await self._save()
         if self._trim_enabled():
             # P4d ACTIVATION SITE: the envelope above is persisted with the
             # originals still in RAM, so the trim may now seal and evict the
             # pre-boundary payloads. A failed trim always leaves the originals.
             await self._trim_archived_prefix()
-        return summary
+
+    async def _settle_manual(
+        self, summary: str, outcome: CompactionOutcome | None
+    ) -> None:
+        """Settle a published manual boundary, absorbing further cancellation.
+
+        The boundary is already in the live message list, so abandoning the
+        save or the trim here would leave it half-settled, and the caller's own
+        bookkeeping runs only after a normal return. A cancellation delivered
+        during settlement is therefore recorded on the carrier and settlement
+        continues; repeated cancellations must not tear it either. A settlement
+        failure is typed instead of raw, because the caller has to report a
+        persistence failure for a boundary that is already published.
+        """
+        settlement = asyncio.create_task(self._settle_published())
+        while True:
+            try:
+                await asyncio.shield(settlement)
+                return
+            except asyncio.CancelledError:
+                if settlement.cancelled():
+                    # Only a cancelled settlement has no outcome left to
+                    # report. One that already finished is awaited again
+                    # below, so its summary or its own failure still surfaces
+                    # instead of being replaced by this cancellation.
+                    raise
+                if outcome is not None:
+                    outcome.cancellation_observed = True
+            except Exception as exc:
+                raise CompactionSettlementError(
+                    published=True, summary_length=len(summary)
+                ) from exc
 
     def _trim_enabled(self) -> bool:
         """Whether the sealed-prefix trim path may run (active since P4d)."""

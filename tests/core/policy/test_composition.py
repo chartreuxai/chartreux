@@ -10,6 +10,7 @@ import pytest
 
 from chartreux.core.agents import AgentManager
 from chartreux.core.agents.identities import Delegation, get_builtin_identity
+from chartreux.core.agents.identity_launch import _overlay_resource_loader
 from chartreux.core.config.agent_selection import AgentSelectionConfig
 from chartreux.core.config.harness_files import (
     FileSource,
@@ -854,3 +855,186 @@ def test_role_instructions_ride_as_the_per_launch_overlay() -> None:
     assert prompt.index("Review with care.") < prompt.index("## Execution context")
     # The overlay suppresses the model catalog section.
     assert "# Model catalog" not in prompt
+
+
+# --- First-hand check exception (ceremony step 6, P3 section H) --------------
+
+
+def _shipped_body(kind: ResourceKind, name: str) -> str:
+    harness = get_harness_files_manager()
+    loader = policy_resource_loader(user_resource_directories(harness))
+    resolved = loader.resolve(kind, name)
+    assert resolved.content is not None
+    return resolved.content
+
+
+def _execution_overlay_body() -> str:
+    resolved = _overlay_resource_loader().resolve(
+        ResourceKind.OVERLAY, "review-execution"
+    )
+    assert resolved.content is not None
+    return resolved.content
+
+
+def test_ceremony_step_six_inserts_the_exception_after_the_prohibition() -> None:
+    # Isolation: the ceremony body itself keeps the S8 phrase verbatim and
+    # carries the H exception immediately after the complete existing sentence.
+    ceremony = _shipped_body(ResourceKind.WORKFLOW, "ceremony")
+    prohibition = "never run tests, builds, or other verification yourself"
+    exception = "A higher-priority instruction may require a first-hand"
+    assert prohibition in ceremony
+    assert exception in ceremony
+    assert ceremony.index(prohibition) < ceremony.index(exception)
+    assert ceremony.index(exception) < ceremony.index("## Delegated verification")
+    # The insertion does not sever the prohibition from its own step sentence.
+    assert f"{prohibition}." in ceremony
+    for anchor in (
+        "the claim-specific disputed-evidence exception in the orchestrator identity",
+        "never race active work",
+        "a proportionate, sufficiently discriminating check",
+        "record claim, signal, check, and result",
+        "Never retry a denied effect or bypass higher-priority instructions or "
+        "runtime permissions",
+        "if unavailable or inconclusive, do not rely on the claim",
+        "main-review's predeclared criterion, budget, ledger and scoped-refinement "
+        "protocol",
+        "a review result does not grant design or plan acceptance",
+    ):
+        assert anchor in ceremony, anchor
+
+
+def test_ceremony_delegated_verification_retains_its_prohibition() -> None:
+    ceremony = _shipped_body(ResourceKind.WORKFLOW, "ceremony")
+    prohibition = "Do not run verification yourself."
+    reference = "The narrow first-hand check exceptions stated in step 6 still apply."
+    assert prohibition in ceremony
+    assert reference in ceremony
+    assert ceremony.index(prohibition) < ceremony.index(reference)
+    # The exception never widens itself into a blanket permission.
+    normalised = ceremony.lower()
+    for widened in ("may bypass runtime permissions", "may retry a denied effect"):
+        assert widened not in normalised
+
+
+def test_ceremony_exception_composes_with_orchestrator_and_lints_clean() -> None:
+    # Composed: the prohibition and its narrow exception reach the served
+    # policy text together, the acceptance gates survive, and S8 stays clean.
+    result = compose_policy(_inputs(identity="orchestrator", workflow="ceremony"))
+    text = result.text
+    prohibition = "never run tests, builds, or other verification yourself"
+    exception = "A higher-priority instruction may require a first-hand"
+    assert prohibition in text
+    assert exception in text
+    assert text.index(prohibition) < text.index(exception)
+    assert "Do not run verification yourself." in text
+    assert (
+        "The narrow first-hand check exceptions stated in step 6 still apply." in text
+    )
+    # The explicit acceptance gates the exception must never replace.
+    assert "requires a separate, explicit plan acceptance" in text
+    assert "a review result does not grant design or plan acceptance" in text
+    assert (
+        lint_composed(
+            result.policy_text,
+            identity_facts=result.identity_facts,
+            workflow="ceremony",
+        )
+        == ()
+    )
+
+
+def test_ceremony_exception_never_leaks_into_a_minimal_composition() -> None:
+    result = compose_policy(_inputs())
+    for anchor in (
+        "A higher-priority instruction may require a first-hand",
+        "The narrow first-hand check exceptions stated in step 6 still apply.",
+    ):
+        assert anchor not in result.text
+        assert anchor not in result.policy_text
+    assert (
+        lint_composed(
+            result.policy_text, identity_facts=result.identity_facts, workflow="minimal"
+        )
+        == ()
+    )
+
+
+# --- Reviewer identity and execution overlay (P3 section H) ------------------
+
+
+def test_reviewer_identity_distinguishes_initial_full_read_and_delta_reviews() -> None:
+    reviewer = _shipped_body(ResourceKind.IDENTITY, "reviewer")
+    assert (
+        "For an initial review, read the complete artifact and acceptance criteria."
+        in reviewer
+    )
+    for anchor in (
+        "For an explicitly briefed refinement, examine the exact pinned delta",
+        "evidenced acceptance-criterion contradictions anywhere",
+        "A full-read convergence panel still requires a complete read when the "
+        "brief specifies it",
+        "Repetition of an adjudicated claim without cited new evidence is advisory",
+        "cite new evidence to reopen it",
+        # The removal checks the replacement must leave intact.
+        "callers, dependencies, configuration, packaging, tests, "
+        "persisted-state compatibility, and unintended loss",
+    ):
+        assert anchor in reviewer, anchor
+    # The retired unconditional phrasing is gone, not merely supplemented.
+    assert "Read each artifact in full, not only its diff." not in reviewer
+
+
+def test_reviewer_report_template_classifies_findings_and_discloses_paths() -> None:
+    reviewer = _shipped_body(ResourceKind.IDENTITY, "reviewer")
+    assert (
+        "| # | Severity | Classification | Location | Finding | Evidence |" in reviewer
+    )
+    assert (
+        "Classify each finding as new-in-delta, prior-blocker-fix, "
+        "acceptance-criterion, or pre-existing-adjudicated; cite the evidence that "
+        "supports the classification." in reviewer
+    )
+    assert (
+        "**Touched paths:** {complete cumulative set, including reverted edits, or "
+        "none}" in reviewer
+    )
+
+
+def test_execution_overlay_full_reads_convergence_and_briefed_deltas() -> None:
+    overlay = _execution_overlay_body()
+    for anchor in (
+        "full-read the initial artifact and criteria",
+        "for an explicitly briefed refinement inspect the pinned delta",
+        "prior blocker fixes, delta regressions and interactions",
+        "evidenced acceptance-criterion contradictions anywhere",
+        "Full-read the convergence panel when its brief requires it",
+        "cite each finding with file:line",
+        "new-in-delta, prior-blocker-fix, acceptance-criterion, or "
+        "pre-existing-adjudicated",
+        "a settled claim needs cited new evidence to reopen",
+        # Retained receipts and independent security probes.
+        "A receipt for any revision other than the one under review is stale",
+        "never present a receipt as your own run",
+        "independently choose and run the security probes",
+        "a receipt never substitutes for your own security judgment",
+    ):
+        assert anchor in overlay, anchor
+    assert "read it in full rather than only its diff" not in overlay
+
+
+def test_execution_overlay_keeps_worker_hygiene_without_new_authority() -> None:
+    overlay = _execution_overlay_body()
+    for anchor in (
+        "authorized scratchpad destination",
+        "no repository mutation is ever licensed",
+        "Never copy the whole repository",
+        "take it with git archive",
+        "disclose the untracked inputs it omits",
+        "Make no live provider calls without explicit authorization",
+        "Bound and rank your probes",
+        "report the work incomplete rather than guessing",
+        "complete cumulative touched-path set, including reverted paths",
+    ):
+        assert anchor in overlay, anchor
+    assert "grants no new permissions" in overlay
+    assert "does not license editing files to make a check pass" in overlay

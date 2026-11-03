@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import AsyncGenerator, Callable, Coroutine
 from dataclasses import dataclass
+import math
 from typing import Any
 
 from chartreux.app_server._model import ProtocolModel, validate_wire
@@ -29,6 +30,17 @@ class AppServerConnectionClosed(RuntimeError):
 
 
 _DEFAULT_REQUEST_TIMEOUT = 30.0
+
+
+def _validated_timeout(value: float, *, name: str) -> float:
+    """Reject a timeout the wait cannot honor as given."""
+    try:
+        valid = math.isfinite(value) and value > 0
+    except TypeError as exc:
+        raise ValueError(f"{name} must be a finite positive number") from exc
+    if not valid:
+        raise ValueError(f"{name} must be a finite positive number")
+    return value
 
 
 type ServerMessage = Notification | ServerRequest
@@ -63,11 +75,11 @@ class AppServerClient:
         run_peer: Callable[[], Coroutine[Any, Any, None]] | None = None,
         request_timeout: float = _DEFAULT_REQUEST_TIMEOUT,
     ) -> None:
-        if request_timeout <= 0:
-            raise ValueError("request_timeout must be positive")
         self._transport = transport
         self._run_peer = run_peer
-        self._request_timeout = request_timeout
+        self._request_timeout = _validated_timeout(
+            request_timeout, name="request_timeout"
+        )
         self._peer_task: asyncio.Task[None] | None = None
         self._reader_task: asyncio.Task[None] | None = None
         self._next_request_id = 1
@@ -119,7 +131,15 @@ class AppServerClient:
         *,
         wait_for_incoming: bool = False,
         response_boundary: Callable[[dict[str, Any]], None] | None = None,
+        timeout: float | None = None,
     ) -> dict[str, Any]:
+        # An unusable override is rejected before the frame can leave, so a
+        # caller cannot silently get the instance default or an endless wait.
+        request_timeout = (
+            self._request_timeout
+            if timeout is None
+            else _validated_timeout(timeout, name="timeout")
+        )
         await self.start()
         request_id = f"client-{self._next_request_id}"
         self._next_request_id += 1
@@ -140,7 +160,7 @@ class AppServerClient:
                 "params": protocol_value(params),
             })
             try:
-                response = await asyncio.wait_for(future, timeout=self._request_timeout)
+                response = await asyncio.wait_for(future, timeout=request_timeout)
             except TimeoutError as exc:
                 self._abandoned_request_ids.add(request_id)
                 raise TimeoutError(f"App server request timed out: {method}") from exc

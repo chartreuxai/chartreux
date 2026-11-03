@@ -172,7 +172,7 @@ async def test_explicit_compaction_failure_is_typed(
     agent_loop = build_test_agent_loop()
     session = await create_test_app_server_session(agent_loop)
 
-    async def fail_compact(_instructions: str = "") -> str:
+    async def fail_compact(_instructions: str = "", *, manual: bool = False) -> str:
         raise CompactionFailedError("tool_call")
 
     monkeypatch.setattr(agent_loop, "compact", fail_compact)
@@ -992,7 +992,7 @@ async def test_compact_refreshes_the_cached_context_gauge(
     agent_loop = build_test_agent_loop()
     session = await create_test_app_server_session(agent_loop)
 
-    async def compact(_instructions: str = "") -> str:
+    async def compact(_instructions: str = "", *, manual: bool = False) -> str:
         agent_loop.stats.context_tokens = 0
         return "summary"
 

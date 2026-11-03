@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from unittest.mock import AsyncMock
 
 import pytest
@@ -79,3 +80,65 @@ async def test_compaction_empties_the_context_gauge() -> None:
             app.query_one(SessionStatusLine).state.context_tokens
             == surviving_summary_tokens
         )
+
+
+@pytest.mark.asyncio
+async def test_a_successful_compaction_clears_the_queued_prompts() -> None:
+    """The server reset the conversation, so the folded queue no longer applies."""
+    app = build_test_chartreux_app()
+    cleared: list[int] = []
+
+    async def clear_server_queue() -> None:
+        cleared.append(1)
+
+    async with app.run_test():
+        assert app.event_handler is not None
+        app._queue.clear_server_queue = clear_server_queue
+        app.app_server.compact = AsyncMock(return_value="summary")
+
+        await app._run_compact(CompactMessage())
+
+    assert cleared == [1]
+
+
+@pytest.mark.asyncio
+async def test_a_failed_compaction_reports_the_error_and_clears_its_slot() -> None:
+    app = build_test_chartreux_app()
+
+    async with app.run_test():
+        assert app.event_handler is not None
+        message = CompactMessage()
+        app.event_handler.current_compact = message
+        app._agent_task = asyncio.current_task()
+        app.app_server.compact = AsyncMock(side_effect=RuntimeError("disk unavailable"))
+
+        await app._run_compact(message)
+
+        # The typed persistence error reaches the widget instead of vanishing.
+        assert message.error_message == "disk unavailable"
+        assert message.get_content() == "Error: disk unavailable"
+        # The slot is released, so the next /compact is not mistaken for a
+        # running one.
+        assert app._agent_task is None
+        assert app.event_handler.current_compact is None
+
+
+@pytest.mark.asyncio
+async def test_an_interrupted_compaction_is_reported_and_reraises() -> None:
+    app = build_test_chartreux_app()
+
+    async with app.run_test():
+        assert app.event_handler is not None
+        message = CompactMessage()
+        app.event_handler.current_compact = message
+        app._agent_task = asyncio.current_task()
+        app.app_server.compact = AsyncMock(side_effect=asyncio.CancelledError())
+
+        with pytest.raises(asyncio.CancelledError):
+            await app._run_compact(message)
+
+        assert message.get_content() == "Error: Compaction interrupted"
+        # Cleanup runs on the interrupted path too, and the cancellation itself
+        # is never swallowed.
+        assert app._agent_task is None
+        assert app.event_handler.current_compact is None

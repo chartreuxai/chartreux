@@ -28,7 +28,7 @@ The launch runs in the background by default — collect the advisor's result wi
 
 For large or cross-cutting changes, first dispatch a bounded exploration child (`purpose="exploration"`) that loads `sub-architecture-mapper` to map the affected subsystems, then use that output to frame the design question.
 
-4. **Synthesize.** Review the advisor's analysis. The main agent owns the final design — accept, adjust, or reject the advisor's recommendation. If the advisor's design misses something the user asked for, fix it.
+4. **Synthesize.** Review the advisor's analysis. The main agent owns the final design — accept, adjust, or reject the advisor's recommendation. If the advisor's design misses something the user asked for, fix it. When reviewing a design, apply main-review's predeclared convergence rule, cap, fresh-seat scopes, completeness checks, and consolidation. After each panel the main agent updates the artifact-local adjudication ledger before any further dispatch; for an inline design keep the ledger inline. Link the ledger from task state rather than duplicating it. A clean review is not design acceptance.
 5. **Present to the user.** Share the design inline in the conversation. Obtain the user's explicit design acceptance before proceeding; continued discussion, questions, or silence are not acceptance.
 
 ## Design content

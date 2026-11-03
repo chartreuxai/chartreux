@@ -23,6 +23,7 @@ import pytest
 from chartreux.core.agents import AgentManager
 from chartreux.core.agents.identities import Delegation, get_builtin_identity
 from chartreux.core.config.agent_selection import AgentSelectionConfig
+from chartreux.core.config.harness_files import get_harness_files_manager
 from chartreux.core.dispatch.lint import lint_composed
 from chartreux.core.dispatch.renderer import (
     DispatchRenderError,
@@ -40,9 +41,13 @@ from chartreux.core.model_catalog.loader import CatalogSnapshot
 from chartreux.core.model_catalog.resolver import ModelResolver
 from chartreux.core.model_catalog.schema import ModelCatalog
 from chartreux.core.policy.bundle import BundleIntegrityError, load_and_activate
+from chartreux.core.policy.composition import ExecutionContext, compose_policy
 from chartreux.core.policy.manifest import routes_from_snapshot
 from chartreux.core.skills.manager import SkillManager
-from chartreux.core.system_prompt import get_universal_system_prompt
+from chartreux.core.system_prompt import (
+    _build_composition_inputs,
+    get_universal_system_prompt,
+)
 from chartreux.core.tools.manager import ToolManager
 from tests.conftest import (
     build_test_vibe_config,
@@ -81,10 +86,15 @@ CODER_CONTRACT_SENTENCES = (
 # --- Composed rendering (design §5) ----------------------------------------
 
 
-def _composed_config(selection: AgentSelectionConfig, catalog: ModelCatalog):
+def _composed_config(
+    selection: AgentSelectionConfig,
+    catalog: ModelCatalog,
+    *,
+    include_model_info: bool = True,
+):
     return build_test_vibe_config(
         agent=selection,
-        include_model_info=True,
+        include_model_info=include_model_info,
         include_prompt_detail=False,
         include_project_context=False,
         include_commit_signature=False,
@@ -597,6 +607,33 @@ def pinned_token_count(text: str) -> int:
     return len(_PINNED_TOKEN_PATTERN.findall(text))
 
 
+def _render_composed_prompt_pair(
+    selection: AgentSelectionConfig, catalog: ModelCatalog
+) -> tuple[str, str]:
+    """The current revision's pre-dedup and served composed prompts.
+
+    The composition renders the launch-target table into its policy text only
+    (that text is what the frozen-policy hash covers) and excludes it from the
+    served artifact, so ONE composition of these inputs yields both prompts:
+    the one the composition would serve had the table not been deduped, and
+    the one it serves now. The session-detail sections stay off so the two
+    artifacts differ by exactly that insertion.
+    """
+    config = _composed_config(selection, catalog, include_model_info=False)
+    inputs = _build_composition_inputs(
+        config,
+        execution_context=ExecutionContext.INTERACTIVE_MAIN,
+        skill_manager=SkillManager(lambda: config),
+        scratchpad_dir=None,
+        cwd=Path.cwd(),
+        harness_files=get_harness_files_manager(),
+        tool_manager=None,
+        role_instructions=None,
+    )
+    result = compose_policy(inputs)
+    return result.policy_text, result.text
+
+
 def test_route_table_dedup_saves_tokens_against_the_pinned_baseline() -> None:
     config = _composed_config(ORCHESTRATED_SELECTION, multi_model_catalog())
     baseline = _PRE_CHANGE_PROMPT.read_text(encoding="utf-8")
@@ -608,15 +645,25 @@ def test_route_table_dedup_saves_tokens_against_the_pinned_baseline() -> None:
     table = render_launch_target_region(
         dict(config.purpose_routes.routes), session_model_alias(config)
     )
-    baseline_tokens = pinned_token_count(baseline)
-    deduped_tokens = pinned_token_count(deduped)
-    delta = baseline_tokens - deduped_tokens
-    # Removing the section also merges its two separating blank-line runs
-    # into one, so the delta is the section itself less that one boundary
-    # piece.
-    assert pinned_token_count("\n\n") == 1
-    assert delta == pinned_token_count(table) - 1
-    assert delta > 0
+    # The delta is measured INSIDE one revision: the historical baseline is
+    # frozen while the rest of the prompt keeps growing, so the historical
+    # difference no longer isolates the dedup.
+    pre_dedup, served = _render_composed_prompt_pair(
+        ORCHESTRATED_SELECTION, multi_model_catalog()
+    )
+    assert pre_dedup.count(_TABLE_HEADING) == 1
+    assert _TABLE_HEADING not in served
+    # The table is the whole difference: dropping it and the separator that
+    # joined it to the following section reproduces the served artifact byte
+    # for byte, so the dedup removes nothing else.
+    assert pre_dedup.replace(table + "\n\n", "", 1) == served
+    # What the dedup saves is the section's own pinned tokens plus one more
+    # blank-line boundary run: the pre-dedup artifact separates the neighbours
+    # with two runs, the served one with a single run, and a run costs two
+    # tokens in flowing text (the tokenizer splits it before a non-space
+    # neighbour instead of keeping it whole).
+    delta = pinned_token_count(pre_dedup) - pinned_token_count(served)
+    assert delta == pinned_token_count(table) + 2
 
 
 # --- Placeholder hygiene and custom prompts ---------------------------------

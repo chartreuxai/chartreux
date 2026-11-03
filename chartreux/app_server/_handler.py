@@ -35,7 +35,7 @@ from chartreux.app_server._projection import (
 )
 from chartreux.app_server._resources import ResourceRequestHandler
 from chartreux.app_server._review import ReviewRequestHandler
-from chartreux.app_server._root_session import RootSessionCoordinator
+from chartreux.app_server._root_session import RootSessionCoordinator, SessionHandoff
 from chartreux.app_server._runtime import (
     AgentRuntimeFactory,
     RuntimeSessionNotFoundError,
@@ -171,6 +171,7 @@ from chartreux.app_server.protocol import (
 )
 from chartreux.core.agent_loop import AgentLoop, AgentLoopStateError
 from chartreux.core.compaction import CompactionFailedError
+from chartreux.core.compaction.manager import CompactionSettlementError
 from chartreux.core.git.worktree import (
     TransferAttempt,
     abort_transfer,
@@ -198,6 +199,13 @@ from chartreux.core.subagents import (
 from chartreux.observability.logging import logger
 
 DEFAULT_HISTORY_LIMIT = 200
+
+# A manual /compact summarizes the whole conversation behind the LIFECYCLE
+# reserve, so a stalled provider would hold every other request off for as long
+# as it waits. This budget requests cooperative cancellation of that wait — it
+# is not a cap on the operation or on the response: settlement still runs after
+# it fires, so an already-published boundary is reported, never dropped.
+_MANUAL_COMPACTION_TIMEOUT_SECONDS = 720.0
 
 _RELEASE_REASONS: dict[ReleaseAgentOutcome, str] = {
     ReleaseAgentOutcome.RELEASED: (
@@ -1481,15 +1489,107 @@ class CoreRequestHandler:
             SessionExecutionKind.LIFECYCLE, f"compact:{params.session_id}"
         ):
             previous_history = self._turns.history
+            # The manager marks publication on the carrier as it happens, so an
+            # interrupted call can still be classified by what it published.
+            outcome = self._agent_loop.compaction_outcome
+            deadline = asyncio.timeout(_MANUAL_COMPACTION_TIMEOUT_SECONDS)
+            summary: str | None = None
+            settlement: CompactionSettlementError | None = None
             try:
-                summary = await self._agent_loop.compact(params.extra_instructions)
+                async with deadline:
+                    summary = await self._agent_loop.compact(
+                        params.extra_instructions, manual=True
+                    )
+            except CompactionSettlementError as exc:
+                # The boundary is in the live message list; only its persistence
+                # failed. Deadline expiry cannot change what there is to settle.
+                settlement = exc
             except CompactionFailedError as exc:
-                raise RequestFailure(
-                    ProtocolErrorCode.COMPACTION_FAILED,
-                    str(exc),
-                    {"reason": exc.reason},
+                if not deadline.expired():
+                    raise RequestFailure(
+                        ProtocolErrorCode.COMPACTION_FAILED,
+                        str(exc),
+                        {"reason": exc.reason},
+                    ) from exc
+                # A provider that turned the deadline's own cancellation into a
+                # failure of its own is still an expired run: row 1 governs.
+                raise self._expired_compaction_failure() from exc
+            except asyncio.CancelledError as exc:
+                if not deadline.expired() and not outcome.published:
+                    # Nothing was published, so no compaction is owed: release
+                    # the session view the cancelled request still owns — with
+                    # no checkpoint, which would claim a compaction — and let
+                    # the cancellation out.
+                    after_reset = await self._turns.reset()
+                    if after_reset is not None:
+                        after_reset()
+                    raise
+                if deadline.expired() and not outcome.published:
+                    # The deadline and an external cancellation both fired, and
+                    # the cancellation count keeps the timeout from surfacing as
+                    # TimeoutError. Expiry still governs an unpublished run.
+                    raise self._expired_compaction_failure() from exc
+                # A published boundary whose settlement was itself interrupted:
+                # classified below.
+            except TimeoutError as exc:
+                if not deadline.expired():
+                    # A provider timeout inside a live deadline is the
+                    # provider's failure, not deadline expiry.
+                    raise
+                if not outcome.published:
+                    raise self._expired_compaction_failure() from exc
+                # A published boundary still owes its settlement: classified
+                # below, whatever type the interruption arrived as.
+            except Exception as exc:
+                if not deadline.expired():
+                    raise
+                # Deadline expiry governs the outcome whatever type the failure
+                # arrives as (row 9): a published boundary is still settled.
+                if not outcome.published:
+                    raise self._expired_compaction_failure() from exc
+                raise await self._published_compaction_failure(
+                    params, previous_history, None
                 ) from exc
+            if summary is None:
+                raise await self._published_compaction_failure(
+                    params, previous_history, settlement
+                ) from settlement
+            handoff, after_response = await self._hand_off_compacted_session(
+                params, previous_history, summary
+            )
+        return (
+            SessionCompactResponse(
+                summary=summary, state=handoff.state, session_log=handoff.session_log
+            ),
+            after_response,
+        )
+
+    @staticmethod
+    def _expired_compaction_failure() -> RequestFailure:
+        """Classify a deadline-expired manual compaction that published nothing."""
+        return RequestFailure(
+            ProtocolErrorCode.COMPACTION_FAILED,
+            "Manual compaction timed out before it published a summary",
+            {"reason": "timeout"},
+        )
+
+    async def _hand_off_compacted_session(
+        self,
+        params: SessionCompactParams,
+        previous_history: list[PublicHistoryEntry],
+        summary: str,
+    ) -> tuple[SessionHandoff, Callable[[], None] | None]:
+        """Reset and hand off the session a published compaction leaves behind.
+
+        The boundary is already live, so a failure here is a persistence
+        failure — the client reconciles instead of retrying a summarization
+        that already happened — and never a raw exception.
+        """
+        reset_settled = False
+        after_response: Callable[[], None] | None = None
+        try:
             after_response = await self._turns.reset()
+            reset_settled = True
             handoff = self._root_session.replace_idle(
                 params.session_id,
                 current_history=previous_history,
@@ -1497,11 +1597,93 @@ class CoreRequestHandler:
                 checkpoint_message="Context compacted",
                 checkpoint_details={"summaryLength": len(summary)},
             )
-        return (
-            SessionCompactResponse(
-                summary=summary, state=handoff.state, session_log=handoff.session_log
-            ),
-            after_response,
+        except Exception as exc:
+            if after_response is not None:
+                # The typed error carries no deferred callback, so the queue
+                # reset is published here — without letting it mask the error
+                # that brought us to it.
+                with suppress(Exception):
+                    after_response()
+            raise await self._published_compaction_failure(
+                params,
+                previous_history,
+                None,
+                summary_length=len(summary),
+                reset_settled=reset_settled,
+            ) from exc
+        return handoff, after_response
+
+    async def _published_compaction_failure(
+        self,
+        params: SessionCompactParams,
+        previous_history: list[PublicHistoryEntry],
+        cause: CompactionSettlementError | None,
+        *,
+        summary_length: int | None = None,
+        reset_settled: bool = False,
+    ) -> RequestFailure:
+        """Settle what a published-but-unsettled manual compaction still owes.
+
+        The boundary is already live, so the reset and the idle replacement run
+        regardless of the failure: they publish the state a client needs to
+        reconcile. The failure is typed as persistence rather than compaction
+        so a client does not retry a summarization that already happened.
+        """
+        if not reset_settled:
+            try:
+                after_reset = await self._turns.reset()
+            except Exception as exc:
+                # The replacement below still runs, and the state it publishes
+                # is what a client reconciles with: a reset failure must not
+                # replace the typed error with a raw exception.
+                logger.warning(
+                    "Published compaction could not reset the turn state", exc_info=exc
+                )
+            else:
+                if after_reset is not None:
+                    # The error response carries no deferred callback, and the
+                    # replacement below can still fail, so run it before that —
+                    # without letting it mask the error that brought us here.
+                    try:
+                        after_reset()
+                    except Exception as exc:
+                        logger.warning(
+                            "Published compaction could not run the deferred reset",
+                            exc_info=exc,
+                        )
+        if summary_length is None and cause is not None:
+            summary_length = cause.summary_length
+        data: dict[str, Any] = {"reason": "persistence"}
+        try:
+            handoff = self._root_session.replace_idle(
+                params.session_id,
+                current_history=previous_history,
+                checkpoint_kind="compaction",
+                checkpoint_message="Context compacted",
+                checkpoint_details=(
+                    {"summaryLength": summary_length}
+                    if summary_length is not None
+                    else None
+                ),
+            )
+        except Exception as exc:
+            # Without a settled replacement there is no authoritative state to
+            # hand over; the client has to reconcile later.
+            logger.warning(
+                "Published compaction could not replace the idle session", exc_info=exc
+            )
+        else:
+            data["state"] = handoff.state.model_dump(mode="json", by_alias=True)
+        detail = (
+            str(cause)
+            if cause is not None
+            else "The published compaction was interrupted before it settled."
+        )
+        return RequestFailure(
+            ProtocolErrorCode.COMPACTION_FAILED,
+            f"{detail} The conversation is compacted; reconcile the session "
+            "state before retrying.",
+            data,
         )
 
     async def _relocate(  # noqa: PLR0912, PLR0915

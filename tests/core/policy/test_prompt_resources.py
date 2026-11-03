@@ -609,6 +609,159 @@ def test_orchestrator_identity_carries_the_validated_deltas(
         _assert_contains(orchestrator, placeholder)
 
 
+def test_orchestrator_identity_delegates_reading_and_narrows_inline_work(
+    bodies: dict[str, str],
+) -> None:
+    orchestrator = bodies["identity/orchestrator"]
+    # Reading, searches, instruction files, and investigation are delegated
+    # work, not an inline license.
+    _assert_contains(orchestrator, "Use `task` to delegate source or artifact reading")
+    _assert_contains(
+        orchestrator,
+        "directory inspection, searches, routing or instruction-file reading",
+    )
+    _assert_contains(
+        orchestrator, "Do not perform these inline even if the work seems small"
+    )
+    _assert_contains(
+        orchestrator,
+        "Ask children to read applicable instructions and return citations",
+    )
+    _assert_contains(
+        orchestrator,
+        "Do not use shell, file, web, image, or other tools to carry out "
+        "delegated work indirectly",
+    )
+    _assert_contains(orchestrator, "report the blocker rather than doing it yourself")
+    # The retained direct surface stays named and narrow.
+    _assert_contains(
+        orchestrator,
+        "Direct read-only probes are limited to orchestration metadata and "
+        "assignment preflight facts",
+    )
+    _assert_contains(orchestrator, "not a substitute for investigation")
+    # The narrowing never becomes an inline permission.
+    for widened in (
+        "inline work is permitted",
+        "investigate inline",
+        "perform these inline anyway",
+    ):
+        _assert_lacks(orchestrator, widened)
+
+
+def test_orchestrator_identity_narrows_the_first_hand_check_exceptions(
+    bodies: dict[str, str],
+) -> None:
+    orchestrator = bodies["identity/orchestrator"]
+    # Gate exception: only when a higher-priority instruction requires it.
+    _assert_contains(orchestrator, "**First-hand check exceptions.**")
+    _assert_contains(
+        orchestrator,
+        "When a higher-priority instruction requires it, personally re-run the "
+        "discriminating check",
+    )
+    _assert_contains(orchestrator, "gates a commit, merge, or publish")
+    # Claim-specific disputed-evidence signals are enumerated, each tied to a
+    # specific claim needed for the next decision.
+    _assert_contains(
+        orchestrator, "specific recorded signal casts doubt on a specific claim"
+    )
+    for signal in (
+        "an incomplete outcome",
+        "relevant failure or stop",
+        "expired or unavailable terminal result",
+        "blocked submission",
+        "contradictory audit or tool evidence",
+        "materially garbled citation",
+        "a denial affecting that claim",
+    ):
+        _assert_contains(orchestrator, signal)
+    # A bare stall is never evidence.
+    _assert_contains(orchestrator, "A normal wait timeout alone is not such a signal")
+    # Collect the available result and use lifecycle recovery before inferring.
+    _assert_contains(orchestrator, "First collect an available result by its run ID")
+    _assert_contains(orchestrator, "use lifecycle recovery where applicable")
+    _assert_contains(
+        orchestrator, "do not infer completion from a stall or audit stamp"
+    )
+    # Never race a still-running worker.
+    _assert_contains(orchestrator, "do not invent a claim or race the worker")
+    _assert_contains(orchestrator, "wait, park, or use the authorized recovery process")
+    # Proportionate check, escalating to the full required check.
+    _assert_contains(
+        orchestrator,
+        "a proportionate, sufficiently discriminating command and observed result",
+    )
+    _assert_contains(
+        orchestrator,
+        "run the full required check when a narrower one cannot establish the claim",
+    )
+    # One-line state-note record of claim, signal, check, result.
+    _assert_contains(
+        orchestrator,
+        "Record one line in the workspace state note: claim, signal, check, result.",
+    )
+    # The exception is narrow and the safety boundaries survive it.
+    _assert_contains(
+        orchestrator,
+        "narrow exceptions to the delegation mandate, not permission for general "
+        "investigation or routine verification",
+    )
+    _assert_contains(
+        orchestrator,
+        "Never retry a denied effect, perform destructive or unapproved actions",
+    )
+    _assert_contains(
+        orchestrator, "bypass higher-priority instructions or runtime permissions"
+    )
+    _assert_contains(
+        orchestrator,
+        "do not rely on the claim; park the affected work or stop the gated action",
+    )
+    # Negative: the exception never widens into a general first-hand license,
+    # a timeout-as-evidence rule, or an optional check.
+    for widened in (
+        "before relying on any subagent claim",
+        "every subagent claim",
+        "timeout alone is a signal",
+        "skip the discriminating check",
+        "the check is optional",
+    ):
+        _assert_lacks(orchestrator, widened)
+
+
+def test_orchestrator_identity_keeps_the_direct_tool_permission_boundaries(
+    bodies: dict[str, str],
+) -> None:
+    orchestrator = bodies["identity/orchestrator"]
+    # Higher-priority instructions and runtime permissions always win.
+    _assert_contains(
+        orchestrator,
+        "Higher-priority instructions, runtime permissions, and safety gates "
+        "always prevail",
+    )
+    _assert_contains(
+        orchestrator,
+        "no delegation or direct-tool exception grants permission for a "
+        "prohibited or unapproved action",
+    )
+    # Persistence and bookkeeping edits stay scoped to orchestration artifacts.
+    _assert_contains(
+        orchestrator,
+        "Use workspace persistence and trivial state/bookkeeping edits only for "
+        "orchestration artifacts",
+    )
+    # The standing rule still defers to the resolved tool set.
+    _assert_contains(orchestrator, "Deference to tool allowances")
+    # Negative: an exception may never be read as a permission grant.
+    for widened in (
+        "grants permission for a denied",
+        "permission is implied",
+        "overrides runtime permissions",
+    ):
+        _assert_lacks(orchestrator, widened)
+
+
 def test_orchestrator_minimal_none_resolves_with_no_missing_required_pieces(
     identity_loader: ResourceLoader,
     workflow_loader: ResourceLoader,

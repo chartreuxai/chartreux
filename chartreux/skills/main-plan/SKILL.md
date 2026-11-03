@@ -28,7 +28,7 @@ The launch runs in the background by default — collect the advisor's result wi
 
 For cross-cutting changes that span multiple subsystems, first dispatch a bounded exploration child (`purpose="exploration"`) that loads `sub-architecture-mapper` to map interfaces and dependencies, then use that output to frame the planning question.
 
-4. **Synthesize.** Review the advisor's plan. The main agent owns the final plan — adjust work package boundaries, fix missing dependencies, and ensure the plan matches the approved design. If the advisor's plan contradicts the design, trust the design.
+4. **Synthesize.** Review the advisor's plan. The main agent owns the final plan — adjust work package boundaries, fix missing dependencies, and ensure the plan matches the approved design. If the advisor's plan contradicts the design, trust the design. When reviewing a plan, apply main-review's predeclared convergence rule, cap, fresh-seat scopes, completeness checks, and consolidation. After each panel the main agent updates the artifact-local adjudication ledger before any further dispatch; for an inline plan keep the ledger inline. Link the ledger from task state rather than duplicating it. A clean review is not plan acceptance.
 5. **Present to the user.** Share the plan inline in the conversation. Obtain the user's explicit plan acceptance before proceeding to implementation; continued discussion, questions, or silence are not acceptance.
 
 ## Work package quality

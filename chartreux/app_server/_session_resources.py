@@ -29,6 +29,7 @@ from chartreux.app_server.models import (
 from chartreux.app_server.protocol import (
     AgentTranscriptGetParams,
     AgentTranscriptGetResponse,
+    AppServerResponseError,
     EmptyResponse,
     LoopsClearParams,
     LoopsClearResponse,
@@ -39,6 +40,7 @@ from chartreux.app_server.protocol import (
     LoopsListParams,
     LoopsListResponse,
     PageRequest,
+    ProtocolErrorCode,
     ReviewBaselineParams,
     ReviewBaselineResponse,
     ReviewHunksParams,
@@ -88,6 +90,11 @@ from chartreux.app_server.protocol import (
 from chartreux.app_server.review import ReviewOwner, ReviewTarget
 
 type ShellTimelineEvent = HistoryEntryAdded | HistoryEntryUpdated
+
+# A manual compaction may summarize for minutes, so its request outlives the
+# client's 30-second default by the margin the server's own deadline needs to
+# settle and answer. Only this request takes the override.
+_COMPACT_REQUEST_TIMEOUT_SECONDS = 750.0
 
 
 class ShellResource:
@@ -405,20 +412,48 @@ class SessionResource:
 
     async def compact(self, extra_instructions: str = "") -> str:
         client = await self._connection.connect()
-        response = validate_wire(
-            SessionCompactResponse,
-            await client.request(
+        try:
+            result = await client.request(
                 "session/compact",
                 SessionCompactParams(
                     session_id=self._state.session_id,
                     extra_instructions=extra_instructions,
                 ),
-            ),
-        )
+                timeout=_COMPACT_REQUEST_TIMEOUT_SECONDS,
+            )
+        except AppServerResponseError as exc:
+            self._adopt_compaction_failure_state(exc)
+            raise
+        response = validate_wire(SessionCompactResponse, result)
         self._state.projection.replace_state(response.state)
         self._state.session_log = response.session_log
         self._connection.mark_session_attached()
         return response.summary
+
+    def _adopt_compaction_failure_state(self, exc: AppServerResponseError) -> None:
+        """Adopt the state a failed compaction still published.
+
+        A persistence failure is reported after the boundary was published, so
+        the conversation *is* compacted; forwarding the error without that state
+        would leave the projection showing a conversation the server no longer
+        holds. Only a well-formed state is adopted, so a malformed one cannot
+        mask the typed failure it arrived with. The session log is not resent
+        with the error, so it stays behind until the next refresh or reattach.
+        """
+        error = exc.error
+        if error.code is not ProtocolErrorCode.COMPACTION_FAILED:
+            return
+        data = error.data
+        if not isinstance(data, dict) or data.get("reason") != "persistence":
+            return
+        if "state" not in data:
+            return
+        try:
+            state = PublicSessionState.model_validate(data["state"])
+        except Exception:
+            return
+        self._state.projection.replace_state(state)
+        self._connection.mark_session_attached()
 
     async def rewind_has_file_changes(self, entry_id: str) -> bool:
         return bool(await self.rewind_preview(entry_id))
