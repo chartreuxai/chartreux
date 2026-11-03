@@ -19,6 +19,7 @@ if TYPE_CHECKING:
     from chartreux.core.dispatch.route_inspection import RouteReport
     from chartreux.core.model_catalog.schema import ProviderDefinition
     from chartreux.core.skills.manager import ShadowEntry, SkillLoadFailure
+    from chartreux.core.trusted_folders import TrustedFoldersManager
 
 
 @dataclass(frozen=True)
@@ -76,15 +77,15 @@ class InvalidTarget(ValueError):
     pass
 
 
-async def _load_config() -> tuple[
-    ChartreuxConfigSchema, HarnessFilesManager, list[Check]
-]:
+async def _load_config(
+    trust_store: TrustedFoldersManager | None = None,
+) -> tuple[ChartreuxConfigSchema, HarnessFilesManager, list[Check]]:
     from chartreux.core.config.default_orchestrator import build_default_orchestrator
     from chartreux.core.config.harness_files import HarnessFilesManager
     from chartreux.core.config.layers.project import ProjectConfigLayer
     from chartreux.core.trusted_folders import TrustedFoldersManager
 
-    trust_store = TrustedFoldersManager()
+    trust_store = trust_store or TrustedFoldersManager()
     manager = HarnessFilesManager(
         sources=("user", "project"), cwd=Path.cwd(), trust_store=trust_store
     )
@@ -94,10 +95,54 @@ async def _load_config() -> tuple[
         for layer in orchestrator.layers
         if isinstance(layer, ProjectConfigLayer) and layer.is_trusted is False
     ]
-    if trust_store.load_error:
-        checks.append(Check("trust store", "unverified", trust_store.load_error))
+    trust_store_check = _trust_store_check(trust_store)
+    if trust_store_check is not None:
+        checks.append(trust_store_check)
     checks.append(_agent_selections_check(orchestrator.config, manager))
     return orchestrator.config, manager, checks
+
+
+_TRUST_STORE_STATUS = {
+    "missing": "skipped",
+    "unreadable": "unverified",
+    "malformed": "fail",
+    "invalid": "fail",
+}
+
+_TRUST_STORE_REASON = {
+    "missing": "no persisted trust decisions; every folder is untrusted until one is saved",
+    "unreadable": "the trust store exists but cannot be read; every folder is "
+    "untrusted until it can be read",
+    "malformed": "the trust store is not valid TOML; it is never rewritten and no folder is "
+    "trusted until it is repaired",
+    "invalid": "the trust store's trusted/untrusted lists are invalid; it is never rewritten "
+    "and no folder is trusted until it is repaired",
+}
+
+
+def _trust_store_check(trust_store: TrustedFoldersManager) -> Check | None:
+    """One check per explicit trust-store read state, never one merged row.
+
+    The read path distinguishes missing/unreadable/malformed/invalid/ready;
+    doctor merged every non-ready state into a single "unverified" row, so an
+    absent store (nothing persisted yet) was indistinguishable from a corrupt
+    one. Each state now renders as its own check: the corrupt states fail the
+    run instead of being reported as merely unverified, and the store's own
+    read state names the remedy. The typed state is surfaced — never
+    swallowed into "untrusted" — and ``load_error`` still carries the read
+    detail for the unreadable case.
+    """
+    from chartreux.core.trusted_folders import TrustStoreState
+
+    state = trust_store.store_state
+    if state is TrustStoreState.READY:
+        return None
+    reason = _TRUST_STORE_REASON[state.value]
+    if state is TrustStoreState.UNREADABLE and trust_store.load_error:
+        reason = f"{reason}: {trust_store.load_error}"
+    return Check(
+        f"trust store ({state.value})", _TRUST_STORE_STATUS[state.value], reason
+    )
 
 
 def _agent_selections_check(
@@ -367,6 +412,38 @@ def _target(config: ChartreuxConfigSchema, args: argparse.Namespace) -> ModelCon
     )
 
 
+async def _inspect_config(
+    checks: list[Check],
+) -> tuple[ChartreuxConfigSchema, HarnessFilesManager] | None:
+    """Append every configuration-side check; ``None`` when the load failed.
+
+    The typed trust-store row is appended on BOTH paths. A discovered project
+    config.toml beside a store that cannot answer fails the load before the
+    trust row is built, so the failure path renders it here: the combined case
+    keeps the store's own read state (O4a3-A) instead of hiding it behind the
+    config failure.
+    """
+    from chartreux.core.trusted_folders import TrustedFoldersManager
+
+    trust_store = TrustedFoldersManager()
+    try:
+        config, manager, source_checks = await _load_config(trust_store)
+    except Exception as exc:
+        trust_check = _trust_store_check(trust_store)
+        if trust_check is not None:
+            checks.append(trust_check)
+        checks.append(_config_failure_check(exc))
+        return None
+    checks.extend([
+        *source_checks,
+        Check("config", "pass", "trusted configuration validated"),
+        *_retired_inputs_checks(manager),
+        *_skills_checks(config, manager),
+        *_routes_checks(config),
+    ])
+    return config, manager
+
+
 async def _diagnose(args: argparse.Namespace) -> list[Check]:
     from chartreux.core.model_catalog.loader import load_catalog
 
@@ -382,18 +459,10 @@ async def _diagnose(args: argparse.Namespace) -> list[Check]:
                 "invalid or unreadable models.toml; check catalog syntax and schema",
             )
         )
-    try:
-        config, manager, source_checks = await _load_config()
-        checks.extend([
-            *source_checks,
-            Check("config", "pass", "trusted configuration validated"),
-            *_retired_inputs_checks(manager),
-            *_skills_checks(config, manager),
-            *_routes_checks(config),
-        ])
-    except Exception as exc:
-        checks.append(_config_failure_check(exc))
+    loaded = await _inspect_config(checks)
+    if loaded is None:
         return checks
+    config, manager = loaded
     selected = _target(config, args) if args.smoke else None
     providers: set[str] = set()
     for name, resolve in (

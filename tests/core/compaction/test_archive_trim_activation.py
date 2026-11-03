@@ -64,7 +64,10 @@ from chartreux.core.llm_models import (
 from chartreux.core.message_list import MessageList
 from chartreux.core.session.session_loader import MESSAGES_FILENAME, SessionLoader
 from chartreux.core.session.session_logger import SessionDiskFullError, SessionLogger
-from chartreux.core.session.transcript_archive import verify_archived_prefix_on_disk
+from chartreux.core.session.transcript_archive import (
+    hydrate_archived_messages,
+    verify_archived_prefix_on_disk,
+)
 from chartreux.core.session_types import AgentStats
 from chartreux.core.tools.manager import ToolManager
 from chartreux.core.usage import UsagePurpose
@@ -585,7 +588,7 @@ async def test_field_preservation_matrix_only_reasoning_payloads_is_emptied(
 
 
 @pytest.mark.asyncio
-async def test_warm_resume_with_a_retained_descriptor_does_not_retrim(
+async def test_warm_resume_with_a_retained_descriptor_clears_it_by_clear_and_reseal(
     session_config: SessionLoggingConfig, mock_tool_manager: ToolManager
 ) -> None:
     config = _config()
@@ -614,8 +617,10 @@ async def test_warm_resume_with_a_retained_descriptor_does_not_retrim(
     loaded_dumps = _dumps(loaded)
 
     # Warm resume: the logger rebinds to the SAME session (its descriptor is
-    # retained — the P4c1 warm-continuation rule) and the list rebinds to the
-    # complete loaded history.
+    # retained through the rebind) and the list rebinds to the complete
+    # loaded history; the resume path then runs the clear-and-reseal
+    # transaction (T2b), which proves the rebound list hydrated from disk
+    # and CLEARS the retained descriptor — never re-pinned.
     logger.apply_resumed_session(
         logger.session_id, session_dir, SessionLoader.load_metadata(session_dir)
     )
@@ -627,12 +632,18 @@ async def test_warm_resume_with_a_retained_descriptor_does_not_retrim(
             cast(Any, _forbidden_publish),
         )
         messages.reset_preserving_system(loaded)
+        resume_txn = await logger.clear_and_reseal_warm_resume(
+            messages, session_id=logger.session_id
+        )
 
+    assert resume_txn.outcome == "proved_and_transitioned"
     # Nothing re-trimmed: the resumed list holds the COMPLETE records (payloads
-    # included) and carries no list-side descriptor; the logger's retained
-    # descriptor is unchanged. Trim re-arms only through a later compaction
-    # seal, and never from the resume path itself.
-    assert logger.archive_descriptor is descriptor
+    # included) and carries no list-side descriptor. INVERTED (the old node
+    # pinned `logger.archive_descriptor is descriptor`): clear-and-reseal
+    # cleared the retained descriptor by construction — the resume path never
+    # re-seals and never publishes a trim, and trim re-arms only through a
+    # later compaction seal (the post-seal positive arm below).
+    assert logger.archive_descriptor is None
     assert messages.archive_descriptor is None
     assert _dumps(messages)[1:] == loaded_dumps
     assert (
@@ -646,6 +657,89 @@ async def _forbidden_seal(self: SessionLogger, *args: Any, **kwargs: Any) -> Any
 
 def _forbidden_publish(self: SessionLogger, *args: Any, **kwargs: Any) -> None:
     raise AssertionError("the resume path must never publish a trim")
+
+
+@pytest.mark.asyncio
+async def test_subsequent_seal_after_warm_resume_mints_a_fresh_receipt_at_the_new_epoch(
+    session_config: SessionLoggingConfig, mock_tool_manager: ToolManager
+) -> None:
+    """The LL post-seal positive arm (ADDED beside the retained forbidden
+    seal/publish guards): after the warm-resume clear-and-reseal cleared the
+    old authority, the NEXT compaction seal mints a FRESH receipt at the new
+    epoch — that seal (outside the resume window) is what re-arms the trim.
+    """
+    config = _config()
+    logger = _build_logger(session_config, "p4d-resume-rearm")
+    messages = _conversation()
+    stats = AgentStats(steps=1)
+    complete = _ScriptedComplete(
+        [
+            mock_llm_chunk(content="<summary>first</summary>"),
+            mock_llm_chunk(content="<summary>second</summary>"),
+        ],
+        stats,
+    )
+    manager = _manager(
+        logger=logger,
+        messages=messages,
+        stats=stats,
+        config=config,
+        tool_manager=mock_tool_manager,
+        complete=complete,
+    )
+    await manager.compact()
+    old = messages.archive_descriptor
+    assert old is not None
+    assert logger.archive_descriptor is old
+    session_dir = logger.session_dir
+    assert session_dir is not None
+    loaded, _metadata = SessionLoader.load_session(session_dir)
+
+    # Warm resume + clear-and-reseal: the retained authority is cleared.
+    logger.apply_resumed_session(
+        logger.session_id, session_dir, SessionLoader.load_metadata(session_dir)
+    )
+    messages.reset_preserving_system(loaded)
+    resume_txn = await logger.clear_and_reseal_warm_resume(
+        messages, session_id=logger.session_id
+    )
+    assert resume_txn.outcome == "proved_and_transitioned"
+    assert logger.archive_descriptor is None
+    assert messages.archive_descriptor is None
+    epoch_after_resume = messages.message_epoch
+
+    # A new settled round lands, then the subsequent seal re-arms: a fresh
+    # receipt minted at the NEW epoch, never a re-pin of the old descriptor.
+    receipts: list[Any] = []
+    real_seal = SessionLogger.seal_archive
+
+    async def _seal_spy(self: SessionLogger, *args: Any, **kwargs: Any) -> Any:
+        receipt = await real_seal(self, *args, **kwargs)
+        receipts.append(receipt)
+        return receipt
+
+    with pytest.MonkeyPatch.context() as patcher:
+        patcher.setattr(SessionLogger, "seal_archive", _seal_spy)
+        messages.append(
+            LLMMessage(role=Role.user, content="third ask", message_id="u3")
+        )
+        messages.append(
+            LLMMessage(
+                role=Role.assistant,
+                content="third answer",
+                message_id="a3",
+                reasoning_payloads=[{"opaque": "payload-3"}],
+            )
+        )
+        await manager.compact()
+
+    new = messages.archive_descriptor
+    assert new is not None and new is not old
+    assert new.message_epoch == epoch_after_resume == messages.message_epoch
+    assert logger.archive_descriptor is new
+    assert len(receipts) == 1
+    assert receipts[0].descriptor is new, "the fresh receipt names the new descriptor"
+    verify_archived_prefix_on_disk(new, _messages_path(logger))
 
 
 @pytest.mark.asyncio
@@ -949,3 +1043,132 @@ async def test_live_archive_authority_gates_the_admission_validators(
         violation.kind
         for violation in validate_transcript(messages, live_tail_exempt=True)
     ] == ["unauthorized_archived_prefix"]
+
+
+# ---------------------------------------------------------------------------
+# Disk / field fidelity (T3): the archived prefix bytes are exactly what the
+# trim claims — the complete original records, never a partial or corrupted
+# field state — while the live replacements are exactly the declared trim.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_archived_prefix_disk_bytes_are_the_exact_untrimmed_records(
+    session_config: SessionLoggingConfig, mock_tool_manager: ToolManager
+) -> None:
+    config = _config()
+    logger = _build_logger(session_config, "p4d-disk-fidelity")
+    messages = _conversation()
+    stats = AgentStats(steps=1)
+    complete = _ScriptedComplete(
+        [mock_llm_chunk(content="<summary>all done</summary>")], stats
+    )
+    manager = _manager(
+        logger=logger,
+        messages=messages,
+        stats=stats,
+        config=config,
+        tool_manager=mock_tool_manager,
+        complete=complete,
+    )
+    originals = [
+        SessionLogger._message_record(message) for message in _non_system(messages)[:5]
+    ]
+
+    await manager.compact()
+
+    descriptor = messages.archive_descriptor
+    assert descriptor is not None
+    path = _messages_path(logger)
+    raw = path.read_bytes()
+    # The transcript is a complete JSONL file: every record line is terminated,
+    # so the archived prefix cannot end inside a record.
+    assert raw.endswith(b"\n")
+    prefix = raw[: descriptor.prefix_end_byte]
+    assert prefix.endswith(b"\n"), "the prefix holds complete record lines"
+    lines = prefix.splitlines()
+    assert len(lines) == descriptor.archived_count == 5
+    records = [json.loads(line) for line in lines]
+    # Field fidelity on disk: every archived record equals the ORIGINAL
+    # message's full serialized record — reasoning payloads, tool results,
+    # image references, display fields and all — byte-for-byte as JSON.
+    assert records == originals
+    assert records[1]["reasoning_payloads"] == [{"opaque": "payload-1"}]
+    assert records[4]["reasoning_payloads"] == [{"opaque": "payload-2"}]
+    # The prefix is exactly the bytes the descriptor hashes, and the shared
+    # read interface hydrates them back to the originals.
+    assert hashlib.sha256(prefix).hexdigest() == descriptor.prefix_sha256
+    assert [
+        SessionLogger._message_record(message)
+        for message in hydrate_archived_messages(descriptor, prefix)
+    ] == originals
+    # The live tail after the prefix starts on a record boundary: the NEXT
+    # complete line is the compaction boundary envelope, not a partial record.
+    tail = raw[descriptor.prefix_end_byte :]
+    boundary_line = tail.split(b"\n", 1)[0]
+    boundary = json.loads(boundary_line)
+    assert boundary["context_boundary"] == "compaction"
+
+
+@pytest.mark.asyncio
+async def test_trim_leaves_only_reasoning_payloads_empty_on_disk_and_in_ram(
+    session_config: SessionLoggingConfig, mock_tool_manager: ToolManager
+) -> None:
+    config = _config()
+    logger = _build_logger(session_config, "p4d-trim-shape")
+    messages = _conversation()
+    stats = AgentStats(steps=1)
+    complete = _ScriptedComplete(
+        [mock_llm_chunk(content="<summary>all done</summary>")], stats
+    )
+    manager = _manager(
+        logger=logger,
+        messages=messages,
+        stats=stats,
+        config=config,
+        tool_manager=mock_tool_manager,
+        complete=complete,
+    )
+    originals = [
+        SessionLogger._message_record(message) for message in _non_system(messages)[:5]
+    ]
+
+    await manager.compact()
+
+    descriptor = messages.archive_descriptor
+    assert descriptor is not None
+    raw = _messages_path(logger).read_bytes()
+    disk_records = [
+        json.loads(line) for line in raw[: descriptor.prefix_end_byte].splitlines()
+    ]
+    live_records = [
+        SessionLogger._message_record(message, allow_archived=True)
+        for message in _non_system(messages)[: descriptor.archived_count]
+    ]
+    assert len(disk_records) == len(live_records) == len(originals) == 5
+
+    for disk_record, live_record, original in zip(
+        disk_records, live_records, originals, strict=True
+    ):
+        # The disk record is the complete original; the live replacement is
+        # the declared trim and nothing else. `reasoning_payloads` is omitted
+        # from the live record exactly because the field is None, never an
+        # empty list, a placeholder, or a partial dict.
+        assert disk_record == original
+        assert live_record == {
+            key: value for key, value in original.items() if key != "reasoning_payloads"
+        }
+        if "reasoning_payloads" in original:
+            assert original["reasoning_payloads"]
+            assert "reasoning_payloads" not in live_record
+            assert set(disk_record) - set(live_record) == {"reasoning_payloads"}
+        else:
+            assert "reasoning_payloads" not in disk_record
+            assert set(disk_record) == set(live_record)
+        # Every field the trim promises to preserve is identical on both
+        # sides: the emptied field is the only difference, so no partial or
+        # corrupted field state can hide here.
+        for key in original:
+            if key != "reasoning_payloads":
+                assert live_record[key] == disk_record[key] == original[key]
+    verify_archived_prefix_on_disk(descriptor, _messages_path(logger))

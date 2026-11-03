@@ -114,7 +114,11 @@ from chartreux.core.config._restrictions import ConfigCandidate
 from chartreux.core.config._root_persistence import read_saved_roots
 from chartreux.core.config.chartreux_schema import ChartreuxConfigSchema
 from chartreux.core.config.orchestrator import ConfigOrchestrator
-from chartreux.core.dangerous_commands import OPERATION_REGISTRY
+from chartreux.core.dangerous_commands import (
+    OPERATION_REGISTRY,
+    REMOTE_EXEC_OPERATION_ID,
+    canonical_remote_destination,
+)
 from chartreux.core.git.worktree import ManagedWorktree, PreparedWorktree
 from chartreux.core.git.worktree.record import OwnershipToken, release_holder
 from chartreux.core.session.session_lease import SessionBusyError
@@ -748,12 +752,25 @@ class SessionBackendImpl:
             raise SessionBackendError(
                 ProtocolErrorCode.INVALID_PARAMS, "Unknown dangerous operation"
             )
+        # A destination scopes the revocation to one exact canonical
+        # destination of network.remote-exec; any other operation rejects it,
+        # and a non-canonical spelling fails closed.
+        if params.destination is not None and (
+            params.operation_id != REMOTE_EXEC_OPERATION_ID
+            or canonical_remote_destination(params.destination) is None
+        ):
+            raise SessionBackendError(
+                ProtocolErrorCode.INVALID_PARAMS,
+                "A destination-scoped revocation requires network.remote-exec "
+                "and one exact canonical destination",
+            )
         try:
             return await self.children.revoke_dangerous_command_grant(
                 session_id=params.session_id,
                 operation_id=params.operation_id,
                 expected_live_generation=params.expected_live_generation,
                 expected_disk_revision=params.expected_disk_revision,
+                destination=params.destination,
             )
         except (ValueError, RuntimeError):
             raise SessionBackendError(

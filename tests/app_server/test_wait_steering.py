@@ -1237,7 +1237,11 @@ async def test_composed_skill_steer_over_the_live_reuse_tail_is_accepted(
         ]
         assert len(restored) == 1
         assert restored[0]._context_injection_origin == CONTEXT_INJECTION_TOOL_PAIR_V1
-        assert _install_transcript_repair(session_dir, loaded, _metadata) is loaded
+        installed, repair_pending = _install_transcript_repair(
+            session_dir, loaded, _metadata
+        )
+        assert installed is loaded
+        assert repair_pending is False
     finally:
         await root.close()
         await loop.aclose()

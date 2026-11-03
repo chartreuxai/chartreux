@@ -458,6 +458,14 @@ def _status_probe_replacements(  # noqa: PLR0911
 #     ``X=5 grep -m $X`` never sees the 5 (probed in zsh, bash, and sh) —
 #     authorizing from a prefix assignment would diverge from what actually
 #     executes.
+#     (c') The same evaluation admits ONE double-quoted spelling: a word that
+#     is exactly ``"$NAME"`` or ``"${NAME}"`` resolves through the identical
+#     path when a literal assignment to NAME precedes the command unchanged.
+#     The admission is limited to an invocation whose sole simple command is
+#     the analyzed command, so the execution transport can bind the resolved
+#     word as one literal argv element instead of re-running shell text; a
+#     prefixed, concatenated, nested, modifier, empty, or ambient form matches
+#     nothing here and keeps the ordinary expansion denial.
 #
 # Everything else keeps its denial: an unrecognized shape denies with the same
 # class and message as before, and a recognized-but-rejected shape keeps its
@@ -758,7 +766,8 @@ def _dynamic_argument_element(child: Node) -> bool:
     """Whether child is one unquoted argument element carrying expansion syntax.
 
     Double-quoted elements are excluded: their expansion text contains quotes,
-    which the static evaluator rejects, so they keep the walk's denial.
+    which the static evaluator rejects. The one admitted quoted spelling goes
+    through :func:`_quoted_variable_expression` instead.
     """
     if child.type in _DYNAMIC_ELEMENT_NODES:
         return True
@@ -790,13 +799,84 @@ def _argument_position_key(argument_tokens: list[str]) -> str:
     return f"positional:{positional + 1}"
 
 
+# A whole double-quoted `"$NAME"` / `"${NAME}"` word. The pattern covers the
+# node text entirely, so a prefixed (`"pre$NAME"`), concatenated (`"$A$B"`),
+# nested, modifier (`"${NAME:-default}"`), or empty form matches nothing.
+_QUOTED_VARIABLE_WORD_RE = re.compile(
+    r'"\$(?:\{[A-Za-z_][A-Za-z0-9_]*\}|[A-Za-z_][A-Za-z0-9_]*)"'
+)
+
+
+def _quoted_variable_expression(node: Node) -> str | None:
+    """The bare expansion text of a whole double-quoted variable word, or None."""
+    if node.type != "string" or node.text is None:
+        return None
+    text = node.text.decode("utf-8", errors="replace")
+    if _QUOTED_VARIABLE_WORD_RE.fullmatch(text) is None:
+        return None
+    return text[1:-1]
+
+
+def _sole_command_range(root: Node) -> tuple[int, int] | None:
+    """The byte range of the invocation's sole simple command, or None.
+
+    The quoted-word admission is bound to a literal argv plan by the
+    execution transport, so it is limited to an invocation that transport can
+    run without shell text: literal assignment statements followed by exactly
+    one simple command with no command-prefix assignment, redirect, pipeline,
+    command list, or wrapper. Anything else keeps the ordinary expansion
+    denial (fail closed).
+    """
+    if root.type != "program" or root.has_error:
+        return None
+    statements = [
+        child
+        for child in root.children
+        if child.type not in {"variable_assignment", ";", "comment"}
+    ]
+    if len(statements) != 1 or statements[0].type != "command":
+        return None
+    command = statements[0]
+    if any(child.type == "variable_assignment" for child in command.children):
+        return None
+    return command.start_byte, command.end_byte
+
+
+def _quoted_word_replacement(
+    child: Node,
+    node: Node,
+    command_name: str | None,
+    argument_tokens: list[str],
+    variables: dict[str, str],
+    quoted_word_scope: tuple[int, int] | None,
+) -> str | None:
+    """The literal one whole double-quoted variable word resolves to, or None.
+
+    Only the scope command's word is eligible, only in a provably read-only
+    position of a table-whitelisted command, and only when the static
+    expansion resolves the name to a non-empty literal.
+    """
+    if quoted_word_scope is None or command_name is None:
+        return None
+    if (node.start_byte, node.end_byte) != quoted_word_scope:
+        return None
+    expression = _quoted_variable_expression(child)
+    if expression is None:
+        return None
+    return evaluate_expansion_for_position(
+        command_name, _argument_position_key(argument_tokens), expression, variables
+    )
+
+
 def _static_expansion_replacements(
     node: Node,
     authorized: list[tuple[int, int]],
     add_reason: Callable[[Diagnostic], None],
     variables: dict[str, str],
     read_roots: frozenset[Path],
-    status_probes: dict[tuple[int, int], str] | None = None,
+    status_probes: dict[tuple[int, int], str] | None,
+    quoted_word_scope: tuple[int, int] | None,
+    admitted_quoted_words: list[int],
 ) -> dict[tuple[int, int], str]:
     """Literal replacements for this command's statically expanded constructs.
 
@@ -807,6 +887,11 @@ def _static_expansion_replacements(
     ``read_roots`` are the roots the sed simulation may read inside.
     ``status_probes`` carries the admitted same-invocation ``$?`` arguments;
     their replacement is the construct's own source text, not a literal.
+    ``quoted_word_scope`` marks the one command an invocation may bind to a
+    literal argv plan; only inside it does a whole double-quoted ``"$NAME"`` /
+    ``"${NAME}"`` argument resolve, and each such admission increments
+    ``admitted_quoted_words`` so the execution transport can re-derive the
+    same plan.
     """
     text = (node.text or b"").decode("utf-8", errors="replace")
     replacements: dict[tuple[int, int], str] = dict(status_probes or {})
@@ -860,6 +945,15 @@ def _static_expansion_replacements(
             command_name = token.rsplit("/", 1)[-1]
             continue
         if not _dynamic_argument_element(child) or child.text is None:
+            quoted_value = _quoted_word_replacement(
+                child, node, command_name, argument_tokens, variables, quoted_word_scope
+            )
+            if quoted_value is not None:
+                authorized.append(key)
+                replacements[key] = shlex.quote(quoted_value)
+                argument_tokens.append(quoted_value)
+                admitted_quoted_words[0] += 1
+                continue
             token = _supported_command_part(child)
             if token is not None:
                 argument_tokens.append(token)
@@ -1247,6 +1341,39 @@ _COMMAND_LOOKUP_MUTATORS = frozenset({
     ".",
 })
 
+# Shell builtins that change the shell's OPTION families (F1pkg1(b)): the
+# pinned executor option contract holds every expansion-relevant option OFF
+# in the executing process, so command text that flips one fails closed.
+# setopt/emulate are zsh; shopt and set are POSIX. A nested `set`/`shopt`
+# already denies as a command-lookup mutation, so those two are covered here
+# only at the top level (and in wrapped argv, where the mutator gate does not
+# fire); setopt/emulate are not lookup mutators and deny at any depth.
+_OPTION_CHANGING_COMMANDS = frozenset({"setopt", "emulate"})
+
+
+def _option_change_reason(
+    name: str, parts: list[str], *, nested_source: bool
+) -> Diagnostic | None:
+    """The policy reason for an option-changing shell builtin, else None."""
+    if name in _OPTION_CHANGING_COMMANDS:
+        return _policy_reason(
+            f"a shell option change ({name}) outside the pinned executor "
+            "option contract"
+        )
+    if (
+        not nested_source
+        and name in {"set", "shopt"}
+        and any(
+            argument.startswith(("-", "+")) and argument != "--"
+            for argument in parts[1:]
+        )
+    ):
+        return _policy_reason(
+            f"a shell option change ({name}) outside the pinned executor "
+            "option contract"
+        )
+    return None
+
 
 def argv_permission_diagnostics(
     parts: list[str], *, nested_source: bool = False
@@ -1318,6 +1445,8 @@ def argv_permission_diagnostics(
         reasons.append(
             _policy_reason(f"unsupported command lookup modification ({name})")
         )
+    if reason := _option_change_reason(name, parts, nested_source=nested_source):
+        reasons.append(reason)
     return tuple(reasons)
 
 
@@ -1365,6 +1494,12 @@ class ShellPermissionAnalysis:
     # inspection) read them here. Only provably-literal bindings are
     # recorded; anything else is denied upstream as uninspectable.
     command_assignments: tuple[tuple[tuple[str, str], ...], ...] = ()
+    # F1pkg3: how many whole double-quoted variable words this invocation
+    # resolved to a literal (always 0 unless the invocation is assignment
+    # statements followed by one simple command). A non-zero count is the
+    # execution transport's signal that it must run the literal argv plan,
+    # never the original shell text.
+    admitted_quoted_words: int = 0
 
     @property
     def approval_diagnostic(self) -> Diagnostic:
@@ -1486,6 +1621,13 @@ def _analyze_shell_command(  # noqa: PLR0915, PLR0914
     # ordinary expansion denial never fires for exactly those nodes.
     status_probes = _status_probe_replacements(tree.root_node)
     authorized.extend(status_probes)
+    # F1pkg3: the one command whose whole double-quoted variable words may
+    # bind to a literal argv plan, and how many such words were admitted in
+    # this invocation (the execution transport re-derives the same shape). A
+    # nested shell payload is executed by an inner shell whose text this
+    # transport never rewrites, so it is never admission-eligible.
+    quoted_word_scope = None if nested_source else _sole_command_range(tree.root_node)
+    admitted_quoted_words = [0]
 
     def add_reason(diagnostic: Diagnostic) -> None:
         detail = diagnostic.detail or ""
@@ -1650,6 +1792,8 @@ def _analyze_shell_command(  # noqa: PLR0915, PLR0914
                 invocation_variables,
                 read_roots,
                 status_probes,
+                quoted_word_scope,
+                admitted_quoted_words,
             )
             parts: list[str] = []
             prefix_assignments: list[tuple[str, str]] = []
@@ -1754,6 +1898,7 @@ def _analyze_shell_command(  # noqa: PLR0915, PLR0914
         redirect_operands=tuple(tuple(group) for group in redirect_groups)
         + (tuple(pending_targets),),
         command_assignments=tuple(command_assignment_groups),
+        admitted_quoted_words=admitted_quoted_words[0],
     )
 
 

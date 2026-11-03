@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Awaitable, Callable, Sequence
+from dataclasses import dataclass
 import logging
 import time
 from typing import TYPE_CHECKING, Any, Literal, Protocol
@@ -78,6 +80,24 @@ class CompletionFn(Protocol):
     ) -> LLMChunk: ...
 
 
+@dataclass(frozen=True, slots=True)
+class PendingPostTurnTrim:
+    """A post-turn trim captured at the exclusive idle seam (T1a).
+
+    Keyed by session / message epoch / boundary: the record is meaningful only
+    while the session, the ``MessageList`` epoch and the compaction boundary it
+    was captured at all still hold. A list rebind (reset/resume bumps the
+    epoch) or a new session makes it stale, and the next attempt discards it.
+    The capture is the single recording point; the same guarded entry makes the
+    recorded pending LIVE — drain/fence/seal/publish through
+    ``SessionLogger.complete_post_turn_trim`` (T1b).
+    """
+
+    session_id: str
+    message_epoch: int
+    boundary_message_id: str
+
+
 class CompactionManager:
     """Summarizes a conversation into a compact-context envelope.
 
@@ -105,6 +125,9 @@ class CompactionManager:
         tool_manager_getter: Callable[[], ToolManager | None] | None = None,
         has_active_turn: Callable[[], bool] | None = None,
         trim_enabled_getter: Callable[[], bool] | None = None,
+        pending_trim_getter: Callable[[], PendingPostTurnTrim | None] | None = None,
+        pending_trim_recorder: Callable[[PendingPostTurnTrim | None], None]
+        | None = None,
     ) -> None:
         self._messages = messages
         self._stats = stats_getter
@@ -123,6 +146,10 @@ class CompactionManager:
         self._tool_manager_getter = tool_manager_getter
         self._has_active_turn = has_active_turn
         self._trim_enabled_getter = trim_enabled_getter
+        # T1a pending post-turn trim holder wiring: the loop owns the holder;
+        # the guarded post-finalization entry reads and records through these.
+        self._pending_trim_getter = pending_trim_getter
+        self._pending_trim_recorder = pending_trim_recorder
 
     async def compact(self, extra_instructions: str = "") -> str:
         summary_prefix = UtilityPrompt.COMPACT_SUMMARY_PREFIX.read()
@@ -243,6 +270,104 @@ class CompactionManager:
         except Exception as exc:
             # Compaction may succeed without RAM trimming: retain the originals.
             logger.debug("archived-prefix trim skipped: %s", exc)
+
+    async def capture_post_turn_pending_trim(
+        self, *, session_id: str, message_epoch: int
+    ) -> None:
+        """GUARDED post-finalization entry — the T1 post-turn seal (T1a capture
+        + T1b drain/fence/publication, landed together at one seam).
+
+        ``AgentLoop.act`` awaits this after ``checkpoint_recorder.seal_turn()``
+        and before ``_active_turn = None``: the genuinely exclusive idle seam
+        (a new act(), resume, the relocator and config transactions are all
+        refused while the turn is still registered). The entry records the
+        pending trim in the loop's holder — the single recording point — and
+        then makes the recorded pending LIVE at the same exclusive seam: it
+        drains queued/in-flight saves, fences, seals the archive for the
+        pending boundary and publishes, through
+        ``SessionLogger.complete_post_turn_trim``.
+
+        Guards: the post-turn seam only (a turn must still be registered);
+        trim enabled; a live sealing surface; the holder wired. A pending
+        captured at another session or message epoch is stale after a rebind
+        and is discarded at this attempt boundary. The newest compaction
+        boundary coalesces (an existing same-key pending is replaced, never
+        stacked). A boundary is never invented merely to trim, and an invalid
+        eligible prefix is skipped. The holder is consumed at the attempt
+        boundary. Any failure — including cancellation, which the logger
+        drains without publishing — is absorbed: a failed or cancelled
+        finalization never turns a completed turn into a failure, never
+        authorizes eviction, and never partially publishes; the originals are
+        retained.
+        """
+        try:
+            if self._pending_trim_getter is None or self._pending_trim_recorder is None:
+                return
+            if self._has_active_turn is not None and not self._has_active_turn():
+                # Not the post-finalization seam: no turn still registered.
+                return
+            if not self._trim_enabled():
+                return
+            logger_ = (
+                self._session_logger_getter() if self._session_logger_getter else None
+            )
+            if logger_ is None or not logger_.enabled:
+                return
+            current = self._pending_trim_getter()
+            if current is not None and (
+                current.session_id != session_id
+                or current.message_epoch != message_epoch
+            ):
+                # Stale on rebind/new session: discard at the attempt boundary.
+                self._pending_trim_recorder(None)
+            eligible = eligible_archive_prefix(list(self._messages))
+            if eligible is None or eligible.boundary_message_id is None:
+                # Never invent a boundary merely to trim; invalid prefixes skip.
+                return
+            # Coalesce to the newest boundary (the single recording point).
+            pending = PendingPostTurnTrim(
+                session_id=session_id,
+                message_epoch=message_epoch,
+                boundary_message_id=eligible.boundary_message_id,
+            )
+            self._pending_trim_recorder(pending)
+            # T1b: make the recorded pending LIVE at the same exclusive seam —
+            # drain/fence/seal/publish. The holder is consumed at this attempt
+            # boundary whatever the outcome.
+            try:
+                await self._complete_post_turn_pending_trim(logger_, pending)
+            except asyncio.CancelledError:
+                # The logger drained its in-flight persist and published
+                # nothing; absorb so the completed turn does not become a
+                # failure and the loop can unregister the turn normally.
+                logger.debug("post-turn trim completion cancelled; originals retained")
+            finally:
+                self._pending_trim_recorder(None)
+        except Exception as exc:
+            # A failed finalization never turns a completed turn into a failure.
+            logger.debug("post-turn pending trim capture skipped: %s", exc)
+
+    async def _complete_post_turn_pending_trim(
+        self, logger_: SessionLogger, pending: PendingPostTurnTrim
+    ) -> None:
+        """Drain/fence/seal/publish the recorded pending through the logger (T1b)."""
+        tool_manager = (
+            self._tool_manager_getter() if self._tool_manager_getter else None
+        )
+        if tool_manager is None:
+            return
+        result = await logger_.complete_post_turn_trim(
+            self._messages,
+            self._stats(),
+            self._config(),
+            tool_manager,
+            session_id=pending.session_id,
+            message_epoch=pending.message_epoch,
+            boundary_message_id=pending.boundary_message_id,
+        )
+        logger.debug(
+            "post-turn trim outcome=%s detail=%r", result.outcome, result.detail
+        )
 
     async def _summarize(
         self, snapshot: list[LLMMessage], extra_instructions: str

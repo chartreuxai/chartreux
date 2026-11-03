@@ -16,6 +16,7 @@ import asyncio
 import hashlib
 import inspect
 import json
+import os
 from pathlib import Path
 from threading import Event
 from typing import Any
@@ -938,3 +939,228 @@ class TestP4a4StaleDescriptorNeverOverwrites:
             disabled_logger.fence_and_publish_archive_trim(
                 messages, descriptor, [], save_generation=0, reset_generation=0
             )
+
+
+# ---------------------------------------------------------------------------
+# T2a: the warm-resume clear-and-reseal proof/transaction — the drain and
+# generation fence under the save lock: a paused in-flight save is drained
+# before the proof runs, a queued save is fenced THROUGH the synchronous
+# rebind in the same lock hold, and disk bytes changed mid-proof fail the
+# proof closed with authority retained.
+# ---------------------------------------------------------------------------
+
+
+class TestT2aWarmResumeProofFence:
+    @staticmethod
+    def _rebound(messages: MessageList) -> list[LLMMessage]:
+        """Rebind the list exactly as the warm-resume commit does."""
+        loaded = [m for m in messages if m.role is not Role.system]
+        messages.reset_preserving_system(list(loaded))
+        assert messages.message_epoch == 1
+        return loaded
+
+    @pytest.mark.asyncio
+    async def test_paused_in_flight_save_is_drained_before_the_proof_runs(
+        self,
+        session_config: SessionLoggingConfig,
+        mock_vibe_config: ChartreuxConfigSchema,
+        mock_tool_manager: ToolManager,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        logger, messages, descriptor = await _fence_sealed_logger(
+            session_config, "t2a-inflight", mock_vibe_config, mock_tool_manager
+        )
+        await _fence_save(logger, messages, mock_vibe_config, mock_tool_manager)
+        messages_path = _fence_messages_path(logger)
+        raw_before = messages_path.read_bytes()
+        prefix_before = raw_before[: descriptor.prefix_end_byte]
+        loaded = self._rebound(messages)
+
+        import chartreux.core.session.session_logger as logger_module
+
+        order: list[str] = []
+        real_prove = logger_module.prove_rebound_hydration
+
+        def spy_prove(*args: Any, **kwargs: Any) -> Any:
+            order.append("proof")
+            return real_prove(*args, **kwargs)
+
+        monkeypatch.setattr(logger_module, "prove_rebound_hydration", spy_prove)
+
+        started, release = Event(), Event()
+        original = logger._save_interaction_sync
+
+        def gated(*args: Any, **kwargs: Any) -> Any:
+            started.set()
+            assert release.wait(5)
+            result = original(*args, **kwargs)
+            order.append("save_done")
+            return result
+
+        monkeypatch.setattr(logger, "_save_interaction_sync", gated)
+
+        # A paused in-flight save holds the save lock mid-worker and appends a
+        # record the rebound list does not hold.
+        extra = loaded + [_fence_user("extra", "extra")]
+        save_task = asyncio.create_task(
+            _fence_save(logger, extra, mock_vibe_config, mock_tool_manager, steps=2)
+        )
+        assert await asyncio.to_thread(started.wait, 5)
+        txn = asyncio.create_task(
+            logger.clear_and_reseal_warm_resume(messages, session_id=logger.session_id)
+        )
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        # The transaction waits on the save lock: the proof has NOT run while
+        # the in-flight save is paused — no race with the proof.
+        assert order == []
+        assert not txn.done()
+        release.set()
+        await save_task
+        result = await txn
+
+        # The drain completed first; the proof then saw the save's bytes.
+        assert order == ["save_done", "proof"]
+        # The save appended a record the rebound list does not hold, so the
+        # complete-loaded-records check fails closed.
+        assert result.outcome == "refused_proof"
+        # Authority retained; the archived prefix bytes are byte-identical and
+        # nothing was staged.
+        assert logger.archive_descriptor is descriptor
+        raw_after = messages_path.read_bytes()
+        assert raw_after[: descriptor.prefix_end_byte] == prefix_before
+        assert logger.session_dir is not None
+        assert not list(logger.session_dir.glob("messages.jsonl.recovered-*"))
+
+    @pytest.mark.asyncio
+    async def test_queued_save_is_fenced_through_the_resume_rebind(
+        self,
+        session_config: SessionLoggingConfig,
+        mock_vibe_config: ChartreuxConfigSchema,
+        mock_tool_manager: ToolManager,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        logger, messages, descriptor = await _fence_sealed_logger(
+            session_config, "t2a-queued", mock_vibe_config, mock_tool_manager
+        )
+        await _fence_save(logger, messages, mock_vibe_config, mock_tool_manager)
+        messages_path = _fence_messages_path(logger)
+        raw_before = messages_path.read_bytes()
+        self._rebound(messages)
+
+        import chartreux.core.session.session_logger as logger_module
+
+        started, release = Event(), Event()
+        real_prove = logger_module.prove_rebound_hydration
+
+        def gated_prove(*args: Any, **kwargs: Any) -> Any:
+            started.set()
+            assert release.wait(5)
+            return real_prove(*args, **kwargs)
+
+        monkeypatch.setattr(logger_module, "prove_rebound_hydration", gated_prove)
+
+        save_generation = logger._transcript_cursor_generation
+        reset_generation = logger._archive_generation
+        txn = asyncio.create_task(
+            logger.clear_and_reseal_warm_resume(messages, session_id=logger.session_id)
+        )
+        assert await asyncio.to_thread(started.wait, 5)
+        # While the proof runs under the held save lock, queue a stale save:
+        # it snapshots the CURRENT generation, then waits on the lock.
+        stale = asyncio.create_task(
+            _fence_save(
+                logger,
+                [_fence_user("stale", "stale")],
+                mock_vibe_config,
+                mock_tool_manager,
+                steps=2,
+            )
+        )
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        assert not stale.done()
+        release.set()
+        result = await txn
+        await stale
+
+        # The proof held; the authority transition ran, and the generation
+        # fence stayed effective THROUGH the synchronous rebind in the same
+        # lock hold: the queued save discarded itself under the lock.
+        assert result.outcome == "proved_and_transitioned"
+        assert logger.archive_descriptor is None  # cleared, never re-pinned
+        assert messages.archive_descriptor is None
+        assert logger._transcript_cursor_generation == save_generation + 1
+        assert logger._archive_generation == reset_generation + 1
+        # No bytes written by the fenced save; its snapshot was not published.
+        assert messages_path.read_bytes() == raw_before
+        snapshot = logger.last_save_archive_snapshot
+        assert snapshot is not None
+        assert snapshot.descriptor is None
+        assert snapshot.message_epoch == 1
+
+    @pytest.mark.asyncio
+    async def test_changed_disk_bytes_mid_proof_fail_closed_and_retain_authority(
+        self,
+        session_config: SessionLoggingConfig,
+        mock_vibe_config: ChartreuxConfigSchema,
+        mock_tool_manager: ToolManager,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        logger, messages, descriptor = await _fence_sealed_logger(
+            session_config, "t2a-midproof", mock_vibe_config, mock_tool_manager
+        )
+        await _fence_save(logger, messages, mock_vibe_config, mock_tool_manager)
+        messages_path = _fence_messages_path(logger)
+        self._rebound(messages)
+
+        import chartreux.core.session.transcript_archive as archive_module
+
+        real_read_chunks = archive_module.read_chunks
+        mutated = False
+
+        def mutating_read_chunks(path: Path, *, chunk_size: int = 1024 * 1024) -> Any:
+            nonlocal mutated
+            if path != messages_path:
+                yield from real_read_chunks(path, chunk_size=chunk_size)
+                return
+            # Unbuffered reads (os.read): a buffered reader would pre-read the
+            # whole small file, hiding a mid-proof on-disk change from the
+            # in-flight stream. Raw reads see the mutation in later chunks.
+            fd = os.open(path, os.O_RDONLY)
+            try:
+                while True:
+                    chunk = os.read(fd, 16)
+                    if not chunk:
+                        return
+                    yield chunk
+                    if not mutated:
+                        # Change disk bytes MID-PROOF: flip one byte inside
+                        # the archived prefix region after the first chunk
+                        # was read; the remaining chunks stream changed bytes.
+                        mutated = True
+                        with open(path, "r+b") as stream:
+                            stream.seek(20)
+                            current = stream.read(1)
+                            stream.seek(20)
+                            stream.write(bytes([current[0] ^ 0x01]))
+            finally:
+                os.close(fd)
+
+        monkeypatch.setattr(archive_module, "read_chunks", mutating_read_chunks)
+
+        save_generation = logger._transcript_cursor_generation
+        reset_generation = logger._archive_generation
+        result = await logger.clear_and_reseal_warm_resume(
+            messages, session_id=logger.session_id
+        )
+
+        assert mutated
+        # The mid-proof byte change fails the proof closed (prefix hash).
+        assert result.outcome == "refused_proof"
+        # Authority and originals stay; the fence never moved; nothing staged.
+        assert logger.archive_descriptor is descriptor
+        assert logger._transcript_cursor_generation == save_generation
+        assert logger._archive_generation == reset_generation
+        assert logger.session_dir is not None
+        assert not list(logger.session_dir.glob("messages.jsonl.recovered-*"))

@@ -2,6 +2,292 @@
 
 All notable changes to Chartreux are documented in this file.
 
+## 0.7.1 (2026-11-03)
+
+Follow-up completion of the 0.7.0 surface rather than a new headline feature:
+remote execution behind a closed destination grammar with destination-scoped
+revocation, durable trust-store writes and a `trust` command line, the executor
+shell-option contract with its three glob follow-ups, HTTPie's `https` entry
+point, and trimming that now runs after a completed turn and re-arms across a
+warm resume.
+
+### Added
+
+- `chartreux trust list [PATH]` and `chartreux trust remove PATH` inspect and
+  edit the user trust store without starting a session. `list` reports the
+  stored entries with their origin and names the closest ancestor entry that
+  governs an untrusted path (a nested entry is marked as overriding its
+  ancestor). `remove` deletes exactly the named entry, so its siblings and
+  descendants survive, asks for confirmation defaulting to no, and refuses
+  non-interactive use. There is deliberately no force flag: `--yes`,
+  `--force`, and `-y` are rejected as unknown arguments. A removal goes
+  through the same checked write as the interactive decision and reports that
+  a restart is needed; a durability-uncertain write is an explicit error,
+  never a silent success, and an unusable store is refused with exit code 2
+  and a byte-identical store. The untrusted-config warning now names these
+  commands instead of describing a manual edit.
+
+- Remote execution over `ssh` is admitted for one exact destination. `ssh`
+  left the default denylist under a closed grammar: a single, standalone
+  invocation with a positive destination — an IP literal, or (with the
+  hostname work below) a uniquely and non-locally resolved hostname — is
+  classified `network.remote-exec` and asks for approval with the exact
+  destination attached. The spawned command pins `UserKnownHostsFile`,
+  `HostKeyAlias`, `StrictHostKeyChecking=yes`, and `BatchMode=yes` as
+  leading options at every execution transport, derived from the approved
+  destination; a hostile or unmodeled option, a composed or wrapped
+  invocation, an unparseable destination, and a loopback, unspecified, or
+  otherwise local literal all hard-deny with no approval path (see the
+  retained limitations below: the pinned known-hosts file is not
+  provisionable yet, so an approved spawn fails host-key verification
+  closed until provisioning lands).
+
+- Hostname destinations resolve, validate, and pin. A
+  `user@hostname:port` destination is admitted only when the system resolver
+  (honoring `/etc/hosts`) answers with exactly one non-local address; an
+  ambiguous or multi-answer resolution, a local answer, and a resolution
+  failure stay denied. The resolved address rides into the spawned argv as
+  the destination operand while `HostKeyAlias` stays bound to the granted
+  hostname. The resolution is re-observed once at spawn: a hostname whose
+  answer changes between approval and execution is denied rather than
+  contacted, so a rebound answer never reaches the command line.
+
+- Bounded remote transfers. `scp` and `rsync` left the default denylist
+  under a closed transfer grammar: a single standalone transfer with exactly
+  two operands, exactly one of them a `user@host:path` remote operand, the
+  host an IP literal or a uniquely non-locally resolved hostname, and the
+  path inside a closed character set with no `..` segment. Only safe option
+  clusters are admitted (plus `scp -P` for the port; `rsync` injects a
+  pinned `-e ssh` transport), the call is classified `network.remote-exec`
+  with the exact destination on the approval, and the admitted transfer pins
+  the same host-key identity and resolved address into the actual argv at
+  every spawn point. Remote-to-remote copies, a remote spec with no user,
+  the daemon `host::module` form, user-supplied transports (`-e`/`--rsh`,
+  `-S`), symlink following (`-L`), destination-mutating options (`--delete`,
+  `--remove-source-files`, `rsync -P`, `--inplace`, the
+  backup/partial/temp-dir families), the legacy scp protocol and
+  server-chosen names (`-O`, `-T`), and any local, ambiguous, or failed
+  destination all hard-deny. A locality-only attestation entry —
+  network-namespace locality without the SSH trust context — hard-denies
+  transfers even on a client that admits `ssh` execution.
+
+- Destination-scoped revocation. `policy/dangerous_commands/revoke` now
+  carries the exact canonical destination beside the registered session, the
+  operation, the expected live generation, and the expected disk revision,
+  and reports the live and saved outcomes apart. Revoking a destination
+  removes only that destination's session grants, invalidates whole every
+  pending once permit containing it, and removes the same destination from
+  the saved project list. **Settings > Shell Permissions** lists each exact
+  `user@host:port` under the section that holds it (live, accepted config,
+  or disk only), Enter on a destination row revokes exactly it, and the
+  whole-scope revoke stays reachable as one separate row behind an explicit
+  `y` confirmation.
+
+- Glob admissions for the pinned executor. A path component whose trailing
+  star run is exactly two stars (`src/**`, never the recursive `**/` form)
+  is admitted for `cat` and `wc` with no options when the live executor
+  contract proves the run single-level (the POSIX family, or `bash` with
+  `globstar` held off); the plan enumerates the directory and the actual
+  spawn receives its literal words. A whole double-quoted `"$NAME"` or
+  `"${NAME}"` word in a provably read-only position of a whitelisted reader
+  resolves to one literal argv element only when a literal assignment to
+  that name precedes the command unchanged in the same invocation.
+  Everything else stays conservatively denied, and the recursive `**/`
+  fall-out control keeps its denial.
+
+- HTTPie's `https` entry point left the default denylist under the same
+  restricted, positional-only grammar as `http`. It admits a literal
+  `https://` destination and a schemeless operand (`https host/path`), which
+  the client turns into `https://`; a literal loopback destination resolves
+  run-class and a non-loopback schemeless destination resolves ask-class as
+  `network.egress`. An explicit non-https scheme (`https http://host/`)
+  would issue a plain-HTTP request and hard-denies as a cross-scheme
+  spelling, as do options, file-reading request items, and every other
+  spelling outside the grammar. The localhost shorthand
+  (`https :8443/status`) is not a literal URL the recognizer parses, so it
+  resolves ask-class rather than riding a loopback auto-allow.
+
+- Trim savings are measured rather than asserted
+  (`docs/project/trim-savings.md`): three deterministic transcript mixes,
+  five trials per arm, on a quiet machine. The payload-only trim freed
+  65,790 B against 1,347 B of control noise in the tool-output-heavy mix
+  (64 KiB reasoning alongside 768 KiB of tool output), 1,572,607 B against
+  3,391 B in the reasoning-heavy mix (1.5 MiB reasoning), and 8,389,289 B
+  in the 8 MiB positive control against 3,747 B of noise; the independently
+  serialized reasoning bytes removed were 66,816 B, 1,596,234 B, and
+  8,512,128 B. The decisive limitation is scope, not magnitude: the 768 KiB
+  of tool output stayed resident.
+
+### Changed
+
+- Trust decisions persist through one checked atomic write. Trusting or
+  untrusting a folder or workspace now writes a fsynced temporary file,
+  atomically replaces the store, fsyncs the directory, and re-reads the
+  revision under the lock before replacing; the revision is a content hash,
+  so a same-size write inside one mtime tick is still a conflict. The
+  outcomes are explicit — saved, not saved, durability uncertain, conflict,
+  malformed, or locked — a malformed store is never rewritten, and a refused
+  write never publishes live trust for the decision that failed. A store
+  that cannot be answered is refused instead of being read as "untrusted":
+  `chartreux doctor` renders one check per store state (missing skipped,
+  unreadable unverified, malformed or invalid failed with a repair remedy
+  and exit code 1), `chartreux skills` exits 2, and the workspace,
+  relocation, project-env, and harness consumers raise a typed error
+  instead of silently resolving untrusted. A missing store remains the
+  ordinary first-run default.
+
+- Every spawned shell runs under a pinned executor contract.
+  Expansion-relevant option families are held off (bash `extglob`,
+  `globstar`, `nullglob`, `dotglob`, `failglob`, `nocaseglob`; zsh
+  `extendedglob`, `globdots`, `kshglob`, `nullglob`, `caseglob`, `shglob`),
+  startup-file environment variables (`BASH_ENV`, `ENV`, `ZSHENV`,
+  `KSH_ENV`) are scrubbed, `ZDOTDIR` is redirected, the locale is pinned,
+  and the contract is applied last so a project `.env` cannot re-introduce
+  an option. The shell invocation admits only `-c` and
+  `--noprofile`/`--norc`/`--noediting`; an option-changing builtin
+  (`setopt`, `emulate`, top-level `set`/`shopt`) denies; a nested shell
+  re-entry with an expansion-bearing payload denies; and an unknown executor
+  fails closed at resolution and again at spawn. Extended-glob syntax
+  without glob metacharacters (`^foo`, `foo#`, `a~b`) is detected
+  quote-aware and stays literal, and the same pinned plan is what the argv,
+  shell-string, background, and terminal transports consume — the
+  background launcher re-derives the bound plan at execution and hard-denies
+  rather than falling back to the original shell text.
+
+- Trimming now runs after a completed turn. The post-turn seam captures the
+  settled boundary during the turn's own completion, and the logger then
+  seals and publishes it in one synchronous fenced step after the pending
+  saves drain and the archive lock is held; compaction is no longer the only
+  trigger. The trim is best-effort: a failed seal or a failed publish keeps
+  the originals effective, carries a receipt, and never fails the completed
+  turn.
+
+- A warm in-process resume re-arms trimming. All resume paths clear the
+  old-epoch descriptor and reseal after a full streaming hydration proof —
+  session and path identity, archived prefix bytes, and every record on disk
+  parsed equal to the loaded records, exactly once each. A failed proof
+  keeps the old descriptor and the retained authority with byte-identical
+  bytes and loud logging, and there is no silent re-pin fallback: the
+  resume still succeeds, but that session stays un-armed rather than
+  risking a rewind it cannot prove.
+
+### Fixed
+
+- The question widget's expired-draft preservation store was dead machinery
+  and is removed with the widget lifecycle unchanged (a characterization
+  test pins the close message, queue advance, and surface handoff before and
+  after removal). A model question that originates in a bounded child is now
+  refused at admission with the same typed refusal the tool-level guard
+  already produced, so no callback is opened that nobody could answer and
+  nothing is granted.
+
+- `chartreux doctor` keeps its typed trust row when a corrupt store and a
+  discovered project configuration are both present; the config-load
+  failure path no longer returns before rendering the store state.
+
+- The remote-exec wire symbols moved to a shared leaf outside both the core
+  and app-server packages, so the app-server client boundary no longer
+  imports `chartreux.core.dangerous_commands`; the import-boundary tests
+  pass again. This is an internal layout fix; the wire models and the
+  exported names are unchanged.
+
+- Investigation and test-debt outcomes. The stale-lock anomaly is the
+  session-lease filesystem lock, whose inert leftovers are designed to be
+  re-acquired by the next process; it is not a live defect, and new
+  subprocess-held lease tests pin both the live-owner block and the
+  owner-death re-acquisition. A trace of the suite's git traffic found no
+  offender: the `index.lock` churn observed during this cycle was an
+  external application's status poll running without `--no-optional-locks`,
+  not a test writing into the main repository. The shipped-skill dedup audit
+  found no duplicate sources, the wheelhouse requirement for the
+  installed-contract tests is documented in the README, the stale release
+  worktrees and hash-matched branches were removed, and pyright is pinned to
+  1.1.414.
+
+### Retained limitations
+
+- Intermediate states, recorded because each was its own integration point:
+  before the `trust` CLI landed, the untrusted-config warning still
+  described the manual edit; before the trailing-star and quoted-word
+  follow-ups, the executor contract narrowed glob admissions further (no
+  trailing `**` and no quoted-variable word); before hostname pinning
+  landed, only IP-literal `ssh` destinations were admitted; while transfers
+  were still denied, pinned hostname execution worked but `scp` and `rsync`
+  did not; before the destination-scoped backend landed, revocation was
+  whole-grant only; and between the backend and the Settings control,
+  destination revocation existed at the protocol without a panel control.
+  No intermediate state claims a later state's guarantees.
+
+- An approved `ssh` spawn cannot complete host-key verification yet. The
+  pinned `UserKnownHostsFile` is the fixed, unprovisionable path
+  `/dev/null/chartreux-pinned-known-hosts`, so with
+  `StrictHostKeyChecking=yes` and `BatchMode=yes` the connection fails
+  closed instead of trusting an unknown key. This is fail-closed by
+  construction rather than a working end-to-end remote session: the
+  destination grammar, authority model, and argv pinning are exercised, and
+  provisioning the pinned known-hosts file is the remaining step.
+
+- Remote execution from the terminal transports and the ACP path hard-denies
+  without an execution-bound attestation entry, and ACP clients default to
+  the non-attestation posture. The attestation is client-self-reported: it
+  closes accidental misrouting — a client that cannot prove it shares the
+  approved network namespace and SSH trust context is denied — but it
+  cannot stop a client that lies about its own context. A locality-only
+  entry is not enough for transfers.
+
+- Strict-client compatibility is unchanged from the 0.7.0 convention: the
+  destination request field and the destination-aware projection follow the
+  strict wire models, so an older strict app server rejects the new request
+  (the whole-scope request included, because the defaulted field still
+  serializes) and an older strict client rejects the new response keys.
+  Client and app server must run the same protocol version.
+
+- Revocation undoes no remote effect. A command already running keeps
+  running, an already-asked approval question is not cancelled (and
+  answering it after the revocation grants fresh authority for the decided
+  scope, which the revoke reports as a concurrent-regrant warning), the
+  running session keeps whatever its accepted config already granted until
+  a reload or start, a child's or another process's store is outside the
+  transaction, and the panel reports the server's response rather than
+  independently verifying it.
+
+- The automatic post-turn trim is best-effort by design: it is a memory
+  optimization on the completion path, so a failure to seal or publish
+  leaves the original history effective and is reported as a receipt, never
+  as a failed turn or a lost conversation. A trim therefore may simply not
+  happen on a given turn.
+
+- The warm-resume re-arm depends on its hydration proof. When the proof
+  fails — a foreign session, a trimmed prefix, changed archived bytes, a
+  paused in-flight save — the resume keeps the old descriptor and the
+  session stays un-armed for trimming; the alternative considered,
+  re-pinning an unproven archive, was rejected as the riskier failure.
+
+- Trim scope is unchanged and is the decisive limitation: only the sealed
+  messages' reasoning payloads are released, so tool output and visible
+  text stay resident. The measurement shows magnitude for reasoning-heavy
+  transcripts but little for tool-output-heavy ones, and the 0.8.0
+  structural-tombstone decision is the place for the rest.
+
+- `ascii_chrome` is not a full-ASCII mode. A native 80x24 capture measured
+  the chrome glyphs replaced, but widget borders (U+2500), the literal
+  header separator (U+00B7), the status-line em dash (U+2014), and the
+  braille loading spinner (U+28xx) remain non-ASCII. The remaining shell
+  over-denials documented in the tools-safety guide stay in force: a star
+  run of three or more, a run that does not end the component, a wildcard
+  in a middle component, every command outside the read whitelist, and
+  every quoted variable outside the one admitted word shape; the work-budget
+  caps are unchanged, and system-wide startup files and the shell binary
+  remain a root-owned trust base.
+
+- Native verification found no desktop-availability blocker and recorded
+  pass verdicts for the OAuth browser launch (a real `xdg-open`/Firefox
+  dispatch to a loopback URL), NO_COLOR contrast at compact dimensions and
+  across a light palette (grayscale-only SGR with structure retained), and
+  trust persistence (the store written on disk and honored across a
+  restart). Those checks are native, not hermetic-only; the
+  `ascii_chrome` finding above is the one measured negative.
+
 ## 0.7.0 (2026-11-01)
 
 Everything shipped since v0.6.1: the skills and route inspection tooling, the

@@ -35,7 +35,13 @@ from chartreux.app_server.protocol import (
 from chartreux.core.agent_loop import AgentLoop
 from chartreux.core.llm_models import ManualShellContext
 from chartreux.core.tools import secret_redaction
+from chartreux.core.tools.builtins._remote_exec import RemoteExecDenial
+from chartreux.core.tools.builtins._shell_permission_resolver import (
+    remote_exec_plan_for_command,
+)
 from chartreux.core.tools.builtins.bash import BashToolConfig
+from chartreux.core.tools.utils import effective_scratchpad_roots
+from chartreux.core.utils.shell import terminal_shell_text_refusal
 
 
 class ShellRequestHandler:
@@ -76,6 +82,40 @@ class ShellRequestHandler:
             raise RequestFailure(
                 ProtocolErrorCode.INVALID_PARAMS, "Shell command cannot be empty"
             )
+        # F1pkg1(a)/(c) terminal consumption contract: the session shell
+        # transport is non-attesting — it runs shell text under the ambient
+        # executor and no client attests one, so expansion refuses before any
+        # effect starts and before the executor is reached. Non-expanding
+        # text runs through the same spawn_shell_command that consumes the
+        # pinned executor contract at execution in this process (_shell.py),
+        # so the approved semantics equal the actual spawn.
+        refusal = terminal_shell_text_refusal(command)
+        if refusal is not None:
+            raise RequestFailure(ProtocolErrorCode.FORBIDDEN, refusal)
+        # S4b1b + S4b2a: the session shell spawns in this process, so its
+        # executor is the server itself — attested by construction. A
+        # standalone ssh invocation with a positive destination (literal IP,
+        # or a hostname resolved uniquely non-local) runs with the pinned
+        # plan (resolved address + fixed host-key identity in the actual
+        # argv); every other ssh spelling hard-refuses here, before any
+        # effect starts. The manual `!` path is direct user authority, so no
+        # model-side grant flow applies — but the pin still lands at the spawn.
+        try:
+            path_authority = self._agent_loop.tool_manager.path_authority("bash")
+            remote_plan = remote_exec_plan_for_command(
+                command,
+                cwd=self._agent_loop.cwd,
+                workspace=self._agent_loop.tool_manager.workspace,
+                authority=path_authority,
+                scratchpad_roots=effective_scratchpad_roots(path_authority),
+                workspace_roots=frozenset(
+                    self._agent_loop.tool_manager.workspace.authorized_roots
+                ),
+            )
+        except RemoteExecDenial as exc:
+            raise RequestFailure(ProtocolErrorCode.FORBIDDEN, str(exc)) from exc
+        if remote_plan is not None:
+            command = remote_plan.command
         operation_id = params.operation_id or str(uuid4())
         run_params = ShellRunParams(
             session_id=params.session_id,

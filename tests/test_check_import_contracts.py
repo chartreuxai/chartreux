@@ -5,7 +5,10 @@ from pathlib import Path
 import sys
 import textwrap
 
+from chartreux.utils.io import read_safe
+
 SCRIPTS_DIR = Path(__file__).resolve().parents[1] / "scripts"
+PACKAGE_ROOT = Path(__file__).resolve().parents[1] / "chartreux"
 if str(SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPTS_DIR))
 
@@ -214,3 +217,24 @@ def test_check_all_flags_cross_file_type_checking_reexport(tmp_path: Path, monke
     monkeypatch.setattr(sys, "argv", ["check_import_contracts.py", str(repo)])
     rc = cic.check_all()
     assert rc == 1
+
+
+def test_dead_expired_question_draft_store_stays_removed():
+    """D3 absence pin: the expired-question draft store is gone from the tree.
+
+    The store was written on the TUI close path and never read, so removing it
+    is behaviorally inert — which is also why nothing else in the suite would
+    notice a reintroduction. Scan the package sources so a restored write or
+    its plumbing fails here instead of silently accruing again.
+    """
+    sources = sorted(PACKAGE_ROOT.rglob("*.py"))
+    assert PACKAGE_ROOT / "cli" / "textual_ui" / "turn_supervisor.py" in sources
+
+    dead_names = ("expired_question_drafts", "preserve_draft")
+    offenders = [
+        path.relative_to(PACKAGE_ROOT).as_posix()
+        for path in sources
+        if any(name in read_safe(path).text for name in dead_names)
+    ]
+
+    assert offenders == []

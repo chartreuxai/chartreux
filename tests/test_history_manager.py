@@ -324,6 +324,7 @@ def test_history_manager_serializes_process_read_merge_replace(
         _release_history_child(second)
         _wait_for_child_signal(second, b"attempting")
         # The second process cannot read the stale snapshot held by the first.
+        assert second.stdout is not None
         assert not select.select([second.stdout], [], [], 0.2)[0]
         _release_history_child(first)
         _assert_child_succeeded(first)
@@ -358,6 +359,7 @@ def test_history_manager_lock_released_when_holder_is_killed(tmp_path: Path) -> 
         processes.append(writer)
         _release_history_child(writer)
         _wait_for_child_signal(writer, b"attempting")
+        assert writer.stdout is not None
         assert not select.select([writer.stdout], [], [], 0.2)[0]
         holder.kill()
         holder.communicate(timeout=10)

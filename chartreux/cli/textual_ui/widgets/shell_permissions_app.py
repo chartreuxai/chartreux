@@ -4,11 +4,15 @@ The panel is the Settings entry for the ``shell_permissions`` deferred
 descriptor. It distinguishes live session grants, saved project grants (with
 the disk revision), and blocking explicit denylist entries, and revokes one
 operation at a time with the expected live generation and disk revision from
-the last inspection. Live and saved outcomes are reported separately; a
-conflict or uncertain outcome marks the list stale and asks for a refresh
-instead of claiming an unconditional revocation. The panel writes no config
-and makes no authority decisions — it drives the P5 endpoints through the
-protocol-only ``ShellPermissionsService``.
+the last inspection. Remote-exec authority is destination-keyed, so each
+``network.remote-exec`` destination is its own row under the section that
+holds it (live session, accepted config, or disk only) and revokes exactly
+that destination; the whole-scope revoke stays reachable as one explicit
+row whose confirmation states that it removes every destination. Live and
+saved outcomes are reported separately; a conflict or uncertain outcome marks
+the list stale and asks for a refresh instead of claiming an unconditional
+revocation. The panel writes no config and makes no authority decisions — it
+drives the P5 endpoints through the protocol-only ``ShellPermissionsService``.
 """
 
 from __future__ import annotations
@@ -36,11 +40,34 @@ from chartreux.ui.shell_permissions import (
 from chartreux.ui.shortcut_hints import shortcut, shortcut_hint
 from chartreux.ui.widgets.navigable_option_list import NavigableOptionList
 from chartreux.ui.widgets.no_markup_static import NoMarkupStatic
+from chartreux.utils.remote_exec import REMOTE_EXEC_OPERATION_ID
 
 MIN_MODAL_WIDTH = 84
 MIN_MODAL_HEIGHT = 28
 STALE_SUFFIX = " The list is stale; press R to refresh."
 DOUBLE_CLICK = 2
+DESTINATION_ROW = "dest:"
+WHOLE_SCOPE_ROW = "whole:"
+WHOLE_REMOTE_EXEC_LABEL = (
+    f"{REMOTE_EXEC_OPERATION_ID} — all destinations in every scope · confirm required"
+)
+WHOLE_REMOTE_EXEC_CONFIRM = (
+    "! Confirm: revoking "
+    f"{REMOTE_EXEC_OPERATION_ID} removes EVERY remote-exec destination — live "
+    "grants in every scope and every saved destination of this project."
+)
+_SECTION_SOURCE_LABEL = {
+    "live": "live session",
+    "saved": "saved for this project (accepted config)",
+    "disk": "on disk only; not accepted by this session",
+}
+
+
+def _scope_summary(repositories: list[str]) -> str:
+    return repositories[0] + (
+        f" (+{len(repositories) - 1} more)" if len(repositories) > 1 else ""
+    )
+
 
 _LIVE_STATUS_TEXT = {
     "removed": "live session authority removed",
@@ -134,6 +161,8 @@ class ShellPermissionsApp(ModalScreen[ShellPermissionsResult]):
         Binding("shift+tab", "previous_group", show=False, priority=True),
         Binding("escape", "close", "Back", show=False, priority=True),
         Binding("r", "refresh", "Refresh", show=False),
+        Binding("y", "confirm_whole_scope", show=False),
+        Binding("n", "cancel_whole_scope", show=False),
     ]
 
     def __init__(self, service: ShellPermissionsService) -> None:
@@ -144,6 +173,7 @@ class ShellPermissionsApp(ModalScreen[ShellPermissionsResult]):
         self._busy = False
         self._busy_label = "Inspecting authority"
         self._stale = False
+        self._confirm = False
         self._outcome_feedback = ""
         self._feedback_class = ""
         self._pointer_command_started = False
@@ -244,27 +274,62 @@ class ShellPermissionsApp(ModalScreen[ShellPermissionsResult]):
         )
 
     def _grant_rows(
-        self, grants: tuple[ShellPermissionsGrant, ...], *, source: str, row_prefix: str
+        self, grants: tuple[ShellPermissionsGrant, ...], *, section: str
     ) -> list[Option]:
+        """One row per scope-keyed operation; destination grants are excluded."""
+        source_label = _SECTION_SOURCE_LABEL[section]
         by_operation: dict[str, list[str]] = {}
         for grant in grants:
+            if grant.operation_id == REMOTE_EXEC_OPERATION_ID:
+                continue
             by_operation.setdefault(grant.operation_id, []).append(grant.repository)
         rows: list[Option] = []
         for operation_id, repositories in by_operation.items():
-            scope = repositories[0] + (
-                f" (+{len(repositories) - 1} more)" if len(repositories) > 1 else ""
-            )
             rows.append(
                 Option(
                     Content.assemble(
                         (operation_id, ""),
-                        (f" — {source}", "$text-muted"),
-                        (f" · {scope}", "$text-muted"),
+                        (f" — {source_label}", "$text-muted"),
+                        (f" · {_scope_summary(repositories)}", "$text-muted"),
                     ),
-                    id=f"{row_prefix}:{operation_id}",
+                    id=f"{section}:{operation_id}",
                 )
             )
         return rows
+
+    def _destination_rows(
+        self, grants: tuple[ShellPermissionsGrant, ...], *, section: str
+    ) -> list[Option]:
+        """One row per exact remote-exec destination held by this section."""
+        source_label = _SECTION_SOURCE_LABEL[section]
+        by_destination: dict[str, list[str]] = {}
+        for grant in grants:
+            if grant.destination is not None:
+                by_destination.setdefault(grant.destination, []).append(
+                    grant.repository
+                )
+        return [
+            Option(
+                Content.assemble(
+                    (f"{REMOTE_EXEC_OPERATION_ID} · ", "$text-muted"),
+                    (destination, ""),
+                    (f" — {source_label}", "$text-muted"),
+                    (f" · {_scope_summary(repositories)}", "$text-muted"),
+                ),
+                id=f"{DESTINATION_ROW}{section}:{destination}",
+            )
+            for destination, repositories in sorted(by_destination.items())
+        ]
+
+    def _remote_exec_present(self, grants: tuple[ShellPermissionsGrant, ...]) -> bool:
+        return any(grant.operation_id == REMOTE_EXEC_OPERATION_ID for grant in grants)
+
+    def _whole_remote_exec_row(self) -> Option:
+        """The one explicit whole-scope remote-exec revoke, confirmed by y."""
+        return Option(
+            Content.assemble((WHOLE_REMOTE_EXEC_LABEL, "")),
+            id=f"{WHOLE_SCOPE_ROW}{REMOTE_EXEC_OPERATION_ID}",
+        )
 
     def _denylist_rows(self, inspection: ShellPermissionsInspection) -> list[Option]:
         rows: list[Option] = []
@@ -282,19 +347,27 @@ class ShellPermissionsApp(ModalScreen[ShellPermissionsResult]):
             )
         return rows
 
-    def _saved_rows(self, inspection: ShellPermissionsInspection) -> list[Option]:
-        rows = self._grant_rows(
-            inspection.saved_grants, source="saved for this project", row_prefix="saved"
-        )
-        rows.extend(
+    def _disk_rows(self, inspection: ShellPermissionsInspection) -> list[Option]:
+        source_label = _SECTION_SOURCE_LABEL["disk"]
+        rows = [
             Option(
                 Content.assemble(
-                    (operation_id, ""),
-                    (" — on disk only; not accepted by this session", "$text-muted"),
+                    (operation_id, ""), (f" — {source_label}", "$text-muted")
                 ),
                 id=f"disk:{operation_id}",
             )
             for operation_id in inspection.disk_only_operations
+        ]
+        rows.extend(
+            Option(
+                Content.assemble(
+                    (f"{REMOTE_EXEC_OPERATION_ID} · ", "$text-muted"),
+                    (destination, ""),
+                    (f" — {source_label}", "$text-muted"),
+                ),
+                id=f"{DESTINATION_ROW}disk:{destination}",
+            )
+            for destination in inspection.disk_only_destinations
         )
         if inspection.saved_operations_unavailable:
             rows.append(
@@ -309,6 +382,46 @@ class ShellPermissionsApp(ModalScreen[ShellPermissionsResult]):
             )
         return rows
 
+    def _section_rows(
+        self, inspection: ShellPermissionsInspection
+    ) -> tuple[list[Option], list[Option], list[Option]]:
+        """Live, saved (accepted config), and disk-only rows, in that order.
+
+        The whole-scope remote-exec rows carry only the live and accepted
+        destinations, but the whole-scope revoke removes every one of them;
+        because all three sections would offer the identical action, exactly
+        one row is emitted, under the first section that holds remote-exec
+        authority.
+        """
+        live_rows = self._grant_rows(inspection.live_grants, section="live")
+        live_destinations = self._destination_rows(
+            inspection.live_grants, section="live"
+        )
+        saved_rows = self._grant_rows(inspection.saved_grants, section="saved")
+        saved_destinations = self._destination_rows(
+            inspection.saved_grants, section="saved"
+        )
+        disk_rows = self._disk_rows(inspection)
+        holder = (
+            "live"
+            if self._remote_exec_present(inspection.live_grants)
+            else "saved"
+            if self._remote_exec_present(inspection.saved_grants)
+            else "disk"
+            if inspection.disk_only_destinations
+            else None
+        )
+        whole = self._whole_remote_exec_row() if holder is not None else None
+        if whole is not None and holder == "live":
+            live_rows.append(whole)
+        live_rows.extend(live_destinations)
+        if whole is not None and holder == "saved":
+            saved_rows.append(whole)
+        saved_rows.extend(saved_destinations)
+        if whole is not None and holder == "disk":
+            disk_rows.insert(0, whole)
+        return live_rows, saved_rows, disk_rows
+
     def _render_rows(self) -> None:
         grants = self.query_one("#shell-permissions-grants", ShellPermissionsOptionList)
         highlighted = (
@@ -319,15 +432,13 @@ class ShellPermissionsApp(ModalScreen[ShellPermissionsResult]):
         rows: list[Option] = []
         inspection = self._inspection
         if inspection is not None:
+            live_rows, saved_rows, disk_rows = self._section_rows(inspection)
             rows.append(self._heading("Live session grants", "live"))
-            rows.extend(
-                self._grant_rows(
-                    inspection.live_grants, source="live session", row_prefix="live"
-                )
-                or [self._empty("live")]
+            rows.extend(live_rows or [self._empty("live")])
+            rows.append(
+                self._heading("Saved project grants (accepted config)", "saved")
             )
-            rows.append(self._heading("Saved project grants", "saved"))
-            rows.extend(self._saved_rows(inspection) or [self._empty("saved")])
+            rows.extend(saved_rows + disk_rows or [self._empty("saved")])
             rows.append(self._heading("Blocked by explicit denylist", "denylist"))
             rows.extend(self._denylist_rows(inspection) or [self._empty("denylist")])
         elif self._load_error is not None:
@@ -396,6 +507,14 @@ class ShellPermissionsApp(ModalScreen[ShellPermissionsResult]):
         if self._busy:
             widget.update(shortcut_hint(f"Running: {self._busy_label}"))
             return
+        if self._confirm:
+            widget.update(
+                shortcut_hint(
+                    f"{shortcut('y')} confirm  {shortcut('n')} or "
+                    f"{shortcut('Esc')} cancel"
+                )
+            )
+            return
         actions = self.query_one("#shell-permissions-actions", OptionList)
         if actions.has_focus:
             action = actions.highlighted_option
@@ -407,6 +526,10 @@ class ShellPermissionsApp(ModalScreen[ShellPermissionsResult]):
             option_id = str(option.id) if option is not None and option.id else ""
             if option_id.startswith("deny:"):
                 enter_label = "Explain veto"
+            elif option_id.startswith(WHOLE_SCOPE_ROW):
+                enter_label = "Revoke all"
+            elif option_id.startswith(DESTINATION_ROW):
+                enter_label = "Revoke destination"
             elif option_id.startswith(("live:", "saved:", "disk:")):
                 enter_label = "Revoke"
         widget.update(
@@ -449,6 +572,7 @@ class ShellPermissionsApp(ModalScreen[ShellPermissionsResult]):
     def action_refresh(self) -> None:
         if self._busy:
             return
+        self._clear_confirmation()
         self.run_worker(
             self._inspect(),
             group="shell-permissions",
@@ -466,18 +590,55 @@ class ShellPermissionsApp(ModalScreen[ShellPermissionsResult]):
         self._render_feedback()
         self._update_hint()
 
-    def _revoke_operation(self, operation_id: str) -> None:
+    # -- whole-scope confirmation ----------------------------------------
+
+    def _clear_confirmation(self) -> None:
+        if not self._confirm:
+            return
+        self._confirm = False
+        if self._outcome_feedback == WHOLE_REMOTE_EXEC_CONFIRM:
+            self._outcome_feedback = ""
+            self._feedback_class = ""
+            self._render_feedback()
+
+    def _request_whole_remote_exec(self) -> None:
+        """Ask for the batch confirmation before the whole-scope removal."""
+        if self._busy or self._inspection is None:
+            return
+        self._confirm = True
+        self._outcome_feedback = WHOLE_REMOTE_EXEC_CONFIRM
+        self._feedback_class = "warning"
+        self._render_feedback()
+        self._update_hint()
+
+    def action_confirm_whole_scope(self) -> None:
+        if not self._confirm or self._busy:
+            return
+        self._clear_confirmation()
+        self._revoke_operation(REMOTE_EXEC_OPERATION_ID)
+
+    def action_cancel_whole_scope(self) -> None:
+        self._clear_confirmation()
+        self._update_hint()
+
+    # -- revocation ------------------------------------------------------
+
+    def _revoke_operation(
+        self, operation_id: str, *, destination: str | None = None
+    ) -> None:
         inspection = self._inspection
         if self._busy or inspection is None:
             return
+        label = destination or operation_id
         self._busy = True
-        self._busy_label = f"Revoking {operation_id}"
+        self._busy_label = f"Revoking {label}"
         self._update_hint()
         self.run_worker(
             self._revoke(
                 operation_id,
                 inspection.live_authority_generation,
                 inspection.disk_revision,
+                destination,
             ),
             group="shell-permissions",
             exclusive=True,
@@ -489,15 +650,18 @@ class ShellPermissionsApp(ModalScreen[ShellPermissionsResult]):
         operation_id: str,
         expected_live_generation: int,
         expected_disk_revision: str | None,
+        destination: str | None,
     ) -> None:
+        label = destination or operation_id
         try:
             outcome = await self.service.revoke(
                 operation_id=operation_id,
                 expected_live_generation=expected_live_generation,
                 expected_disk_revision=expected_disk_revision,
+                destination=destination,
             )
         except Exception as exc:
-            self._outcome_feedback = f"Failed: Revoking {operation_id} failed: {exc}"
+            self._outcome_feedback = f"Failed: Revoking {label} failed: {exc}"
             self._feedback_class = "error"
             self._busy = False
             self._render_feedback()
@@ -518,6 +682,11 @@ class ShellPermissionsApp(ModalScreen[ShellPermissionsResult]):
 
     def _report(self, outcome: ShellPermissionsRevocation) -> None:
         operation_id = outcome.operation_id
+        label = (
+            f"{operation_id} ({outcome.destination})"
+            if outcome.destination is not None
+            else operation_id
+        )
         live_text = _LIVE_STATUS_TEXT[outcome.live_status]
         if outcome.live_status == "conflict" and outcome.live_generation is not None:
             live_text += f" (now generation {outcome.live_generation})"
@@ -527,7 +696,7 @@ class ShellPermissionsApp(ModalScreen[ShellPermissionsResult]):
             or "failed" in {outcome.live_status, outcome.saved_status}
             or outcome.warning is not None
         )
-        message = f"Revoking {operation_id}: {live_text}; {saved_text}."
+        message = f"Revoking {label}: {live_text}; {saved_text}."
         if outcome.warning is not None:
             message += f" {outcome.warning}"
         if uncertain:
@@ -558,16 +727,31 @@ class ShellPermissionsApp(ModalScreen[ShellPermissionsResult]):
             return
         if self._busy or event.option.disabled or event.option.id is None:
             return
-        option_id = str(event.option.id)
-        if option_id.startswith("deny:"):
+        self._select_row(str(event.option.id))
+
+    def _select_row(self, option_id: str) -> None:
+        if self._confirm:
+            # The pending whole-scope confirmation owns the next decision:
+            # selecting another row must not revoke something behind the prompt.
+            self._update_hint()
+        elif option_id.startswith("deny:"):
             self._explain_veto(option_id[len("deny:") :])
-            return
-        for prefix in ("live:", "saved:", "disk:"):
-            if option_id.startswith(prefix):
-                self._revoke_operation(option_id[len(prefix) :])
-                return
+        elif option_id.startswith(WHOLE_SCOPE_ROW):
+            self._request_whole_remote_exec()
+        elif option_id.startswith(DESTINATION_ROW):
+            destination = option_id[len(DESTINATION_ROW) :].split(":", 1)[1]
+            self._revoke_operation(REMOTE_EXEC_OPERATION_ID, destination=destination)
+        else:
+            for prefix in ("live:", "saved:", "disk:"):
+                if option_id.startswith(prefix):
+                    self._revoke_operation(option_id[len(prefix) :])
+                    return
 
     def action_close(self) -> None:
+        if self._confirm:
+            # Escape cancels the confirmation before it can leave the panel.
+            self.action_cancel_whole_scope()
+            return
         if self._busy:
             self._update_hint()
             return

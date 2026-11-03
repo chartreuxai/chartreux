@@ -38,6 +38,7 @@ def parse_arguments() -> argparse.Namespace:
             "  mcp            Manage MCP server configuration (chartreux mcp --help).\n"
             "  models         Manage the model catalog (chartreux models --help).\n"
             "  skills         Compare user skill copies with the shipped ones (chartreux skills --help).\n"
+            "  trust          Inspect and remove stored workspace trust decisions (chartreux trust --help).\n"
             "\n"
             "Environment variables:\n"
             "  CHARTREUX_HOME       Override the Chartreux home directory (default: ~/.chartreux)\n"
@@ -444,31 +445,43 @@ def _set_process_title() -> None:
         pass
 
 
+def _dispatch_sessionless_command(argv: list[str]) -> bool:
+    """Run the subcommand named by *argv*, if any; True when one ran.
+
+    These commands establish no session: they must answer from the stored
+    configuration alone, so dispatch happens before argument parsing and
+    before logging or the message loop exist.
+    """
+    match argv[:1]:
+        case ["doctor"]:
+            from chartreux.cli.doctor_command import run_doctor_cli
+
+            run_doctor_cli(argv[1:])
+        case ["models"]:
+            from chartreux.core.model_catalog.migration import run_models_cli
+
+            run_models_cli(argv[1:])
+        case ["mcp"]:
+            from chartreux.cli.mcp_command import run_mcp_cli
+
+            run_mcp_cli(argv[1:])
+        case ["skills"]:
+            from chartreux.cli.skills_command import run_skills_cli
+
+            run_skills_cli(argv[1:])
+        case ["trust"]:
+            from chartreux.cli.trust_command import run_trust_cli
+
+            run_trust_cli(argv[1:])
+        case _:
+            return False
+    return True
+
+
 def main() -> None:
     _set_process_title()
 
-    if sys.argv[1:2] == ["doctor"]:
-        from chartreux.cli.doctor_command import run_doctor_cli
-
-        run_doctor_cli(sys.argv[2:])
-        return
-
-    if sys.argv[1:2] == ["models"]:
-        from chartreux.core.model_catalog.migration import run_models_cli
-
-        run_models_cli(sys.argv[2:])
-        return
-
-    if sys.argv[1:2] == ["mcp"]:
-        from chartreux.cli.mcp_command import run_mcp_cli
-
-        run_mcp_cli(sys.argv[2:])
-        return
-
-    if sys.argv[1:2] == ["skills"]:
-        from chartreux.cli.skills_command import run_skills_cli
-
-        run_skills_cli(sys.argv[2:])
+    if _dispatch_sessionless_command(sys.argv[1:]):
         return
 
     args = parse_arguments()

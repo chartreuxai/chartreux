@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 import shlex
 
 import pytest
@@ -14,7 +15,18 @@ from chartreux.core.tools.builtins._shell_command_policy import (
     inline_interpreter_switch,
     path_candidates,
 )
+from chartreux.core.tools.builtins._shell_permission_resolver import (
+    _has_unquoted_extended_syntax,
+)
 from chartreux.core.tools.builtins.bash import Bash, BashArgs
+from chartreux.core.utils.shell import (
+    UnknownShellExecutorError,
+    _shell_environment,
+    current_executor_contract,
+    executor_option_contract,
+    shell_executor,
+    spawn_shell_command,
+)
 from tests.tools._shell_policy_test_support import (
     EXECUTOR_REGISTRY,
     bash_tool as bash_tool,
@@ -781,3 +793,238 @@ def test_sudo_u_quoted_multi_word_payload_matches_the_direct_token(bash_tool):
     assert wrapped is not None and direct is not None
     assert wrapped.permission is direct.permission, (wrapped, direct)
     assert wrapped.denial_kind == direct.denial_kind, (wrapped, direct)
+
+
+# --- v0.7.1 F1pkg1(b): the immutable executor option contract -----------------
+#
+# The contract pins, in the EXECUTING process, the executor identity, every
+# expansion-relevant option family OFF, the startup files off via the child
+# environment, and the locale. Unknown executors, option-changing shell
+# invocations and builtins, and nested shell re-entry with an expansion-
+# bearing payload fail closed. The recognition pins above stay: the grammar
+# still recognizes `bash +O extglob -c code` as a shell_source boundary; the
+# DENIAL is layered at resolution (Amendment UU: re-decided, not presupposed
+# flips — the payload-boundary recognition and the recursive-rm hard denial
+# REMAIN, the new contract gets separate tests).
+
+
+def test_executor_option_contract_pins_every_known_family() -> None:
+    bash_contract = executor_option_contract("/usr/bin/bash")
+    assert bash_contract is not None and bash_contract.family == "bash"
+    assert {"extglob", "globstar", "nullglob", "dotglob", "failglob", "nocaseglob"} <= (
+        bash_contract.pinned_off_options
+    )
+    zsh_contract = executor_option_contract("/usr/bin/zsh")
+    assert zsh_contract is not None and zsh_contract.family == "zsh"
+    assert {"extendedglob", "globdots", "kshglob", "nullglob", "caseglob"} <= (
+        zsh_contract.pinned_off_options
+    )
+    assert ("ZDOTDIR", "/dev/null/chartreux-pinned-no-zdotdir") in (
+        zsh_contract.startup_env_pins
+    )
+    posix_contract = executor_option_contract("/bin/sh")
+    assert posix_contract is not None and posix_contract.family == "posix"
+    # No $SHELL: the kernel default /bin/sh applies at spawn.
+    assert executor_option_contract(None) is not None
+    # An unknown executor has NO contract: fail closed.
+    assert executor_option_contract("/usr/bin/fish") is None
+    assert executor_option_contract("/usr/local/bin/mybash") is None
+
+
+def test_current_executor_contract_follows_the_ambient_shell(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("SHELL", "/usr/bin/bash")
+    assert current_executor_contract() is not None
+    assert current_executor_contract().family == "bash"  # type: ignore[union-attr]
+    monkeypatch.setenv("SHELL", "/usr/bin/fish")
+    assert current_executor_contract() is None
+    assert shell_executor() == "/usr/bin/fish"
+
+
+def test_shell_environment_pins_startup_and_locale(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("SHELL", "/usr/bin/zsh")
+    env = _shell_environment({
+        "BASH_ENV": "/tmp/hostile",
+        "ENV": "/tmp/hostile",
+        "ZSHENV": "/tmp/hostile",
+        "KSH_ENV": "/tmp/hostile",
+        "ZDOTDIR": "/home/user",
+        "LC_ALL": "C.UTF-8",
+        "LC_COLLATE": "C.UTF-8",
+    })
+    for name in ("BASH_ENV", "ENV", "ZSHENV", "KSH_ENV", "LC_ALL"):
+        assert name not in env, name
+    assert env["ZDOTDIR"] == "/dev/null/chartreux-pinned-no-zdotdir"
+    assert env["LC_COLLATE"] == "C"
+    assert env["LC_CTYPE"] == "C.UTF-8"
+
+
+@pytest.mark.asyncio
+async def test_spawn_shell_command_refuses_an_unknown_executor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("SHELL", "/usr/bin/fish")
+    with pytest.raises(UnknownShellExecutorError, match="no pinned executor"):
+        await spawn_shell_command("echo hi", cwd=tmp_path)
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "bash +O extglob -c 'echo hi'",
+        "bash -O extglob -c 'echo hi'",
+        "bash +o errexit -c 'echo hi'",
+        "env CI=1 bash +o errexit -c 'echo hi'",
+        "zsh -o extendedglob -c 'echo hi'",
+        "zsh +O extendedglob -c 'echo hi'",
+        "bash --posix -c 'echo hi'",
+        "bash --rcfile startup -c 'echo hi'",
+        "bash -ec 'echo hi'",
+    ],
+)
+def test_shell_invocation_option_changes_fail_closed(bash_tool, command: str) -> None:
+    """A shell invocation whose own argv changes an option family or the
+    startup behavior is outside the pinned executor option contract.
+    """
+    result = bash_tool.resolve_permission(BashArgs(command=command))
+    assert result is not None and result.permission is ToolPermission.NEVER, command
+    assert "pinned executor option contract" in (result.reason or ""), command
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "bash -c 'echo hi'",
+        "sh -c 'echo hi'",
+        "zsh -c 'echo hi'",
+        "bash --noprofile -c 'echo hi'",
+        "bash --norc --noediting -c 'echo hi'",
+        "bash -c 'uv run python -c \"print(1)\"'",
+    ],
+)
+def test_plain_and_rc_disabling_shell_invocations_stay_admitted(
+    bash_tool, command: str
+) -> None:
+    result = bash_tool.resolve_permission(BashArgs(command=command))
+    assert result is not None and result.permission is ToolPermission.ALWAYS, command
+
+
+def test_option_changing_shell_invocation_keeps_the_recursive_rm_reason(
+    bash_tool,
+) -> None:
+    """UU: the recursive-rm hard denial REMAINS — the deferred contract
+    denial never preempts an earlier payload guard's own reason.
+    """
+    result = bash_tool.resolve_permission(
+        BashArgs(command="bash +O extglob -c 'uv run rm -r build'")
+    )
+    assert result is not None and result.permission is ToolPermission.NEVER
+    assert result.reason == (
+        "Command denied: recursive rm option '-r' in 'rm -r build'. "
+        "This is a hard guard regardless of target."
+    )
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "setopt extendedglob; echo hi",
+        "setopt NO_NOMATCH; echo hi",
+        "shopt -s extglob; echo hi",
+        "set -o extglob; echo hi",
+        "set -e; echo hi",
+        "emulate -L zsh; echo hi",
+        "bash -c 'setopt extendedglob; echo hi'",
+        "env CI=1 setopt extendedglob; echo hi",
+    ],
+)
+def test_option_changing_builtins_fail_closed(bash_tool, command: str) -> None:
+    result = bash_tool.resolve_permission(BashArgs(command=command))
+    assert result is not None and result.permission is ToolPermission.NEVER, command
+    assert "pinned executor option contract" in (result.reason or ""), command
+
+
+def test_set_with_only_positional_arguments_stays_admitted(bash_tool) -> None:
+    result = bash_tool.resolve_permission(BashArgs(command="set -- x; echo hi"))
+    assert result is not None and result.permission is ToolPermission.ALWAYS
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "bash -c 'echo *.py'",
+        "bash -c 'echo ^foo'",
+        "bash -c 'ls foo#'",
+        "bash -c 'echo a~b'",
+        "bash -c \"bash -c 'echo *.py'\"",
+        "env CI=1 bash -c 'echo *.py'",
+    ],
+)
+def test_nested_shell_reentry_with_expansion_bearing_payload_fails_closed(
+    bash_tool, command: str
+) -> None:
+    """A nested shell's payload that pathname-expands (or carries extended-glob
+    syntax even without *?[ characters) runs under an inner executor this
+    process does not pin: fail closed.
+    """
+    result = bash_tool.resolve_permission(BashArgs(command=command))
+    assert result is not None and result.permission is ToolPermission.NEVER, command
+    assert "nested shell re-entry" in (result.reason or ""), command
+
+
+def test_extended_syntax_detection_is_quote_aware() -> None:
+    """Extended syntax is detected even without *?[ characters, but only in
+    UNQUOTED text: quoted or escaped markers stay literal data.
+    """
+    # Unquoted extended-glob operators and zsh EXTENDED_GLOB markers:
+    assert _has_unquoted_extended_syntax("echo ^foo")
+    assert _has_unquoted_extended_syntax("echo foo#")
+    assert _has_unquoted_extended_syntax("echo a~b")
+    assert _has_unquoted_extended_syntax("echo @(foo)")
+    assert _has_unquoted_extended_syntax("echo +(foo)")
+    assert _has_unquoted_extended_syntax("echo !(foo)")
+    assert _has_unquoted_extended_syntax("echo *(.)")
+    # Quoted, escaped, comment, tilde-home and mid-word caret stay literal:
+    assert not _has_unquoted_extended_syntax("echo '^foo'")
+    assert not _has_unquoted_extended_syntax('echo "^foo"')
+    assert not _has_unquoted_extended_syntax("echo \\^foo")
+    assert not _has_unquoted_extended_syntax("echo x^y")
+    assert not _has_unquoted_extended_syntax("echo #comment")
+    assert not _has_unquoted_extended_syntax("echo ~/home")
+    assert not _has_unquoted_extended_syntax("echo plain")
+
+
+@pytest.mark.parametrize(
+    "command", ["ls *", "cat *.py", "echo ^foo", "ls foo#", "bash -c 'echo *.py'"]
+)
+def test_unknown_executor_fails_closed_for_expansion_bearing_commands(
+    bash_tool, monkeypatch: pytest.MonkeyPatch, command: str
+) -> None:
+    monkeypatch.setenv("SHELL", "/usr/bin/fish")
+    result = bash_tool.resolve_permission(BashArgs(command=command))
+    assert result is not None and result.permission is ToolPermission.NEVER, command
+    assert "no pinned executor option contract" in (result.reason or ""), command
+
+
+@pytest.mark.parametrize("command", ["echo hi", "git status", "bash -c 'echo hi'"])
+def test_unknown_executor_still_admits_plain_commands(
+    bash_tool, monkeypatch: pytest.MonkeyPatch, command: str
+) -> None:
+    monkeypatch.setenv("SHELL", "/usr/bin/fish")
+    result = bash_tool.resolve_permission(BashArgs(command=command))
+    assert result is not None and result.permission is ToolPermission.ALWAYS, command
+
+
+def test_executor_boundary_recognition_of_option_forms_is_retained() -> None:
+    """UU: the :259 recognition pin REMAINS — the grammar still parses
+    `bash +O extglob -c code` as a shell_source boundary; the contract denial
+    is layered at resolution, not in the grammar.
+    """
+    boundary = executor_boundary(shlex.split("bash +O extglob -c code"))
+    assert boundary is not None
+    assert boundary.boundary_kind == "shell_source"
+    assert boundary.inline_payload_ranges == ((4, 5),)
+    assert boundary.inline_payloads == ("code",)

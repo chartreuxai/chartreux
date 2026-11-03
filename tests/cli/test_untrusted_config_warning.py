@@ -135,3 +135,17 @@ async def test_untrusted_config_warning_keeps_prior_project_acknowledgments(
         )
         await pilot.pause(0.2)
         assert _warnings(third) == []
+
+
+@pytest.mark.asyncio
+async def test_untrusted_config_warning_points_at_the_trust_cli(
+    _stub_untrusted_config: AsyncMock,
+) -> None:
+    """The warning names the trust CLI instead of manual edits of the store."""
+    app = build_test_chartreux_app()
+    async with app.run_test() as pilot:
+        assert await _wait_until(pilot, lambda: bool(_warnings(app)))
+        message = _warnings(app)[0]._message
+        assert "chartreux trust list" in message
+        assert "chartreux trust remove <path>" in message
+        assert 'remove them from "untrusted"' not in message

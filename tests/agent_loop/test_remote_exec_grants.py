@@ -100,6 +100,52 @@ def _bash(project: Path, *authorities: DangerousCommandAuthority) -> Bash:
     return tool
 
 
+@pytest.fixture
+def s4b2a_resolution(monkeypatch: pytest.MonkeyPatch):
+    """Hermetic hostname resolution for the S4b2a arms (module-seam patch).
+
+    Installs ``_remote_exec._hostname_resolver`` with a fixed answer table
+    (``example.com`` resolves to one non-local address by default; any other
+    host fails resolution) and a fixed local-interface enumeration, so no arm
+    touches real DNS or the host's interfaces. Returns an installer taking an
+    extra ``{host: (answers, error)}`` mapping for the deny arms.
+    """
+    import ipaddress
+    import socket
+
+    from chartreux.core.tools.builtins import _remote_exec
+
+    def _install(
+        extra: dict[str, tuple[tuple[str, ...], Exception | None]] | None = None,
+    ) -> None:
+        table: dict[str, tuple[tuple[str, ...], Exception | None]] = {
+            "example.com": (("93.184.216.34",), None)
+        }
+        if extra:
+            table.update(extra)
+
+        def fake_resolver(host: str) -> frozenset:
+            answers, error = table.get(
+                host, ((), socket.gaierror(-2, "Name or service not known"))
+            )
+            if error is not None:
+                raise error
+            return frozenset(ipaddress.ip_address(text) for text in answers)
+
+        monkeypatch.setattr(_remote_exec, "_hostname_resolver", fake_resolver)
+        monkeypatch.setattr(
+            _remote_exec,
+            "_interface_addresses",
+            lambda: frozenset({
+                ipaddress.ip_address("192.168.10.20"),
+                ipaddress.ip_address("::1"),
+            }),
+        )
+
+    _install()
+    return _install
+
+
 class TestCanonicalDestination:
     """Canonical spelling: explicit user, lowercased host, port defaulting to 22."""
 
@@ -265,9 +311,14 @@ class TestOperationDistinctness:
         "granted",
         [frozenset({"network.egress"}), frozenset({REMOTE_EXEC_OPERATION_ID})],
     )
-    def test_ssh_stays_denied_at_the_resolver_until_s4b(
-        self, tmp_path: Path, granted: frozenset[str]
+    def test_ssh_hostname_is_admitted_with_pinning_at_the_resolver(
+        self, tmp_path: Path, granted: frozenset[str], s4b2a_resolution
     ):
+        # S4b2a flip of this node (formerly test_ssh_stays_denied_at_the_
+        # resolver_until_s4b — never dropped): the hostname destination
+        # resolves uniquely non-local, so a covering destination grant now
+        # ADMITS with pinning, while an egress-only grant still never admits
+        # a remote command (the ask stays uncovered).
         repo = _repo(tmp_path / "repo")
         scope = _scope(repo)
         destination = _destination("deploy@example.com")
@@ -281,8 +332,15 @@ class TestOperationDistinctness:
         result = tool.resolve_permission(
             BashArgs(command="ssh deploy@example.com uptime")
         )
-        assert result is not None
-        assert result.permission.value == "never"
+        if REMOTE_EXEC_OPERATION_ID in granted:
+            assert result is None or result.permission.value == "always"
+            assert result is None or result.dangerous_command_proposal is None
+        else:
+            assert result is not None
+            assert result.permission.value == "never"
+            proposal = result.dangerous_command_proposal
+            assert proposal is not None
+            assert proposal.destination == destination
 
     def test_egress_grant_admits_egress_but_remote_exec_grant_does_not(
         self, tmp_path: Path
@@ -709,3 +767,349 @@ class TestLifecycle:
         })
         assert store.revoke_session({(REMOTE_EXEC_OPERATION_ID, scope)})
         assert store.dangerous_command_authorities() == ()
+
+
+class TestS4b1bIpLiteralSshAdmission:
+    """v0.7.1 S4b1b + S4b2a: the ACTIVE ssh arms at the resolver seam.
+
+    ssh left the shipped denylist together with its closed grammar in the
+    same change: a positive destination — literal IP, or since S4b2a a
+    hostname whose system-resolver answer is unique and non-local —
+    classifies ask as network.remote-exec with the exact GRANTED destination
+    (the hostname, not the resolved address) attached to the proposal, and
+    every other spelling — local/ambiguous literal, ambiguous/local/failed
+    hostname resolution — denies by grammar with NO proposal, so no approval
+    path exists for it. The locality verdict is the S4b1a fail-closed
+    classifier and the resolve-validate verdict is S4b2a's, exercised here
+    against fixed seams so the suite is hermetic.
+    """
+
+    @pytest.fixture
+    def fixed_interfaces(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        import socket
+
+        def fake_getaddrinfo(host, port):
+            return [
+                (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("192.168.10.20", 0)),
+                (socket.AF_INET6, socket.SOCK_STREAM, 6, "", ("::1", 0, 0, 0)),
+            ]
+
+        monkeypatch.setattr(socket, "getaddrinfo", fake_getaddrinfo)
+
+    def test_positive_literal_ip_asks_with_the_destination_on_the_proposal(
+        self, tmp_path: Path, fixed_interfaces
+    ):
+        repo = _repo(tmp_path / "repo")
+        tool = _bash(repo)
+        result = tool.resolve_permission(BashArgs(command="ssh deploy@8.8.8.8 uptime"))
+        assert result is not None
+        # An ask is a NEVER context that carries the proposal; a grant
+        # covering the proposal's destination turns it into ALWAYS.
+        assert result.permission is ToolPermission.NEVER
+        proposal = result.dangerous_command_proposal
+        assert proposal is not None
+        assert proposal.operations == (REMOTE_EXEC_OPERATION_ID,)
+        assert proposal.destination == _destination("deploy@8.8.8.8:22")
+
+    def test_port_form_attaches_the_full_destination_key(
+        self, tmp_path: Path, fixed_interfaces
+    ):
+        repo = _repo(tmp_path / "repo")
+        tool = _bash(repo)
+        result = tool.resolve_permission(
+            BashArgs(command="ssh -p 2222 deploy@8.8.8.8 uptime")
+        )
+        assert result is not None
+        proposal = result.dangerous_command_proposal
+        assert proposal is not None
+        assert proposal.destination == _destination("deploy@8.8.8.8:2222")
+
+    def test_grant_for_the_exact_destination_admits(
+        self, tmp_path: Path, fixed_interfaces
+    ):
+        repo = _repo(tmp_path / "repo")
+        authority = DangerousCommandAuthority(
+            operations=frozenset({REMOTE_EXEC_OPERATION_ID}),
+            scope=_scope(repo),
+            source="runtime_grant",
+            destination=_destination("deploy@8.8.8.8:22"),
+        )
+        tool = _bash(repo, authority)
+        result = tool.resolve_permission(BashArgs(command="ssh deploy@8.8.8.8 uptime"))
+        assert result is None or result.permission is ToolPermission.ALWAYS
+        assert result is None or result.dangerous_command_proposal is None
+
+    def test_grant_for_another_destination_still_asks(
+        self, tmp_path: Path, fixed_interfaces
+    ):
+        repo = _repo(tmp_path / "repo")
+        authority = DangerousCommandAuthority(
+            operations=frozenset({REMOTE_EXEC_OPERATION_ID}),
+            scope=_scope(repo),
+            source="runtime_grant",
+            destination=_destination("deploy@1.1.1.1:22"),
+        )
+        tool = _bash(repo, authority)
+        result = tool.resolve_permission(BashArgs(command="ssh deploy@8.8.8.8 uptime"))
+        assert result is not None
+        assert result.permission is ToolPermission.NEVER
+        proposal = result.dangerous_command_proposal
+        assert proposal is not None
+        assert proposal.destination == _destination("deploy@8.8.8.8:22")
+
+    def test_hostname_destination_asks_with_the_hostname_destination(
+        self, tmp_path: Path, fixed_interfaces, s4b2a_resolution
+    ):
+        # S4b2a flip of this node (formerly a grammar denial with no proposal
+        # — never dropped): a hostname that resolves uniquely non-local is an
+        # ask carrying the GRANTED HOSTNAME destination on the proposal — the
+        # resolved address is pinned at the execution boundary, not here.
+        repo = _repo(tmp_path / "repo")
+        tool = _bash(repo)
+        result = tool.resolve_permission(
+            BashArgs(command="ssh deploy@example.com uptime")
+        )
+        assert result is not None
+        assert result.permission is ToolPermission.NEVER
+        proposal = result.dangerous_command_proposal
+        assert proposal is not None
+        assert proposal.operations == (REMOTE_EXEC_OPERATION_ID,)
+        assert proposal.destination == _destination("deploy@example.com:22")
+
+    def test_hostname_port_form_attaches_the_hostname_destination_key(
+        self, tmp_path: Path, fixed_interfaces, s4b2a_resolution
+    ):
+        repo = _repo(tmp_path / "repo")
+        tool = _bash(repo)
+        result = tool.resolve_permission(
+            BashArgs(command="ssh -p 2222 deploy@example.com uptime")
+        )
+        assert result is not None
+        proposal = result.dangerous_command_proposal
+        assert proposal is not None
+        assert proposal.destination == _destination("deploy@example.com:2222")
+
+    def test_grant_for_the_exact_hostname_destination_admits(
+        self, tmp_path: Path, fixed_interfaces, s4b2a_resolution
+    ):
+        # The reassessed hostname outcome: admitted-with-pinning, explicitly.
+        repo = _repo(tmp_path / "repo")
+        authority = DangerousCommandAuthority(
+            operations=frozenset({REMOTE_EXEC_OPERATION_ID}),
+            scope=_scope(repo),
+            source="runtime_grant",
+            destination=_destination("deploy@example.com:22"),
+        )
+        tool = _bash(repo, authority)
+        result = tool.resolve_permission(
+            BashArgs(command="ssh deploy@example.com uptime")
+        )
+        assert result is None or result.permission is ToolPermission.ALWAYS
+        assert result is None or result.dangerous_command_proposal is None
+
+    def test_grant_for_the_resolved_address_does_not_admit_the_hostname(
+        self, tmp_path: Path, fixed_interfaces, s4b2a_resolution
+    ):
+        # The grant is keyed on the hostname, never on the resolved address:
+        # a grant for 93.184.216.34 does not cover deploy@example.com.
+        repo = _repo(tmp_path / "repo")
+        authority = DangerousCommandAuthority(
+            operations=frozenset({REMOTE_EXEC_OPERATION_ID}),
+            scope=_scope(repo),
+            source="runtime_grant",
+            destination=_destination("deploy@93.184.216.34:22"),
+        )
+        tool = _bash(repo, authority)
+        result = tool.resolve_permission(
+            BashArgs(command="ssh deploy@example.com uptime")
+        )
+        assert result is not None
+        assert result.permission is ToolPermission.NEVER
+        proposal = result.dangerous_command_proposal
+        assert proposal is not None
+        assert proposal.destination == _destination("deploy@example.com:22")
+
+    @pytest.mark.parametrize(
+        ("host", "answers", "reason"),
+        [
+            # Ambiguous (multi-answer) resolution denies with no proposal.
+            ("amb.example.com", ("93.184.216.34", "1.1.1.1"), "multiple addresses"),
+            # A single LOCAL answer denies with no proposal.
+            ("local.example.com", ("127.0.0.1",), "local address"),
+            # A resolution failure denies with no proposal.
+            ("nx.example.com", (), "could not be resolved"),
+        ],
+        ids=["ambiguous", "local_answer", "failed"],
+    )
+    def test_hostname_resolution_denials_hard_deny_with_no_proposal(
+        self,
+        tmp_path: Path,
+        fixed_interfaces,
+        s4b2a_resolution,
+        host: str,
+        answers: tuple[str, ...],
+        reason: str,
+    ):
+        # S4b2a resolution arms (the grants-suite home per JJJ F4): every
+        # non-unique-non-local resolution is a grammar denial — NEVER, no
+        # denial kind, no proposal — even with a covering grant.
+        import socket
+
+        s4b2a_resolution({
+            host: (
+                answers,
+                socket.gaierror(-2, "Name or service not known")
+                if not answers
+                else None,
+            )
+        })
+        repo = _repo(tmp_path / "repo")
+        authority = DangerousCommandAuthority(
+            operations=frozenset({REMOTE_EXEC_OPERATION_ID}),
+            scope=_scope(repo),
+            source="runtime_grant",
+            destination=_destination(f"deploy@{host}:22"),
+        )
+        tool = _bash(repo, authority)
+        result = tool.resolve_permission(BashArgs(command=f"ssh deploy@{host} uptime"))
+        assert result is not None
+        assert result.permission is ToolPermission.NEVER
+        assert result.denial_kind is None
+        assert result.dangerous_command_proposal is None
+        assert reason in (result.reason or "")
+
+    def test_local_literal_denies_by_grammar_with_no_proposal(
+        self, tmp_path: Path, fixed_interfaces
+    ):
+        repo = _repo(tmp_path / "repo")
+        tool = _bash(repo)
+        result = tool.resolve_permission(
+            BashArgs(command="ssh deploy@127.0.0.1 uptime")
+        )
+        assert result is not None
+        assert result.permission is ToolPermission.NEVER
+        assert result.dangerous_command_proposal is None
+        assert "local or ambiguous" in (result.reason or "")
+
+
+class TestS4b2bRebindAtThePlan:
+    """S4b2b negative changed-answer arm (resolution-level only — this suite
+    never spawns).
+
+    A hostname whose resolver answer CHANGES between the plan's validation
+    observation and the spawn re-observation is never planned: the pinned
+    plan re-derivation raises ``RemoteExecDenial`` even with a covering
+    destination grant, so the changed answer is never contacted (HHH).
+    """
+
+    @pytest.fixture
+    def fixed_interfaces(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        import socket
+
+        def fake_getaddrinfo(host, port):
+            return [
+                (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("192.168.10.20", 0)),
+                (socket.AF_INET6, socket.SOCK_STREAM, 6, "", ("::1", 0, 0, 0)),
+            ]
+
+        monkeypatch.setattr(socket, "getaddrinfo", fake_getaddrinfo)
+
+    def test_changed_answer_denies_the_plan_even_with_a_covering_grant(
+        self, tmp_path: Path, fixed_interfaces, monkeypatch: pytest.MonkeyPatch
+    ):
+        import ipaddress
+        import socket
+
+        from chartreux.core.tools.builtins import _remote_exec
+        from chartreux.core.tools.builtins._remote_exec import RemoteExecDenial
+        from chartreux.core.tools.builtins._shell_permission_resolver import (
+            remote_exec_plan_for_command,
+        )
+        from chartreux.core.tools.utils import effective_scratchpad_roots
+
+        state = {"calls": 0}
+
+        def fake_resolver(host: str) -> frozenset:
+            if host != "example.com":
+                raise socket.gaierror(-2, "Name or service not known")
+            state["calls"] += 1
+            # Validation observation: the unique non-local pin; every later
+            # (spawn re-)observation: the rebound-to-local answer.
+            answer = "93.184.216.34" if state["calls"] == 1 else "127.0.0.1"
+            return frozenset({ipaddress.ip_address(answer)})
+
+        monkeypatch.setattr(_remote_exec, "_hostname_resolver", fake_resolver)
+        monkeypatch.setattr(
+            _remote_exec,
+            "_interface_addresses",
+            lambda: frozenset({
+                ipaddress.ip_address("192.168.10.20"),
+                ipaddress.ip_address("::1"),
+            }),
+        )
+
+        repo = _repo(tmp_path / "repo")
+        authority = DangerousCommandAuthority(
+            operations=frozenset({REMOTE_EXEC_OPERATION_ID}),
+            scope=_scope(repo),
+            source="runtime_grant",
+            destination=_destination("deploy@example.com:22"),
+        )
+        tool = _bash(repo, authority)
+        plan = None
+        message = ""
+        try:
+            plan = remote_exec_plan_for_command(
+                "ssh deploy@example.com uptime",
+                cwd=repo,
+                workspace=tool.workspace,
+                authority=tool.path_authority,
+                scratchpad_roots=effective_scratchpad_roots(tool.path_authority),
+                workspace_roots=frozenset(tool.workspace.authorized_roots),
+            )
+        except RemoteExecDenial as exc:
+            message = str(exc)
+        if plan is None:
+            # Deny half (HHH outcome a): the changed answer is denied with a
+            # discriminating reason naming the rebind.
+            assert "never contacted" in message
+            assert "127.0.0.1" in message
+            assert "93.184.216.34" in message
+        else:
+            # Execute-original-pinned half (HHH outcome b): the plan carries
+            # the ORIGINAL validated pin — the rebound answer is nowhere.
+            assert plan.resolved_address == "93.184.216.34"
+            assert "deploy@93.184.216.34" in plan.argv
+            assert "127.0.0.1" not in plan.argv
+            assert "127.0.0.1" not in plan.command
+
+    def test_unchanged_answer_still_builds_the_pinned_plan(
+        self, tmp_path: Path, fixed_interfaces, s4b2a_resolution
+    ):
+        # Positive control: a stable resolution passes the rebinding guard
+        # and the plan carries the validated pinned address.
+        from chartreux.core.tools.builtins._shell_permission_resolver import (
+            remote_exec_plan_for_command,
+        )
+        from chartreux.core.tools.utils import effective_scratchpad_roots
+
+        repo = _repo(tmp_path / "repo")
+        authority = DangerousCommandAuthority(
+            operations=frozenset({REMOTE_EXEC_OPERATION_ID}),
+            scope=_scope(repo),
+            source="runtime_grant",
+            destination=_destination("deploy@example.com:22"),
+        )
+        tool = _bash(repo, authority)
+        plan = remote_exec_plan_for_command(
+            "ssh deploy@example.com uptime",
+            cwd=repo,
+            workspace=tool.workspace,
+            authority=tool.path_authority,
+            scratchpad_roots=effective_scratchpad_roots(tool.path_authority),
+            workspace_roots=frozenset(tool.workspace.authorized_roots),
+        )
+        assert plan is not None
+        assert plan.resolved_address == "93.184.216.34"
+        assert "deploy@93.184.216.34" in plan.argv
+        assert "HostKeyAlias=deploy@example.com:22" in plan.argv

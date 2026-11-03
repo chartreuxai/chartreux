@@ -51,6 +51,7 @@ from chartreux.core.config.orchestrator import ConfigOrchestrator
 from chartreux.core.git.errors import GitError
 from chartreux.core.git.worktree.repository import WorktreeRepository
 from chartreux.core.session.session_logger import SessionLogger
+from chartreux.core.trusted_folders import TrustedFoldersManager, TrustStoreState
 from chartreux.observability.logging import logger
 
 
@@ -128,8 +129,9 @@ class WorkspaceRelocator:
         repository, and the rest are invisible to the turn check.
 
         Raises:
-            AgentLoopStateError: Something is in flight, or *cwd* is not a
-                directory.
+            AgentLoopStateError: Something is in flight, *cwd* is not a
+                directory, or the trust store cannot answer for the
+                destination.
         """
         if self._has_active_turn():
             raise AgentLoopStateError("Cannot relocate while a turn is active")
@@ -139,6 +141,13 @@ class WorkspaceRelocator:
         self._require_background_jobs_idle()
         if not target.is_dir():
             raise AgentLoopStateError(f"Not a directory: {target}")
+        # Before the session is taken, the grant, or the bind: a store that
+        # cannot answer leaves the destination's trust unknown, and the move
+        # would then silently drop or misread the project configuration the
+        # destination's trust decides.
+        self._require_usable_trust_store(
+            self._harness_files_getter().trust_store, target
+        )
 
         # Taken before the first await, and held across both. Checking once and
         # then awaiting would leave a window for an operation to start against a
@@ -183,6 +192,28 @@ class WorkspaceRelocator:
             self._trust_taken_by_move = checkout
         finally:
             self._release_session("relocation")
+
+    @staticmethod
+    def _require_usable_trust_store(
+        trust_store: TrustedFoldersManager, target: Path
+    ) -> None:
+        """Refuse a move the trust store cannot vouch for.
+
+        ``MISSING`` is the genuine first-run default (nothing persisted,
+        nothing trusted), and an unreadable, malformed, or invalid store is a
+        different thing entirely: the folder decisions are unknown, so the
+        destination's project configuration would resolve against an answer
+        nobody has. Read as "untrusted" the move would silently drop it; the
+        typed state is surfaced instead.
+        """
+        state = trust_store.store_state
+        if state in {TrustStoreState.MISSING, TrustStoreState.READY}:
+            return
+        raise AgentLoopStateError(
+            f"Cannot relocate to {target}: the trust store is {state.value} "
+            f"({trust_store.load_error}), so the destination's trust state is "
+            "unknown; run `chartreux doctor` to repair it"
+        )
 
     def release_move_trust(self) -> None:
         """Revoke only the trust this session's own moves acquired.

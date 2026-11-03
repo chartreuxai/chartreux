@@ -27,6 +27,7 @@ from chartreux.core.llm_models import (
     AvailableFunction,
     LLMMessage,
     Role,
+    archived_replacement,
 )
 from chartreux.core.message_list import MessageList
 from chartreux.core.session.session_loader import (
@@ -45,9 +46,11 @@ from chartreux.core.session.transcript_archive import (
     ArchiveSaveSnapshot,
     ArchiveSealError,
     ArchiveSealReceipt,
+    ReboundHydrationProof,
     archived_prefix_chunks,
     eligible_archive_prefix,
     iter_archived_records,
+    prove_rebound_hydration,
     verify_archived_prefix_on_disk,
 )
 from chartreux.core.session_types import (
@@ -234,6 +237,70 @@ class _PromptSerialization:
     tools_available: list[dict[str, Any]]
 
 
+#: The explicit outcome of one post-turn trim completion attempt (T1b). Every
+#: attempt reports exactly one of these; nothing is silently skipped.
+PostTurnTrimOutcome = Literal[
+    # The pending trim was drained, fenced, sealed and published.
+    "published",
+    # A seal/publication for the same boundary is already in flight.
+    "excluded_concurrent",
+    # The boundary was already sealed and published (e.g. a later seam).
+    "excluded_already_published",
+    "refused_disabled",
+    "refused_session_mismatch",
+    # The pending's message epoch does not match the live list (stale after a
+    # rebind): refused at the attempt boundary, never sealed.
+    "refused_epoch_mismatch",
+    "refused_boundary_mismatch",
+    # A retained descriptor pairs with a different list epoch: stale authority.
+    "refused_stale_authority",
+    # Sealing was refused or failed: no receipt, originals retained.
+    "failed_seal",
+    # The seal succeeded but publication failed: the pre-seal archived bytes
+    # and descriptor remain effective; the receipt is carried for reporting.
+    "failed_publish",
+]
+
+
+@dataclass(frozen=True, slots=True)
+class PostTurnTrimResult:
+    """The reported outcome of a ``complete_post_turn_trim`` attempt (T1b)."""
+
+    outcome: PostTurnTrimOutcome
+    detail: str = ""
+    receipt: ArchiveSealReceipt | None = None
+
+
+#: The explicit outcome of one warm-resume clear-and-reseal proof/transaction
+#: attempt (T2a). Every attempt reports exactly one of these; nothing is
+#: silently skipped.
+WarmResumeOutcome = Literal[
+    # The hydration proof held and the staged repair + authority transition
+    # completed under the save lock: the retained descriptor is CLEARED
+    # (clear-and-reseal), never re-pinned.
+    "proved_and_transitioned",
+    "refused_disabled",
+    "refused_session_mismatch",
+    # The hydration proof failed closed: archive authority and the originals
+    # stay — the on-disk bytes are byte-identical, nothing was staged, and no
+    # descriptor re-pin fallback exists.
+    "refused_proof",
+    # The proof held but the staged repair failed: the rollback transition
+    # completed (original bytes restored / retained) before the fence moved.
+    "failed_repair_rolled_back",
+]
+
+
+@dataclass(frozen=True, slots=True)
+class WarmResumeTransactionResult:
+    """The reported outcome of a ``clear_and_reseal_warm_resume`` attempt (T2a)."""
+
+    outcome: WarmResumeOutcome
+    detail: str = ""
+    proof: ReboundHydrationProof | None = None
+    artifact_path: Path | None = None
+
+
 # Over the method limit, as AgentLoop and ChartreuxApp already are: most of thesethese
 # are one-line accessors onto the metadata record this owns, and hiding them
 # behind a second object would put a hop between the log and everything that
@@ -280,6 +347,13 @@ class SessionLogger:  # noqa: PLR0904
         # Serializes writes so concurrent saves cannot interleave appends to
         # messages.jsonl or race on the metadata read-modify-write.
         self._save_lock = asyncio.Lock()
+        # T1b post-turn trim completion: exclusivity per compaction boundary.
+        # A boundary is in ``_trim_in_flight_boundaries`` while its
+        # drain/fence/seal/publication attempt runs and in
+        # ``_trim_published_boundaries`` once published; a second attempt for
+        # the same boundary is excluded, never a concurrent seal/publication.
+        self._trim_in_flight_boundaries: set[str] = set()
+        self._trim_published_boundaries: set[str] = set()
 
         # Repair every configured store independently, including when new logging
         # is disabled. The repair recognizes session directories and leaves other
@@ -1458,6 +1532,309 @@ class SessionLogger:  # noqa: PLR0904
             descriptor=descriptor, message_epoch=message_epoch
         )
 
+    def _rollback_post_turn_trim(
+        self,
+        descriptor_before: ArchivedPrefixV1 | None,
+        snapshot_before: ArchiveSaveSnapshot | None,
+    ) -> None:
+        """Restore the pre-seal archive authority after a failed publication.
+
+        Called only from the synchronous post-seal block of
+        ``complete_post_turn_trim`` (no await between the seal's return and
+        this call), so the restore is atomic: no save can interleave. The
+        original (pre-seal) archived bytes and descriptor remain effective.
+        """
+        self._archive_descriptor = descriptor_before
+        self._last_save_archive_snapshot = snapshot_before
+
+    async def complete_post_turn_trim(  # noqa: PLR0911 - one explicit outcome per refusal/failure arm
+        self,
+        messages: MessageList,
+        stats: AgentStats,
+        config: ChartreuxConfigSchema,
+        tool_manager: ToolManager,
+        *,
+        session_id: str,
+        message_epoch: int,
+        boundary_message_id: str,
+        trim_mode: Literal["payloads", "tombstones"] = "payloads",
+    ) -> PostTurnTrimResult:
+        """Drain, fence, seal and publish a pending post-turn trim (T1b).
+
+        This is the completion half of the guarded post-finalization entry:
+        the compaction manager records the pending trim at the exclusive idle
+        seam and calls this with the recorded key. The path, in order:
+
+        1. validate the key (session, message epoch, boundary) against the
+           live list — a stale key is refused at this attempt boundary;
+        2. DRAIN queued/in-flight saves and take the exclusivity + fence
+           snapshot under ``_save_lock``: every save queued before this point
+           completes first, the boundary enters the in-flight set (no
+           concurrent seal/publication for the same boundary), and the save /
+           reset generations are snapshotted for the publication fence;
+        3. SEAL via ``seal_archive`` (its own durable persist runs under the
+           save lock, after the drained saves, and issues the receipt only
+           after on-disk verification);
+        4. FENCE + PUBLISH in one synchronous call to
+           ``fence_and_publish_archive_trim`` — the fence and the publication
+           never split as active behavior.
+
+        Failure semantics, each reported as an explicit outcome: a refused or
+        failed seal issues no receipt and retains the originals; a seal that
+        succeeds but cannot publish rolls the retained descriptor and save
+        snapshot back to their pre-seal values, so the original archived bytes
+        and descriptor remain effective and nothing is partially published; a
+        cancellation during the seal is drained inside ``seal_archive`` (no
+        receipt, no publication) and re-raised. Every attempt returns a
+        ``PostTurnTrimResult``; the caller decides what to swallow.
+        """
+        if not self.enabled:
+            return PostTurnTrimResult("refused_disabled", "session logging is disabled")
+        if session_id != self.session_id:
+            return PostTurnTrimResult(
+                "refused_session_mismatch",
+                f"pending session {session_id!r} != logger session {self.session_id!r}",
+            )
+        if message_epoch != messages.message_epoch:
+            return PostTurnTrimResult(
+                "refused_epoch_mismatch",
+                f"pending message epoch {message_epoch} != list epoch "
+                f"{messages.message_epoch}: stale after a rebind, never sealed",
+            )
+        eligible = eligible_archive_prefix(list(messages))
+        if eligible is None or eligible.boundary_message_id != boundary_message_id:
+            return PostTurnTrimResult(
+                "refused_boundary_mismatch",
+                f"pending boundary {boundary_message_id!r} is not the live "
+                "eligible boundary",
+            )
+        # Drain + exclusivity + fence snapshot under the save lock. Releasing
+        # the lock before the seal is safe: seal_archive re-acquires it, so any
+        # save queued in between still completes before the sealing persist,
+        # and the publication fence discards anything snapshotted earlier.
+        async with self._save_lock:
+            if boundary_message_id in self._trim_published_boundaries:
+                return PostTurnTrimResult(
+                    "excluded_already_published",
+                    f"boundary {boundary_message_id!r} was already sealed and published",
+                )
+            if boundary_message_id in self._trim_in_flight_boundaries:
+                return PostTurnTrimResult(
+                    "excluded_concurrent",
+                    f"a seal/publication for boundary {boundary_message_id!r} "
+                    "is already in flight",
+                )
+            retained_before = self._archive_descriptor
+            snapshot_before = self._last_save_archive_snapshot
+            if (
+                retained_before is not None
+                and retained_before.message_epoch != message_epoch
+            ):
+                return PostTurnTrimResult(
+                    "refused_stale_authority",
+                    f"retained descriptor epoch {retained_before.message_epoch} "
+                    f"!= list epoch {message_epoch}: stale authority, no receipt",
+                )
+            save_generation = self._transcript_cursor_generation
+            reset_generation = self._archive_generation
+            self._trim_in_flight_boundaries.add(boundary_message_id)
+        try:
+            try:
+                receipt = await self.seal_archive(
+                    messages, stats, config, tool_manager, trim_mode=trim_mode
+                )
+            except asyncio.CancelledError:
+                # seal_archive drained its persist worker under the save lock
+                # and issued no receipt: nothing is published. The retained
+                # authority is untouched (no receipt path was reached).
+                raise
+            except Exception as exc:
+                # No receipt: seal_archive already restored its save snapshot
+                # and retained no descriptor — the originals stay effective.
+                return PostTurnTrimResult("failed_seal", f"{type(exc).__name__}: {exc}")
+            # The publish block is fully synchronous: no await can interleave
+            # between the seal's receipt and the fence+publication.
+            try:
+                eligible_now = eligible_archive_prefix(list(messages))
+                if (
+                    eligible_now is None
+                    or eligible_now.boundary_message_id != boundary_message_id
+                    or len(eligible_now.messages) != receipt.descriptor.archived_count
+                ):
+                    raise ArchiveSealError(
+                        "the list moved between sealing and publication; no publish"
+                    )
+                replacements = [
+                    archived_replacement(
+                        message,
+                        receipt.descriptor,
+                        trim_mode=receipt.descriptor.trim_mode,
+                    )
+                    for message in eligible_now.messages
+                ]
+                self.fence_and_publish_archive_trim(
+                    messages,
+                    receipt.descriptor,
+                    replacements,
+                    save_generation=save_generation,
+                    reset_generation=reset_generation,
+                )
+            except BaseException as exc:
+                # The seal succeeded but the trim could not be published:
+                # restore the pre-seal descriptor/snapshot so the original
+                # archived bytes and descriptor remain effective. Nothing is
+                # partially published (the fence either ran whole or not at
+                # all — it is synchronous).
+                self._rollback_post_turn_trim(retained_before, snapshot_before)
+                if isinstance(exc, asyncio.CancelledError):
+                    raise
+                return PostTurnTrimResult(
+                    "failed_publish", f"{type(exc).__name__}: {exc}", receipt=receipt
+                )
+            self._trim_published_boundaries.add(boundary_message_id)
+            return PostTurnTrimResult("published", receipt=receipt)
+        finally:
+            self._trim_in_flight_boundaries.discard(boundary_message_id)
+
+    async def clear_and_reseal_warm_resume(
+        self,
+        messages: MessageList,
+        *,
+        session_id: str,
+        repair_messages: Sequence[LLMMessage] | None = None,
+    ) -> WarmResumeTransactionResult:
+        """The warm-resume clear-and-reseal PROOF/TRANSACTION half (T2a).
+
+        Everything runs under ONE ``_save_lock`` hold, which DRAINS every
+        queued/in-flight save: in-flight persist workers finish before the
+        proof reads, and every save that snapshotted before this attempt
+        discards itself under the lock once the fence moves the save
+        generation — so the drain/generation fence stays effective THROUGH
+        the synchronous rebind performed below in the same lock hold.
+
+        Order:
+        1. PROOF — the rebound list is proven FULLY HYDRATED from the target
+           disk (archived bytes, session/path identity, COMPLETE loaded
+           records) through the shared archive read interface. Archive
+           authority is retained UNTIL this proof AND the fence both hold; a
+           failed proof returns ``refused_proof`` with the on-disk bytes
+           untouched (byte-identical), the retained descriptor in place, and
+           nothing staged — there is NO descriptor re-pin fallback.
+        2. STAGED REPAIR (only when ``repair_messages`` is given) — the
+           original is preserved as a verified recovery artifact BEFORE the
+           replacement, the live path is replaced with the exact old prefix
+           bytes plus the repaired tail, and the staged result is re-proven
+           against the complete repaired records: the exact archived prefix
+           bytes are preserved (asserted, not assumed). A failure after
+           replacement rolls back — the artifact's verified bytes are
+           restored over the live path.
+        3. AUTHORITY TRANSITION — synchronous in the same lock hold: the save
+           generation moves (the fence), the reset generation bumps (the
+           rebind), and both archive authorities are CLEARED —
+           clear-and-reseal, never re-pinned — so the next seal mints a
+           fresh receipt at the new epoch.
+        """
+        from chartreux.core.agent_loop._transcript_integrity import (
+            TranscriptIntegrityError,
+        )
+
+        if not self.enabled:
+            return WarmResumeTransactionResult(
+                "refused_disabled", "session logging is disabled"
+            )
+        if session_id != self.session_id:
+            return WarmResumeTransactionResult(
+                "refused_session_mismatch",
+                f"resume session {session_id!r} != logger session {self.session_id!r}",
+            )
+        session_info = self._get_session_info()
+        if session_info is None:
+            return WarmResumeTransactionResult(
+                "refused_disabled", "no session is bound to this logger"
+            )
+        session_dir, _session_metadata = session_info
+        messages_path = session_dir / MESSAGES_FILENAME
+        async with self._save_lock:
+            # Drain complete at this acquisition: in-flight workers finished;
+            # saves queued earlier discard under the lock once the fence below
+            # moves the save generation (same hold as the rebind).
+            retained = self._archive_descriptor
+            loaded_records = [
+                SessionLogger._message_record(message, allow_archived=True)
+                for message in messages
+                if message.role is not Role.system
+            ]
+            try:
+                proof = await asyncio.to_thread(
+                    prove_rebound_hydration,
+                    retained,
+                    session_id=session_id,
+                    messages_path=messages_path,
+                    loaded_records=loaded_records,
+                )
+            except ArchiveIntegrityError as exc:
+                # Fail closed: authority and originals stay. The proof is
+                # read-only, so the on-disk bytes are byte-identical; nothing
+                # was staged and no re-pin fallback exists.
+                return WarmResumeTransactionResult(
+                    "refused_proof", f"hydration proof failed closed: {exc}"
+                )
+            artifact_path: Path | None = None
+            if repair_messages is not None:
+                staging = asyncio.create_task(
+                    asyncio.to_thread(
+                        SessionLogger._stage_repaired_transcript,
+                        messages_path,
+                        repair_messages,
+                        retained,
+                        self.session_id,
+                    )
+                )
+                try:
+                    artifact_path = await asyncio.shield(staging)
+                except asyncio.CancelledError:
+                    # Drain the staging worker under the save lock, then prove
+                    # the rollback/authority transition: a completed staging
+                    # replaced the live path, so restore the artifact's
+                    # verified original bytes; the retained authority stays
+                    # (the transition below was never reached).
+                    while not staging.done():
+                        try:
+                            await asyncio.shield(staging)
+                        except asyncio.CancelledError:
+                            continue
+                        except BaseException:
+                            break
+                    if staging.exception() is None:
+                        try:
+                            SessionLogger._restore_staged_artifact(
+                                messages_path, staging.result()
+                            )
+                        except OSError:
+                            pass
+                    raise
+                except (OSError, ValueError, TranscriptIntegrityError) as exc:
+                    # The staging refused: pre-replacement failures leave the
+                    # original live path intact; post-replacement failures
+                    # already rolled back inside _stage_repaired_transcript.
+                    return WarmResumeTransactionResult(
+                        "failed_repair_rolled_back",
+                        f"staged repair failed; original restored/retained: {exc}",
+                        proof=proof,
+                    )
+            # Synchronous authority transition in the same lock hold: fence,
+            # rebind generation, clear-and-reseal (never re-pinned).
+            self.invalidate_transcript_cursor()
+            self._archive_generation += 1
+            messages.clear_archive_descriptor()
+            self._archive_descriptor = None
+            self._last_save_archive_snapshot = ArchiveSaveSnapshot(
+                descriptor=None, message_epoch=messages.message_epoch
+            )
+            return WarmResumeTransactionResult(
+                "proved_and_transitioned", proof=proof, artifact_path=artifact_path
+            )
+
     @staticmethod
     def _quarantine_corrupt_transcript(messages_path: Path) -> Path:
         """Preserve an unreadable transcript before replacing its live path."""
@@ -1568,6 +1945,96 @@ class SessionLogger:  # noqa: PLR0904
         message = (
             f"Session transcript repaired in place at {messages_path}; the "
             f"original transcript was preserved at {artifact_path}."
+        )
+        logger.warning(message)
+        warnings.warn(message, RuntimeWarning, stacklevel=3)
+        return artifact_path
+
+    @staticmethod
+    def _restore_staged_artifact(messages_path: Path, artifact_path: Path) -> None:
+        """Restore a staged recovery artifact over the replaced live path (T2a).
+
+        The artifact was verified by read-back at staging time, so streaming
+        it back over ``messages_path`` reproduces the ORIGINAL bytes exactly —
+        the proven rollback of a post-replacement failure or cancellation.
+        """
+        durable_replace_stream(messages_path, read_chunks(artifact_path))
+
+    @staticmethod
+    def _stage_repaired_transcript(
+        messages_path: Path,
+        repaired_messages: Sequence[LLMMessage],
+        retained: ArchivedPrefixV1 | None,
+        session_id: str,
+    ) -> Path:
+        """Stage a warm-resume repair, preserving the exact archived prefix bytes (T2a).
+
+        The original transcript is preserved as a verified recovery artifact
+        BEFORE the live path is replaced (same staging as
+        ``migrate_repaired_transcript``). The replacement streams the OLD
+        PREFIX BYTES verbatim — the first ``prefix_end_byte`` bytes of the
+        current live file — followed by the repaired tail records one line at
+        a time, so the archived prefix is byte-identical BY CONSTRUCTION
+        (reading the live path mid-stream is safe: the rename publishes only
+        after the stream completes). The staged result is then RE-PROVEN
+        through the shared read interface against the complete repaired
+        records: any deviation — a repair that would have altered the sealed
+        prefix — fails closed and rolls back, restoring the artifact's
+        verified original bytes over the live path. Returns the artifact
+        path.
+        """
+        from chartreux.core.agent_loop._transcript_integrity import (
+            TranscriptIntegrityError,
+        )
+
+        prefix_end_byte = retained.prefix_end_byte if retained is not None else 0
+        archived_count = retained.archived_count if retained is not None else 0
+        non_system_repaired = [
+            message for message in repaired_messages if message.role != Role.system
+        ]
+        repaired_records = [
+            SessionLogger._message_record(message) for message in non_system_repaired
+        ]
+        timestamp = utc_now().strftime("%Y%m%dT%H%M%S%fZ")
+        artifact_path = messages_path.with_name(
+            f"{messages_path.name}.recovered-{timestamp}-{uuid4().hex}"
+        )
+        while artifact_path.exists():
+            artifact_path = messages_path.with_name(
+                f"{messages_path.name}.recovered-{timestamp}-{uuid4().hex}"
+            )
+        try:
+            SessionLogger._stage_recovery_artifact(messages_path, artifact_path)
+            tail_records = repaired_records[archived_count:]
+
+            def replacement_chunks() -> Iterator[bytes]:
+                # The exact old prefix bytes stream through verbatim; only the
+                # repaired tail is re-serialized.
+                yield from archived_prefix_chunks(messages_path, prefix_end_byte)
+                yield from SessionLogger._transcript_chunks(tail_records)
+
+            durable_replace_stream(messages_path, replacement_chunks())
+        except OSError as exc:
+            raise TranscriptIntegrityError.migration_failed(messages_path, exc) from exc
+        try:
+            prove_rebound_hydration(
+                retained,
+                session_id=session_id,
+                messages_path=messages_path,
+                loaded_records=repaired_records,
+            )
+        except (ArchiveIntegrityError, OSError) as exc:
+            # Post-replacement failure: roll back to the staged original.
+            try:
+                SessionLogger._restore_staged_artifact(messages_path, artifact_path)
+            except OSError as rollback_exc:
+                raise TranscriptIntegrityError.migration_failed(
+                    messages_path, rollback_exc
+                ) from rollback_exc
+            raise TranscriptIntegrityError.migration_failed(messages_path, exc) from exc
+        message = (
+            f"Session transcript repair staged at {messages_path} preserving the "
+            f"archived prefix; the original transcript was preserved at {artifact_path}."
         )
         logger.warning(message)
         warnings.warn(message, RuntimeWarning, stacklevel=3)

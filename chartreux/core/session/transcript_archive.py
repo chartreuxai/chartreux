@@ -15,6 +15,7 @@ format).
 
 from __future__ import annotations
 
+from collections import deque
 from collections.abc import Iterable, Iterator, Sequence
 from dataclasses import dataclass
 import hashlib
@@ -421,3 +422,198 @@ def verify_archived_prefix_on_disk(descriptor: ArchivedPrefixV1, path: Path) -> 
         raise ArchiveIntegrityError(
             f"cannot read the archived prefix at {path}: {exc}"
         ) from exc
+
+
+@dataclass(frozen=True)
+class ReboundHydrationProof:
+    """Proof that a rebound list is fully hydrated from the target disk (T2a).
+
+    Issued only by :func:`prove_rebound_hydration` after the archived bytes,
+    the session/path identity, and the COMPLETE loaded records all verified
+    against the target transcript in one streaming pass.
+    """
+
+    session_id: str
+    descriptor: ArchivedPrefixV1 | None
+    archived_count: int
+    loaded_count: int
+    transcript_bytes: int
+    transcript_sha256: str
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.session_id, str) or not self.session_id:
+            raise ValueError(
+                f"ReboundHydrationProof.session_id must be a non-empty str, "
+                f"got {self.session_id!r}"
+            )
+        if self.descriptor is not None and (
+            not isinstance(self.descriptor, ArchivedPrefixV1)
+            or self.descriptor.session_id != self.session_id
+        ):
+            raise ValueError(
+                "ReboundHydrationProof.descriptor must name the proven session, "
+                f"got {self.descriptor!r}"
+            )
+        _require_int("archived_count", self.archived_count)
+        _require_int("loaded_count", self.loaded_count)
+        _require_int("transcript_bytes", self.transcript_bytes)
+        if (
+            not isinstance(self.transcript_sha256, str)
+            or len(self.transcript_sha256) != _SHA256_HEX_LENGTH
+            or any(c not in _HEX_DIGITS for c in self.transcript_sha256)
+        ):
+            raise ValueError(
+                "ReboundHydrationProof.transcript_sha256 must be 64 lowercase hex "
+                f"chars, got {self.transcript_sha256!r}"
+            )
+
+
+def _require_proof_identity(
+    descriptor: ArchivedPrefixV1 | None,
+    session_id: str,
+    messages_path: Path,
+    loaded_records: Sequence[dict[str, Any]],
+) -> None:
+    """The identity checks of a hydration proof, fail-closed (T2a)."""
+    if not isinstance(session_id, str) or not session_id:
+        raise ArchiveIntegrityError(
+            f"session identity must be a non-empty str, got {session_id!r}"
+        )
+    if descriptor is not None and descriptor.session_id != session_id:
+        raise ArchiveIntegrityError(
+            f"foreign-session descriptor {descriptor.session_id!r} cannot prove "
+            f"hydration of the resumed session {session_id!r}"
+        )
+    for index, record in enumerate(loaded_records):
+        if not isinstance(record, dict):
+            raise ArchiveIntegrityError(f"loaded record {index} is not a JSON object")
+    if not messages_path.is_file():
+        raise ArchiveIntegrityError(
+            f"the target transcript is missing at {messages_path}"
+        )
+
+
+def _compare_tail_records(
+    tail_chunks: Iterable[bytes],
+    loaded_records: Sequence[dict[str, Any]],
+    archived_count: int,
+) -> int:
+    """Compare the streamed live-tail records against the loaded records (T2a).
+
+    Returns the number of disk records seen. Any mismatch, a non-JSON line, or
+    a trailing partial line raises ``ArchiveIntegrityError`` — never a partial
+    comparison.
+    """
+    buf = b""
+    record_index = archived_count
+    for chunk in tail_chunks:
+        buf += chunk
+        while True:
+            newline = buf.find(b"\n")
+            if newline < 0:
+                break
+            line, buf = buf[:newline], buf[newline + 1 :]
+            record = _parse_record_line(line)
+            if (
+                record_index >= len(loaded_records)
+                or loaded_records[record_index] != record
+            ):
+                raise ArchiveIntegrityError(
+                    f"target record {record_index} does not match loaded record "
+                    f"{record_index}"
+                )
+            record_index += 1
+    if buf:
+        raise ArchiveIntegrityError("the target transcript ends inside a record line")
+    return record_index
+
+
+def prove_rebound_hydration(
+    descriptor: ArchivedPrefixV1 | None,
+    *,
+    session_id: str,
+    messages_path: Path,
+    loaded_records: Sequence[dict[str, Any]],
+) -> ReboundHydrationProof:
+    """Prove the rebound list is FULLY HYDRATED from the target disk (T2a).
+
+    One streaming pass over ``messages_path`` feeds every check, so bytes
+    changed mid-proof fail closed instead of splitting the proof:
+
+    - session identity: a retained ``descriptor`` must name ``session_id``
+      (a foreign-session descriptor is rejected);
+    - path identity: ``messages_path`` must be the transcript file on the
+      target disk (a missing file is rejected);
+    - archived bytes: the descriptor's prefix bytes verify through the shared
+      read interface — ``iter_archived_records`` over the streamed prefix
+      chunks (byte count, sha256, record count, JSON structure, no trailing
+      partial line);
+    - complete loaded records: EVERY record on disk — the archived prefix
+      records and the live tail alike — parses and equals the corresponding
+      loaded record, and the disk holds exactly ``len(loaded_records)``
+      records: the rebound list is fully hydrated, nothing missing or extra.
+
+    Any mismatch raises ``ArchiveIntegrityError`` — never a partial proof.
+    The proof is READ-ONLY: a failed proof leaves the target bytes untouched
+    (byte-identical), so archive authority can be retained on refusal.
+    """
+    _require_proof_identity(descriptor, session_id, messages_path, loaded_records)
+    prefix_end_byte = descriptor.prefix_end_byte if descriptor is not None else 0
+    archived_count = descriptor.archived_count if descriptor is not None else 0
+    hasher = hashlib.sha256()
+    total = 0
+    tail_chunks: deque[bytes] = deque()
+
+    def prefix_chunks() -> Iterator[bytes]:
+        # One pass: the prefix bytes stream into the shared read interface,
+        # every byte is hashed for the complete-transcript digest, and the
+        # bytes past prefix_end_byte queue for the tail comparison.
+        nonlocal total
+        for chunk in read_chunks(messages_path):
+            if not chunk:
+                continue
+            hasher.update(chunk)
+            total += len(chunk)
+            if total <= prefix_end_byte:
+                yield chunk
+                continue
+            keep = prefix_end_byte - (total - len(chunk))
+            if keep > 0:
+                yield chunk[:keep]
+                chunk = chunk[keep:]
+            if chunk:
+                tail_chunks.append(chunk)
+
+    archived_records: list[dict[str, Any]] = []
+    try:
+        if descriptor is not None:
+            for record in iter_archived_records(descriptor, prefix_chunks()):
+                archived_records.append(record)
+        else:
+            for _chunk in prefix_chunks():
+                pass
+    except OSError as exc:
+        raise ArchiveIntegrityError(
+            f"cannot read the target transcript at {messages_path}: {exc}"
+        ) from exc
+    # The archived prefix records must be the head of the loaded records.
+    for index, record in enumerate(archived_records):
+        if index >= len(loaded_records) or loaded_records[index] != record:
+            raise ArchiveIntegrityError(
+                f"archived record {index} does not match loaded record {index}"
+            )
+    # The live tail: every remaining disk record must equal its loaded record.
+    record_count = _compare_tail_records(tail_chunks, loaded_records, archived_count)
+    if record_count != len(loaded_records):
+        raise ArchiveIntegrityError(
+            f"the target transcript holds {record_count} records but the rebound "
+            f"list loaded {len(loaded_records)}"
+        )
+    return ReboundHydrationProof(
+        session_id=session_id,
+        descriptor=descriptor,
+        archived_count=archived_count,
+        loaded_count=len(loaded_records),
+        transcript_bytes=total,
+        transcript_sha256=hasher.hexdigest(),
+    )

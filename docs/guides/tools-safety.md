@@ -69,6 +69,8 @@ Chartreux asks before trusting a new workspace when it detects material that can
 
 Trust can apply to the current folder, the repository root when offered, or the current session. Declining records the folder as untrusted. Persisted decisions are stored in `~/.chartreux/trusted_folders.toml`. Trusted project configuration, prompts, skills, hooks, and instructions are then eligible to load; untrusted project configuration is not. Passing `--add-dir` is an explicit trust grant for that session.
 
+`chartreux trust list` prints every persisted decision, labeled `trusted` or `untrusted`. `chartreux trust list PATH` prints the decision that governs one path: the closest recorded decision wins, so a child path inherits its nearest recorded ancestor rather than the entry above it. `chartreux trust remove PATH` removes exactly the one entry recorded for `PATH` — sibling and descendant entries and every decision recorded for another path are untouched, and removing a path that only inherits trust from an ancestor is refused because nothing is recorded for it. The removal asks for confirmation and defaults to no; without an interactive terminal it is denied, and there is no force or assume-yes flag. A running session keeps the decision it loaded, so restart Chartreux after a removal for it to take effect.
+
 Inside a trusted folder, the project `.env` (the trusted folder's `.env` plus `$CHARTREUX_HOME/.env`) is injected into `bash` and `bash_start` subprocess environments, and its values are masked in tool output; see [Project environment injection](configuration.md#project-environment-injection).
 
 ## Shell safety
@@ -98,7 +100,7 @@ Grant and denial semantics:
 - **Recheck is the final gate**: an approval installs runtime authority and then the full permission pipeline rechecks (tool disablement, denylist, sensitivity, path and parent-ceiling restrictions, repository identity). On a recheck failure nothing executes and an unused once authority is destroyed. Child approval never lifts a missing parent dangerous-command authority.
 - **Noninteractive sessions** deny dangerous commands promptly with remediation naming the actual path: publication operations point to the persistent knob (`Add git.push to dangerous_command_grants_by_project for this project in your user config.toml`); consequential operations state they cannot be pre-authorized and require approval in an interactive session; a mixed call's remediation covers only the persistable subset, naming the operations that still need interactive approval. The denial carries the resolver's reason. This is the headless statement for every ask-class operation: dangerous git commands, `network.egress` (non-loopback egress through modeled `curl`/`wget`), and `network.remote-exec` alike are denied with remediation in headless/programmatic mode, and `dangerous_command_grants_by_project` is the pre-authorization path (a remote-exec denial names `remote_exec_grants_by_project` and the exact destination instead).
 - **Child sessions** deny dangerous commands outright regardless of user-input capability: the denial with remediation returns a blocker to the parent, and the persisted grant fields are the only child pre-authorization paths — `dangerous_command_grants_by_project` for the scope-keyed operations and `remote_exec_grants_by_project` for a remote-exec destination. A saved project grant runs in a child with no prompt, while a session grant never propagates: grants are store-local to the loop that owns them. Main interactive sessions keep their approval dialogs. The same blanket denial covers ask-class `network.egress` egress, remote-exec, and the out-of-root grant flow: a child never surfaces the interactive root-grant prompt, and out-of-root scope comes only from already-issued child-local grants, parent-directed scope changes, or `authorized_roots_by_project`.
-- Revocation and inspection: the app server exposes `policy/dangerous_commands/read` and `policy/dangerous_commands/revoke` (see [App server](../integrations/app-server.md)); there is deliberately no public "grant an arbitrary operation" endpoint — grants come only from the runtime approval flow. The Textual settings panel **Settings > Shell Permissions** (in the Advanced & Tools group) shows live and saved dangerous-command authority and lets the user revoke it.
+- Revocation and inspection: the app server exposes `policy/dangerous_commands/read` and `policy/dangerous_commands/revoke` (see [App server](../integrations/app-server.md)); there is deliberately no public "grant an arbitrary operation" endpoint — grants come only from the runtime approval flow. The Textual settings panel **Settings > Shell Permissions** (in the Advanced & Tools group) shows live and saved dangerous-command authority and lets the user revoke it — destination-scoped for remote-exec, with the whole-scope revoke kept as its own confirmed row (see [remote-exec destination revocation](#remote-exec-destination-revocation-v071)). There is no sessionless CLI and no approval-prompt control: a revocation needs a live registered session.
 
 ### State-aware clean-tree checkout exemption
 
@@ -117,9 +119,67 @@ A command run on a remote machine is a separate operation, `network.remote-exec`
 - **Honest scope.** The approval question states that remote commands and their effects are outside chartreux's local guards — trusting the destination, not approving a contained payload. The grant authorizes reaching the host; it does not contain or review what runs there.
 - **Resolver boundary.** Loopback and local-machine destinations are hard-denied regardless of any grant, and the SSH grammar that produces a proposal is admitted separately from this grant model: a grant can only authorize a destination the resolver has already validated.
 
+### Remote-exec destination revocation (v0.7.1)
+
+A destination grant is revoked selectively. **Settings > Shell Permissions** lists each exact `user@host:port` destination as its own row under the section that holds it — live session, accepted config, or disk only — and revoking that row removes only that destination's session grants, invalidates every pending once permit containing it whole, and removes the same destination from the saved project list. The whole-scope revoke stays reachable as one separate row that requires an explicit `y` confirmation, because it drops every live destination grant in every scope and every saved destination of the project rather than one destination. The revoke rides the existing `policy/dangerous_commands/revoke` verb: the request carries the registered session, the operation, the exact canonical destination, the expected live generation, and the expected disk revision, and the response reports the live and saved outcomes apart. The read projection carries the destination on every remote-exec entry and reports the disk destinations separately from the disk operations.
+
+A revocation is not a containment guarantee. Four limits are disclosed rather than implied:
+
+- **An in-flight command is not undone.** A remote command already running keeps running: the grant stops the next invocation, not the current one. A question already awaiting an answer is not cancelled either, and answering it after the revocation still grants fresh authority for the decided scope; the revocation rechecks the live generation after its saved-side write and reports that concurrent regrant as a warning.
+- **The accepted config can keep authorizing until a reload or start.** Saved authority is removed from the user config on disk for future sessions, while the running session keeps whatever its accepted config already granted until the next reload or session start. The response carries that warning and the panel shows it instead of claiming the authority is gone.
+- **Children and other processes are outside any atomic picture.** Session grants are store-local to the loop that owns them, so revoking this session's grants cannot reach a child's store, another running process, or a session that is not registered with this app server. Only the registered session's live authority and the project's saved destinations are touched; there is no cross-process atomicity.
+- **The client self-attests the outcome.** The panel reports what the revocation response says; it cannot independently verify that the server removed the authority, so a transport or server fault surfaces as an error or an uncertain outcome instead of a blind retry. The inspection that follows a revocation is a fresh read, so the list shows what the server reports next, not what the panel assumes.
+
+Strict-client note: the destination parameter and the destination-aware projection follow this release's strict convention — an older strict app server rejects the new request field (the whole-scope request included, because the defaulted field still serializes as an explicit null) and an older strict client rejects the new response keys, so client and server must run the same protocol version.
+
 ### Breaking change
 
 Recognized git operations left the shipped denylist, and `denylist = []` no longer implicitly authorizes them: an empty explicit denylist used to leave the agent free to push; now publication needs a runtime grant (or a saved project grant) exactly as before. Explicit denylist entries remain an absolute veto, so an explicit `denylist = ["git push"]` still blocks pushes outright.
+
+## v0.7.1 remote-exec and shell-policy summary
+
+This section is the release-level reading map; the clause-level passages above
+and in [Network-client egress modeling](#network-client-egress-modeling-v070)
+and [Retained shell-policy limitations](#retained-shell-policy-limitations)
+remain authoritative for their own clauses.
+
+Remote execution in v0.7.1 is a closed destination grammar behind the
+`network.remote-exec` grant model. `ssh`, `scp`, and `rsync` are the only
+clients classified `network.remote-exec`: one standalone invocation each, one
+exact `user@host:port` destination per call, ask-class with that destination
+attached to the approval, and the approved address plus the fixed host-key
+identity pinned into the spawned argv at every transport. `ssh` admits an IP
+literal or a hostname the system resolver answers uniquely and non-locally;
+`scp` and `rsync` add the bounded-transfer grammar (two operands, one remote
+operand, closed path charset, safe options only). A resolution that changes
+between validation and spawn is never contacted, and a locality-only
+attestation entry denies transfers even where it admits `ssh` execution.
+Revocation is destination-scoped in **Settings > Shell Permissions** and on the
+`policy/dangerous_commands/revoke` wire, with the whole-scope revoke kept as a
+separate confirmed action; it stops future invocations and undecided future
+authority, and it never claims to undo a running command or reach another
+process.
+
+The shell-policy side of the release is the pinned executor contract plus two
+narrow glob admissions. Every spawned shell runs with the expansion-relevant
+option families off, startup files redirected, and the locale pinned, while an
+unknown executor, an option-changing invocation, and a nested shell re-entry
+with an expansion-bearing payload fail closed; the contract is read at
+execution, and the argv, shell-string, background, and terminal transports
+either consume the bound plan or hard-deny. The two admissions are a
+single-component trailing `**` for the read whitelist and one whole
+double-quoted variable word preceded by a literal assignment; everything else
+retains its conservative denial. HTTPie's `https` entry point is modeled under
+the `http` grammar with the https scheme forced only onto a schemeless operand.
+
+The retained limitations are the same in both areas: a remote-exec destination
+grant trusts the destination, not a payload; the pinned known-hosts file is not
+provisionable yet, so an admitted `ssh` spawn fails host-key verification
+closed; attestation is client-self-reported, so it stops accidental misrouting
+rather than a lying client; strict clients must run the same protocol version
+as the app server; revocation undoes no remote effect; the executor contract's
+remaining trust base is root-owned system startup files and the shell binary;
+and the shell work-budget caps are unchanged in this release.
 
 ## Local tool trust
 
@@ -247,13 +307,31 @@ Executor option parsing recognizes the interpreter's own flags, so
 denied, and `VIRTUAL_ENV` is no longer a dangerous environment assignment (it
 is a benign venv hint), so a `VIRTUAL_ENV=...` prefix no longer denies.
 
-Probed egress-capable clients without destination modeling — `ssh`, `scp`,
-`rsync`, `ftp`, `telnet`, `httpie`, `https`, `wget2`, `aria2c`, `lftp` — ship
+Probed egress-capable clients without destination modeling — `ftp`,
+`telnet`, `httpie`, `wget2`, `aria2c`, `lftp` — ship
 on the default `[tools.bash]` denylist until they are modeled; removing an
 entry re-enables that client as an ordinary denylist edit. HTTPie's `http`
 left that denylist in v0.7.0 under the restricted grammar described in
 [Network-client egress modeling](#network-client-egress-modeling-v070), as
-`curl` and `wget` did under the destination-aware egress rule.
+`curl` and `wget` did under the destination-aware egress rule; its `https`
+entry point left it in v0.7.1 under the same grammar with the https scheme
+forced onto a schemeless operand. `ssh` left that
+denylist in v0.7.1 under the closed destination grammar: only a single
+standalone `ssh` invocation with a positive destination is admitted — an IP
+literal, or a hostname the system resolver (which honors `/etc/hosts`) answers
+with exactly one non-local address — classified `network.remote-exec` with the
+exact granted destination attached to the approval — while every other
+spelling, and any hostname whose resolution is ambiguous, local, or failed,
+hard-denies with no approval path; the admitted address plus a fixed host-key
+identity are pinned into the spawned argv at every execution transport, and for
+a hostname destination the pinned operand is the resolved address while the
+host-key identity stays bound to the granted hostname. `scp` and `rsync` left
+that denylist in v0.7.1 under the closed bounded transfer grammar: only a
+single standalone transfer of exactly two operands with exactly one
+`user@host:path` remote operand is admitted, classified `network.remote-exec`
+with the exact granted destination attached to the approval, while every other
+remote-bearing spelling hard-denies with no approval path (the bounded-transfer
+clauses in the retained-denials passage below).
 
 ### Recursive rm analysis
 
@@ -341,22 +419,33 @@ writes are collected and gated first: a redirect target or an explicit output
 file outside policy is denied by the path layer before any egress authority is
 considered.
 
-`httpie` and `wget2` stay on the default denylist, and HTTPie's `https`
-entry point joins them:
+`httpie` and `wget2` stay on the default denylist:
 
 - **`httpie`.** Admission is gated on a test confirming that the INSTALLED
   entry point carries HTTPie's request grammar. That confirmation does not
   hold: HTTPie 3.x ships its plugin/CLI manager (`httpie plugins install ...`)
   under this name, and the request client is `http`. The gate fails closed, so
   every `httpie` spelling stays denied.
-- **`https`.** HTTPie's `https` entry point is the same request client with
-  the https scheme defaulted, and it has no documented, corpus-tested grammar
-  of its own — the `http` model above admits only HTTPie's request grammar.
-  Under the same prerequisite rule that keeps `wget2` and `httpie` denied, the
-  entry stays and every `https` spelling resolves denied fail-closed: a plain
-  remote destination, a loopback destination, and an https-scheme destination
-  alike, so no auto-allow rides beside the modeled `http`. Grammar modeling is
-  deferred to the v0.8.0 backlog.
+- **`https`.** HTTPie's `https` entry point is the same request client as
+  `http` and left the default denylist in v0.7.1 under the same restricted,
+  positional-only grammar: `https [METHOD] URL ITEM...` with the same closed
+  method set, the same literal request items, and no option admitted. The one
+  difference is the scheme. HTTPie forces `https://` onto a SCHEMELESS operand
+  for this program name — its parser reads the program name and prefixes the
+  scheme before `--default-scheme` is ever consulted, and no option is admitted
+  anyway — so a schemeless operand is a bounded destination the model can name:
+  a literal loopback one (`https localhost:8443/status`) resolves run-class and
+  a non-loopback one resolves ask-class as `network.egress`. An explicit scheme
+  is never rewritten, so `https http://host/` keeps its `http://` and really
+  does issue a plain-HTTP request: it hard-denies as a cross-scheme spelling,
+  with no operation ID and no approval path, and so does every other non-https
+  scheme (`ftp://`, `file://`). Every other rule of the `http` grammar applies
+  unchanged: an option, a request item that reads a local file, a missing
+  destination, a stray operand, and an invocation whose own environment sets
+  `HTTPIE_CONFIG_DIR` all hard-deny. HTTPie's localhost shorthand
+  (`https :8443/status`, i.e. `localhost:8443`) is not a literal URL the
+  recognizer parses, so it resolves ask-class rather than riding a loopback
+  auto-allow.
 - **`wget2`.** Loopback auto-allow requires a documented, corpus-tested effective redirect-disable, and no effective redirect-disable is established for wget2 in this release, so the denylist entry stays and every `wget2` spelling resolves denied — loopback `http(s)://` operands included. The remaining gates are pinned the same way rather than inherited from wget: recursive retrieval (`-r`/`--recursive`, `-p`, `-m`), input and config files (`-i FILE`/`--input-file`, `--config=FILE`, `--post-file`, `--body-file`), and an `-O` output path outside policy are all denied. wget2's user manual documents `--max-redirect=number` (default 20) with no documented disable value, and its `-e`/`--execute` option runs a startup command straight from the command line while `--local-plugin`/`--plugin` load code — effects a destination model would have to bound before admission. No wget2 binary is installed in the environment this release was verified in, so none of these flags were checked against a running client; the spellings come from the manual and the denial corpus pins the outcome, not flag parsing.
 
 #### FTP PASV residual
@@ -367,35 +456,87 @@ FTP honors the address in the server's PASV response and has no
 DISCLOSED for the modeled `wget` rather than gated; a future wget2 admission
 must gate or disclose it again instead of inheriting it silently. Until then a `wget2 ftp://...` operand is denied with the retained entry, and the corpus row that pins it records that denial rather than a loopback auto-allow.
 
-The `ssh`, `scp`, `rsync`, `ftp`, `telnet`, `aria2c`, `lftp`, and `watch`
-denials stand: destination parsing cannot bound remote command execution,
-secondary connections, or scripting, and `watch` is a command repeater rather
-than an egress client. In particular `ssh`, `scp`, and `rsync` are never
-classified as `network.egress`, so the separate `network.remote-exec` path can
-be modeled on top of them without this rule shadowing it.
+The `ftp`, `telnet`, `aria2c`, `lftp`, and `watch` denials
+stand: destination parsing cannot bound remote command execution, secondary
+connections, or scripting, and `watch` is a command repeater rather than an
+egress client. `ssh` is the exception since v0.7.1: its closed grammar admits
+only a positive destination — an IP literal, or a hostname the system resolver
+(which honors `/etc/hosts`) answers uniquely and non-locally — and the approved
+address plus a fixed `HostKeyAlias`/`UserKnownHostsFile` host-key identity are
+pinned into the actual argv every spawn point receives; for a hostname
+destination the resolved address rides as the destination operand while the
+`HostKeyAlias` pin stays bound to the granted hostname, and an ambiguous, local,
+or failed hostname resolution stays denied with no approval path. `scp` and
+`rsync` are the same exception since v0.7.1 under the closed bounded transfer
+grammar: only a single standalone transfer of exactly two operands, exactly
+one of them a `user@host:path` remote operand, is admitted — the host an IP
+literal or a uniquely and non-locally resolved hostname, the path inside a
+closed character set with no `..` segment — with only safe option clusters
+(and the `-P` port) admitted, classified `network.remote-exec` with the exact
+granted destination attached to the approval. Remote-to-remote copies,
+user-supplied transports (`-e`/`--rsh`, `-S`), symlink-following (`-L`),
+destination-mutating options (`--delete`, `--remove-source-files`, `-P`,
+`--inplace`, the backup/partial/temp-dir families), the legacy scp protocol
+and server-chosen names (`-O`, `-T`), the rsync daemon form (`host::module`),
+a remote spec with no user, and any local, ambiguous, or failed destination
+all hard-deny with no approval path; a transfer with no remote operand is an
+ordinary local copy governed by the path layer. The admitted transfer pins the
+same fixed `HostKeyAlias`/`UserKnownHostsFile` host-key identity and the
+resolved address into the actual argv every spawn point receives — for a
+hostname destination the resolved address rides as the remote operand's host
+while the `HostKeyAlias` pin stays bound to the granted hostname — and a
+changed resolution at spawn time never reaches the spawn. A locality-only
+attestation entry (network-namespace locality without the SSH trust context)
+does not admit transfers: it hard-denies `scp`/`rsync` even on a client that
+admits `ssh` execution. In particular
+`ssh`, `scp`, and `rsync` are never classified as `network.egress`, so the
+separate `network.remote-exec` path can be modeled on top of them without this
+rule shadowing it.
 
 ### Retained shell-policy limitations
 
 Some over-denials and inspection gaps are retained, documented trade-offs in
 this release; each names its fast-follow pointer:
 
-- **Trailing-`**` over-denial.** A run of two or more consecutive stars in a
-  path glob — including a trailing `**` — fails closed even when the shell's
-  own expansion is safe: zsh's recursive globstar spans directory levels the
-  one-component model cannot expand faithfully. The over-denial is retained
-  until the executor shell-option contract (fast-follow) lands.
-- **Extglob residual hazard.** The static model inspects plain POSIX globbing
-  only. The executor's shell normally runs with extended globbing off, but
-  under an extendedglob-active environment (for example one activated in
-  `~/.zshenv`) extended patterns can match more than the static model
-  inspects — an under-inspection hazard. Detection and modeling are
-  fast-follow, behind the executor shell-option contract.
+- **Trailing-`**` admission.** A path component whose trailing star run is
+  exactly two stars — `src/**`, never the recursive `**/` form — is admitted
+  for the whitelisted read commands (`cat` and `wc` with no options) through
+  the same literal argv plan a single `*` binds: the plan enumerates the real
+  directory, the words the OS receives are the plan's words, and the shell
+  never re-expands the original text. The admission is limited to that one
+  spelling and that one transport, and it requires an executor whose pinned
+  contract proves the run is single-level, which is why it does not reach
+  zsh: zsh's recursive search is not governed by any option the contract
+  holds off, and an unknown executor has no contract at all. The remaining
+  over-denial is the same spelling everywhere else — a run of three or more
+  stars, a run that does not end the component (`a**b`), a wildcard in a
+  middle component, and every command outside the whitelist still fail closed
+  on the path glob, and the retained per-call budgets, no-match, symlink, and
+  containment checks are unchanged.
+- **Extglob environment residual.** The static model inspects plain POSIX
+  globbing only, but the executor shell-option contract now pins the executing
+  shell itself: every spawned shell runs with the expansion-relevant option
+  families held off, startup-file environment variables scrubbed or redirected
+  away (so a `~/.zshenv` cannot switch extendedglob on), and the locale
+  pinned, while an unknown shell, an option-changing invocation, or a nested
+  shell re-entry with an expansion-bearing payload fails closed. Extended-glob
+  syntax without glob metacharacters (`^foo`, `foo#`, `a~b`) is detected
+  quote-aware and stays literal under the pinned contract. The residual is
+  root-owned: system-wide startup files (`/etc/zshenv`, `/etc/profile`) and the
+  shell binary itself remain a root-owned trust base, exactly like the
+  interpreter the model runs on.
 - **Quoted-variable conservative denial.** Static expansion intentionally
   resolves only plain unquoted words in provably read-only argument positions
   of whitelisted commands, bound only by literal assignments proven unchanged
-  through the invocation. A quoted variable — or a variable in any other
-  position — is conservatively denied rather than resolved. Resolution is
-  fast-follow.
+  through the invocation. One quoted spelling joins them: a whole
+  double-quoted `"$NAME"` or `"${NAME}"` word resolves by that same static
+  expansion — as exactly one literal argv element bound to the actual spawn —
+  but only when a literal assignment to that name precedes the command
+  unchanged in the same invocation. Every other quoted variable is still
+  conservatively denied rather than resolved: an empty value, an ambient
+  (unassigned) name, a prefixed assignment value, a modifier form such as
+  `${NAME:-default}`, and a concatenated or nested word such as `"pre$NAME"`
+  or `"$NAME$OTHER"`.
 - **Find pattern-operand carve-out.** Quoted or literal `find -name`,
   `-iname`, `-path`, and `-ipath` operand tokens bypass path-glob inspection:
   the shell never pathname-expands them, so they remain pure pattern data,

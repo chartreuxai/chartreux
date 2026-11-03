@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+import asyncio
+from pathlib import Path
+import threading
+from typing import Any
 from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
@@ -13,6 +17,7 @@ from chartreux.core.compaction.context import (
     render_compaction_context,
     select_model_context,
 )
+from chartreux.core.compaction.manager import PendingPostTurnTrim
 from chartreux.core.errors import ContextTooLongError
 from chartreux.core.file_outline import outline_source
 from chartreux.core.file_revision import full_revision
@@ -26,7 +31,15 @@ from chartreux.core.llm_models import (
     ToolCall,
 )
 from chartreux.core.message_list import MessageList
+from chartreux.core.session.session_loader import MESSAGES_FILENAME
+from chartreux.core.session.session_logger import (
+    PostTurnTrimResult,
+    SessionDiskFullError,
+    SessionLogger,
+)
+from chartreux.core.session.transcript_archive import verify_archived_prefix_on_disk
 from chartreux.core.session_types import AgentStats
+from chartreux.core.tools.manager import ToolManager
 from chartreux.core.usage import UsagePurpose
 from tests.conftest import (
     build_test_agent_loop,
@@ -34,6 +47,11 @@ from tests.conftest import (
     make_test_models,
 )
 from tests.mock.utils import mock_llm_chunk
+from tests.session.persistence._session_persistence_support import (
+    mock_tool_manager as mock_tool_manager,
+    session_config as session_config,
+    temp_session_dir as temp_session_dir,
+)
 from tests.stubs.fake_backend import FakeBackend
 
 
@@ -1046,3 +1064,838 @@ async def test_compaction_during_active_invocation_leaves_the_active_invocation_
         "newest ask",
         messages[-1].content,
     ]
+
+
+def _boundary_message(content: str = "compaction boundary") -> LLMMessage:
+    return LLMMessage(
+        role=Role.user, content=content, injected=True, context_boundary="compaction"
+    )
+
+
+class _PendingTrimBox:
+    """Stand-in for the loop's pending-trim holder (getter + recorder pair)."""
+
+    def __init__(self) -> None:
+        self.value: PendingPostTurnTrim | None = None
+
+    def getter(self) -> PendingPostTurnTrim | None:
+        return self.value
+
+    def recorder(self, pending: PendingPostTurnTrim | None) -> None:
+        self.value = pending
+
+
+def _build_post_turn_manager(
+    *,
+    messages: MessageList,
+    stats: AgentStats,
+    active_turn: bool,
+    box: _PendingTrimBox,
+    seal_receipt: Mock | None = None,
+) -> tuple[CompactionManager, Mock]:
+    cfg = build_test_vibe_config(
+        models=make_test_models(auto_compact_threshold=999),
+        raise_on_compaction_failure=False,
+    )
+    complete = _FakeComplete(
+        [mock_llm_chunk(content="<summary>post-turn</summary>")], stats
+    )
+    fake_logger = Mock()
+    fake_logger.enabled = True
+    fake_logger.seal_archive = AsyncMock()
+    # T1b: the entry completes the recorded pending through the logger's
+    # drain/fence/seal/publish method (a Mock intercepts it, so seal_archive and
+    # fence_and_publish_archive_trim are never reached through the entry).
+    fake_logger.complete_post_turn_trim = AsyncMock(
+        return_value=PostTurnTrimResult("published")
+    )
+    if seal_receipt is not None:
+        fake_logger.seal_archive.return_value = seal_receipt
+    manager = CompactionManager(
+        messages=messages,
+        stats_getter=lambda: stats,
+        config_getter=lambda: cfg,
+        complete=complete,
+        available_tools=lambda: [],
+        tool_choice=lambda: "auto",
+        save=_noop,
+        session_logger_getter=lambda: fake_logger,
+        tool_manager_getter=lambda: Mock(),
+        has_active_turn=lambda: active_turn,
+        trim_enabled_getter=lambda: True,
+        pending_trim_getter=box.getter,
+        pending_trim_recorder=box.recorder,
+    )
+    return manager, fake_logger
+
+
+@pytest.mark.asyncio
+async def test_post_turn_entry_records_then_completes_the_pending_at_the_seam() -> None:
+    # T1b positive arm (mocked logger): at the post-finalization seam (the turn
+    # is still registered — after seal_turn, before _active_turn = None) the
+    # guarded entry records pending state keyed by session/epoch/boundary (the
+    # single recording point) and then makes it LIVE at the same seam by
+    # awaiting the logger's drain/fence/seal/publish completion with the
+    # recorded key. The holder is consumed at the attempt boundary.
+    messages = _conversation()
+    boundary = _boundary_message()
+    messages.append(boundary)
+    stats = AgentStats()
+    box = _PendingTrimBox()
+    manager, fake_logger = _build_post_turn_manager(
+        messages=messages, stats=stats, active_turn=True, box=box
+    )
+
+    await manager.capture_post_turn_pending_trim(
+        session_id="session-1", message_epoch=messages.message_epoch
+    )
+
+    # The completion ran exactly once, with the recorded pending key.
+    fake_logger.complete_post_turn_trim.assert_awaited_once()
+    call = fake_logger.complete_post_turn_trim.await_args
+    assert call.kwargs["session_id"] == "session-1"
+    assert call.kwargs["message_epoch"] == messages.message_epoch
+    assert call.kwargs["boundary_message_id"] == boundary.message_id
+    # The holder is consumed at the attempt boundary.
+    assert box.value is None
+    # Through the mocked logger the raw sealing surface is never reached by the
+    # entry itself (the completion method owns it).
+    fake_logger.seal_archive.assert_not_called()
+    fake_logger.fence_and_publish_archive_trim.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_post_turn_entry_coalesces_to_the_newest_boundary() -> None:
+    # Coalescing: a second post-turn attempt with a newer boundary replaces
+    # the pending record (newest wins, never stacked) and the completion runs
+    # with the newest boundary.
+    messages = _conversation()
+    first = _boundary_message("first boundary")
+    messages.append(first)
+    stats = AgentStats()
+    box = _PendingTrimBox()
+    manager, fake_logger = _build_post_turn_manager(
+        messages=messages, stats=stats, active_turn=True, box=box
+    )
+
+    await manager.capture_post_turn_pending_trim(
+        session_id="session-1", message_epoch=messages.message_epoch
+    )
+    assert fake_logger.complete_post_turn_trim.await_count == 1
+    assert (
+        fake_logger.complete_post_turn_trim.await_args.kwargs["boundary_message_id"]
+        == first.message_id
+    )
+
+    second = _boundary_message("second boundary")
+    messages.append(second)
+    await manager.capture_post_turn_pending_trim(
+        session_id="session-1", message_epoch=messages.message_epoch
+    )
+
+    assert fake_logger.complete_post_turn_trim.await_count == 2
+    assert (
+        fake_logger.complete_post_turn_trim.await_args.kwargs["boundary_message_id"]
+        == second.message_id
+    )
+    assert box.value is None
+    fake_logger.seal_archive.assert_not_called()
+    fake_logger.fence_and_publish_archive_trim.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_post_turn_entry_never_invents_a_boundary() -> None:
+    # No compaction boundary in the list: the entry records nothing and never
+    # reaches the completion — a boundary is never created merely to trim.
+    messages = _conversation()
+    stats = AgentStats()
+    box = _PendingTrimBox()
+    manager, fake_logger = _build_post_turn_manager(
+        messages=messages, stats=stats, active_turn=True, box=box
+    )
+
+    await manager.capture_post_turn_pending_trim(
+        session_id="session-1", message_epoch=messages.message_epoch
+    )
+
+    assert box.value is None
+    fake_logger.complete_post_turn_trim.assert_not_called()
+    fake_logger.seal_archive.assert_not_called()
+    fake_logger.fence_and_publish_archive_trim.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_post_turn_entry_skips_an_invalid_prefix() -> None:
+    # A boundary with nothing settled before it: the eligible prefix is
+    # invalid (None), so the entry skips it and records nothing.
+    messages = MessageList([
+        LLMMessage(role=Role.system, content="sys"),
+        _boundary_message(),
+    ])
+    stats = AgentStats()
+    box = _PendingTrimBox()
+    manager, fake_logger = _build_post_turn_manager(
+        messages=messages, stats=stats, active_turn=True, box=box
+    )
+
+    await manager.capture_post_turn_pending_trim(
+        session_id="session-1", message_epoch=messages.message_epoch
+    )
+
+    assert box.value is None
+    fake_logger.complete_post_turn_trim.assert_not_called()
+    fake_logger.seal_archive.assert_not_called()
+    fake_logger.fence_and_publish_archive_trim.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_post_turn_entry_discards_a_stale_pending_on_rebind() -> None:
+    # Stale rebind discard — the T1a MUTATION TARGET (design JJJ): the epoch
+    # check is what makes this arm discriminating. The discard is observed AT
+    # THE ATTEMPT BOUNDARY: after a rebind (new message epoch, no boundary in
+    # the rebound list) the stale pending is cleared and no completion runs.
+    # Removing the epoch check leaves the stale pending in place, so the
+    # cleared-state assertion below fails.
+    messages = _conversation()
+    boundary = _boundary_message()
+    messages.append(boundary)
+    stats = AgentStats()
+    box = _PendingTrimBox()
+    manager, fake_logger = _build_post_turn_manager(
+        messages=messages, stats=stats, active_turn=True, box=box
+    )
+
+    await manager.capture_post_turn_pending_trim(
+        session_id="session-1", message_epoch=messages.message_epoch
+    )
+    assert fake_logger.complete_post_turn_trim.await_count == 1
+
+    # Rebind (reset/resume): new message epoch, no boundary in the new list.
+    messages.reset([
+        LLMMessage(role=Role.system, content="sys"),
+        LLMMessage(role=Role.user, content="fresh ask"),
+    ])
+    new_epoch = messages.message_epoch
+    assert new_epoch != 0
+
+    await manager.capture_post_turn_pending_trim(
+        session_id="session-1", message_epoch=new_epoch
+    )
+
+    # The discard, observed at the attempt boundary: pending cleared, no
+    # completion for the stale key.
+    assert box.value is None
+    assert fake_logger.complete_post_turn_trim.await_count == 1
+    fake_logger.seal_archive.assert_not_called()
+    fake_logger.fence_and_publish_archive_trim.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_baseline_trim_path_still_seals_when_no_turn_is_active() -> None:
+    # The baseline trim path (the seal+publish block in _trim_archived_prefix)
+    # is UNCHANGED by T1b — with no active turn it still seals and publishes
+    # exactly as before.
+    messages = _conversation()
+    messages.append(_boundary_message())
+    stats = AgentStats()
+    box = _PendingTrimBox()
+    receipt = Mock()
+    receipt.descriptor.archived_count = 2  # eligible prefix of _conversation()+boundary
+    receipt.descriptor.trim_mode = "payloads"
+    manager, fake_logger = _build_post_turn_manager(
+        messages=messages, stats=stats, active_turn=False, box=box, seal_receipt=receipt
+    )
+
+    await manager._trim_archived_prefix()
+
+    fake_logger.seal_archive.assert_awaited_once()
+    fake_logger.fence_and_publish_archive_trim.assert_called_once()
+    # The post-turn entry's seam guard declines here (no turn is registered),
+    # so it records nothing and never reaches the completion.
+    await manager.capture_post_turn_pending_trim(
+        session_id="session-1", message_epoch=messages.message_epoch
+    )
+    assert box.value is None
+    fake_logger.complete_post_turn_trim.assert_not_called()
+    fake_logger.seal_archive.assert_awaited_once()
+
+
+# ---------------------------------------------------------------------------
+# T1b completion arms with a REAL SessionLogger (drain/fence/seal/publish)
+# ---------------------------------------------------------------------------
+
+
+def _messages_path(logger: SessionLogger) -> Path:
+    session_dir = logger.session_dir
+    assert session_dir is not None
+    return session_dir / MESSAGES_FILENAME
+
+
+def _post_turn_config() -> Any:
+    return build_test_vibe_config(
+        models=make_test_models(auto_compact_threshold=999),
+        raise_on_compaction_failure=False,
+    )
+
+
+def _build_real_post_turn_manager(
+    *,
+    logger: SessionLogger,
+    messages: MessageList,
+    stats: AgentStats,
+    tool_manager: ToolManager,
+    box: _PendingTrimBox,
+    active_turn: bool = True,
+) -> CompactionManager:
+    cfg = _post_turn_config()
+    complete = _FakeComplete([], stats)
+    return CompactionManager(
+        messages=messages,
+        stats_getter=lambda: stats,
+        config_getter=lambda: cfg,
+        complete=complete,
+        available_tools=lambda: [],
+        tool_choice=lambda: "auto",
+        save=_noop,
+        session_logger_getter=lambda: logger,
+        tool_manager_getter=lambda: tool_manager,
+        has_active_turn=lambda: active_turn,
+        trim_enabled_getter=lambda: True,
+        pending_trim_getter=box.getter,
+        pending_trim_recorder=box.recorder,
+    )
+
+
+def _non_system(messages: MessageList) -> list[LLMMessage]:
+    return [message for message in messages if message.role is not Role.system]
+
+
+def _outcome_spy(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    """Record every complete_post_turn_trim outcome in call order."""
+    outcomes: list[str] = []
+    real_complete = SessionLogger.complete_post_turn_trim
+
+    async def _spy(self: SessionLogger, *args: Any, **kwargs: Any) -> Any:
+        result = await real_complete(self, *args, **kwargs)
+        outcomes.append(result.outcome)
+        return result
+
+    monkeypatch.setattr(SessionLogger, "complete_post_turn_trim", _spy)
+    return outcomes
+
+
+@pytest.mark.asyncio
+async def test_post_turn_entry_seals_and_publishes_at_the_seam_with_a_real_logger(
+    session_config: Any, mock_tool_manager: ToolManager
+) -> None:
+    # T1b positive post-turn arm with a real logger: the guarded entry drains,
+    # fences, seals and publishes the recorded pending at the exclusive seam.
+    from chartreux.core.agent_loop._transcript_integrity import archive_reference
+
+    config = _post_turn_config()
+    logger = SessionLogger(session_config, "t1b-seam")
+    messages = _conversation()
+    boundary = _boundary_message()
+    boundary_id = boundary.message_id
+    assert boundary_id is not None
+    messages.append(boundary)
+    stats = AgentStats()
+    # The boundary is persisted with the originals present (the compact() save).
+    await logger.save_interaction(messages, stats, config, mock_tool_manager)
+    box = _PendingTrimBox()
+    manager = _build_real_post_turn_manager(
+        logger=logger,
+        messages=messages,
+        stats=stats,
+        tool_manager=mock_tool_manager,
+        box=box,
+    )
+    generation_before = logger.transcript_save_generation
+
+    await manager.capture_post_turn_pending_trim(
+        session_id="t1b-seam", message_epoch=messages.message_epoch
+    )
+
+    # Descriptor advance: both owners carry the new descriptor for the boundary.
+    descriptor = messages.archive_descriptor
+    assert descriptor is not None
+    assert descriptor.archived_count == 2  # settled round before the boundary
+    assert descriptor.boundary_message_id == boundary.message_id
+    assert logger.archive_descriptor is descriptor
+    # Fenced publication: the save generation moved (the fence ran) and the
+    # sealed slots carry the archive marker; the tail stays live.
+    assert logger.transcript_save_generation > generation_before
+    sealed = _non_system(messages)[: descriptor.archived_count]
+    assert all(archive_reference(message) is descriptor for message in sealed)
+    tail = _non_system(messages)[descriptor.archived_count :]
+    assert [message.context_boundary for message in tail] == [None, "compaction"]
+    assert all(archive_reference(message) is None for message in tail)
+    # The archived prefix on disk verifies against the descriptor.
+    verify_archived_prefix_on_disk(descriptor, _messages_path(logger))
+    # The holder is consumed at the attempt boundary.
+    assert box.value is None
+    # Exclusivity: a second attempt for the same boundary is excluded, not a
+    # concurrent seal/publication.
+    result = await logger.complete_post_turn_trim(
+        messages,
+        stats,
+        config,
+        mock_tool_manager,
+        session_id="t1b-seam",
+        message_epoch=messages.message_epoch,
+        boundary_message_id=boundary_id,
+    )
+    assert result.outcome == "excluded_already_published"
+    assert messages.archive_descriptor is descriptor
+
+
+@pytest.mark.asyncio
+async def test_post_turn_completion_is_exclusive_per_boundary(
+    session_config: Any, mock_tool_manager: ToolManager, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Exclusivity arm: while one drain/fence/seal/publish attempt for a boundary
+    # is in flight, a concurrent attempt for the SAME boundary is excluded at
+    # the attempt boundary — exactly one seal and one publication happen.
+    config = _post_turn_config()
+    logger = SessionLogger(session_config, "t1b-exclusive")
+    messages = _conversation()
+    boundary = _boundary_message()
+    messages.append(boundary)
+    stats = AgentStats()
+    await logger.save_interaction(messages, stats, config, mock_tool_manager)
+
+    seal_calls = 0
+    real_seal = SessionLogger.seal_archive
+
+    async def _seal_spy(self: SessionLogger, *args: Any, **kwargs: Any) -> Any:
+        nonlocal seal_calls
+        seal_calls += 1
+        return await real_seal(self, *args, **kwargs)
+
+    fence_calls = 0
+    real_fence = SessionLogger.fence_and_publish_archive_trim
+
+    def _fence_spy(self: SessionLogger, *args: Any, **kwargs: Any) -> Any:
+        nonlocal fence_calls
+        fence_calls += 1
+        return real_fence(self, *args, **kwargs)
+
+    # Gate the sealing plan (runs on a worker thread) so the first attempt is
+    # observably in flight inside the seal when the second attempt arrives.
+    plan_entered = threading.Event()
+    plan_release = threading.Event()
+    real_plan = SessionLogger._plan_archive_seal
+
+    def _gated_plan(self: SessionLogger, *args: Any, **kwargs: Any) -> Any:
+        plan_entered.set()
+        plan_release.wait(timeout=30)
+        return real_plan(self, *args, **kwargs)
+
+    monkeypatch.setattr(SessionLogger, "seal_archive", _seal_spy)
+    monkeypatch.setattr(SessionLogger, "fence_and_publish_archive_trim", _fence_spy)
+    monkeypatch.setattr(SessionLogger, "_plan_archive_seal", _gated_plan)
+
+    kwargs = {
+        "session_id": "t1b-exclusive",
+        "message_epoch": messages.message_epoch,
+        "boundary_message_id": boundary.message_id,
+    }
+    first = asyncio.create_task(
+        logger.complete_post_turn_trim(
+            messages, stats, config, mock_tool_manager, **kwargs
+        )
+    )
+    try:
+        deadline = asyncio.get_running_loop().time() + 10
+        while not plan_entered.is_set():
+            assert asyncio.get_running_loop().time() < deadline, (
+                "the first attempt never reached the sealing plan"
+            )
+            await asyncio.sleep(0.005)
+        # The first attempt holds the boundary in flight: a concurrent attempt
+        # for the same boundary is excluded at the attempt boundary.
+        second = await logger.complete_post_turn_trim(
+            messages, stats, config, mock_tool_manager, **kwargs
+        )
+        assert second.outcome == "excluded_concurrent"
+        assert seal_calls == 1
+        plan_release.set()
+        first_result = await first
+    finally:
+        plan_release.set()
+    assert first_result.outcome == "published"
+    # Exactly one seal and one fenced publication for the boundary.
+    assert seal_calls == 1
+    assert fence_calls == 1
+    assert logger._trim_published_boundaries == {boundary.message_id}
+    assert logger._trim_in_flight_boundaries == set()
+    assert messages.archive_descriptor is not None
+
+
+@pytest.mark.asyncio
+async def test_post_turn_completion_drains_queued_saves_before_fencing(
+    session_config: Any, mock_tool_manager: ToolManager, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Drain arm: a save queued/in-flight when the completion starts is drained
+    # (it finishes under the save lock) BEFORE the sealing persist runs, and
+    # the publication fence moves the save generation afterwards.
+    config = _post_turn_config()
+    logger = SessionLogger(session_config, "t1b-drain")
+    messages = _conversation()
+    boundary = _boundary_message()
+    boundary_id = boundary.message_id
+    assert boundary_id is not None
+    messages.append(boundary)
+    stats = AgentStats()
+    await logger.save_interaction(messages, stats, config, mock_tool_manager)
+
+    order: list[str] = []
+    save_entered = threading.Event()
+    save_release = threading.Event()
+    real_sync = SessionLogger._save_interaction_sync
+    sync_calls = 0
+
+    def _gated_sync(self: SessionLogger, *args: Any, **kwargs: Any) -> Any:
+        nonlocal sync_calls
+        sync_calls += 1
+        if sync_calls == 1:
+            # The queued ordinary save's persist: block while holding the lock.
+            order.append("save-persist-start")
+            save_entered.set()
+            save_release.wait(timeout=30)
+            order.append("save-persist-end")
+        else:
+            order.append("seal-persist-start")
+        return real_sync(self, *args, **kwargs)
+
+    monkeypatch.setattr(SessionLogger, "_save_interaction_sync", _gated_sync)
+    messages.append(LLMMessage(role=Role.assistant, content="extra answer"))
+    queued_save = asyncio.create_task(
+        logger.save_interaction(messages, stats, config, mock_tool_manager)
+    )
+    try:
+        deadline = asyncio.get_running_loop().time() + 10
+        while not save_entered.is_set():
+            assert asyncio.get_running_loop().time() < deadline, (
+                "the queued save never started its persist"
+            )
+            await asyncio.sleep(0.005)
+        generation_before = logger.transcript_save_generation
+        completion = asyncio.create_task(
+            logger.complete_post_turn_trim(
+                messages,
+                stats,
+                config,
+                mock_tool_manager,
+                session_id="t1b-drain",
+                message_epoch=messages.message_epoch,
+                boundary_message_id=boundary_id,
+            )
+        )
+        # While the queued save holds the lock, the completion is still draining.
+        await asyncio.sleep(0.05)
+        assert order == ["save-persist-start"]
+        assert not completion.done()
+        save_release.set()
+        await queued_save
+        result = await completion
+    finally:
+        save_release.set()
+    assert result.outcome == "published"
+    # The queued save drained completely before the sealing persist began.
+    assert order == ["save-persist-start", "save-persist-end", "seal-persist-start"]
+    # The publication fence moved the save generation.
+    assert logger.transcript_save_generation > generation_before
+
+
+@pytest.mark.asyncio
+async def test_post_turn_completion_failed_seal_retains_originals_and_recovers(
+    session_config: Any, mock_tool_manager: ToolManager, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Failed-finalization arm: the sealing persist fails — no receipt, the
+    # originals are retained, nothing is published, the holder is consumed, and
+    # the turn is still complete (a later seam retries and succeeds).
+    from chartreux.core.agent_loop._transcript_integrity import archive_reference
+
+    config = _post_turn_config()
+    logger = SessionLogger(session_config, "t1b-failed")
+    messages = _conversation()
+    boundary = _boundary_message()
+    messages.append(boundary)
+    stats = AgentStats()
+    await logger.save_interaction(messages, stats, config, mock_tool_manager)
+    box = _PendingTrimBox()
+    manager = _build_real_post_turn_manager(
+        logger=logger,
+        messages=messages,
+        stats=stats,
+        tool_manager=mock_tool_manager,
+        box=box,
+    )
+    outcomes = _outcome_spy(monkeypatch)
+    real_sync = SessionLogger._seal_persist_sync
+
+    def _disk_full(*args: Any, **kwargs: Any) -> Any:
+        raise SessionDiskFullError(_messages_path(logger), "seal persist")
+
+    monkeypatch.setattr(SessionLogger, "_seal_persist_sync", _disk_full)
+
+    await manager.capture_post_turn_pending_trim(
+        session_id="t1b-failed", message_epoch=messages.message_epoch
+    )
+
+    assert outcomes == ["failed_seal"]
+    # Originals retained: no descriptor on either owner, no markers, the
+    # transcript on disk still holds the boundary and the originals.
+    assert messages.archive_descriptor is None
+    assert logger.archive_descriptor is None
+    assert all(archive_reference(message) is None for message in messages)
+    assert box.value is None
+    raw = _messages_path(logger).read_bytes()
+    assert b'"context_boundary": "compaction"' in raw
+    # The turn is still complete: with the failure removed, a later seam
+    # retries and publishes.
+    monkeypatch.setattr(SessionLogger, "_seal_persist_sync", real_sync)
+    await manager.capture_post_turn_pending_trim(
+        session_id="t1b-failed", message_epoch=messages.message_epoch
+    )
+    assert outcomes == ["failed_seal", "published"]
+    assert messages.archive_descriptor is not None
+    assert logger.archive_descriptor is messages.archive_descriptor
+
+
+@pytest.mark.asyncio
+async def test_post_turn_completion_cancelled_retains_originals(
+    session_config: Any, mock_tool_manager: ToolManager, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Cancelled-finalization arm: the completion is cancelled mid-seal — the
+    # in-flight persist is drained inside seal_archive, no receipt is issued,
+    # nothing is published, the originals are retained, the holder is consumed,
+    # and the entry absorbs the cancellation so the completed turn does not
+    # become a failure (a later seam works).
+    from chartreux.core.agent_loop._transcript_integrity import archive_reference
+
+    config = _post_turn_config()
+    logger = SessionLogger(session_config, "t1b-cancelled")
+    messages = _conversation()
+    boundary = _boundary_message()
+    messages.append(boundary)
+    stats = AgentStats()
+    await logger.save_interaction(messages, stats, config, mock_tool_manager)
+    box = _PendingTrimBox()
+    manager = _build_real_post_turn_manager(
+        logger=logger,
+        messages=messages,
+        stats=stats,
+        tool_manager=mock_tool_manager,
+        box=box,
+    )
+    fence_calls = 0
+    real_fence = SessionLogger.fence_and_publish_archive_trim
+
+    def _fence_spy(self: SessionLogger, *args: Any, **kwargs: Any) -> Any:
+        nonlocal fence_calls
+        fence_calls += 1
+        return real_fence(self, *args, **kwargs)
+
+    plan_entered = threading.Event()
+    plan_release = threading.Event()
+    real_plan = SessionLogger._plan_archive_seal
+
+    def _gated_plan(self: SessionLogger, *args: Any, **kwargs: Any) -> Any:
+        plan_entered.set()
+        plan_release.wait(timeout=30)
+        return real_plan(self, *args, **kwargs)
+
+    monkeypatch.setattr(SessionLogger, "fence_and_publish_archive_trim", _fence_spy)
+    monkeypatch.setattr(SessionLogger, "_plan_archive_seal", _gated_plan)
+
+    entry_task = asyncio.create_task(
+        manager.capture_post_turn_pending_trim(
+            session_id="t1b-cancelled", message_epoch=messages.message_epoch
+        )
+    )
+    try:
+        deadline = asyncio.get_running_loop().time() + 10
+        while not plan_entered.is_set():
+            assert asyncio.get_running_loop().time() < deadline, (
+                "the completion never reached the sealing plan"
+            )
+            await asyncio.sleep(0.005)
+        entry_task.cancel()
+        try:
+            await entry_task
+        except asyncio.CancelledError:
+            # The runtime may deliver the cancellation to the awaiter even
+            # though the entry absorbed it internally; either way the entry has
+            # finished and nothing was published.
+            pass
+    finally:
+        plan_release.set()
+    # Nothing partially published: no fence, no descriptor, no markers,
+    # holder consumed, originals on disk.
+    assert fence_calls == 0
+    assert messages.archive_descriptor is None
+    assert logger.archive_descriptor is None
+    assert all(archive_reference(message) is None for message in messages)
+    assert box.value is None
+    assert logger._trim_in_flight_boundaries == set()
+    raw = _messages_path(logger).read_bytes()
+    assert b'"context_boundary": "compaction"' in raw
+    # The turn is still complete: a later seam (plan restored) publishes.
+    monkeypatch.setattr(SessionLogger, "_plan_archive_seal", real_plan)
+    await manager.capture_post_turn_pending_trim(
+        session_id="t1b-cancelled", message_epoch=messages.message_epoch
+    )
+    assert messages.archive_descriptor is not None
+    assert fence_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_post_turn_seal_succeeds_but_publish_fails_keeps_originals(
+    session_config: Any, mock_tool_manager: ToolManager, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Seal-succeeds-but-cannot-publish arm: a first boundary is published
+    # (pre-seal state = descriptor D1); a second boundary's seal SUCCEEDS but
+    # the publication fails — the pre-seal archived bytes and descriptor D1
+    # remain effective, nothing is partially published, and the outcome is
+    # reported explicitly as failed_publish with the receipt.
+    from chartreux.core.agent_loop._transcript_integrity import archive_reference
+
+    config = _post_turn_config()
+    logger = SessionLogger(session_config, "t1b-cannot-publish")
+    messages = _conversation()
+    first_boundary = _boundary_message("first boundary")
+    messages.append(first_boundary)
+    stats = AgentStats()
+    await logger.save_interaction(messages, stats, config, mock_tool_manager)
+    box = _PendingTrimBox()
+    manager = _build_real_post_turn_manager(
+        logger=logger,
+        messages=messages,
+        stats=stats,
+        tool_manager=mock_tool_manager,
+        box=box,
+    )
+    outcomes = _outcome_spy(monkeypatch)
+
+    await manager.capture_post_turn_pending_trim(
+        session_id="t1b-cannot-publish", message_epoch=messages.message_epoch
+    )
+    d1 = messages.archive_descriptor
+    assert d1 is not None and logger.archive_descriptor is d1
+
+    # A newer settled round plus a second boundary.
+    messages.append(LLMMessage(role=Role.user, content="third ask"))
+    messages.append(LLMMessage(role=Role.assistant, content="third answer"))
+    second_boundary = _boundary_message("second boundary")
+    messages.append(second_boundary)
+    await logger.save_interaction(messages, stats, config, mock_tool_manager)
+
+    results: list[Any] = []
+    real_complete = SessionLogger.complete_post_turn_trim
+
+    async def _capturing_spy(self: SessionLogger, *args: Any, **kwargs: Any) -> Any:
+        result = await real_complete(self, *args, **kwargs)
+        results.append(result)
+        return result
+
+    monkeypatch.setattr(SessionLogger, "complete_post_turn_trim", _capturing_spy)
+
+    def _cannot_publish(self: SessionLogger, *args: Any, **kwargs: Any) -> Any:
+        raise ValueError("simulated cannot-publish (stale fence)")
+
+    monkeypatch.setattr(
+        SessionLogger, "fence_and_publish_archive_trim", _cannot_publish
+    )
+
+    await manager.capture_post_turn_pending_trim(
+        session_id="t1b-cannot-publish", message_epoch=messages.message_epoch
+    )
+
+    assert outcomes == ["published", "failed_publish"]
+    assert results[-1].outcome == "failed_publish"
+    assert results[-1].receipt is not None  # the seal receipt is reported
+    # The pre-seal descriptor remains effective on both owners.
+    assert logger.archive_descriptor is d1
+    assert messages.archive_descriptor is d1
+    # The original archived bytes on disk still verify against D1.
+    verify_archived_prefix_on_disk(d1, _messages_path(logger))
+    # Nothing partially published: the newly eligible region keeps its
+    # originals (no markers beyond D1's sealed slots).
+    non_system = _non_system(messages)
+    assert all(
+        archive_reference(message) is d1 for message in non_system[: d1.archived_count]
+    )
+    assert all(
+        archive_reference(message) is None
+        for message in non_system[d1.archived_count :]
+    )
+    assert box.value is None
+
+
+@pytest.mark.asyncio
+async def test_post_turn_completion_refuses_stale_epoch_and_session_keys(
+    session_config: Any, mock_tool_manager: ToolManager, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The epoch/fence check in the completion path: a pending keyed to a stale
+    # message epoch (after a rebind) or another session is refused AT THE
+    # ATTEMPT BOUNDARY — never sealed, never published.
+    config = _post_turn_config()
+    logger = SessionLogger(session_config, "t1b-refused")
+    messages = _conversation()
+    boundary = _boundary_message()
+    boundary_id = boundary.message_id
+    assert boundary_id is not None
+    messages.append(boundary)
+    stats = AgentStats()
+    await logger.save_interaction(messages, stats, config, mock_tool_manager)
+    seal_calls = 0
+    real_seal = SessionLogger.seal_archive
+
+    async def _seal_spy(self: SessionLogger, *args: Any, **kwargs: Any) -> Any:
+        nonlocal seal_calls
+        seal_calls += 1
+        return await real_seal(self, *args, **kwargs)
+
+    monkeypatch.setattr(SessionLogger, "seal_archive", _seal_spy)
+
+    stale_epoch = await logger.complete_post_turn_trim(
+        messages,
+        stats,
+        config,
+        mock_tool_manager,
+        session_id="t1b-refused",
+        message_epoch=messages.message_epoch + 1,
+        boundary_message_id=boundary_id,
+    )
+    assert stale_epoch.outcome == "refused_epoch_mismatch"
+
+    wrong_session = await logger.complete_post_turn_trim(
+        messages,
+        stats,
+        config,
+        mock_tool_manager,
+        session_id="another-session",
+        message_epoch=messages.message_epoch,
+        boundary_message_id=boundary_id,
+    )
+    assert wrong_session.outcome == "refused_session_mismatch"
+
+    wrong_boundary = await logger.complete_post_turn_trim(
+        messages,
+        stats,
+        config,
+        mock_tool_manager,
+        session_id="t1b-refused",
+        message_epoch=messages.message_epoch,
+        boundary_message_id="no-such-boundary",
+    )
+    assert wrong_boundary.outcome == "refused_boundary_mismatch"
+
+    # No seal ran for any refused key; nothing was published.
+    assert seal_calls == 0
+    assert messages.archive_descriptor is None
+    assert logger.archive_descriptor is None
+    assert logger._trim_in_flight_boundaries == set()
+    assert logger._trim_published_boundaries == set()

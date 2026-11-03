@@ -5192,8 +5192,9 @@ class ChartreuxApp(App):  # noqa: PLR0904
             warning = (
                 "⚠ Untrusted local config folders are being ignored:\n\n"
                 f"{folders}\n\n"
-                f'If you want them loaded, remove them from "untrusted" in '
-                f"{response.settings_path}, or ask Chartreux to do it."
+                "If you want them loaded, review the stored decisions with "
+                "`chartreux trust list` and remove the matching entries with "
+                "`chartreux trust remove <path>`."
             )
             await self._mount_and_scroll(WarningMessage(warning, show_border=False))
             await asyncio.to_thread(

@@ -76,10 +76,16 @@ class DangerousCommandGrantScopeWire(ProtocolModel):
 
 
 class DangerousCommandGrantWire(ProtocolModel):
-    """One dangerous-command authority entry: an operation in one scope."""
+    """One dangerous-command authority entry: an operation in one scope.
+
+    ``destination`` carries the exact canonical destination
+    (``user@host:port``) for a ``network.remote-exec`` entry and is ``None``
+    for every scope-only operation.
+    """
 
     operation_id: str
     scope: DangerousCommandGrantScopeWire
+    destination: str | None = None
 
 
 class DangerousCommandDenylistBlockWire(ProtocolModel):
@@ -106,10 +112,11 @@ class DangerousCommandAuthorityReadResponse(ProtocolModel):
     is the saved user-config authority the session's accepted restrictions
     contribute for the registered project. ``saved_operations`` and
     ``disk_revision`` are the fresh disk read (``None`` when unavailable), and
-    ``disk_revision`` is the expected revision for a saved removal.
-    ``live_authority_generation`` is the expected live revision for a
-    revocation. No project key is accepted: the project is always the
-    registered session's own working directory.
+    ``disk_revision`` is the expected revision for a saved removal;
+    ``saved_destinations`` is the same disk read's remote-exec destinations
+    (also ``None`` when unavailable). ``live_authority_generation`` is the
+    expected live revision for a revocation. No project key is accepted: the
+    project is always the registered session's own working directory.
     """
 
     project: str
@@ -117,6 +124,7 @@ class DangerousCommandAuthorityReadResponse(ProtocolModel):
     live_grants: list[DangerousCommandGrantWire]
     accepted_saved_grants: list[DangerousCommandGrantWire]
     saved_operations: list[str] | None = None
+    saved_destinations: list[str] | None = None
     disk_revision: str | None = None
     blocking_denylist: list[DangerousCommandDenylistBlockWire]
 
@@ -126,6 +134,11 @@ class DangerousCommandRevokeParams(ProtocolModel):
     operation_id: str
     expected_live_generation: int = Field(ge=0)
     expected_disk_revision: str | None = None
+    # v0.7.1 S4b3: an exact canonical destination (``user@host:port``) scopes
+    # the revocation of ``network.remote-exec`` to that one destination under
+    # each of the session's scopes; absent means the whole-scope revoke.
+    # Only ``network.remote-exec`` accepts a destination.
+    destination: str | None = None
     user_initiated: Literal[True]
 
     @field_validator("user_initiated", mode="before")
@@ -164,15 +177,17 @@ class DangerousCommandRevokeResponse(ProtocolModel):
     and takes effect immediately: installed pending once permits are
     invalidated and cached authority is dropped, but a question already
     awaiting an answer is not cancelled, so answering it after the
-    revocation still grants fresh authority for the decided scope. Saved
-    authority is removed from the user config on disk with the expected disk
-    revision; the running session's accepted config is unchanged until a
-    reload, exactly as a save never applies to the running session.
-    ``live_authority_generation`` is the session's generation after the
-    attempt. ``warning`` reports that the session keeps authority the
-    accepted config still grants until the next reload or start, or that a
-    failed saved removal can let the authority return on the next reload
-    or start.
+    revocation still grants fresh authority for the decided scope. A
+    destination-scoped revocation removes only that destination's grants and
+    invalidates whole once permits containing it. Saved authority is removed
+    from the user config on disk with the expected disk revision; the running
+    session's accepted config is unchanged until a reload, exactly as a save
+    never applies to the running session. ``live_authority_generation`` is
+    the session's generation after the attempt. ``warning`` reports that the
+    session keeps authority the accepted config still grants until the next
+    reload or start, that a failed saved removal can let the authority return
+    on the next reload or start, or that a pending approval answered during
+    the revocation re-granted fresh authority (recheck-and-warn).
     """
 
     live: DangerousCommandRevocationOutcome

@@ -589,7 +589,7 @@ class AgentRuntimeFactory:
             # PI1/T (S4 resume install): under the held lease, fail closed on an
             # unrepairable transcript and durably migrate a repaired one BEFORE
             # the loop is rebound to the repaired messages.
-            loaded_messages = await asyncio.to_thread(
+            loaded_messages, repair_pending = await asyncio.to_thread(
                 _install_transcript_repair, session_path, loaded_messages, metadata
             )
             await source.retire_background_jobs()
@@ -667,6 +667,17 @@ class AgentRuntimeFactory:
                 bound_policy=activated_policy,
             )
             source.replace_session_lease(lease)
+            # T2b warm-resume clear-and-reseal: the rebind above retained a
+            # matching archive descriptor (the old warm-continuation rule);
+            # the resume transaction now proves the rebound list hydrated
+            # from the target disk and CLEARS the retained descriptor
+            # (clear-and-reseal, never re-pinned) — the next seal mints a
+            # fresh receipt at the new epoch.
+            await _clear_and_reseal_warm_resume(
+                source,
+                session_id,
+                repair_messages=loaded_messages if repair_pending else None,
+            )
         except BaseException:
             source.committed_model = previous_identity
             source.config.attach_committed_model(previous_identity)
@@ -716,7 +727,7 @@ class AgentRuntimeFactory:
         # PI1/T (S4 resume install): under the held lease, fail closed on an
         # unrepairable transcript and durably migrate a repaired one BEFORE the
         # loop is built around the repaired messages.
-        loaded_messages = await asyncio.to_thread(
+        loaded_messages, repair_pending = await asyncio.to_thread(
             _install_transcript_repair, session_path, loaded_messages, metadata
         )
         await blueprint.config_orchestrator.reload()
@@ -772,6 +783,15 @@ class AgentRuntimeFactory:
             )
             _apply_stored_stats(replacement, metadata)
             _mark_legacy_root_cost_incomplete(replacement.stats, session_metadata)
+            # T2b warm-resume clear-and-reseal: the resume transaction proves
+            # the rebound list hydrated from the target disk and CLEARS the
+            # retained archive descriptor (never re-pinned) — the next seal
+            # mints a fresh receipt at the new epoch.
+            await _clear_and_reseal_warm_resume(
+                replacement,
+                session_id,
+                repair_messages=loaded_messages if repair_pending else None,
+            )
         except BaseException:
             await close_agent_loop(replacement)
             raise
@@ -996,6 +1016,13 @@ class AgentRuntimeFactory:
             child.session_logger.apply_resumed_session(
                 session_id, session_dir, metadata
             )
+            # T2b warm-resume clear-and-reseal, riding the child's logger
+            # rebind: the resume transaction proves the rebound child list
+            # hydrated from the target disk and CLEARS the archive authority
+            # (never re-pinned) — the next seal mints a fresh receipt at the
+            # new epoch. Runs after the message reset and the logger rebind
+            # above, before the launch-config/stats tail.
+            await _clear_and_reseal_warm_resume(child, session_id)
             if child.session_logger.session_metadata is not None:
                 child.session_logger.session_metadata.launch_config = (
                     _launch_metadata(candidate, child._identity_binding())
@@ -1920,7 +1947,7 @@ def _load_session(
 
 def _install_transcript_repair(
     session_path: Path, loaded_messages: list[LLMMessage], metadata: dict[str, object]
-) -> list[LLMMessage]:
+) -> tuple[list[LLMMessage], bool]:
     """S4 resume install: fail closed on violations, migrate repairs durably.
 
     Runs only on the two write-owning root install paths, under the held
@@ -1929,10 +1956,14 @@ def _install_transcript_repair(
     is where an unrepairable (ambiguous) transcript fails closed with the
     typed transcript-integrity diagnostic, and where a repaired transcript is
     durably migrated — the original preserved as an artifact first.
+
+    Returns the (possibly repaired) messages plus whether a repair was pending,
+    so the warm-resume clear-and-reseal transaction can stage it under its own
+    save-lock fence (T2b).
     """
     report = pop_report_from_metadata(metadata)
     if report is None:
-        return loaded_messages
+        return loaded_messages, False
     if report.violations:
         raise TranscriptIntegrityError(
             report.violations, context="session resume install"
@@ -1941,7 +1972,38 @@ def _install_transcript_repair(
         SessionLogger.migrate_repaired_transcript(
             session_path / MESSAGES_FILENAME, loaded_messages
         )
-    return loaded_messages
+    return loaded_messages, report.repaired
+
+
+async def _clear_and_reseal_warm_resume(
+    loop: AgentLoop,
+    session_id: str,
+    *,
+    repair_messages: Sequence[LLMMessage] | None = None,
+) -> None:
+    """T2b: run the warm-resume clear-and-reseal transaction on a resume path.
+
+    The loop's logger must already be bound to the resumed session and its
+    message list must already hold the rebound (fully loaded) history. The
+    transaction proves the rebound list hydrated from the target disk under
+    the save lock and then CLEARS both archive authorities (clear-and-reseal,
+    never re-pinned), so the next seal mints a fresh receipt at the new
+    epoch. A non-transitioning outcome (a failed proof, a rolled-back staged
+    repair, a disabled logger) keeps the retained authority fail-closed and is
+    logged here — the failed-proof no-op is never silent.
+    """
+    result = await loop.session_logger.clear_and_reseal_warm_resume(
+        loop.messages, session_id=session_id, repair_messages=repair_messages
+    )
+    if result.outcome != "proved_and_transitioned":
+        logger.warning(
+            "Warm resume did not clear-and-reseal the archive authority "
+            "(session_id=%s, outcome=%s): %s — the retained descriptor stays "
+            "and trim re-arms only through a later compaction seal",
+            session_id,
+            result.outcome,
+            result.detail,
+        )
 
 
 def _resolve_resume_session_id(config: ChartreuxConfigSchema, session_id: str) -> str:

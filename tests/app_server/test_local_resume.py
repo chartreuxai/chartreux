@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
+import threading
 from types import SimpleNamespace
-from typing import cast
+from typing import Any, cast
 
 import pytest
 
@@ -28,9 +30,23 @@ from chartreux.app_server.session import AppServerSession
 from chartreux.app_server.transport import memory_transport_pair
 from chartreux.core.agent_loop import AgentLoop
 from chartreux.core.config import SessionLoggingConfig
-from chartreux.core.llm_models import LLMMessage, Role
+from chartreux.core.llm_models import (
+    FunctionCall,
+    LLMMessage,
+    PersistedToolResult,
+    Role,
+    ToolCall,
+)
+from chartreux.core.message_list import MessageList
 from chartreux.core.session.resume_sessions import ResumeSessionInfo
-from chartreux.core.session.session_loader import SessionLoader
+from chartreux.core.session.session_loader import MESSAGES_FILENAME, SessionLoader
+import chartreux.core.session.session_logger as session_logger_module
+from chartreux.core.session.session_logger import SessionLogger
+from chartreux.core.session.transcript_archive import (
+    ArchivedPrefixV1,
+    ArchiveIntegrityError,
+)
+from chartreux.core.utils.tags import CancellationReason, get_user_cancellation_message
 from tests.app_server._local_runtime_support import (
     _configure_local_accounting,
     _init_repo,
@@ -399,17 +415,53 @@ async def test_resume_rebinds_session_in_place_preserving_backend(
         await source.aclose()
 
 
-@pytest.mark.asyncio
-async def test_warm_child_continuation_retains_the_archive_descriptor(
-    tmp_path: Path,
-) -> None:
-    """M1's resume rule: a warm continuation keeps its existing descriptor.
+def _placeholder(call_id: str) -> LLMMessage:
+    """The synthetic TOOL_NO_RESPONSE backfill placeholder (PI1 poison)."""
+    return LLMMessage(
+        role=Role.tool,
+        tool_call_id=call_id,
+        name="read_file",
+        content=str(get_user_cancellation_message(CancellationReason.TOOL_NO_RESPONSE)),
+    )
 
-    The warm-continuation rebind (``rebind_to_session`` for a resident root,
-    ``resume_child`` for a child) both commit through
-    ``SessionLogger.apply_resumed_session``; retention is session-scoped, so
-    the same conversation keeps its archive authority and resume does not
-    re-trim.
+
+def _poisoned_transcript() -> list[LLMMessage]:
+    """[user, assistant(call), placeholder, steered user, genuine result].
+
+    The repairable PI1 shape: ``SessionLoader.load_session`` repairs it in
+    memory (the shadowed placeholder drops) and the repair report rides the
+    metadata to the write-owning resume install.
+    """
+    return [
+        LLMMessage(role=Role.user, content="question", message_id="u1"),
+        LLMMessage(
+            role=Role.assistant,
+            content="working",
+            tool_calls=[
+                ToolCall(
+                    id="t1",
+                    index=0,
+                    function=FunctionCall(name="read_file", arguments="{}"),
+                )
+            ],
+        ),
+        _placeholder("t1"),
+        LLMMessage(role=Role.user, content="steered mid-turn"),
+        LLMMessage(
+            role=Role.tool,
+            tool_call_id="t1",
+            name="read_file",
+            content="file contents",
+            tool_result=PersistedToolResult(output={"text": "file contents"}),
+        ),
+    ]
+
+
+async def _build_warm_session(
+    tmp_path: Path, transcript_messages: list[LLMMessage], *, archived_count: int = 1
+) -> tuple[AgentLoop, Path, ArchivedPrefixV1]:
+    """A persisted session whose on-disk transcript carries a retained
+    archive descriptor (the warm-resume precondition).
     """
     logging = SessionLoggingConfig(
         enabled=True, save_dir=str(tmp_path / "sessions"), session_prefix="session"
@@ -418,23 +470,271 @@ async def test_warm_child_continuation_retains_the_archive_descriptor(
         config=build_test_vibe_config(session_logging=logging)
     )
     await source.persist_empty_session()
-    transcript = tmp_path / "messages.jsonl"
-    write_transcript(
-        transcript, [LLMMessage(role=Role.user, content="question", message_id="u1")]
-    )
+    session_dir = source.session_logger.session_dir
+    assert session_dir is not None
+    transcript = session_dir / MESSAGES_FILENAME
+    write_transcript(transcript, transcript_messages)
     descriptor = descriptor_for_prefix(
         transcript,
-        1,
+        archived_count,
         session_id=source.session_id,
         message_epoch=source.messages.message_epoch,
     )
     source.session_logger.retain_archive_descriptor(descriptor)
+    return source, transcript, descriptor
+
+
+def _txn_outcome_spy(monkeypatch: pytest.MonkeyPatch, outcomes: list[str]) -> None:
+    """Record the outcome of every clear-and-reseal transaction run."""
+    real_txn = SessionLogger.clear_and_reseal_warm_resume
+
+    async def _txn_spy(self: SessionLogger, *args: Any, **kwargs: Any) -> Any:
+        result = await real_txn(self, *args, **kwargs)
+        outcomes.append(result.outcome)
+        return result
+
+    monkeypatch.setattr(SessionLogger, "clear_and_reseal_warm_resume", _txn_spy)
+
+
+def _migration_snapshot_spy(
+    monkeypatch: pytest.MonkeyPatch, migrated_bytes: list[bytes]
+) -> None:
+    """Snapshot the live transcript right after the durable repair migration."""
+    real_install = runtime._install_transcript_repair
+
+    def _install_spy(
+        session_path: Path, messages: list[LLMMessage], metadata: dict[str, object]
+    ) -> tuple[list[LLMMessage], bool]:
+        result = real_install(session_path, messages, metadata)
+        migrated_bytes.append((session_path / MESSAGES_FILENAME).read_bytes())
+        return result
+
+    monkeypatch.setattr(runtime, "_install_transcript_repair", _install_spy)
+
+
+@pytest.mark.asyncio
+async def test_warm_child_continuation_clears_the_archive_descriptor_on_resume(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """T2b clear-and-reseal INVERTS the M1 warm-continuation retention rule.
+
+    The warm-resume rebind (``rebind_to_session`` for a resident root,
+    ``resume_child`` for a child) commits through
+    ``SessionLogger.apply_resumed_session`` and then runs the warm-resume
+    clear-and-reseal transaction: the retained archive descriptor is proven
+    fully hydrated from the target disk and then CLEARED — never re-pinned —
+    so the next compaction seal mints a fresh receipt at the new epoch (trim
+    re-arms through that seal, never from the resume path itself).
+    """
+    source, _transcript, _descriptor = await _build_warm_session(
+        tmp_path, [LLMMessage(role=Role.user, content="question", message_id="u1")]
+    )
+    outcomes: list[str] = []
+    _txn_outcome_spy(monkeypatch, outcomes)
     try:
         await runtime.AgentRuntimeFactory().resume_root(source, source.session_id)
 
-        assert source.session_logger.archive_descriptor is descriptor
+        # INVERTED (the old node asserted `archive_descriptor is descriptor`
+        # after resume): clear-and-reseal cleared the retained descriptor —
+        # the authority transitioned under the resume transaction.
+        assert outcomes == ["proved_and_transitioned"]
+        assert source.session_logger.archive_descriptor is None
+        assert source.messages.archive_descriptor is None
     finally:
         await source.aclose()
+
+
+@pytest.mark.asyncio
+async def test_warm_resume_transaction_failure_after_replacement_rolls_back(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Transaction arm (Amendment W): a failure AFTER the staged repair
+    replaced the live transcript but BEFORE the rebind/authority transition
+    rolls back to the recovery artifact's verified bytes and RETAINS the
+    archive authority (fail-closed, never a silent partial state).
+    """
+    source, transcript, descriptor = await _build_warm_session(
+        tmp_path, _poisoned_transcript()
+    )
+    outcomes: list[str] = []
+    _txn_outcome_spy(monkeypatch, outcomes)
+    migrated_bytes: list[bytes] = []
+    _migration_snapshot_spy(monkeypatch, migrated_bytes)
+
+    prove_calls: list[int] = []
+    real_prove = session_logger_module.prove_rebound_hydration
+
+    def _failing_reprove(*args: Any, **kwargs: Any) -> Any:
+        prove_calls.append(len(prove_calls) + 1)
+        if len(prove_calls) == 2:
+            # The staged re-prove — after the replacement, before the
+            # rebind/authority transition: fail closed.
+            raise ArchiveIntegrityError("injected post-replacement failure")
+        return real_prove(*args, **kwargs)
+
+    monkeypatch.setattr(
+        session_logger_module, "prove_rebound_hydration", _failing_reprove
+    )
+
+    try:
+        await runtime.AgentRuntimeFactory().resume_root(source, source.session_id)
+
+        # The transaction reported the rollback; the retained authority and
+        # the on-disk bytes (restored from the verified artifact) survive.
+        assert outcomes == ["failed_repair_rolled_back"]
+        assert source.session_logger.archive_descriptor is descriptor
+        assert migrated_bytes and transcript.read_bytes() == migrated_bytes[0]
+        session_dir = source.session_logger.session_dir
+        assert session_dir is not None
+        assert list(session_dir.glob("messages.jsonl.recovered-*"))
+    finally:
+        await source.aclose()
+
+
+@pytest.mark.asyncio
+async def test_warm_resume_transaction_cancellation_after_replacement_restores(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Transaction arm (Amendment W): cancellation in the window AFTER the
+    staged repair replaced the live path but BEFORE the authority transition
+    drains the staging worker, restores the artifact's verified bytes over
+    the live path, and re-raises — the retained authority stays.
+    """
+    source, transcript, descriptor = await _build_warm_session(
+        tmp_path, _poisoned_transcript()
+    )
+    migrated_bytes: list[bytes] = []
+    _migration_snapshot_spy(monkeypatch, migrated_bytes)
+
+    entered = threading.Event()
+    block = threading.Event()
+    prove_calls = 0
+    real_prove = session_logger_module.prove_rebound_hydration
+
+    def _blocking_reprove(*args: Any, **kwargs: Any) -> Any:
+        nonlocal prove_calls
+        prove_calls += 1
+        if prove_calls == 2:
+            # The staged re-prove: hold the window open so the cancellation
+            # lands after the replacement, before the transition.
+            entered.set()
+            assert block.wait(5)
+        return real_prove(*args, **kwargs)
+
+    monkeypatch.setattr(
+        session_logger_module, "prove_rebound_hydration", _blocking_reprove
+    )
+
+    factory = runtime.AgentRuntimeFactory()
+    task = asyncio.create_task(factory.resume_root(source, source.session_id))
+    assert await asyncio.to_thread(entered.wait, 5)
+    task.cancel()
+    await asyncio.sleep(0.1)
+    block.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    try:
+        # The cancellation rolled the replacement back and kept the authority.
+        assert source.session_logger.archive_descriptor is descriptor
+        assert migrated_bytes and transcript.read_bytes() == migrated_bytes[0]
+    finally:
+        await source.aclose()
+
+
+@pytest.mark.asyncio
+async def test_resume_child_runs_clear_and_reseal_after_the_rebind_in_order(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The genuinely child-path node (plan round 3): ``resume_child`` builds
+    a NEW child around the stored session and runs the clear-and-reseal
+    transaction after the message reset and the logger rebind (the :988-996
+    ordering holds under the new semantics). The retained root authority is
+    untouched by the child resume; the new child's archive authority is
+    CLEARED — the expected re-arm outcome (a fresh receipt at the next
+    seal's new epoch).
+    """
+    logging = SessionLoggingConfig(
+        enabled=True, save_dir=str(tmp_path / "sessions"), session_prefix="session"
+    )
+    config = build_test_vibe_config(session_logging=logging)
+    parent = build_test_agent_loop(config=config)
+    factory = runtime.AgentRuntimeFactory()
+    try:
+        await parent.persist_empty_session()
+        parent_dir = parent.session_logger.session_dir
+        assert parent_dir is not None
+        parent_transcript = parent_dir / MESSAGES_FILENAME
+        write_transcript(
+            parent_transcript,
+            [LLMMessage(role=Role.user, content="root question", message_id="r1")],
+        )
+        parent_descriptor = descriptor_for_prefix(
+            parent_transcript,
+            1,
+            session_id=parent.session_id,
+            message_epoch=parent.messages.message_epoch,
+        )
+        parent.session_logger.retain_archive_descriptor(parent_descriptor)
+
+        child = await factory.create_child(parent, "coder")
+        await child.wait_until_ready()
+        child.messages.append(
+            LLMMessage(role=Role.user, content="child question", message_id="c1")
+        )
+        await child.persist_empty_session()
+        child_dir = child.session_logger.session_dir
+        assert child_dir is not None
+        child_id = child.session_id
+        await child.aclose()
+
+        order: list[str] = []
+        outcomes: list[str] = []
+        real_reset = MessageList.reset_preserving_system
+        real_apply = SessionLogger.apply_resumed_session
+        real_txn = SessionLogger.clear_and_reseal_warm_resume
+
+        def _reset_spy(self: MessageList, *args: Any, **kwargs: Any) -> Any:
+            order.append("reset_preserving_system")
+            return real_reset(self, *args, **kwargs)
+
+        def _apply_spy(self: SessionLogger, *args: Any, **kwargs: Any) -> Any:
+            order.append("apply_resumed_session")
+            return real_apply(self, *args, **kwargs)
+
+        async def _txn_spy(self: SessionLogger, *args: Any, **kwargs: Any) -> Any:
+            order.append("clear_and_reseal_warm_resume")
+            result = await real_txn(self, *args, **kwargs)
+            outcomes.append(result.outcome)
+            return result
+
+        monkeypatch.setattr(MessageList, "reset_preserving_system", _reset_spy)
+        monkeypatch.setattr(SessionLogger, "apply_resumed_session", _apply_spy)
+        monkeypatch.setattr(SessionLogger, "clear_and_reseal_warm_resume", _txn_spy)
+
+        resumed = await factory.resume_child(parent, "coder", child_id, child_dir)
+        try:
+            # Child ordering: the transaction rides the rebind — the last
+            # three steps are reset -> logger rebind -> clear-and-reseal, and
+            # the transaction ran exactly once on the child path.
+            assert order[-3:] == [
+                "reset_preserving_system",
+                "apply_resumed_session",
+                "clear_and_reseal_warm_resume",
+            ]
+            assert order.count("clear_and_reseal_warm_resume") == 1
+            assert outcomes == ["proved_and_transitioned"]
+            # New child (not the retained incarnation), bound to the stored
+            # session, with its archive authority CLEARED (clear-and-reseal).
+            assert resumed is not child
+            assert resumed.session_id == child_id
+            assert resumed.session_logger.archive_descriptor is None
+            assert resumed.messages.archive_descriptor is None
+            # The retained root authority is untouched by the child resume.
+            assert parent.session_logger.archive_descriptor is parent_descriptor
+        finally:
+            await resumed.aclose()
+    finally:
+        await parent.aclose()
 
 
 def test_continue_prefers_valid_terminal_session_pointer(

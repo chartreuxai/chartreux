@@ -5,13 +5,28 @@ import tomllib
 
 import pytest
 
+from chartreux.core import env
 from chartreux.core.config.fingerprint import create_file_fingerprint
-from chartreux.core.config.layer import UntrustedLayerError
+from chartreux.core.config.harness_files import HarnessFilesManager
+from chartreux.core.config.layer import (
+    ConfigLayer,
+    RawConfig,
+    TrustStoreStateError,
+    UntrustedLayerError,
+    require_answerable_trust_store,
+)
 from chartreux.core.config.layers.project import ProjectConfigLayer
 from chartreux.core.config.patch import AddOperationPatch, ConfigPatch
-from chartreux.core.config.types import MISSING_BACKING_STORE_DATA_FINGERPRINT
+from chartreux.core.config.types import (
+    MISSING_BACKING_STORE_DATA_FINGERPRINT,
+    LayerConfigSnapshot,
+)
 from chartreux.core.paths._vibe_home import GlobalPath
-from chartreux.core.trusted_folders import trusted_folders_manager
+from chartreux.core.trusted_folders import (
+    TrustedFoldersManager,
+    TrustStoreState,
+    trusted_folders_manager,
+)
 
 
 @pytest.mark.asyncio
@@ -329,3 +344,123 @@ async def test_apply_creates_file_when_none_discovered(
 
     assert layer.is_file_discovered
     assert layer.config_file_path == created_path
+
+
+def _malformed_trust_store(config_dir: Path) -> TrustedFoldersManager:
+    """A store that exists but cannot be parsed, loaded from that state."""
+    (config_dir / "trusted_folders.toml").write_text("[malformed")
+    store = TrustedFoldersManager()
+    assert store.store_state is TrustStoreState.MALFORMED
+    return store
+
+
+class _StoreBackedLayer(ConfigLayer[RawConfig]):
+    """A minimal layer whose trust check goes through the shared guard."""
+
+    def __init__(self, trust_store: TrustedFoldersManager) -> None:
+        super().__init__(name="store-backed")
+        self._trust_store = trust_store
+
+    async def _build_config_snapshot(self) -> LayerConfigSnapshot:
+        raise AssertionError("no snapshot is read from an unusable store")
+
+    async def _save_to_store(self, _next_config: RawConfig) -> str:
+        raise AssertionError("nothing is written to an unusable store")
+
+    async def _check_trust(self) -> bool:
+        require_answerable_trust_store(self._trust_store, self.name)
+        return True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("consumer", ["env", "layer", "project", "harness-files"])
+async def test_group_c_consumer_never_reswallows_an_unusable_trust_store(
+    consumer: str, tmp_path: Path, config_dir: Path
+) -> None:
+    """OBSERVABLE: no group-C consumer answers a trust question from a broken store.
+
+    A malformed store answers ``is_trusted``/``find_trust_root`` with "nothing
+    is trusted", so every consumer below would otherwise proceed with a
+    definite answer it cannot support: the project-env API would skip the
+    trusted folder's ``.env``, the project config layer would read the folder as
+    explicitly untrusted (or, with a stale cached verdict, as trusted), and the
+    harness-files manager would load a folder's instructions from an unknown
+    state (the directory listing stays fail-closed, contributing no root). Each
+    surfaces the typed store state instead — ``TrustStoreStateError`` — and the
+    failure path never grants trust. The layer case additionally pins that the
+    base-class trust dispatch re-raises the typed error instead of collapsing it
+    into ``LayerImplementationError``. Re-swallowing the error in any consumer
+    fails this node.
+    """
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / ".env").write_text(
+        "PROJECT_KEY=sk-project-0123456789\n", encoding="utf-8"
+    )
+    config_file = project / ".chartreux" / "config.toml"
+    config_file.parent.mkdir(parents=True)
+    config_file.write_text('theme = "dark"\n', encoding="utf-8")
+    store = _malformed_trust_store(config_dir)
+
+    if consumer == "env":
+        with pytest.raises(TrustStoreStateError, match="trust store malformed"):
+            env.project_env_for_cwd(project, manager=store)
+        with pytest.raises(TrustStoreStateError, match="trust store malformed"):
+            env.project_env_file(project, manager=store)
+        assert store.is_trusted(project) is not True
+    elif consumer == "layer":
+        layer = _StoreBackedLayer(store)
+        with pytest.raises(TrustStoreStateError, match="trust store malformed"):
+            await layer.resolve_trust()
+        with pytest.raises(TrustStoreStateError, match="trust store malformed"):
+            await layer.load()
+        assert store.is_trusted(project) is not True
+    elif consumer == "project":
+        layer = ProjectConfigLayer(path=project, trust_store=store)
+        with pytest.raises(TrustStoreStateError, match="trust store malformed"):
+            await layer.load()
+        with pytest.raises(TrustStoreStateError, match="trust store malformed"):
+            await layer.resolve_trust()
+        assert store.is_trusted(config_file.parent) is not True
+    else:
+        manager = HarnessFilesManager(
+            sources=("project",), cwd=project, trust_store=store
+        )
+        with pytest.raises(TrustStoreStateError, match="trust store malformed"):
+            manager.load_instruction_documents()
+        with pytest.raises(TrustStoreStateError, match="trust store malformed"):
+            manager.load_project_docs()
+        # The listing stays fail-closed: an unknown state contributes no root,
+        # so the project surface is never enabled from an unanswered question.
+        assert manager.project_roots == []
+        assert store.is_trusted(project) is not True
+
+
+@pytest.mark.asyncio
+async def test_group_c_missing_store_stays_the_first_run_default(
+    tmp_path: Path,
+) -> None:
+    """OBSERVABLE: ``MISSING`` is not an error — nothing persisted, nothing trusted.
+
+    The first launch of a fresh install has no store at all, and every group-C
+    consumer must keep its pre-existing untrusted answer rather than raise.
+    Only unreadable, malformed, and invalid stores are errors.
+    """
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / ".env").write_text(
+        "PROJECT_KEY=sk-project-0123456789\n", encoding="utf-8"
+    )
+    config_file = project / ".chartreux" / "config.toml"
+    config_file.parent.mkdir(parents=True)
+    config_file.write_text('theme = "dark"\n', encoding="utf-8")
+    store = TrustedFoldersManager()
+    assert store.store_state is TrustStoreState.MISSING
+
+    assert env.project_env_for_cwd(project, manager=store) == {}
+    layer = ProjectConfigLayer(path=project, trust_store=store)
+    with pytest.raises(UntrustedLayerError):
+        await layer.load()
+    manager = HarnessFilesManager(sources=("project",), cwd=project, trust_store=store)
+    assert manager.project_roots == []
+    assert store.is_trusted(project) is None

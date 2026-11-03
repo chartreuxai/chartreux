@@ -329,6 +329,46 @@ async def remove_remote_exec_grant[S: ConfigSchema](
     )
 
 
+def remove_all_project_remote_exec_grants(
+    raw: Mapping[str, Any], *, project: Path, value: str
+) -> dict[str, Any]:
+    """Remove every saved remote-exec destination of one project (whole-scope revoke).
+
+    The project's entry is dropped from ``remote_exec_grants_by_project``, and
+    the field itself is dropped when no project entries remain; every other
+    entry and all unrelated settings are preserved from *raw*. ``value`` is
+    unused (the whole project entry goes) but keeps the shared edit signature.
+    """
+    del value
+    merged = dict(raw)
+    saved = merged.get(REMOTE_EXEC_GRANTS_FIELD)
+    if saved is None:
+        return merged
+    canonical = normalize_remote_exec_grants(
+        _canonical_saved_entries(saved, field=REMOTE_EXEC_GRANTS_FIELD)
+    )
+    key = _canonical_project_key(project, field=REMOTE_EXEC_GRANTS_FIELD)
+    canonical.pop(key, None)
+    if canonical:
+        merged[REMOTE_EXEC_GRANTS_FIELD] = canonical
+    else:
+        merged.pop(REMOTE_EXEC_GRANTS_FIELD, None)
+    return merged
+
+
+async def remove_all_remote_exec_grants[S: ConfigSchema](
+    orchestrator: ConfigOrchestrator[S], *, project: Path, expected_revision: str
+) -> ConfigSaveResult:
+    """Remove every saved remote-exec destination of one project without publishing state."""
+    return await _persist_grant_edit(
+        orchestrator,
+        project=project,
+        value="",
+        expected_revision=expected_revision,
+        edit=remove_all_project_remote_exec_grants,
+    )
+
+
 async def read_saved_dangerous_command_grants[S: ConfigSchema](
     orchestrator: ConfigOrchestrator[S], *, project: Path
 ) -> SavedGrantsRead:

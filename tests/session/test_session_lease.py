@@ -1,7 +1,13 @@
 from __future__ import annotations
 
+from collections.abc import Callable, Iterator
+import json
 import os
 from pathlib import Path
+import signal
+import subprocess
+import sys
+import time
 
 import pytest
 
@@ -98,3 +104,183 @@ def test_session_lease_release_tolerates_an_unlink_failure(
     # lease for the same session acquires cleanly.
     assert (tmp_path / "active" / f"{SESSION_ID}.lock").exists()
     SessionLease(tmp_path, SESSION_ID).acquire().release()
+
+
+_READY_TIMEOUT_S = 5.0
+_CHILD_WAIT_TIMEOUT_S = 5.0
+
+# The holder publishes an OS-level lease (flock) and then waits for the parent
+# to create its stop file. Killing it mid-wait is the owner-death scenario: no
+# release, no diagnostic rewrite, the file left behind.
+_LEASE_HOLDER_SCRIPT = """\
+from __future__ import annotations
+
+import json
+import os
+import sys
+import time
+from pathlib import Path
+
+from chartreux.core.session.session_lease import SessionLease
+
+root = Path(sys.argv[1])
+session_id = sys.argv[2]
+ready_path = Path(sys.argv[3])
+stop_path = Path(sys.argv[4])
+
+lease = SessionLease(root, session_id).acquire()
+try:
+    ready_path.write_text(json.dumps({"process_id": os.getpid()}))
+    deadline = time.monotonic() + 30.0
+    while not stop_path.exists() and time.monotonic() < deadline:
+        time.sleep(0.01)
+finally:
+    lease.release()
+"""
+
+
+class _LeaseHolder:
+    def __init__(
+        self,
+        process: subprocess.Popen[str],
+        root: Path,
+        ready_path: Path,
+        stop_path: Path,
+    ) -> None:
+        self.process = process
+        self.root = root
+        self.ready_path = ready_path
+        self.stop_path = stop_path
+
+    @property
+    def pid(self) -> int:
+        return self.process.pid
+
+    @property
+    def lock_path(self) -> Path:
+        return self.root / "active" / f"{SESSION_ID}.lock"
+
+    def ready(self) -> bool:
+        return self.ready_path.exists()
+
+    def alive(self) -> bool:
+        return self.process.poll() is None
+
+    def kill(self) -> int:
+        if self.alive():
+            self.process.kill()
+        return self.process.wait(timeout=_CHILD_WAIT_TIMEOUT_S)
+
+    def stop(self) -> int:
+        self.stop_path.write_text("stop")
+        return self.process.wait(timeout=_CHILD_WAIT_TIMEOUT_S)
+
+    def stderr_text(self) -> str:
+        if self.process.stderr is None:
+            return ""
+        return self.process.stderr.read()
+
+
+@pytest.fixture
+def start_lease_holder(tmp_path: Path) -> Iterator[Callable[[], _LeaseHolder]]:
+    script = tmp_path / "lease_holder.py"
+    script.write_text(_LEASE_HOLDER_SCRIPT)
+    control = tmp_path / "control"
+    control.mkdir()
+    root = tmp_path / "root"
+    started: list[_LeaseHolder] = []
+
+    def start() -> _LeaseHolder:
+        index = len(started)
+        ready_path = control / f"{index}.ready"
+        stop_path = control / f"{index}.stop"
+        process = subprocess.Popen(
+            [
+                sys.executable,
+                str(script),
+                str(root),
+                SESSION_ID,
+                str(ready_path),
+                str(stop_path),
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        holder = _LeaseHolder(process, root, ready_path, stop_path)
+        started.append(holder)
+        _await_ready(holder)
+        return holder
+
+    try:
+        yield start
+    finally:
+        for holder in started:
+            if holder.alive():
+                holder.kill()
+
+
+def _await_ready(holder: _LeaseHolder) -> None:
+    deadline = time.monotonic() + _READY_TIMEOUT_S
+    while time.monotonic() < deadline:
+        if holder.ready():
+            return
+        if not holder.alive():
+            break
+        time.sleep(0.01)
+    holder.kill()
+    raise AssertionError(
+        f"lease holder never published readiness: {holder.stderr_text()!r}"
+    )
+
+
+def _diagnostic(holder: _LeaseHolder) -> dict[str, object]:
+    return json.loads(holder.lock_path.read_text())
+
+
+def test_a_killed_owner_leaves_an_inert_lock_a_fresh_process_reacquires(
+    start_lease_holder: Callable[[], _LeaseHolder],
+) -> None:
+    dead = start_lease_holder()
+    initial = _diagnostic(dead)
+    assert initial["lease_version"] == 1
+    assert initial["session_id"] == SESSION_ID
+    assert initial["process_id"] == dead.pid
+
+    # Owner death without release: the child never runs its release path.
+    assert dead.kill() == -signal.SIGKILL
+
+    # The file survives and still names the dead owner, but its lock died with
+    # the process — the leftover is inert, which is what makes recovery possible.
+    assert dead.lock_path.exists()
+    assert _diagnostic(dead)["process_id"] == dead.pid
+
+    fresh = start_lease_holder()
+    try:
+        assert fresh.pid != dead.pid
+        diagnostic = _diagnostic(fresh)
+        assert diagnostic["process_id"] == fresh.pid
+        assert diagnostic["session_id"] == SESSION_ID
+    finally:
+        assert fresh.stop() == 0
+
+    # An actual release (not a stale file) unlinks the lock.
+    assert not fresh.lock_path.exists()
+
+
+def test_a_live_subprocess_owner_blocks_a_second_owner(
+    start_lease_holder: Callable[[], _LeaseHolder],
+) -> None:
+    live = start_lease_holder()
+    try:
+        with pytest.raises(SessionBusyError):
+            SessionLease(live.root, SESSION_ID).acquire()
+
+        # The refused acquirer neither disturbed nor inherited the lease.
+        assert live.alive()
+        assert _diagnostic(live)["process_id"] == live.pid
+    finally:
+        assert live.stop() == 0
+
+    # Once the live owner releases, the in-process owner acquires freely.
+    SessionLease(live.root, SESSION_ID).acquire().release()

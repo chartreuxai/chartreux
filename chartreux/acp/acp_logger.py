@@ -30,7 +30,9 @@ BACKUP_COUNT = 3
 
 ACP_LOGGING_ENABLED_KEY = "CHARTREUX_ACP_LOGGING_ENABLED"
 
-_session_cache: TTLCache[int | str, str] = TTLCache(maxsize=1000, ttl=3600)
+_session_cache: TTLCache[int | str, str] = TTLCache[int | str, str](
+    maxsize=1000, ttl=3600
+)
 _current_session: str | None = None
 _logger: logging.Logger | None = None
 

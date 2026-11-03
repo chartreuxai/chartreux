@@ -1085,8 +1085,11 @@ class TestS4LoadRepair:
         original_bytes = messages_path.read_bytes()
 
         messages, metadata = SessionLoader.load_session(session_dir)
-        installed = _install_transcript_repair(session_dir, messages, metadata)
+        installed, repair_pending = _install_transcript_repair(
+            session_dir, messages, metadata
+        )
         assert installed is messages
+        assert repair_pending is True
 
         artifacts = list(session_dir.glob(f"{MESSAGES_FILENAME}.recovered-*"))
         assert len(artifacts) == 1
@@ -1099,8 +1102,11 @@ class TestS4LoadRepair:
         reloaded, reloaded_metadata = SessionLoader.load_session(session_dir)
         assert [m.role for m in reloaded] == [Role.assistant, Role.user, Role.tool]
         assert TRANSCRIPT_INTEGRITY_METADATA_KEY not in reloaded_metadata
-        again = _install_transcript_repair(session_dir, reloaded, reloaded_metadata)
+        again, again_pending = _install_transcript_repair(
+            session_dir, reloaded, reloaded_metadata
+        )
         assert again is reloaded
+        assert again_pending is False
         assert len(list(session_dir.glob(f"{MESSAGES_FILENAME}.recovered-*"))) == 1
 
     def test_ambiguous_duplicate_fails_closed_at_install(self, tmp_path: Path) -> None:
@@ -1171,7 +1177,11 @@ class TestS4LoadRepair:
 
         messages, metadata = SessionLoader.load_session(session_dir)
         assert TRANSCRIPT_INTEGRITY_METADATA_KEY not in metadata
-        assert _install_transcript_repair(session_dir, messages, metadata) is messages
+        installed, repair_pending = _install_transcript_repair(
+            session_dir, messages, metadata
+        )
+        assert installed is messages
+        assert repair_pending is False
         assert not list(session_dir.glob(f"{MESSAGES_FILENAME}.recovered-*"))
         assert messages_path.read_bytes() == original_bytes
 
@@ -2005,7 +2015,11 @@ class TestRound2V1LiveTailScoping:
             session_dir = _write_session(tmp_path / f"session_{name}", messages)
             loaded, metadata = SessionLoader.load_session(session_dir)
             assert TRANSCRIPT_INTEGRITY_METADATA_KEY not in metadata
-            assert _install_transcript_repair(session_dir, loaded, metadata) is loaded
+            installed, repair_pending = _install_transcript_repair(
+                session_dir, loaded, metadata
+            )
+            assert installed is loaded
+            assert repair_pending is False
             # No durable migration was needed: the live shape is clean.
             assert not list(session_dir.glob(f"{MESSAGES_FILENAME}.recovered-*"))
 
@@ -2274,7 +2288,11 @@ class TestRound3W2ProductionLiveTail:
             session_dir = _write_session(tmp_path / "session_steer", transcript)
             loaded, metadata = SessionLoader.load_session(session_dir)
             assert TRANSCRIPT_INTEGRITY_METADATA_KEY not in metadata
-            assert _install_transcript_repair(session_dir, loaded, metadata) is loaded
+            installed, repair_pending = _install_transcript_repair(
+                session_dir, loaded, metadata
+            )
+            assert installed is loaded
+            assert repair_pending is False
             assert not list(session_dir.glob(f"{MESSAGES_FILENAME}.recovered-*"))
         finally:
             await loop.aclose()
@@ -2329,7 +2347,11 @@ class TestRound3W2ProductionLiveTail:
             session_dir = _write_session(tmp_path / "session_skill", transcript)
             loaded, metadata = SessionLoader.load_session(session_dir)
             assert TRANSCRIPT_INTEGRITY_METADATA_KEY not in metadata
-            assert _install_transcript_repair(session_dir, loaded, metadata) is loaded
+            installed, repair_pending = _install_transcript_repair(
+                session_dir, loaded, metadata
+            )
+            assert installed is loaded
+            assert repair_pending is False
             assert not list(session_dir.glob(f"{MESSAGES_FILENAME}.recovered-*"))
         finally:
             await loop.aclose()
@@ -2559,7 +2581,11 @@ class TestRound4X1ComposedSteerVector:
             session_dir = _write_session(tmp_path / "session_x_steer", transcript)
             loaded, metadata = SessionLoader.load_session(session_dir)
             assert TRANSCRIPT_INTEGRITY_METADATA_KEY not in metadata
-            assert _install_transcript_repair(session_dir, loaded, metadata) is loaded
+            installed, repair_pending = _install_transcript_repair(
+                session_dir, loaded, metadata
+            )
+            assert installed is loaded
+            assert repair_pending is False
             assert not list(session_dir.glob(f"{MESSAGES_FILENAME}.recovered-*"))
         finally:
             await loop.aclose()
@@ -2613,7 +2639,11 @@ class TestRound4X1ComposedSteerVector:
             session_dir = _write_session(tmp_path / "session_x_mention", transcript)
             loaded, metadata = SessionLoader.load_session(session_dir)
             assert TRANSCRIPT_INTEGRITY_METADATA_KEY not in metadata
-            assert _install_transcript_repair(session_dir, loaded, metadata) is loaded
+            installed, repair_pending = _install_transcript_repair(
+                session_dir, loaded, metadata
+            )
+            assert installed is loaded
+            assert repair_pending is False
             assert not list(session_dir.glob(f"{MESSAGES_FILENAME}.recovered-*"))
         finally:
             await loop.aclose()
@@ -2663,7 +2693,11 @@ class TestRound4X1ComposedSteerVector:
             session_dir = _write_session(tmp_path / "session_x_two_steers", transcript)
             loaded, metadata = SessionLoader.load_session(session_dir)
             assert TRANSCRIPT_INTEGRITY_METADATA_KEY not in metadata
-            assert _install_transcript_repair(session_dir, loaded, metadata) is loaded
+            installed, repair_pending = _install_transcript_repair(
+                session_dir, loaded, metadata
+            )
+            assert installed is loaded
+            assert repair_pending is False
             assert not list(session_dir.glob(f"{MESSAGES_FILENAME}.recovered-*"))
         finally:
             await loop.aclose()
@@ -2726,7 +2760,11 @@ class TestRound4X1ComposedSteerVector:
             )
             loaded, metadata = SessionLoader.load_session(session_dir)
             assert TRANSCRIPT_INTEGRITY_METADATA_KEY not in metadata
-            assert _install_transcript_repair(session_dir, loaded, metadata) is loaded
+            installed, repair_pending = _install_transcript_repair(
+                session_dir, loaded, metadata
+            )
+            assert installed is loaded
+            assert repair_pending is False
             assert not list(session_dir.glob(f"{MESSAGES_FILENAME}.recovered-*"))
         finally:
             await loop.aclose()
@@ -2766,7 +2804,11 @@ class TestRound4X1ComposedSteerVector:
             session_dir = _write_session(tmp_path / "session_x_steers", transcript)
             loaded, metadata = SessionLoader.load_session(session_dir)
             assert TRANSCRIPT_INTEGRITY_METADATA_KEY not in metadata
-            assert _install_transcript_repair(session_dir, loaded, metadata) is loaded
+            installed, repair_pending = _install_transcript_repair(
+                session_dir, loaded, metadata
+            )
+            assert installed is loaded
+            assert repair_pending is False
             assert not list(session_dir.glob(f"{MESSAGES_FILENAME}.recovered-*"))
         finally:
             await loop.aclose()
@@ -3377,7 +3419,11 @@ class TestRound5YOldFormatSessions:
         session_dir = _write_session(tmp_path / "session_old_settled", messages)
         loaded, metadata = SessionLoader.load_session(session_dir)
         assert TRANSCRIPT_INTEGRITY_METADATA_KEY not in metadata
-        assert _install_transcript_repair(session_dir, loaded, metadata) is loaded
+        installed, repair_pending = _install_transcript_repair(
+            session_dir, loaded, metadata
+        )
+        assert installed is loaded
+        assert repair_pending is False
         assert not list(session_dir.glob(f"{MESSAGES_FILENAME}.recovered-*"))
 
     @pytest.mark.parametrize(
@@ -3660,7 +3706,11 @@ class TestRound5YRealInjectorProvenance:
                 id(restored_pair),
             }
             assert find_persistence_violations(loaded) == []
-            assert _install_transcript_repair(session_dir, loaded, metadata) is loaded
+            installed, repair_pending = _install_transcript_repair(
+                session_dir, loaded, metadata
+            )
+            assert installed is loaded
+            assert repair_pending is False
             assert not list(session_dir.glob(f"{MESSAGES_FILENAME}.recovered-*"))
         finally:
             await loop.aclose()
@@ -3749,7 +3799,11 @@ class TestRound5YRealInjectorProvenance:
             assert (
                 restored[0]._context_injection_origin == CONTEXT_INJECTION_TOOL_PAIR_V1
             )
-            assert _install_transcript_repair(session_dir, loaded, metadata) is loaded
+            installed, repair_pending = _install_transcript_repair(
+                session_dir, loaded, metadata
+            )
+            assert installed is loaded
+            assert repair_pending is False
             assert not list(session_dir.glob(f"{MESSAGES_FILENAME}.recovered-*"))
         finally:
             await loop.aclose()
@@ -3958,8 +4012,11 @@ class TestRound5YSaveModesAndMigration:
         assert validate_provider_ready(loaded) == []
         # The write-owning install migrates durably: the ORIGINAL is
         # preserved as an artifact and the live path carries the marker.
-        installed = _install_transcript_repair(session_dir, loaded, metadata)
+        installed, repair_pending = _install_transcript_repair(
+            session_dir, loaded, metadata
+        )
         assert installed is loaded
+        assert repair_pending is True
         artifacts = list(session_dir.glob(f"{MESSAGES_FILENAME}.recovered-*"))
         assert len(artifacts) == 1
         assert artifacts[0].read_bytes() == original_bytes

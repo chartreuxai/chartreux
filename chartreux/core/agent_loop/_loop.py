@@ -105,6 +105,7 @@ from chartreux.core.compaction import (
     CompactionManager,
 )
 from chartreux.core.compaction.context import select_model_context
+from chartreux.core.compaction.manager import PendingPostTurnTrim
 from chartreux.core.config import ChartreuxConfigSchema, ModelConfig
 from chartreux.core.config._dangerous_command_persistence import (
     read_saved_dangerous_command_grants,
@@ -957,6 +958,11 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
             generate_session_id=lambda suffix: generate_session_id(suffix=suffix),
         )
         self._active_turn: _ActiveTurn | None = None
+        # T1a post-turn pending trim holder, keyed by session/epoch/boundary:
+        # written by the compaction manager's guarded post-finalization entry
+        # (awaited after seal_turn, before _active_turn = None). NON-PUBLISHING
+        # until T1b lands drain/fence/publication.
+        self._pending_trim: PendingPostTurnTrim | None = None
         self.completed_turn_timing: CompletedTurnTiming | None = None
         # Operations that are not turns but still hold the session: anything
         # reading the working directory or acting on its repository for longer
@@ -1136,6 +1142,10 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
             session_logger_getter=lambda: self.session_logger,
             tool_manager_getter=lambda: self.tool_manager,
             has_active_turn=lambda: self._active_turn is not None,
+            # T1a: the loop owns the pending post-turn trim holder; the
+            # guarded post-finalization entry records into it.
+            pending_trim_getter=lambda: self._pending_trim,
+            pending_trim_recorder=self._record_pending_trim,
         )
 
         if defer_heavy_init:
@@ -2048,6 +2058,12 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
         finally:
             self._outward_redactor.clear_admissions()
             self._tool_batch_runner.clear_turn(self._turn.turn_id)
+            # T1a: guarded post-finalization entry — after seal_turn (the inner
+            # finally above) and before the turn is unregistered below. It
+            # records pending state only; it never seals-and-publishes (T1b).
+            await self.compaction_manager.capture_post_turn_pending_trim(
+                session_id=self.session_id, message_epoch=self.messages.message_epoch
+            )
             self._active_turn = None
             self._backend_lifetime.drain(whole_turn_active=False)
 
@@ -2074,6 +2090,10 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
                 except Exception:
                     logger.warning("Could not persist turn timing", exc_info=True)
                 break
+
+    def _record_pending_trim(self, pending: PendingPostTurnTrim | None) -> None:
+        """T1a holder write: the guarded post-finalization entry records here."""
+        self._pending_trim = pending
 
     def _last_user_message(self) -> LLMMessage | None:
         return AgentLoop._last_user_message_from(select_model_context(self.messages))

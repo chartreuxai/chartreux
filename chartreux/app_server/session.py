@@ -181,8 +181,28 @@ class AppServerSession:  # noqa: PLR0904
         client_tool_handler: ClientToolHandler | None = None,
         client_factory: Callable[[], AppServerClient] | None = None,
     ) -> None:
+        # The client_tools channel carries both the client tool methods (which
+        # require a handler) and, since v0.7.1 S4b1b, the execution-bound
+        # remote-exec attestation entries — a capability statement about the
+        # client-owned executor, not a callable client tool, so attestation
+        # entries alone do not require a client tool handler.
         if capabilities.client_tools and client_tool_handler is None:
-            raise ValueError("Client tool capabilities require a client tool handler")
+            from chartreux.utils.remote_exec import (
+                REMOTE_EXEC_NETWORK_LOCALITY_CAPABILITY,
+                REMOTE_EXEC_SSH_TRUST_CAPABILITY,
+            )
+
+            if any(
+                entry
+                not in {
+                    REMOTE_EXEC_NETWORK_LOCALITY_CAPABILITY,
+                    REMOTE_EXEC_SSH_TRUST_CAPABILITY,
+                }
+                for entry in capabilities.client_tools
+            ):
+                raise ValueError(
+                    "Client tool capabilities require a client tool handler"
+                )
         self._state = ClientSessionState(bootstrap)
         self._connection = AppServerConnection(
             client,

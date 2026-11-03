@@ -6,8 +6,12 @@ veto. Revocation is per operation with the expected live generation and disk
 revision from the last inspection; live and saved outcomes are reported
 separately, a conflict marks the list stale and asks for a refresh instead of
 claiming an unconditional revocation, and endpoint errors are surfaced
-verbatim. The service layer is protocol-only: these tests drive it through a
-fake resource, never a live provider.
+verbatim. Remote-exec authority is destination-keyed: each destination is its
+own row under the live, accepted-config, or disk-only section and revokes
+exactly that destination, while the one whole-scope row needs an explicit
+confirmation because it removes every destination. The service layer is
+protocol-only: these tests drive it through a fake resource, never a live
+provider.
 """
 
 from __future__ import annotations
@@ -42,14 +46,19 @@ from chartreux.ui.widgets.no_markup_static import NoMarkupStatic
 PROJECT = "/home/example/projects/shop"
 REPO = "/home/example/projects/shop"
 GIT_DIR = "/home/example/projects/shop/.git"
+REMOTE_EXEC = "network.remote-exec"
+DESTINATION_A = "deploy@203.0.113.10:22"
+DESTINATION_B = "deploy@203.0.113.20:2222"
+DESTINATION_C = "ops@198.51.100.7:2200"
 
 
 def _grant(
-    operation_id: str, *, work_tree: str | None = REPO
+    operation_id: str, *, work_tree: str | None = REPO, destination: str | None = None
 ) -> DangerousCommandGrantWire:
     return DangerousCommandGrantWire(
         operation_id=operation_id,
         scope=DangerousCommandGrantScopeWire(git_dir=GIT_DIR, work_tree=work_tree),
+        destination=destination,
     )
 
 
@@ -58,6 +67,7 @@ def _inspection(
     live: list[DangerousCommandGrantWire] | None = None,
     saved: list[DangerousCommandGrantWire] | None = None,
     saved_operations: list[str] | None = None,
+    saved_destinations: list[str] | None = None,
     disk_revision: str | None = "rev-1",
     blocking: list[DangerousCommandDenylistBlockWire] | None = None,
     generation: int = 3,
@@ -68,6 +78,7 @@ def _inspection(
         live_grants=live or [],
         accepted_saved_grants=saved or [],
         saved_operations=saved_operations,
+        saved_destinations=saved_destinations,
         disk_revision=disk_revision,
         blocking_denylist=blocking or [],
     )
@@ -128,12 +139,14 @@ class FakeResource:
         expected_live_generation: int,
         expected_disk_revision: str | None,
         user_initiated: bool,
+        destination: str | None = None,
     ) -> DangerousCommandRevokeResponse:
         self.revoke_calls.append({
             "operation_id": operation_id,
             "expected_live_generation": expected_live_generation,
             "expected_disk_revision": expected_disk_revision,
             "user_initiated": user_initiated,
+            "destination": destination,
         })
         if self.revoke_gate is not None:
             await self.revoke_gate.wait()
@@ -331,6 +344,7 @@ class TestRevokeFlow:
                 "expected_live_generation": 3,
                 "expected_disk_revision": "rev-1",
                 "user_initiated": True,
+                "destination": None,
             }
             feedback = _feedback(screen)
             # Live and saved outcomes are reported apart, not as one claim.
@@ -365,6 +379,7 @@ class TestRevokeFlow:
                     "expected_live_generation": 3,
                     "expected_disk_revision": "rev-1",
                     "user_initiated": True,
+                    "destination": None,
                 }
             ]
             feedback = _feedback(screen)
@@ -407,6 +422,7 @@ class TestRevokeFlow:
                     "expected_live_generation": 3,
                     "expected_disk_revision": None,
                     "user_initiated": True,
+                    "destination": None,
                 }
             ]
             feedback = _feedback(screen)
@@ -601,6 +617,334 @@ class TestRevokeFlow:
             assert _feedback(screen) == ""
 
 
+class TestDestinationRevoke:
+    """Remote-exec destination rows: selective revoke and the batch confirmation."""
+
+    @pytest.mark.asyncio
+    async def test_each_destination_is_labelled_by_its_entry_kind(self) -> None:
+        resource = FakeResource(
+            [
+                _inspection(
+                    live=[_grant(REMOTE_EXEC, destination=DESTINATION_A)],
+                    saved=[
+                        _grant(REMOTE_EXEC, destination=DESTINATION_A),
+                        _grant(REMOTE_EXEC, destination=DESTINATION_B),
+                    ],
+                    saved_operations=[],
+                    saved_destinations=[DESTINATION_A, DESTINATION_B, DESTINATION_C],
+                )
+            ],
+            revoke=_revoke(),
+        )
+        app = PanelHarness(ShellPermissionsService(resource))
+        async with app.run_test(size=(100, 32)) as pilot:
+            await _wait_until(pilot, lambda: _panel(app)._inspection is not None)
+            screen = _panel(app)
+            ids = _row_ids(screen)
+            # Each exact destination is its own row, under the section that
+            # holds that authority; the disk-only one is reported apart.
+            assert ids == [
+                "head:live",
+                "whole:network.remote-exec",
+                f"dest:live:{DESTINATION_A}",
+                "head:saved",
+                f"dest:saved:{DESTINATION_A}",
+                f"dest:saved:{DESTINATION_B}",
+                f"dest:disk:{DESTINATION_C}",
+                "head:denylist",
+                "state:denylist",
+            ]
+            # Three labelled entry kinds: live session, accepted config, disk.
+            live_row = _row_prompt(screen, f"dest:live:{DESTINATION_A}")
+            assert REMOTE_EXEC in live_row
+            assert DESTINATION_A in live_row
+            assert "live session" in live_row
+            saved_row = _row_prompt(screen, f"dest:saved:{DESTINATION_B}")
+            assert DESTINATION_B in saved_row
+            assert "saved for this project (accepted config)" in saved_row
+            disk_row = _row_prompt(screen, f"dest:disk:{DESTINATION_C}")
+            assert DESTINATION_C in disk_row
+            assert "on disk only; not accepted by this session" in disk_row
+            # A destination row is never shown as authority for the whole
+            # operation: the accepted section carries both rows separately.
+            assert f"dest:saved:{DESTINATION_A}" != f"dest:saved:{DESTINATION_B}"
+            # The whole-scope action states what it removes, and exists once.
+            whole = _row_prompt(screen, "whole:network.remote-exec")
+            assert "all destinations in every scope" in whole
+            assert "confirm required" in whole
+            assert ids.count("whole:network.remote-exec") == 1
+
+    @pytest.mark.asyncio
+    async def test_destination_row_revokes_exactly_that_destination(self) -> None:
+        inspection = _inspection(
+            live=[
+                _grant(REMOTE_EXEC, destination=DESTINATION_A),
+                _grant(REMOTE_EXEC, destination=DESTINATION_B),
+            ],
+            saved_operations=[],
+            saved_destinations=[DESTINATION_A, DESTINATION_B],
+        )
+        refreshed = _inspection(saved_operations=[], saved_destinations=[])
+        resource = FakeResource([inspection, refreshed], revoke=_revoke())
+        app = PanelHarness(ShellPermissionsService(resource))
+        async with app.run_test(size=(100, 32)) as pilot:
+            await _wait_until(pilot, lambda: _panel(app)._inspection is not None)
+            screen = _panel(app)
+            grants = screen.query_one(
+                "#shell-permissions-grants", ShellPermissionsOptionList
+            )
+            grants.highlighted = _row_ids(screen).index(f"dest:live:{DESTINATION_A}")
+            await pilot.pause()
+            assert "Revoke destination" in _hint(screen)
+            await pilot.press("enter")
+            await _wait_until(pilot, lambda: len(resource.revoke_calls) == 1)
+            await _wait_until(pilot, lambda: resource.inspect_calls == 2)
+            # The control names the exact destination: never the whole scope.
+            assert resource.revoke_calls == [
+                {
+                    "operation_id": REMOTE_EXEC,
+                    "expected_live_generation": 3,
+                    "expected_disk_revision": "rev-1",
+                    "user_initiated": True,
+                    "destination": DESTINATION_A,
+                }
+            ]
+            feedback = _feedback(screen)
+            assert f"Revoking {REMOTE_EXEC} ({DESTINATION_A})" in feedback
+            assert "live session authority removed" in feedback
+            assert DESTINATION_A in feedback
+
+    @pytest.mark.asyncio
+    async def test_whole_scope_row_requires_confirmation_before_revoking_all(
+        self,
+    ) -> None:
+        inspection = _inspection(
+            live=[_grant(REMOTE_EXEC, destination=DESTINATION_A)],
+            saved=[_grant(REMOTE_EXEC, destination=DESTINATION_B)],
+            saved_operations=[],
+            saved_destinations=[DESTINATION_A, DESTINATION_B],
+        )
+        refreshed = _inspection(saved_operations=[], saved_destinations=[])
+        resource = FakeResource([inspection, refreshed], revoke=_revoke())
+        app = PanelHarness(ShellPermissionsService(resource))
+        async with app.run_test(size=(100, 32)) as pilot:
+            await _wait_until(pilot, lambda: _panel(app)._inspection is not None)
+            screen = _panel(app)
+            grants = screen.query_one(
+                "#shell-permissions-grants", ShellPermissionsOptionList
+            )
+            grants.highlighted = _row_ids(screen).index("whole:network.remote-exec")
+            await pilot.pause()
+            assert "Revoke all" in _hint(screen)
+            await pilot.press("enter")
+            await pilot.pause()
+            # Nothing is revoked until the user confirms the batch removal.
+            assert resource.revoke_calls == []
+            feedback = _feedback(screen)
+            assert feedback.startswith("! Confirm:")
+            assert "EVERY remote-exec destination" in feedback
+            assert "every saved destination of this project" in feedback
+            assert "y confirm" in _hint(screen)
+            assert screen._confirm
+            # `n` cancels the confirmation and changes no authority.
+            await pilot.press("n")
+            await pilot.pause()
+            assert screen._confirm is False
+            assert resource.revoke_calls == []
+            assert _feedback(screen) == ""
+            # Confirming performs the whole-scope removal (no destination).
+            await pilot.press("enter")
+            await pilot.pause()
+            await pilot.press("y")
+            await _wait_until(pilot, lambda: len(resource.revoke_calls) == 1)
+            assert resource.revoke_calls == [
+                {
+                    "operation_id": REMOTE_EXEC,
+                    "expected_live_generation": 3,
+                    "expected_disk_revision": "rev-1",
+                    "user_initiated": True,
+                    "destination": None,
+                }
+            ]
+            assert f"Revoking {REMOTE_EXEC}:" in _feedback(screen)
+
+    @pytest.mark.asyncio
+    async def test_escape_cancels_the_confirmation_before_closing(self) -> None:
+        inspection = _inspection(
+            live=[_grant(REMOTE_EXEC, destination=DESTINATION_A)],
+            saved_operations=[],
+            saved_destinations=[DESTINATION_A],
+        )
+        resource = FakeResource([inspection], revoke=_revoke())
+        app = PanelHarness(ShellPermissionsService(resource))
+        async with app.run_test(size=(100, 32)) as pilot:
+            await _wait_until(pilot, lambda: _panel(app)._inspection is not None)
+            screen = _panel(app)
+            grants = screen.query_one(
+                "#shell-permissions-grants", ShellPermissionsOptionList
+            )
+            grants.highlighted = _row_ids(screen).index("whole:network.remote-exec")
+            await pilot.pause()
+            await pilot.press("enter")
+            await pilot.pause()
+            assert screen._confirm
+            # The first Escape cancels the confirmation and keeps the panel.
+            await pilot.press("escape")
+            await pilot.pause()
+            assert screen._confirm is False
+            assert app.screen is screen
+            assert resource.revoke_calls == []
+            # The second Escape dismisses the panel.
+            await pilot.press("escape")
+            await pilot.pause()
+            assert app.screen is not screen
+            assert isinstance(app.result, ShellPermissionsResult)
+            assert app.result.feedback == ""
+            assert resource.revoke_calls == []
+
+    @pytest.mark.asyncio
+    async def test_pending_confirmation_refuses_a_second_revocation(self) -> None:
+        inspection = _inspection(
+            live=[_grant("git.push"), _grant(REMOTE_EXEC, destination=DESTINATION_A)],
+            saved_operations=[],
+            saved_destinations=[],
+        )
+        resource = FakeResource([inspection], revoke=_revoke())
+        app = PanelHarness(ShellPermissionsService(resource))
+        async with app.run_test(size=(100, 32)) as pilot:
+            await _wait_until(pilot, lambda: _panel(app)._inspection is not None)
+            screen = _panel(app)
+            grants = screen.query_one(
+                "#shell-permissions-grants", ShellPermissionsOptionList
+            )
+            grants.highlighted = _row_ids(screen).index("whole:network.remote-exec")
+            await pilot.pause()
+            await pilot.press("enter")
+            await pilot.pause()
+            assert screen._confirm
+            # Selecting an ordinary operation row behind the prompt is refused.
+            grants.highlighted = _row_ids(screen).index("live:git.push")
+            await pilot.pause()
+            await pilot.press("enter")
+            await pilot.pause()
+            assert resource.revoke_calls == []
+            assert screen._confirm
+            # Refresh abandons the pending confirmation instead of acting.
+            await pilot.press("r")
+            await _wait_until(pilot, lambda: resource.inspect_calls == 2)
+            assert resource.revoke_calls == []
+            assert screen._confirm is False
+
+    @pytest.mark.asyncio
+    async def test_disk_only_destination_reported_and_revoked(self) -> None:
+        inspection = _inspection(
+            live=[], saved=[], saved_operations=[], saved_destinations=[DESTINATION_C]
+        )
+        refreshed = _inspection(saved_operations=[], saved_destinations=[])
+        resource = FakeResource([inspection, refreshed], revoke=_revoke())
+        app = PanelHarness(ShellPermissionsService(resource))
+        async with app.run_test(size=(100, 32)) as pilot:
+            await _wait_until(pilot, lambda: _panel(app)._inspection is not None)
+            screen = _panel(app)
+            ids = _row_ids(screen)
+            assert "dest:disk:" + DESTINATION_C in ids
+            assert f"dest:saved:{DESTINATION_C}" not in ids
+            grants = screen.query_one(
+                "#shell-permissions-grants", ShellPermissionsOptionList
+            )
+            grants.highlighted = ids.index("dest:disk:" + DESTINATION_C)
+            await pilot.pause()
+            await pilot.press("enter")
+            await _wait_until(pilot, lambda: len(resource.revoke_calls) == 1)
+            await _wait_until(pilot, lambda: resource.inspect_calls == 2)
+            assert resource.revoke_calls == [
+                {
+                    "operation_id": REMOTE_EXEC,
+                    "expected_live_generation": 3,
+                    "expected_disk_revision": "rev-1",
+                    "user_initiated": True,
+                    "destination": DESTINATION_C,
+                }
+            ]
+            assert "dest:disk:" + DESTINATION_C not in _row_ids(screen)
+
+    @pytest.mark.asyncio
+    async def test_destination_error_names_the_destination_and_keeps_the_list(
+        self,
+    ) -> None:
+        inspection = _inspection(
+            live=[_grant(REMOTE_EXEC, destination=DESTINATION_A)],
+            saved_operations=[],
+            saved_destinations=[],
+        )
+        error = AppServerResponseError(
+            ProtocolError(
+                code=ProtocolErrorCode.INVALID_PARAMS,
+                message="A destination-scoped revocation requires network.remote-exec",
+            )
+        )
+        resource = FakeResource([inspection], revoke_error=error)
+        app = PanelHarness(ShellPermissionsService(resource))
+        async with app.run_test(size=(100, 32)) as pilot:
+            await _wait_until(pilot, lambda: _panel(app)._inspection is not None)
+            screen = _panel(app)
+            grants = screen.query_one(
+                "#shell-permissions-grants", ShellPermissionsOptionList
+            )
+            grants.highlighted = _row_ids(screen).index(f"dest:live:{DESTINATION_A}")
+            await pilot.pause()
+            await pilot.press("enter")
+            await _wait_until(pilot, lambda: _feedback(screen).startswith("Failed:"))
+            feedback = _feedback(screen)
+            # The failed operation is named with the destination, verbatim.
+            assert f"Revoking {DESTINATION_A} failed" in feedback
+            assert "A destination-scoped revocation requires" in feedback
+            assert screen.query_one(
+                "#shell-permissions-feedback", NoMarkupStatic
+            ).has_class("error")
+            # Nothing was claimed and the list still shows the authority.
+            assert f"dest:live:{DESTINATION_A}" in _row_ids(screen)
+            assert not screen._stale
+
+    @pytest.mark.asyncio
+    async def test_destination_rows_are_usable_at_80x24(self) -> None:
+        inspection = _inspection(
+            live=[
+                _grant(REMOTE_EXEC, destination=DESTINATION_A),
+                _grant(REMOTE_EXEC, destination=DESTINATION_B),
+            ],
+            saved_operations=[],
+            saved_destinations=[DESTINATION_A, DESTINATION_B],
+        )
+        resource = FakeResource([inspection], revoke=_revoke())
+        app = PanelHarness(ShellPermissionsService(resource))
+        async with app.run_test(size=(80, 24)) as pilot:
+            await _wait_until(pilot, lambda: _panel(app)._inspection is not None)
+            screen = _panel(app)
+            content = screen.query_one("#shell-permissions-content")
+            assert content.has_class("fullscreen")
+            grants = screen.query_one(
+                "#shell-permissions-grants", ShellPermissionsOptionList
+            )
+            assert grants.has_focus
+            # The compact floor keeps every destination reachable by j/k, and
+            # each row's rendering stays inside the panel width.
+            reached: list[str] = []
+            for _ in range(6):
+                option = grants.highlighted_option
+                assert option is not None and option.id is not None
+                reached.append(str(option.id))
+                await pilot.press("j")
+            assert f"dest:live:{DESTINATION_A}" in reached
+            assert f"dest:live:{DESTINATION_B}" in reached
+            assert "whole:network.remote-exec" in reached
+            grants.highlighted = _row_ids(screen).index(f"dest:live:{DESTINATION_B}")
+            await pilot.pause()
+            assert "Revoke destination" in _hint(screen)
+            assert screen.query_one("#shell-permissions-hint").display
+            assert screen.query_one("#shell-permissions-feedback").display
+
+
 class TestPanelConventions:
     @pytest.mark.asyncio
     async def test_80x24_renders_with_focus_and_accurate_hints(
@@ -755,6 +1099,7 @@ class TestShellPermissionsService:
                 "expected_live_generation": 3,
                 "expected_disk_revision": "rev-1",
                 "user_initiated": True,
+                "destination": None,
             }
         ]
         assert outcome.live_status == "removed"
@@ -778,3 +1123,48 @@ class TestShellPermissionsService:
         assert outcome.live_status == "conflict"
         assert outcome.saved_status == "skipped"
         assert outcome.live_generation == 9
+
+    @pytest.mark.asyncio
+    async def test_inspect_projects_the_three_destination_entry_kinds(self) -> None:
+        resource = FakeResource([
+            _inspection(
+                live=[_grant(REMOTE_EXEC, destination=DESTINATION_A)],
+                saved=[_grant(REMOTE_EXEC, destination=DESTINATION_B)],
+                saved_operations=[],
+                saved_destinations=[DESTINATION_B, DESTINATION_C],
+            )
+        ])
+        state = await ShellPermissionsService(resource).inspect()
+        # The exact destination rides on the projection, never a bare operation.
+        assert [
+            (grant.operation_id, grant.destination, grant.source)
+            for grant in state.live_grants
+        ] == [(REMOTE_EXEC, DESTINATION_A, "live")]
+        assert [
+            (grant.operation_id, grant.destination, grant.source)
+            for grant in state.saved_grants
+        ] == [(REMOTE_EXEC, DESTINATION_B, "saved")]
+        # Only the destination the accepted config does not hold is disk-only.
+        assert state.disk_only_destinations == (DESTINATION_C,)
+        assert state.disk_only_operations == ()
+
+    @pytest.mark.asyncio
+    async def test_revoke_passes_the_exact_destination(self) -> None:
+        resource = FakeResource([_inspection()], revoke=_revoke())
+        outcome = await ShellPermissionsService(resource).revoke(
+            operation_id=REMOTE_EXEC,
+            expected_live_generation=3,
+            expected_disk_revision="rev-1",
+            destination=DESTINATION_A,
+        )
+        assert resource.revoke_calls == [
+            {
+                "operation_id": REMOTE_EXEC,
+                "expected_live_generation": 3,
+                "expected_disk_revision": "rev-1",
+                "user_initiated": True,
+                "destination": DESTINATION_A,
+            }
+        ]
+        assert outcome.destination == DESTINATION_A
+        assert not outcome.conflicted

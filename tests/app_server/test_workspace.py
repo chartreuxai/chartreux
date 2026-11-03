@@ -1,21 +1,35 @@
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 
+from git import Repo
 import pytest
 
+from chartreux.app_server._dispatch import RequestFailure
+from chartreux.app_server._handler import CoreRequestHandler
+from chartreux.app_server._host import HostRequestHandler
 from chartreux.app_server._workspace import (
     PromptPreparationError,
     WorkspaceTrustError,
     decide_workspace_trust,
     prepare_prompt,
     read_untrusted_config_dirs,
+    read_workspace_trust,
 )
 from chartreux.app_server.models import ImageAttachment
+from chartreux.app_server.protocol import ProtocolErrorCode
+from chartreux.core.agent_loop.errors import AgentLoopStateError
 from chartreux.core.config import ModelConfig, ProviderConfig
+from chartreux.core.config.harness_files import HarnessFilesManager
+from chartreux.core.git.worktree import WorktreeRepository
 from chartreux.core.llm_models import Backend
 from chartreux.core.paths import TRUSTED_FOLDERS_FILE
-from chartreux.core.trusted_folders import TrustedFoldersManager
+from chartreux.core.trusted_folders import (
+    TrustedFoldersManager,
+    TrustStoreState,
+    WorkspaceTrustStatus,
+)
 from chartreux.utils.images import MAX_IMAGE_BYTES, MAX_IMAGES_PER_MESSAGE
 from tests.conftest import build_test_agent_loop, build_test_vibe_config
 
@@ -253,3 +267,152 @@ def test_read_untrusted_config_dirs_empty_when_nothing_broken(tmp_path: Path) ->
     response = read_untrusted_config_dirs(tmp_path, trust_store)
 
     assert response.dirs == []
+
+
+def _corrupt_trust_store(config_dir: Path) -> TrustedFoldersManager:
+    """A store that exists but cannot be parsed, loaded from that state."""
+    (config_dir / "trusted_folders.toml").write_text("[malformed")
+    store = TrustedFoldersManager()
+    assert store.store_state is TrustStoreState.MALFORMED
+    return store
+
+
+def _repo_and_worktree(root: Path) -> tuple[Path, Path]:
+    """A repository and a real linked worktree of it.
+
+    A move only accepts a destination derived from the session's own
+    repository, so the refusal has to be reached from a directory the move
+    would otherwise accept — a bare pair of directories would refuse for the
+    wrong reason.
+    """
+    repo = root / "repo"
+    repo.mkdir()
+    git_repo = Repo.init(repo, initial_branch="main")
+    git_repo.config_writer().set_value("user", "name", "Tester").release()
+    git_repo.config_writer().set_value("user", "email", "t@example.com").release()
+    (repo / "file.txt").write_text("hello\n")
+    git_repo.index.add(["file.txt"])
+    git_repo.index.commit("initial")
+    with WorktreeRepository.open(repo) as repository:
+        prepared = repository.prepare("feature")
+    return repo, prepared.path.resolve()
+
+
+def _session_decision_handler(
+    workspace: Path, trust_store: TrustedFoldersManager
+) -> CoreRequestHandler:
+    """The session-scope decision path with only its own seam populated.
+
+    That path reads the loop's cwd, the loop's harness files, the session
+    holder and the idle gate; building the rest of the handler would add
+    nothing this node can observe.
+    """
+    handler = CoreRequestHandler.__new__(CoreRequestHandler)
+    handler._agent_loop = SimpleNamespace(  # type: ignore[assignment]
+        cwd=workspace,
+        harness_files=HarnessFilesManager(sources=(), trust_store=trust_store),
+    )
+    handler._execution = SimpleNamespace(  # type: ignore[assignment]
+        active=None, require_idle=lambda: None
+    )
+    handler._require_session = lambda _session_id: None  # type: ignore[assignment]
+    return handler
+
+
+def test_workspace_decision_translates_a_refused_persist(
+    tmp_path: Path, config_dir: Path
+) -> None:
+    """A write the store refuses is an error, never a decision that was made.
+
+    The store loads as missing (the genuine first-run default), so the
+    usability guard passes; a cooperating writer then makes it unusable before
+    the decision is persisted. The checked write refuses and reports that only
+    to the core apply path, which the workspace API would otherwise hand back
+    as an unchanged status — as if the decision had been accepted and simply
+    had no effect. It is translated instead, and the store is left alone.
+    """
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (workspace / "AGENTS.md").write_text("instructions\n", encoding="utf-8")
+    trust_store = TrustedFoldersManager()
+    assert trust_store.store_state is TrustStoreState.MISSING
+    store_path = config_dir / "trusted_folders.toml"
+    store_path.write_text("[malformed")
+
+    with pytest.raises(WorkspaceTrustError, match="was not saved"):
+        decide_workspace_trust(workspace, "trust_cwd", trust_store)
+
+    assert trust_store.is_trusted(workspace) is None
+    assert store_path.read_text() == "[malformed"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "consumer", ["workspace-api", "host-dispatch", "session-decision", "relocation"]
+)
+async def test_group_b_consumer_never_reswallows_an_unusable_trust_store(
+    consumer: str, tmp_path: Path, config_dir: Path
+) -> None:
+    """OBSERVABLE: no group-B consumer answers a trust question from a broken store.
+
+    A malformed store reads as "nothing is trusted" in the store's in-memory
+    lookups, so every consumer below would otherwise report a definite answer
+    it cannot support: the workspace API would return a status with trust
+    details (and accept a decision it cannot persist), the host and the session
+    handler would hand the caller a normal response, and a workspace move would
+    grant session trust and bind a destination whose project configuration is
+    unknown. Each surfaces the typed store state instead — ``WorkspaceTrustError``
+    from the workspace API, ``RequestFailure(INVALID_PARAMS)`` from both server
+    paths, ``AgentLoopStateError`` from the move — and re-swallowing the error
+    in any of them fails this node.
+    """
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (workspace / "AGENTS.md").write_text("instructions\n", encoding="utf-8")
+    trust_store = _corrupt_trust_store(config_dir)
+
+    if consumer == "workspace-api":
+        calls = (
+            lambda: read_workspace_trust(workspace, trust_store),
+            lambda: read_untrusted_config_dirs(workspace, trust_store),
+            lambda: decide_workspace_trust(workspace, "trust_cwd", trust_store),
+        )
+        for call in calls:
+            with pytest.raises(WorkspaceTrustError, match="malformed"):
+                call()
+    elif consumer == "host-dispatch":
+        host = HostRequestHandler(
+            HarnessFilesManager(sources=(), trust_store=trust_store)
+        )
+        with pytest.raises(RequestFailure) as failure:
+            await host.dispatch("workspace/trust/status", {"cwd": str(workspace)})
+        assert failure.value.code is ProtocolErrorCode.INVALID_PARAMS
+        assert "malformed" in str(failure.value)
+    elif consumer == "session-decision":
+        handler = _session_decision_handler(workspace, trust_store)
+        with pytest.raises(RequestFailure) as failure:
+            await handler.dispatch(
+                "workspace/trust/decision",
+                {"decision": "trust_cwd", "cwd": str(workspace), "sessionId": "s1"},
+            )
+        assert failure.value.code is ProtocolErrorCode.INVALID_PARAMS
+        assert "malformed" in str(failure.value)
+    else:
+        repo, worktree = _repo_and_worktree(tmp_path)
+        agent_loop = build_test_agent_loop(
+            cwd=repo,
+            harness_files=HarnessFilesManager(
+                sources=("project",), trust_store=trust_store
+            ).for_session(repo, workspace_roots=[repo]),
+        )
+        try:
+            with pytest.raises(AgentLoopStateError, match="trust store is malformed"):
+                await agent_loop.relocate(worktree)
+
+            assert agent_loop.cwd == repo
+            assert agent_loop.harness_files.cwd == repo
+            assert (
+                trust_store.trust_status(worktree) is not WorkspaceTrustStatus.SESSION
+            )
+        finally:
+            await agent_loop.aclose()

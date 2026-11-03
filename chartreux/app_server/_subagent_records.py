@@ -21,7 +21,12 @@ from chartreux.core.completion_contract import (
     CompletionEnvelope,
     CompletionRequirement,
 )
-from chartreux.core.dangerous_commands import DangerousCommandAuthority, RepositoryScope
+from chartreux.core.dangerous_commands import (
+    REMOTE_EXEC_OPERATION_ID,
+    DangerousCommandAuthority,
+    RemoteDestination,
+    RepositoryScope,
+)
 from chartreux.core.llm_models import LLMMessage
 from chartreux.core.recovery_models import FailureEnvelope, PackageTier
 from chartreux.core.session.transcript_archive import ArchivedPrefixV1
@@ -571,10 +576,11 @@ class StoredChildSession:
 
 @dataclass(frozen=True, slots=True)
 class DangerousCommandGrantEntry:
-    """One (operation, repository scope) authority entry of an inspection."""
+    """One (operation, repository scope[, destination]) authority entry."""
 
     operation_id: str
     scope: RepositoryScope
+    destination: RemoteDestination | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -585,17 +591,24 @@ class DangerousCommandDenylistBlock:
     operations: tuple[str, ...]
 
 
-def _grant_entry_sort_key(entry: DangerousCommandGrantEntry) -> tuple[str, str, str]:
+def _grant_entry_sort_key(
+    entry: DangerousCommandGrantEntry,
+) -> tuple[str, str, str, str]:
     scope = entry.scope
-    return (entry.operation_id, str(scope.git_dir), str(scope.work_tree))
+    return (
+        entry.operation_id,
+        str(scope.git_dir),
+        str(scope.work_tree),
+        entry.destination.key if entry.destination is not None else "",
+    )
 
 
 def _grant_entries(
     authorities: tuple[DangerousCommandAuthority, ...],
 ) -> tuple[DangerousCommandGrantEntry, ...]:
-    """Flatten authority snapshots into sorted (operation, scope) entries."""
+    """Flatten authority snapshots into sorted (operation, scope[, destination]) entries."""
     entries = {
-        DangerousCommandGrantEntry(operation_id, authority.scope)
+        DangerousCommandGrantEntry(operation_id, authority.scope, authority.destination)
         for authority in authorities
         for operation_id in authority.operations
     }
@@ -610,6 +623,7 @@ def _grant_wire(entry: DangerousCommandGrantEntry) -> DangerousCommandGrantWire:
             git_dir=str(scope.git_dir),
             work_tree=str(scope.work_tree) if scope.work_tree is not None else None,
         ),
+        destination=entry.destination.key if entry.destination is not None else None,
     )
 
 
@@ -621,7 +635,9 @@ def _accepted_saved_grants(
     The union covers the session's inherited restrictions (a child accepts its
     parent's sources) and its own accepted restrictions; the same source can
     appear in both, so entries dedupe by project and operations. Only the
-    registered project's grants are relevant to its inspection.
+    registered project's grants are relevant to its inspection. Remote-exec
+    destination grants project as one entry per exact destination, carrying
+    the destination on the entry.
     """
     sources = (
         *loop.runtime_policy.inherited_restrictions,
@@ -643,6 +659,22 @@ def _accepted_saved_grants(
             entries.update(
                 DangerousCommandGrantEntry(operation_id, scope)
                 for operation_id in grant.operations
+            )
+        for destination_grant in source.remote_exec_grants:
+            key = (str(destination_grant.project), ("remote-exec-destinations",))
+            if key in seen:
+                continue
+            seen.add(key)
+            if str(destination_grant.project) != str(project):
+                continue
+            scope = resolve_repository_scope(
+                destination_grant.project, GitRepositoryRelocation()
+            )
+            if scope is None:
+                continue
+            entries.update(
+                DangerousCommandGrantEntry(REMOTE_EXEC_OPERATION_ID, scope, destination)
+                for destination in destination_grant.destinations
             )
     return tuple(sorted(entries, key=_grant_entry_sort_key))
 

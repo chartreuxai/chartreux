@@ -3,11 +3,14 @@ from __future__ import annotations
 import asyncio
 import json
 from pathlib import Path
+import socket
+import subprocess
 from typing import cast
 from unittest.mock import AsyncMock
 
 import pytest
 
+from chartreux.app_server._connection_protocol import ClientToolCapability
 from chartreux.app_server._model import ProtocolModel
 from chartreux.app_server._runtime import AgentRuntimeFactory
 from chartreux.app_server._tool_io import ClientToolIO
@@ -27,14 +30,30 @@ from chartreux.app_server.protocol import (
 from chartreux.app_server.session import AppServerSession
 from chartreux.app_server.transport import memory_transport_pair
 from chartreux.core.agent_loop._loop import ToolExecutionResponse
+from chartreux.core.dangerous_commands import (
+    REMOTE_EXEC_NETWORK_LOCALITY_CAPABILITY,
+    REMOTE_EXEC_OPERATION_ID,
+    REMOTE_EXEC_SSH_TRUST_CAPABILITY,
+    DangerousCommandAuthority,
+    canonical_remote_destination,
+)
 from chartreux.core.events import ToolResultEvent
 from chartreux.core.llm_models import FunctionCall, ToolCall
-from chartreux.core.tools.base import ToolPermission
-from chartreux.core.tools.builtins.bash import BashArgs, BashToolConfig
+from chartreux.core.tools.base import (
+    BaseToolState,
+    InvokeContext,
+    ToolError,
+    ToolPermission,
+)
+from chartreux.core.tools.builtins._shell_command_policy import (
+    GitRepositoryRelocation,
+    resolve_repository_scope,
+)
+from chartreux.core.tools.builtins.bash import Bash, BashArgs, BashToolConfig
 from chartreux.core.tools.builtins.read_file import ReadFileArgs
 from chartreux.core.tools.io_port import ShellCommandRequest
 from tests.conftest import build_test_agent_loop, build_test_vibe_config
-from tests.mock.utils import mock_llm_chunk
+from tests.mock.utils import collect_result, mock_llm_chunk
 from tests.stubs.app_server import build_test_app_server, legacy_backend
 from tests.stubs.fake_backend import FakeBackend
 
@@ -145,6 +164,213 @@ async def test_client_tool_io_projects_typed_filesystem_and_terminal_requests() 
         "clientTool/terminal/output",
         "clientTool/terminal/release",
     ]
+
+
+@pytest.mark.asyncio
+async def test_non_attesting_client_terminal_executor_refuses_glob_bearing_shell_text() -> (
+    None
+):
+    """A ``terminal`` capability is not an executor attestation.
+
+    The server never learns the client's executor, and the protocol carries no
+    execution-bound attestation entry, so expansion-bearing shell text refuses
+    before the client receives any terminal request. A literal argv — the safe
+    fallback that never re-enters a shell — still runs.
+    """
+    requester = FakeClientRequester()
+    capabilities = ClientCapabilities(client_tools=["terminal"])
+    tool_io = ClientToolIO(FakeClientToolBridge(requester, capabilities))
+    assert capabilities.client_tools == ["terminal"]
+    assert tool_io.supports_terminal
+
+    for command, args in (("cat *.txt", None), ("/bin/bash", ["-c", "ls *.py"])):
+        with pytest.raises(RuntimeError, match="needs shell pathname expansion"):
+            await tool_io.run_shell(
+                ShellCommandRequest(
+                    session_id="root",
+                    tool_call_id="call-1",
+                    command=command,
+                    args=args,
+                    cwd=Path("/workspace"),
+                    timeout=1,
+                    max_output_bytes=100,
+                )
+            )
+    assert requester.calls == []
+
+    result = await tool_io.run_shell(
+        ShellCommandRequest(
+            session_id="root",
+            tool_call_id="call-2",
+            command="cat",
+            args=["a.txt"],
+            cwd=Path("/workspace"),
+            timeout=1,
+            max_output_bytes=100,
+        )
+    )
+    assert result.stdout == "host output"
+    terminal_create = cast(
+        ClientToolTerminalCreateParams,
+        next(
+            params
+            for method, params in requester.calls
+            if method == "clientTool/terminal/create"
+        ),
+    )
+    assert terminal_create.command == "cat"
+    assert terminal_create.args == ["a.txt"]
+
+
+# --- S4b1b: execution-bound remote-exec attestation on the client_tools channel
+#
+# A ``terminal`` entry alone is not an executor attestation. The two
+# attestation entries (network-namespace locality AND the filesystem/SSH
+# trust context) together form the execution-bound statement that lets a
+# pinned IP-literal ssh command ride into clientTool/terminal/create; any
+# client that does not attest both — every ACP client and every older client
+# — hard-denies before any terminal request is made.
+
+_S4B1B_COMMAND = "ssh deploy@8.8.8.8 uptime"
+_S4B1B_PINNED_COMMAND = (
+    "ssh -o UserKnownHostsFile=/dev/null/chartreux-pinned-known-hosts"
+    " -o HostKeyAlias=deploy@8.8.8.8:22 -o StrictHostKeyChecking=yes"
+    " -o BatchMode=yes deploy@8.8.8.8 uptime"
+)
+_ATTESTING_CLIENT_TOOLS: list[ClientToolCapability] = [
+    "terminal",
+    REMOTE_EXEC_NETWORK_LOCALITY_CAPABILITY,
+    REMOTE_EXEC_SSH_TRUST_CAPABILITY,
+]
+
+
+@pytest.fixture
+def s4b1b_interfaces(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Hermetic locality: a fixed local-interface enumeration (S4b1a seam)."""
+
+    def fake_getaddrinfo(host, port):
+        return [
+            (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("192.168.10.20", 0)),
+            (socket.AF_INET6, socket.SOCK_STREAM, 6, "", ("::1", 0, 0, 0)),
+        ]
+
+    monkeypatch.setattr(socket, "getaddrinfo", fake_getaddrinfo)
+
+
+def _s4b1b_repo(tmp_path: Path) -> Path:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    return repo
+
+
+def _s4b1b_bash_tool(repo: Path, *, granted: bool) -> Bash:
+    tool = Bash(config_getter=lambda: BashToolConfig(), state=BaseToolState(), cwd=repo)
+    if granted:
+        scope = resolve_repository_scope(repo, GitRepositoryRelocation())
+        assert scope is not None
+        tool.dangerous_command_authorities_getter = lambda: (
+            DangerousCommandAuthority(
+                operations=frozenset({REMOTE_EXEC_OPERATION_ID}),
+                scope=scope,
+                source="runtime_grant",
+                destination=canonical_remote_destination("deploy@8.8.8.8:22"),
+            ),
+        )
+    else:
+        tool.dangerous_command_authorities_getter = lambda: ()
+    return tool
+
+
+@pytest.mark.asyncio
+async def test_execution_bound_attesting_client_receives_the_pinned_ssh_command(
+    tmp_path: Path, s4b1b_interfaces
+) -> None:
+    """Both attestation entries + a covering grant: the pinned command —
+    approved address plus fixed host-key identity — is the command the client
+    terminal is asked to create.
+    """
+    repo = _s4b1b_repo(tmp_path)
+    tool = _s4b1b_bash_tool(repo, granted=True)
+    requester = FakeClientRequester()
+    tool_io = ClientToolIO(
+        FakeClientToolBridge(
+            requester, ClientCapabilities(client_tools=_ATTESTING_CLIENT_TOOLS)
+        )
+    )
+    assert tool_io.remote_exec_attestation.execution_bound
+    ctx = InvokeContext(tool_call_id="call-1", session_id="root", tool_io=tool_io)
+
+    result = await collect_result(tool.run(BashArgs(command=_S4B1B_COMMAND), ctx))
+
+    assert result.exit_code == 0
+    terminal_create = cast(
+        ClientToolTerminalCreateParams,
+        next(
+            params
+            for method, params in requester.calls
+            if method == "clientTool/terminal/create"
+        ),
+    )
+    assert terminal_create.command == _S4B1B_PINNED_COMMAND
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "client_tools",
+    [
+        ["terminal"],  # no attestation entries (every ACP client, older clients)
+        # locality only: not an execution-bound statement; hard-denies
+        # transfers (characterized at this row, discriminating arm at S4b2c).
+        ["terminal", REMOTE_EXEC_NETWORK_LOCALITY_CAPABILITY],
+    ],
+    ids=["non_attesting", "locality_only"],
+)
+async def test_non_execution_bound_client_never_receives_the_ssh_command(
+    tmp_path: Path, s4b1b_interfaces, client_tools: list[ClientToolCapability]
+) -> None:
+    """A terminal client whose executor is not attested as execution-bound
+    (differing namespace or trust context) hard-denies the pinned ssh call
+    before any client request is made — even with a covering grant.
+    """
+    repo = _s4b1b_repo(tmp_path)
+    tool = _s4b1b_bash_tool(repo, granted=True)
+    requester = FakeClientRequester()
+    tool_io = ClientToolIO(
+        FakeClientToolBridge(requester, ClientCapabilities(client_tools=client_tools))
+    )
+    assert not tool_io.remote_exec_attestation.execution_bound
+    ctx = InvokeContext(tool_call_id="call-1", session_id="root", tool_io=tool_io)
+
+    with pytest.raises(ToolError) as err:
+        await collect_result(tool.run(BashArgs(command=_S4B1B_COMMAND), ctx))
+
+    assert "does not attest an execution-bound remote-exec context" in str(err.value)
+    assert requester.calls == []
+
+
+@pytest.mark.asyncio
+async def test_attesting_client_without_a_grant_never_receives_the_ssh_command(
+    tmp_path: Path, s4b1b_interfaces
+) -> None:
+    """Authority must coincide with the pin: an execution-bound client with
+    no network.remote-exec grant covering the destination sends no request.
+    """
+    repo = _s4b1b_repo(tmp_path)
+    tool = _s4b1b_bash_tool(repo, granted=False)
+    requester = FakeClientRequester()
+    tool_io = ClientToolIO(
+        FakeClientToolBridge(
+            requester, ClientCapabilities(client_tools=_ATTESTING_CLIENT_TOOLS)
+        )
+    )
+    ctx = InvokeContext(tool_call_id="call-1", session_id="root", tool_io=tool_io)
+
+    with pytest.raises(ToolError) as err:
+        await collect_result(tool.run(BashArgs(command=_S4B1B_COMMAND), ctx))
+
+    assert "no network.remote-exec grant covers the destination" in str(err.value)
+    assert requester.calls == []
 
 
 @pytest.mark.asyncio

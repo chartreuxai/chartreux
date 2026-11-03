@@ -593,6 +593,14 @@ class ChartreuxAcpAgent(AcpAgent):
                 client_tools.append("filesystem/write")
         if capabilities is not None and capabilities.terminal:
             client_tools.append("terminal")
+        # v0.7.1 S4b1b: the ACP client NEVER attests the execution-bound
+        # remote-exec entries (remote_exec/network_locality +
+        # remote_exec/ssh_trust_context) on this channel — the ACP spec has
+        # no field for them and the agent does not self-attest — so an ACP
+        # client's terminal executor is non-attesting and remote execution
+        # through it hard-denies at the transport (a documented intermediate
+        # state; self-attestation would not protect against a lying client
+        # anyway).
         callback_kinds: list[CallbackKind] = []
         if self._supports_user_input():
             callback_kinds.append("user_input")

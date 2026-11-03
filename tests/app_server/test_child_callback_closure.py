@@ -4,11 +4,15 @@ Q1 (`ask_user_question` execution-denied for bounded children) retired the
 only end-to-end child-callback delivery assertion
 (``test_subagents_assembly_drain.py::test_child_callbacks_round_trip_using_child_session_id``).
 This module replaces that delivery coverage and adds the Q2b closure wire.
-The child callback is injected through the callback seam — the child
-TurnController's broker request handler — because after Q1 no shipped
-producer can mint a child question. The channel is defense-in-depth for
-pre-Q1 callbacks still open in a running session and for future
-child-askable callback kinds.
+
+D2-era premise: children can no longer mint model questions at the
+broker seam — Q1 retired the producer and D2 closed admission (a child-origin
+``MODEL_QUESTION`` is refused with ``ChildQuestionRefusedError`` before any
+callback opens). The wire therefore covers runtime-approval callbacks (which
+share the request broker and are permanently expiry-ineligible), future
+child-askable callback kinds, and pre-D2 callbacks still open in an upgraded
+session. The injected request is built with ``RUNTIME_APPROVAL`` for exactly
+that reason.
 
 Child callbacks are delivered to the parent client (``callback/call``) but
 their history never enters the root projection. Closing one must therefore
@@ -134,7 +138,7 @@ def _child_question(request_id: str) -> UserInputRequestEvent:
             ]
         ),
         tool_call_id=f"{request_id}-effect",
-        origin=UserInputOrigin.MODEL_QUESTION,
+        origin=UserInputOrigin.RUNTIME_APPROVAL,
     )
 
 

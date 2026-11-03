@@ -14,6 +14,7 @@ from textual.widgets import Button
 
 from chartreux.app_server.events import AgentsUpdate, CallbackRequested
 from chartreux.app_server.models import (
+    ExpiredCallbackState,
     OpenCallbackState,
     PublicCallbackEntry,
     PublicEntryGenerationStatus,
@@ -507,6 +508,69 @@ async def test_answering_final_callback_restores_loading_progress() -> None:
     assert loading.base_status == "Running command"
     assert loading._pause_start is None
     app._switch_to_input_app.assert_awaited_once_with()
+
+
+@pytest.mark.asyncio
+async def test_expired_question_draft_lifecycle_characterization() -> None:
+    """Characterize the close path AROUND the expired-draft store (D3).
+
+    Pins what the user sees when the server expires an unanswered question:
+    the warning copy, the dismissed widget, and where the surface goes next —
+    the next queued callback, or the prompt with its program status restored.
+    The closed widget's unsent draft is never delivered; this node states the
+    lifecycle without naming the store that held it.
+    """
+    expired = _question_callback("callback-1").model_copy(
+        update={"state": ExpiredCallbackState(reason="unanswered_timeout")}
+    )
+    next_callback = _question_callback("callback-2")
+
+    queued_app = MagicMock()
+    queued_app._app_server = None
+    queued_app._show_callback = AsyncMock()
+    queued_app._switch_to_input_app = AsyncMock()
+    queued_question = MagicMock(
+        _callback_id="callback-1", other_texts={0: "half-typed draft"}
+    )
+    queued_app.query_one.return_value = queued_question
+    queued_supervisor = TurnSupervisor(
+        interrupt_wait_timeout=lambda: 2.0, interrupt_settle_timeout=lambda: 30.0
+    )
+    queued_supervisor._bind_app(queued_app)
+    queued_supervisor.active_callback = _question_callback("callback-1")
+    queued_supervisor.pending_callbacks = deque([next_callback])
+
+    await queued_supervisor.question_expired(expired)
+
+    assert queued_supervisor.active_callback is None
+    queued_question.close_for_expiry.assert_called_once_with()
+    assert list(queued_supervisor.pending_callbacks) == []
+    queued_app._show_callback.assert_awaited_once_with(next_callback)
+    queued_app.notify.assert_called_once_with(
+        "Unanswered — deferred", severity="warning"
+    )
+    queued_app._switch_to_input_app.assert_not_awaited()
+
+    drained_app = MagicMock()
+    drained_app._app_server = None
+    drained_app._switch_to_input_app = AsyncMock()
+    drained_question = MagicMock(
+        _callback_id="callback-1", other_texts={0: "half-typed draft"}
+    )
+    drained_app.query_one.return_value = drained_question
+    drained_supervisor = TurnSupervisor(
+        interrupt_wait_timeout=lambda: 2.0, interrupt_settle_timeout=lambda: 30.0
+    )
+    drained_supervisor._bind_app(drained_app)
+    drained_supervisor.active_callback = _question_callback("callback-1")
+
+    await drained_supervisor.question_expired(expired)
+
+    assert drained_supervisor.active_callback is None
+    drained_question.close_for_expiry.assert_called_once_with()
+    drained_app._show_callback.assert_not_called()
+    drained_app._switch_to_input_app.assert_awaited_once_with()
+    drained_app._program_status.emit.assert_called_once_with("idle")
 
 
 @pytest.mark.asyncio
@@ -1772,6 +1836,113 @@ async def test_shell_permissions_panel_opens_from_settings_over_app_server(
                 not in [str(row.id) for row in grants.options if row.id is not None]
             ),
         )
+
+
+@pytest.mark.asyncio
+async def test_shell_permissions_panel_revokes_one_destination_over_app_server(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Settings → Shell Permissions revokes exactly one remote-exec destination.
+
+    Both destinations exist as live session grants. The panel row for one of
+    them must reach the wire as a destination-scoped revoke, so the other
+    destination keeps its session grant. The disk read is unavailable to the
+    in-memory config double, so the panel has to say so instead of claiming a
+    saved side.
+    """
+    from textual.widgets import OptionList
+
+    from chartreux.cli.textual_ui.widgets.shell_permissions_app import (
+        ShellPermissionsApp,
+    )
+    from chartreux.core.agent_loop._dangerous_command_grants import (
+        RemoteExecGrantRequirement,
+    )
+    from chartreux.core.dangerous_commands import (
+        REMOTE_EXEC_OPERATION_ID,
+        canonical_remote_destination,
+    )
+    from chartreux.core.tools.builtins._shell_command_policy import (
+        GitRepositoryRelocation,
+        resolve_repository_scope,
+    )
+    from chartreux.ui.widgets.no_markup_static import NoMarkupStatic
+    from tests.stubs.fake_config_orchestrator import FakeConfigOrchestrator
+
+    async def preview_candidate(self: FakeConfigOrchestrator):
+        return SimpleNamespace(config=self.config)
+
+    monkeypatch.setattr(FakeConfigOrchestrator, "preview_candidate", preview_candidate)
+    project = tmp_path / "project"
+    (project / ".git").mkdir(parents=True)
+    scope = resolve_repository_scope(project, GitRepositoryRelocation())
+    assert scope is not None
+    destination_a = canonical_remote_destination("deploy@203.0.113.10")
+    destination_b = canonical_remote_destination("deploy@203.0.113.20:2222")
+    assert destination_a is not None and destination_b is not None
+    loop = build_test_agent_loop(cwd=project)
+    loop._dangerous_command_grants.grant_remote_exec_session({
+        RemoteExecGrantRequirement(scope=scope, destination=destination_a),
+        RemoteExecGrantRequirement(scope=scope, destination=destination_b),
+    })
+    app = build_test_chartreux_app(agent_loop=loop)
+    async with app.run_test(size=(100, 40)) as pilot:
+        await app._session_ready.wait()
+        await app._show_settings()
+        await _wait_until(pilot, lambda: isinstance(app.screen, SettingsScreen))
+        await pilot.press(*"shell")
+        await pilot.pause()
+        await pilot.press("enter")
+        await _wait_until(pilot, lambda: isinstance(app.screen, ShellPermissionsApp))
+        panel = app.screen
+        assert isinstance(panel, ShellPermissionsApp)
+        await _wait_until(pilot, lambda: panel._inspection is not None)
+        grants = panel.query_one("#shell-permissions-grants", OptionList)
+        row_ids = [str(row.id) for row in grants.options if row.id is not None]
+        # Both destinations are their own live row; neither is the operation.
+        assert f"dest:live:{destination_a.key}" in row_ids
+        assert f"dest:live:{destination_b.key}" in row_ids
+        assert "live:network.remote-exec" not in row_ids
+        # The config double has no user source, so no disk read is claimed.
+        assert "state:saved-unavailable" in row_ids
+        assert not any(row_id.startswith("dest:disk:") for row_id in row_ids)
+        # Revoke exactly destination A through the real endpoint.
+        grants.highlighted = row_ids.index(f"dest:live:{destination_a.key}")
+        await pilot.pause()
+        await pilot.press("enter")
+        await _wait_until(
+            pilot,
+            lambda: (
+                "live session authority removed"
+                in str(
+                    panel.query_one(
+                        "#shell-permissions-feedback", NoMarkupStatic
+                    ).content
+                )
+            ),
+        )
+        feedback = str(
+            panel.query_one("#shell-permissions-feedback", NoMarkupStatic).content
+        )
+        assert f"{REMOTE_EXEC_OPERATION_ID} ({destination_a.key})" in feedback
+        assert "no saved removal attempted" in feedback
+        # Only destination A left the session store: B's grant survives.
+        live_destinations = sorted(
+            authority.destination.key
+            for authority in loop._dangerous_command_grants.dangerous_command_authorities()
+            if authority.destination is not None
+        )
+        assert live_destinations == [destination_b.key]
+        # The refreshed list reconciles: A's row is gone, B's stays.
+        await _wait_until(
+            pilot,
+            lambda: (
+                f"dest:live:{destination_a.key}"
+                not in [str(row.id) for row in grants.options if row.id is not None]
+            ),
+        )
+        refreshed = [str(row.id) for row in grants.options if row.id is not None]
+        assert f"dest:live:{destination_b.key}" in refreshed
 
 
 @pytest.mark.asyncio

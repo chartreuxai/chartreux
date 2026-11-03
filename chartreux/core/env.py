@@ -21,6 +21,7 @@ import threading
 
 from dotenv import dotenv_values
 
+from chartreux.core.config.layer import require_answerable_trust_store
 from chartreux.core.paths import GLOBAL_ENV_FILE
 from chartreux.core.trusted_folders import (
     TrustedFoldersManager,
@@ -82,6 +83,10 @@ def trusted_folder_for(
 ) -> Path | None:
     """The trusted folder a working folder belongs to, ``None`` when untrusted."""
     manager = manager or trusted_folders_manager
+    # ``find_trust_root`` answers ``None`` both for an untrusted folder and for
+    # a store that cannot judge it; the second would silently read as the
+    # first, so the typed store state is surfaced instead.
+    require_answerable_trust_store(manager, "project-env")
     return manager.find_trust_root(cwd)
 
 

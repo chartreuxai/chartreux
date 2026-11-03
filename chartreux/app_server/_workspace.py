@@ -27,6 +27,7 @@ from chartreux.core.trusted_folders import (
     TrustedFoldersManager,
     WorkspaceTrustDecision as CoreWorkspaceTrustDecision,
     WorkspaceTrustPrompt,
+    WorkspaceTrustStatus,
     apply_workspace_trust_decision,
     available_workspace_trust_decisions,
     filesystem_identity,
@@ -44,9 +45,73 @@ class WorkspaceTrustError(ValueError):
     pass
 
 
+def _require_usable_trust_store(trust_store: TrustedFoldersManager) -> None:
+    """Refuse a workspace trust answer the store cannot give.
+
+    ``MISSING`` is the genuine first-run default: nothing persisted, nothing
+    trusted. Every other non-ready state leaves the folder decisions unknown,
+    and the readers below resolve that unknown as a definite "untrusted" — the
+    UI would then offer trust decisions against a store that cannot record
+    them. The typed state is surfaced instead, never swallowed into a default.
+    """
+    from chartreux.core.trusted_folders import TrustStoreState
+
+    state = trust_store.store_state
+    if state in {TrustStoreState.MISSING, TrustStoreState.READY}:
+        return
+    raise WorkspaceTrustError(
+        f"Workspace trust store {state.value}: {trust_store.load_error}. "
+        "No folder's trust state can be resolved until the store is repaired; "
+        "run `chartreux doctor` to inspect it."
+    )
+
+
+def _require_decision_in_force(
+    prompt: WorkspaceTrustPrompt,
+    decision: CoreWorkspaceTrustDecision,
+    trust_store: TrustedFoldersManager,
+) -> None:
+    """A refused persist is an error, never a decision that was made.
+
+    The checked write reports a refusal (a store that went malformed or
+    unreadable, a stale revision taken by a cooperating writer) as an outcome
+    the core apply path returns rather than raises, and the caller would
+    otherwise be handed a status that reads as if the decision never happened.
+    The state the caller asked for is re-read and the refusal is translated.
+    """
+    from chartreux.core.trusted_folders import TrustStoreState
+
+    if decision is CoreWorkspaceTrustDecision.TRUST_SESSION:
+        in_force = trust_store.trust_status(prompt.cwd) is WorkspaceTrustStatus.SESSION
+    elif decision is CoreWorkspaceTrustDecision.TRUST_REPO:
+        in_force = (
+            prompt.repo_root is not None
+            and trust_store.is_trusted(prompt.repo_root) is True
+        )
+    elif decision is CoreWorkspaceTrustDecision.TRUST_CWD:
+        in_force = trust_store.is_trusted(prompt.cwd) is True
+    else:
+        in_force = trust_store.is_explicitly_untrusted(prompt.cwd)
+    if in_force:
+        return
+    state = trust_store.store_state
+    # ``load_error`` describes the state the store loaded in, so it is the
+    # refusal detail only while that state is still the unusable one.
+    detail = (
+        trust_store.load_error
+        if state not in {TrustStoreState.MISSING, TrustStoreState.READY}
+        else "the store changed before the decision was written"
+    )
+    raise WorkspaceTrustError(
+        f"Workspace trust decision was not saved ({state.value}): {detail}. "
+        "No folder's trust state was changed."
+    )
+
+
 def read_workspace_trust(
     cwd: Path, trust_store: TrustedFoldersManager
 ) -> WorkspaceTrustStatusResponse:
+    _require_usable_trust_store(trust_store)
     resolved = cwd.expanduser().resolve()
     status = trust_store.trust_status(resolved)
     if status != "untrusted":
@@ -69,6 +134,7 @@ def decide_workspace_trust(
     expected_cwd: Path | None = None,
     expected_cwd_identity: tuple[int, int] | None = None,
 ) -> WorkspaceTrustStatusResponse:
+    _require_usable_trust_store(trust_store)
     resolved = cwd.expanduser().resolve()
     if expected_cwd is not None and resolved != expected_cwd.expanduser().resolve():
         raise WorkspaceTrustError(
@@ -101,12 +167,14 @@ def decide_workspace_trust(
         apply_workspace_trust_decision(prompt, core_decision, manager=trust_store)
     except ValueError as exc:
         raise WorkspaceTrustError(str(exc)) from exc
+    _require_decision_in_force(prompt, core_decision, trust_store)
     return read_workspace_trust(resolved, trust_store)
 
 
 def read_untrusted_config_dirs(
     cwd: Path, trust_store: TrustedFoldersManager
 ) -> WorkspaceUntrustedConfigResponse:
+    _require_usable_trust_store(trust_store)
     resolved = cwd.expanduser().resolve()
     dirs = find_untrusted_config_dirs(resolved, manager=trust_store)
     return WorkspaceUntrustedConfigResponse(

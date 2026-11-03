@@ -73,7 +73,7 @@ This is a personal fork for my own use. Bug reports, Pull requests and even feat
 
 ### Running tests
 
-Run the suite with `uv run pytest`; `pyproject.toml` configures xdist parallelism. Avoid `-o addopts=''`: it disables the configured addopts, including xdist parallelism. The installed-contract tests build a wheel and sdist and install them offline, so set `UV_FIND_LINKS` to a pre-provisioned local wheelhouse.
+Run the suite with `uv run pytest`; `pyproject.toml` configures xdist parallelism. Avoid `-o addopts=''`: it disables the configured addopts, including xdist parallelism. The installed-contract tests build a wheel and sdist and install them offline, so set `UV_FIND_LINKS` to a pre-provisioned local wheelhouse. Because that wheelhouse is pre-provisioned only in CI and a normal local or offline install does not have one, these tests are skipped locally and CI covers them.
 
 ## License
 

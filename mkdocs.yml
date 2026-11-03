@@ -72,4 +72,5 @@ nav:
       - Migration: project/migration.md
       - Privacy: project/privacy.md
       - Changelog: project/changelog.md
+      - Trim savings measurement: project/trim-savings.md
       - Acknowledgements: project/acknowledgements.md

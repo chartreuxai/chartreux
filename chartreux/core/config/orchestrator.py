@@ -29,6 +29,7 @@ from chartreux.core.config._dangerous_command_authority import (
 from chartreux.core.config._dangerous_command_persistence import (
     persist_dangerous_command_grant,
     persist_remote_exec_grant,
+    remove_all_remote_exec_grants,
     remove_dangerous_command_grant,
     remove_remote_exec_grant,
 )
@@ -806,6 +807,24 @@ class ConfigOrchestrator[S: ConfigSchema]:  # noqa: PLR0904
                 project=project,
                 destination=destination,
                 expected_revision=expected_revision,
+            )
+
+    async def remove_all_remote_exec_grants(
+        self, *, project: Path, expected_revision: str
+    ) -> ConfigSaveResult:
+        """Remove every saved remote-exec destination of one project (whole-scope revoke).
+
+        Same discipline as ``remove_remote_exec_grant``: the only sanctioned
+        writer of ``remote_exec_grants_by_project``, keyed by the registered
+        project, revision-checked optimistically, never published.
+        """
+        async with self._mutation_lock:
+            if not self._can_persist or not expected_revision:
+                return ConfigSaveResult(
+                    "user", "not_saved", "unchanged", error="validation"
+                )
+            return await remove_all_remote_exec_grants(
+                self, project=project, expected_revision=expected_revision
             )
 
     async def set_field(

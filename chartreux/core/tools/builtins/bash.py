@@ -19,9 +19,11 @@ from chartreux.core.tools.base import (
     ToolError,
     ToolPermission,
 )
+from chartreux.core.tools.builtins._remote_exec import RemoteExecDenial, RemoteExecPlan
 from chartreux.core.tools.builtins._shell_permission_resolver import (
     GlobExecutionPlan,
     GlobPlanDenial,
+    QuotedWordPlanDenial,
     ShellPermissionResolver,
     _analyze_guardrail_source as _analyze_guardrail_source,
     _collect_outside_dirs as _collect_outside_dirs,
@@ -42,6 +44,10 @@ from chartreux.core.tools.builtins._shell_permission_resolver import (
     _update_guardrail_cwds as _update_guardrail_cwds,
     glob_execution_plan_for_command,
     glob_plan_denial_text,
+    quoted_word_execution_plan_for_command,
+    quoted_word_plan_denial_text,
+    remote_exec_authority_admits,
+    remote_exec_plan_for_command,
     shell_command_checkout_no_overwrite_ignore,
     shell_command_mutation_roots,
     shell_command_write_paths,
@@ -55,7 +61,11 @@ from chartreux.core.tools.utils import (
     effective_scratchpad_roots,
 )
 from chartreux.core.utils import kill_async_subprocess
-from chartreux.core.utils.shell import spawn_argv_command, spawn_shell_command
+from chartreux.core.utils.shell import (
+    spawn_argv_command,
+    spawn_shell_command,
+    terminal_shell_text_refusal,
+)
 from chartreux.utils.io import decode_console_safe
 from chartreux.utils.tool_presentation import ToolEffectKind
 
@@ -391,7 +401,45 @@ class Bash(
             # managed background launcher) does not advertise it and keeps
             # the existing glob denials.
             literal_glob_transport=True,
+            # F1pkg3: the same declaration for the quoted-word admission.
+            literal_quoted_word_transport=True,
         ).resolve_permission(args)
+
+    def _remote_exec_authorities(self) -> tuple:
+        """The live dangerous-command authority snapshot, failing closed."""
+        try:
+            return self.dangerous_command_authorities_getter()
+        except Exception:
+            return ()
+
+    def _remote_exec_plan(self, command: str) -> RemoteExecPlan | None:
+        """The pinned remote-exec plan re-derived at execution (S4b1b).
+
+        None when the command carries no ssh invocation; raises ToolError
+        for every form the closed grammar refuses, so a denied form never
+        silently re-admits at the spawn.
+        """
+        try:
+            return remote_exec_plan_for_command(
+                command,
+                cwd=self.cwd,
+                workspace=self.workspace,
+                authority=self.path_authority,
+                scratchpad_roots=effective_scratchpad_roots(self.path_authority),
+                workspace_roots=frozenset(self.workspace.authorized_roots),
+            )
+        except RemoteExecDenial as exc:
+            raise ToolError(f"Command denied: {exc}") from exc
+
+    def _require_remote_exec_grant(self, plan: RemoteExecPlan) -> None:
+        """Authority must coincide with the pin at the spawn (S4b1b)."""
+        if not remote_exec_authority_admits(
+            self._remote_exec_authorities(), self.cwd, plan.destination
+        ):
+            raise ToolError(
+                "Command denied: no network.remote-exec grant covers the "
+                f"destination {plan.destination.key} in this repository"
+            )
 
     @final
     def _build_timeout_error(
@@ -415,7 +463,7 @@ class Bash(
             mutation_roots_unknown=mutation_roots_unknown,
         )
 
-    async def run(  # noqa: PLR0914, PLR0915 - the A2 rebinding and the S2 plan add locals
+    async def run(  # noqa: PLR0912, PLR0914, PLR0915 - the A2 rebinding and the S2/S4b1b plans add branches, statements, and locals
         self, args: BashArgs, ctx: InvokeContext | None = None
     ) -> AsyncGenerator[ToolStreamEvent | CapturedShellResult, None]:
         timeout = args.timeout or self.config.default_timeout
@@ -476,19 +524,83 @@ class Bash(
         except GlobPlanDenial as exc:
             raise ToolError(glob_plan_denial_text(exc, args.command)) from exc
 
+        # F1pkg3: a call whose whole double-quoted variable word the analysis
+        # resolved binds to a literal argv plan re-derived here at execution
+        # (the same classifier the resolver admitted it with), so the words
+        # that run are the words that were inspected. A call the transport
+        # cannot bind raises — it never falls back to the shell string.
+        try:
+            quoted_word_plan = quoted_word_execution_plan_for_command(
+                args.command,
+                scratchpad_roots=effective_scratchpad_roots(self.path_authority),
+                workspace_roots=frozenset(self.workspace.authorized_roots),
+            )
+        except QuotedWordPlanDenial as exc:
+            raise ToolError(quoted_word_plan_denial_text(exc, args.command)) from exc
+
+        # S4b1b: the pinned remote-exec plan is re-derived here at execution
+        # (the S2/A2 precedent: a mutation between the permission check and
+        # execution is seen and fails closed). A bound glob plan and a
+        # remote-exec plan never coexist: the glob plan requires a whitelist
+        # read command, the remote-exec plan a standalone ssh invocation.
+        remote_plan = self._remote_exec_plan(args.command)
+
+        literal_plan_bound = glob_plan is not None or quoted_word_plan is not None
         if (
-            glob_plan is None
+            not literal_plan_bound
             and ctx is not None
             and ctx.tool_io is not None
             and ctx.tool_io.supports_terminal
             and ctx.session_id is not None
         ):
+            # F1pkg1(c): the terminal transport consumes the bound contract or
+            # hard-denies. A bound glob or quoted-word plan never routes here
+            # (the condition above) — the literal argv transport below
+            # consumes it. Shell text whose expansion no pinned contract
+            # approved for a terminal executor refuses at this site, before
+            # any terminal request is made; it never falls back to running the
+            # text in another shell.
+            refusal = terminal_shell_text_refusal(command)
+            if refusal is not None:
+                raise ToolError(refusal)
+            # S4b1b: the terminal transport is a CLIENT-OWNED executor. The
+            # pinned address + fixed host-key identity ride into
+            # ShellCommandRequest.command, and the client must attest an
+            # execution-bound remote-exec statement (network-namespace
+            # locality AND the filesystem/SSH trust context) on the
+            # client_tools channel; a non-attesting or differing-namespace
+            # client hard-denies here, before any terminal request is made.
+            execute_command = command
+            if remote_plan is not None:
+                attestation = getattr(ctx.tool_io, "remote_exec_attestation", None)
+                if attestation is None or not attestation.execution_bound:
+                    if remote_plan.client == "ssh":
+                        raise ToolError(
+                            "Command denied: the client executor does not attest an "
+                            "execution-bound remote-exec context (network-namespace "
+                            "locality and SSH trust context), so the pinned ssh "
+                            "invocation cannot run on it"
+                        )
+                    # S4b2c (X's second arm): a transfer's footprint crosses
+                    # into the executor's filesystem paths and SSH trust
+                    # context, which the network-namespace locality claim
+                    # alone does not cover — an attestation entry attesting
+                    # locality ONLY hard-denies transfers.
+                    raise ToolError(
+                        "Command denied: the client executor does not attest the "
+                        "filesystem/SSH trust context a transfer's footprint "
+                        "crosses into (an entry attesting network-namespace "
+                        "locality only hard-denies transfers), so the pinned "
+                        f"{remote_plan.client} transfer cannot run on it"
+                    )
+                self._require_remote_exec_grant(remote_plan)
+                execute_command = remote_plan.command
             try:
                 result = await ctx.tool_io.run_shell(
                     ShellCommandRequest(
                         session_id=ctx.session_id,
                         tool_call_id=ctx.tool_call_id,
-                        command=command,
+                        command=execute_command,
                         cwd=self.cwd,
                         timeout=timeout,
                         max_output_bytes=max_bytes,
@@ -533,15 +645,41 @@ class Bash(
         proc = None
         completed = False
         try:
-            if glob_plan is not None:
+            if remote_plan is not None:
+                # S4b1b: the local spawn is this process's own executor, so
+                # it is attested by construction (same network namespace and
+                # filesystem/SSH trust context the locality classifier
+                # enumerated). The pinned plan runs through the literal argv
+                # transport — the words the OS receives are exactly the plan's
+                # words, with the approved address and the fixed host-key
+                # identity pinned in — never the original command string.
+                self._require_remote_exec_grant(remote_plan)
+                proc = await spawn_argv_command(
+                    list(remote_plan.argv), cwd=self.cwd, extra_env=project_env
+                )
+            elif glob_plan is not None:
                 # The literal transport: the plan's words run unchanged, and
                 # every operand is re-opened through the OS containment
-                # boundary immediately before the spawn.
+                # boundary immediately before the spawn. F1pkg1(c): this is
+                # the only transport a bound plan may run through — the argv
+                # below is the plan, never the original command string.
                 _require_glob_plan_containment(glob_plan)
                 proc = await spawn_argv_command(
                     glob_plan.argv, cwd=self.cwd, extra_env=project_env
                 )
+            elif quoted_word_plan is not None:
+                # F1pkg3: the admitted quoted word was resolved by the same
+                # analysis the resolver admitted it with, and the plan's words
+                # are the words that run — the shell never re-expands the
+                # original text.
+                proc = await spawn_argv_command(
+                    quoted_word_plan.argv, cwd=self.cwd, extra_env=project_env
+                )
             else:
+                # The shell-string transport: spawn_shell_command consumes the
+                # pinned executor contract at execution (one executor read;
+                # unknown executor hard-denies) so the shell that expands the
+                # approved text is the pinned one.
                 proc = await spawn_shell_command(
                     command, cwd=self.cwd, extra_env=project_env
                 )

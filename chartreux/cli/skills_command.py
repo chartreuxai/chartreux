@@ -15,6 +15,11 @@ from chartreux.core.skills.manager import ShadowEntry, ShadowState
 if TYPE_CHECKING:
     from chartreux.core.config.chartreux_schema import ChartreuxConfigSchema
     from chartreux.core.config.harness_files import HarnessFilesManager
+    from chartreux.core.trusted_folders import TrustedFoldersManager
+
+
+class TrustStoreError(RuntimeError):
+    """The trust store cannot answer which folders are trusted."""
 
 
 def run_skills_cli(argv: list[str]) -> None:
@@ -66,11 +71,34 @@ async def _load_config() -> tuple[ChartreuxConfigSchema, HarnessFilesManager]:
     from chartreux.core.trusted_folders import TrustedFoldersManager
 
     trust_store = TrustedFoldersManager()
+    _require_usable_trust_store(trust_store)
     manager = HarnessFilesManager(
         sources=("user", "project"), cwd=Path.cwd(), trust_store=trust_store
     )
     orchestrator = await build_default_orchestrator(harness_files=manager)
     return orchestrator.config, manager
+
+
+def _require_usable_trust_store(trust_store: TrustedFoldersManager) -> None:
+    """Refuse to report shadowing against an unknown trust state.
+
+    The inventory covers the directories the session would load, which depends
+    on the store's decisions. A store that cannot be parsed reads as "nothing
+    is trusted", so an ignored corrupt store would describe the wrong trust
+    state as a healthy report. ``MISSING`` is the genuine first-run default
+    (nothing persisted, nothing trusted); every other non-ready state is an
+    operational error, surfaced through the existing exit-code-2 path.
+    """
+    from chartreux.core.trusted_folders import TrustStoreState
+
+    if trust_store.store_state in {TrustStoreState.MISSING, TrustStoreState.READY}:
+        return
+    raise TrustStoreError(
+        f"trust store {trust_store.store_state.value}: {trust_store.load_error}. "
+        "The skill inventory depends on the store's folder decisions, so the "
+        "report would otherwise present an unknown trust state as if every "
+        "folder were untrusted; run `chartreux doctor` to inspect it."
+    )
 
 
 async def _diff(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:

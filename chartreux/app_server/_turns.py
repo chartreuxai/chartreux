@@ -176,6 +176,14 @@ class CallbackRejectedError(RuntimeError):
     pass
 
 
+class ChildQuestionRefusedError(RuntimeError):
+    """A child (subagent) loop's model question, refused at admission.
+
+    Raised into the core broker waiter so the asking tool call resolves with a
+    typed denial instead of opening a callback or hanging (plan D2).
+    """
+
+
 _STEER_RECEIPT_CAPACITY = 128
 
 # The unattended-expiry floor mirrors the [user_questions] config validation
@@ -185,6 +193,14 @@ _MIN_UNATTENDED_TIMEOUT_SECONDS = 60.0
 
 # The terminal history reason for an expired-unanswered callback (plan U/OD1).
 EXPIRED_CALLBACK_REASON = "unanswered_timeout"
+
+# Model-facing denial for a child-origin model question refused at admission
+# (plan D2). Identical to the ask tool's own child refusal so the model reads
+# one contract whichever layer stops the question.
+CHILD_QUESTION_REFUSAL = (
+    "ask_user_question is not available to subagents; return a blocker naming "
+    "the question instead of asking the user"
+)
 
 # Model-facing continuation guidance carried by the server-owned unanswered
 # disposition (plan U/OD1).
@@ -1929,6 +1945,19 @@ class TurnController:  # noqa: PLR0904
             raise TypeError(
                 f"Unsupported user-input request: {type(event.args).__name__}"
             )
+        if (
+            event.origin is UserInputOrigin.MODEL_QUESTION
+            and self._agent_loop.is_subagent
+        ):
+            # Child-origin admission refusal (plan D2): a subagent's model
+            # question never opens a user-input callback. Settling the broker
+            # waiter is the whole refusal — the asking tool call resolves with
+            # the typed denial, nothing is granted, and no authority state is
+            # touched. Returning (not raising) keeps the child turn alive.
+            self._agent_loop.reject_request(
+                event.request_id, ChildQuestionRefusedError(CHILD_QUESTION_REFUSAL)
+            )
+            return
         # Admission for unattended expiry (plan U/OD1): the public snapshot
         # rides on the callback detail for clients. An out-of-range timeout
         # override is rejected here, before any callback is opened.

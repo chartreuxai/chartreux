@@ -18,14 +18,33 @@ from tree_sitter import Language, Parser
 import tree_sitter_bash as tsbash
 
 from chartreux.core.dangerous_commands import (
+    REMOTE_EXEC_OPERATION_ID,
     DangerousCommandAuthority,
     DangerousCommandProposal,
     GitRepositoryRelocation,
+    RemoteDestination,
     RepositoryScope,
+    authority_admits,
     operations_for_ids,
 )
 from chartreux.core.tools.base import ToolError, ToolPermission
 from chartreux.core.tools.builtins._destination import classify_network_egress
+from chartreux.core.tools.builtins._remote_exec import (
+    RemoteExecDenial,
+    RemoteExecPlan,
+    SshCall,
+    enforce_pinned_resolution_at_spawn,
+    pinned_ssh_argv,
+    pinned_ssh_command_text,
+)
+from chartreux.core.tools.builtins._remote_transfer import (
+    REMOTE_EXEC_CLIENTS,
+    TransferCall,
+    classify_remote_exec_call,
+    enforce_pinned_transfer_resolution_at_spawn,
+    pinned_transfer_argv,
+    pinned_transfer_command_text,
+)
 from chartreux.core.tools.builtins._shell_argv import (
     PatternGlobCandidate,
     ShellToken,
@@ -41,6 +60,7 @@ from chartreux.core.tools.builtins._shell_command_policy import (
     _SEVENZIP_ARCHIVE_WRITING_COMMANDS,
     _SEVENZIP_TABLE,
     _WRITE_OPERAND_TABLES,
+    ExecutorBoundary,
     ShellCommandPolicy,
     _has_long,
     _has_short,
@@ -97,6 +117,7 @@ from chartreux.core.tools.utils import (
     effective_scratchpad_roots,
     resolve_tool_path,
 )
+from chartreux.core.utils.shell import current_executor_contract
 from chartreux.core.workspace import Workspace
 
 if TYPE_CHECKING:
@@ -234,6 +255,13 @@ class _GuardrailPart:
     # payload parts inherit the enclosing statement's, so a wrapped
     # client's part carries the effective environment it runs with.
     assignments: tuple[tuple[str, str], ...] = ()
+    # F1pkg1(b) executor-option-contract marks: a shell invocation whose own
+    # argv changes an option family outside the pinned contract, and a
+    # nested shell re-entry whose payload carries expansion intent. Marked
+    # parts deny at the end of resolution, so an earlier payload guard (the
+    # recursive-rm hard denial) keeps its own reason.
+    shell_option_change: bool = False
+    nested_expansion: bool = False
 
 
 def _has_unrecognized_nested_shell(tokens: list[str]) -> bool:
@@ -325,7 +353,7 @@ def _expand_guardrail_parts(  # noqa: PLR0915
             _GuardrailPart(f"cat {shlex.quote(target)}", scope, PathAccess.WRITE)
         )
 
-    def visit(
+    def visit(  # noqa: PLR0912, PLR0914, PLR0915
         part: str,
         scope: tuple[int, ...],
         depth: int,
@@ -354,6 +382,7 @@ def _expand_guardrail_parts(  # noqa: PLR0915
                 assignments=assignments,
             )
         )
+        entry_index = len(expanded) - 1
         tokens = _visit_tokens(part, tokens_override)
         try:
             inline_interpreter_switch(tokens)  # Preserve legacy option diagnostics.
@@ -370,7 +399,19 @@ def _expand_guardrail_parts(  # noqa: PLR0915
         if boundary.boundary_kind == "shell_source":
             if depth >= _MAX_SHELL_DEPTH:
                 raise _UnsafeShellSyntax("shell nesting depth limit exceeded")
+            # F1pkg1(b): the immutable executor option contract holds every
+            # expansion-relevant option OFF in the executing process. A shell
+            # invocation whose own argv changes an option family or the
+            # startup behavior is outside the contract, and a nested shell
+            # re-entry with an expansion-bearing payload runs under an inner
+            # executor this process does not pin: both are MARKED on the part
+            # and deny at the end of resolution, so an earlier payload guard
+            # (the recursive-rm hard denial) keeps its own reason.
+            option_change = _shell_invocation_option_change(tokens, boundary)
+            payload_expansion_intent = False
             for source in boundary.inline_payloads:
+                if _has_unquoted_extended_syntax(source):
+                    payload_expansion_intent = True
                 analysis = _analyze_guardrail_source(
                     source,
                     nested_source=True,
@@ -387,6 +428,8 @@ def _expand_guardrail_parts(  # noqa: PLR0915
                 nested_parts = list(analysis.command_parts)
                 nested_assignments = analysis.command_assignments
                 for index, child in enumerate(nested_parts):
+                    if _expansion_intent_tokens(_visit_tokens(child, None)):
+                        payload_expansion_intent = True
                     targets = (
                         nested_operands[index] if index < len(nested_operands) else ()
                     )
@@ -412,6 +455,12 @@ def _expand_guardrail_parts(  # noqa: PLR0915
                     # Targets that follow the nested source's last command.
                     for target in nested_operands[len(nested_parts)]:
                         append_redirect_operand(target, child_scope)
+            if option_change or payload_expansion_intent:
+                expanded[entry_index] = replace(
+                    expanded[entry_index],
+                    shell_option_change=option_change,
+                    nested_expansion=payload_expansion_intent,
+                )
         if boundary.inner_command_range is not None or boundary.module_command:
             if depth >= _MAX_SHELL_DEPTH:
                 raise _UnsafeShellSyntax("shell nesting depth limit exceeded")
@@ -989,6 +1038,48 @@ def _literal_glob_operand(
     return GlobOperand(text, path, info.st_dev, info.st_ino)
 
 
+# The one consecutive-star spelling the whitelist admits (F1pkg2): a final
+# component whose TRAILING star run is exactly two stars. Under a pinned
+# executor that cannot make the run recurse — bash pins ``globstar`` off, a
+# POSIX shell has no globstar at all — ``**`` names one path component, so the
+# plan binds exactly the literal words ``*`` binds. A longer run stays
+# fail-closed (``***`` is zsh's symlink-following glob), a non-trailing run
+# (``a**b``) stays fail-closed, and a wildcard in a middle component is still
+# refused outright.
+_TRAILING_STAR_RUN_LENGTH = 2
+
+
+def _executor_proves_single_level_stars() -> bool:
+    """Whether the pinned executor proves a trailing star run cannot recurse.
+
+    The contract is read live at the call, never from a prior probe: bash
+    pins ``globstar`` off and a POSIX shell has no globstar at all, so a
+    trailing ``**`` is one single-level star there. zsh's recursive search is
+    not governed by any option the contract pins, so it keeps the fail-closed
+    parse, and an unknown executor fails closed too.
+    """
+    contract = current_executor_contract()
+    if contract is None:
+        return False
+    if contract.family == "posix":
+        return True
+    return contract.family == "bash" and "globstar" in contract.pinned_off_options
+
+
+def _collapse_trailing_star(component: str) -> str:
+    """Rewrite an admissible trailing ``**`` component as its one-star form.
+
+    Every other spelling is returned unchanged, so the existing parse stays
+    the fail-closed path for it.
+    """
+    head = component.rstrip("*")
+    if len(component) - len(head) != _TRAILING_STAR_RUN_LENGTH or "*" in head:
+        return component
+    if not _executor_proves_single_level_stars():
+        return component
+    return f"{head}*"
+
+
 def _glob_operand_matches(  # noqa: PLR0912, PLR0914, PLR0915
     token: object,
     *,
@@ -1002,11 +1093,13 @@ def _glob_operand_matches(  # noqa: PLR0912, PLR0914, PLR0915
 
     The parent is anchored literally and must be an authorized directory with
     no symlink component; the final component may use only ``*``/``?`` (no
-    brackets, no ``**``, no dot-leading pattern). Every match must be a
-    regular file reached without following a symlink and authorized for read,
-    and no match may begin with ``-`` (option-like results stay rejected even
-    after an option terminator). Budgets are per call: the caller's
-    ``enumerated`` and ``match_states`` counters thread across operands.
+    brackets, no dot-leading pattern, and no consecutive-star run except the
+    trailing ``**`` the pinned executor proves means one level). Every match
+    must be a regular file reached without following a symlink and authorized
+    for read, and no match may begin with ``-`` (option-like results stay
+    rejected even after an option terminator). Budgets are per call: the
+    caller's ``enumerated`` and ``match_states`` counters thread across
+    operands.
     """
     text = str(token)
     if any(character in text for character in _GLOB_REJECTED_CHARACTERS):
@@ -1021,7 +1114,7 @@ def _glob_operand_matches(  # noqa: PLR0912, PLR0914, PLR0915
         raise GlobPlanDenial(text, ExpansionFailure.CALLER_DENIED)
     if final.startswith("."):
         raise GlobPlanDenial(text, ExpansionFailure.CALLER_DENIED)
-    atoms = _parse_glob_component(final)
+    atoms = _parse_glob_component(_collapse_trailing_star(final))
     if atoms is None or any(atom[0] == "set" for atom in atoms):
         raise GlobPlanDenial(text, ExpansionFailure.UNSUPPORTED_SYNTAX)
     anchor = Path("/") if text.startswith("/") else cwd
@@ -1232,6 +1325,198 @@ def _glob_intent_token(token: object) -> bool:
     )
 
 
+# --- quoted-word execution binding (F1pkg3) ----------------------------------
+#
+# The analysis admits a whole double-quoted `"$NAME"` / `"${NAME}"` argument
+# only in a provably read-only position and only when a literal assignment to
+# NAME precedes the command unchanged. The admission is worth nothing unless
+# the words that run are the words that were inspected, so the resolved word
+# binds to an immutable literal argv plan: this classifier re-derives the same
+# plan at the execution boundary and the transport consumes it — never the
+# original command string.
+
+
+@dataclass(frozen=True)
+class QuotedWordExecutionPlan:
+    """An immutable literal argv plan for one admitted quoted-variable call.
+
+    ``argv`` executes without shell re-expansion: every admitted quoted word
+    is the literal the analysis resolved, bound at the execution boundary.
+    """
+
+    argv: tuple[str, ...]
+
+
+class QuotedWordPlanDenial(Exception):
+    """An admitted quoted-variable call the literal transport must not run."""
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(reason)
+        self.reason = reason
+
+
+def quoted_word_execution_plan_for_command(
+    command: str,
+    *,
+    scratchpad_roots: frozenset[Path] = frozenset(),
+    workspace_roots: frozenset[Path] | None = None,
+) -> QuotedWordExecutionPlan | None:
+    """The literal argv plan one admitted quoted-variable call must execute.
+
+    None is returned for a command that resolved no whole double-quoted
+    variable word (its shell execution is unchanged). A command whose
+    analysis admitted one but whose shape the literal transport cannot run
+    raises :class:`QuotedWordPlanDenial`: the execution transport must fail
+    closed, never fall back to the original command string.
+    """
+    try:
+        analysis = _analyze_guardrail_source(
+            command, scratchpad_roots=scratchpad_roots, workspace_roots=workspace_roots
+        )
+    except Exception as exc:
+        raise QuotedWordPlanDenial(
+            "the command's shell analysis failed, so its quoted-variable "
+            "expansion cannot be re-derived safely"
+        ) from exc
+    if not analysis.admitted_quoted_words:
+        return None
+    if analysis.approval_reasons:
+        raise QuotedWordPlanDenial(
+            "the command carries shell syntax the analysis cannot model, so "
+            "its quoted-variable expansion cannot be re-derived safely"
+        )
+    try:
+        expanded, inner_redirects, errors = _expand_guardrail_parts(
+            list(analysis.command_parts),
+            scratchpad_roots=scratchpad_roots,
+            redirect_operands=analysis.redirect_operands,
+            workspace_roots=workspace_roots,
+            command_assignments=analysis.command_assignments,
+        )
+        standalone = (
+            not inner_redirects
+            and not errors
+            and not any(analysis.redirect_operands)
+            and len(expanded) == 1
+            and expanded[0].access is None
+            and expanded[0].tokens is None
+        )
+        if not standalone:
+            raise QuotedWordPlanDenial(
+                "an admitted quoted-variable word binds only as the sole "
+                "simple command of its invocation"
+            )
+        tokens = _visit_tokens(expanded[0].text, None)
+    except _UnsafeShellSyntax as exc:
+        raise QuotedWordPlanDenial(str(exc)) from exc
+    if not tokens:
+        raise QuotedWordPlanDenial(
+            "an admitted quoted-variable word bound no executable command"
+        )
+    return QuotedWordExecutionPlan(argv=tuple(tokens))
+
+
+def quoted_word_plan_denial_text(error: QuotedWordPlanDenial, command_part: str) -> str:
+    """The rendered denial for a plan the execution transport cannot consume."""
+    return f"Command denied: {error.reason} ({command_part!r})"
+
+
+# Extended-glob syntax that carries NO *?[ metacharacter (F1pkg1(b) detects it
+# even without them): bash's extglob operators @(/+/! (the pinned executors
+# reject them as syntax errors, so they are never literal words) and zsh's
+# EXTENDED_GLOB operators — a word-initial ^, a mid-word #, an infix ~ — which
+# are literal under the pinned contract but expand under an extendedglob-active
+# shell. A glob metacharacter followed by an unquoted ( is a qualifier or
+# extglob group and counts too.
+_EXTENDED_GLOB_OPERATORS = "@+!*?["
+
+
+def _unquoted_source_characters(text: str) -> list[tuple[str, bool]]:
+    """Each source character with whether the shell sees it unquoted.
+
+    Mirrors the shlex state machine: single quotes protect everything, double
+    quotes protect all but an escaped ``"``/``\\``, and a backslash outside
+    quotes protects the next character.
+    """
+    characters: list[tuple[str, bool]] = []
+    quote = ""
+    index = 0
+    while index < len(text):
+        character = text[index]
+        if character == "\\" and quote != "'" and index + 1 < len(text):
+            characters.append((text[index + 1], False))
+            index += 2
+            continue
+        if character in {'"', "'"} and (not quote or character == quote):
+            quote = "" if quote else character
+            index += 1
+            continue
+        characters.append((character, not quote))
+        index += 1
+    return characters
+
+
+def _has_unquoted_extended_syntax(text: str) -> bool:
+    """Whether shell source text carries UNQUOTED extended-glob syntax.
+
+    Quote-aware, so it fires even when the extended syntax carries no *?[
+    metacharacter (the ShellToken provenance only classifies those).
+    """
+    characters = _unquoted_source_characters(text)
+    previous = ""
+    for index, (character, unquoted) in enumerate(characters):
+        if unquoted:
+            next_character = (
+                characters[index + 1][0]
+                if index + 1 < len(characters) and characters[index + 1][1]
+                else ""
+            )
+            if (
+                character in _EXTENDED_GLOB_OPERATORS
+                and next_character == "("
+                and (character in "@+!" or character in "*?[")
+            ):
+                return True
+            at_word_start = previous == "" or previous.isspace() or previous in "|&;<>"
+            if character == "^" and at_word_start:
+                return True
+            if character in "#~" and not at_word_start:
+                return True
+        previous = character
+    return False
+
+
+def _expansion_intent_tokens(tokens: list[str]) -> bool:
+    """Whether any token would pathname-expand (unquoted glob metacharacters)."""
+    return any(_glob_intent_token(token) for token in tokens)
+
+
+# Shell-invocation option tokens the pinned executor option contract admits:
+# only the -c payload switch and the rc-disabling long flags. Every other
+# option on a shell invocation changes an option family or the startup
+# behavior (rcfile/init-file, login/interactive, posix, +O/-o values) and
+# fails closed (F1pkg1(b)).
+_SHELL_INVOCATION_ALLOWED_LONG = frozenset({"--noprofile", "--norc", "--noediting"})
+
+
+def _shell_invocation_option_change(
+    tokens: list[str], boundary: ExecutorBoundary
+) -> bool:
+    """Whether a shell_source invocation carries option-changing arguments."""
+    if not boundary.inline_payload_ranges:
+        return False
+    payload_start = boundary.inline_payload_ranges[0][0]
+    for token in tokens[1:payload_start]:
+        if token.startswith("--"):
+            if token.partition("=")[0] not in _SHELL_INVOCATION_ALLOWED_LONG:
+                return True
+        elif token.startswith("+"):
+            return True
+        elif token.startswith("-") and token != "-" and token[1:] != "c":
+            return True
+    return False
+
+
 def _whitelist_part_glob_intent(part: str) -> bool:
     """Whether one command part is a whitelist call with a glob operand."""
     try:
@@ -1342,14 +1627,16 @@ def _get_default_denylist() -> list[str]:
         "screen",
         "tmux",
         # Modeled network clients: curl and wget left this denylist in
-        # v0.5.9 P2-a and http (HTTPie's request client) in v0.7.0 S3 —
-        # their DESTINATIONS decide run vs ask under the destination-aware
-        # egress rule (see _destination.py), and curl/wget's local-file
-        # operands are path-inspected by their command policy. Every other
-        # egress client stays denied fail-closed until modeled: denylist and
-        # path policy control known network exfiltration routes (redaction
-        # cannot observe pipe/socket transit). These controls harden against
-        # known payload shapes, not complete egress containment.
+        # v0.5.9 P2-a, and HTTPie's request clients followed — `http` in
+        # v0.7.0 S3 and `https` (the same client with the scheme forced onto a
+        # schemeless operand) in v0.7.1 F2. Their DESTINATIONS decide run vs
+        # ask under the destination-aware egress rule (see _destination.py),
+        # and curl/wget's local-file operands are path-inspected by their
+        # command policy. Every other egress client stays denied fail-closed
+        # until modeled: denylist and path policy control known network
+        # exfiltration routes (redaction cannot observe pipe/socket transit).
+        # These controls harden against known payload shapes, not complete
+        # egress containment.
         #
         # wget2 (v0.7.0 S3) keeps its entry under the "keep denylist entries
         # until the prerequisites are established" rule: loopback auto-allow
@@ -1369,12 +1656,22 @@ def _get_default_denylist() -> list[str]:
         # destination-aware egress rule until modeled there. The v0.7.0 S3
         # model keeps all eight denied because destination parsing cannot
         # bound remote command execution, secondary connections, or
-        # scripting: ssh/scp/rsync stay egress-denied here so S4b's
-        # network.remote-exec path can model them as a SEPARATE operation,
-        # and watch is a command repeater, not an egress client.
-        "ssh",
-        "scp",
-        "rsync",
+        # scripting, and watch is a command repeater, not an egress client.
+        # ssh LEFT this denylist in v0.7.1 S4b1b: its closed grammar is
+        # modeled in the dangerous-command flow below (classify_ssh_call in
+        # _remote_exec.py), with the fail-closed local-address classifier
+        # (classify_local_address, core/dangerous_commands.py, S4b1a) and,
+        # since S4b2a, the resolve-validate model (classify_hostname_resolution)
+        # wired in at that seam — a positive literal-IP or
+        # uniquely-non-locally-resolved hostname destination classifies ask
+        # as network.remote-exec, every other ssh spelling hard-denies there.
+        # scp/rsync LEFT this denylist in v0.7.1 S4b2c under the closed
+        # bounded transfer grammar in _remote_transfer.py, classified at the
+        # same seam by classify_remote_exec_call: a remote-bearing scp/rsync
+        # invocation with a positive destination and the closed option
+        # grammar classifies ask as the same network.remote-exec operation
+        # with the exact destination attached, every other spelling
+        # hard-denies there.
         "ftp",
         "telnet",
         # httpie: HTTPie 3.x installs its plugin/CLI manager under this name,
@@ -1382,14 +1679,6 @@ def _get_default_denylist() -> list[str]:
         # installed entry point carries HTTPie's request grammar; that
         # confirmation does not hold, so the entry stays (v0.7.0 S3).
         "httpie",
-        # https: HTTPie's https entry point is the same request client with
-        # the https scheme defaulted. It never had a modeled grammar, and the
-        # `http` model is admitted only for HTTPie's documented+corpus-tested
-        # request grammar; this twin has no such documented grammar to
-        # confirm, so it is denied fail-closed rather than resolved beside
-        # the modeled `http` (user-adjudicated, v0.7.0). Grammar modeling is
-        # deferred to the v0.8.0 backlog.
-        "https",
         "aria2c",
         "lftp",
         "watch",
@@ -1968,6 +2257,7 @@ class ShellPermissionResolver:
         | None = None,
         injected_env: Mapping[str, str] | None = None,
         literal_glob_transport: bool = False,
+        literal_quoted_word_transport: bool = False,
     ) -> None:
         self.config = config
         self.cwd = cwd
@@ -1979,6 +2269,10 @@ class ShellPermissionResolver:
         # original string to a shell (the managed background launcher, a
         # permission-only probe) keeps the existing glob denials.
         self.literal_glob_transport = literal_glob_transport
+        # F1pkg3 capability declaration for the quoted-word admission: same
+        # rule — only a caller whose execution path consumes the literal argv
+        # plan may admit a whole double-quoted variable word.
+        self.literal_quoted_word_transport = literal_quoted_word_transport
         # Live getter: authority changes must invalidate cached decisions, so
         # the snapshot is read per resolution, never captured at construction.
         self._dangerous_command_authorities = dangerous_command_authorities or (
@@ -3079,7 +3373,7 @@ class ShellPermissionResolver:
                 return False
         return True
 
-    def _resolve_dangerous_command_permission(  # noqa: PLR0911, PLR0912
+    def _resolve_dangerous_command_permission(  # noqa: PLR0911, PLR0912, PLR0914, PLR0915
         self, args: ShellCommandArgs, expanded: list[_GuardrailPart]
     ) -> PermissionContext | None:
         """Classify the whole expanded call and deny missing dangerous authority.
@@ -3095,22 +3389,28 @@ class ShellPermissionResolver:
         receive-pack and hooks.
 
         The modeled network clients classify here too: a curl/wget
-        invocation (v0.5.9 P2-a) or an HTTPie ``http`` invocation (v0.7.0 S3)
-        whose destination is not literal loopback (or whose recognizer cannot
-        parse it — fail-closed, never loopback) or whose
-        destination-changing behavior gate fired resolves ask-class as the
-        network.egress operation, the same grantable class as git push, so
-        the runtime approval flow (dialog in interactive main sessions,
-        denial with remediation in headless and child sessions) composes
-        unchanged. An ``http`` invocation outside the restricted grammar — any
-        option, a request item that reads a local file, a non-http(s) scheme,
-        a missing destination, or a startup-config indirection — is instead a
-        hard denial with no operation ID and no approval path, exactly like an
-        unmodeled git form, because a grant must never make an unbounded
-        spelling approvable.
+        invocation (v0.5.9 P2-a) or an HTTPie ``http`` (v0.7.0 S3) or
+        ``https`` (v0.7.1 F2) invocation whose destination is not literal
+        loopback (or whose recognizer cannot parse it — fail-closed, never
+        loopback) or whose destination-changing behavior gate fired resolves
+        ask-class as the network.egress operation, the same grantable class as
+        git push, so the runtime approval flow (dialog in interactive main
+        sessions, denial with remediation in headless and child sessions)
+        composes unchanged. An HTTPie invocation outside the restricted
+        grammar — any option, a request item that reads a local file, a scheme
+        the client's model does not cover (for ``https``, an explicit
+        ``http://`` or any other non-https scheme, which HTTPie never rewrites
+        to https), a missing destination, or a startup-config indirection — is
+        instead a hard denial with no operation ID and no approval path,
+        exactly like an unmodeled git form, because a grant must never make an
+        unbounded spelling approvable.
         """
         authorities = self._authorities()
         missing: dict[str, RepositoryScope] = {}
+        # The exact destination a missing network.remote-exec authority would
+        # cover (S4b1b); the proposal carries it so the grant is
+        # destination-keyed, never a whole-operation grant.
+        remote_exec_destination: RemoteDestination | None = None
         # A2: the whole-call eligibility gate for the clean-tree checkout
         # exemption, evaluated over the full expanded call at the top of the
         # flow. The exemption applies only when the entire composed shell
@@ -3180,6 +3480,106 @@ class ShellPermissionResolver:
                 )
                 if not covered and "network.egress" not in missing:
                     missing["network.egress"] = min(egress_scopes, key=_scope_sort_key)
+            # v0.7.1 S4b1b + S4b2a: the closed ssh grammar (ssh left the
+            # shipped denylist with it). A denied form — ambiguous, local,
+            # or failed hostname resolution, local/ambiguous literal,
+            # hostile option, unmodeled option, missing destination —
+            # hard-denies with no operation ID and no approval path, like an
+            # unrecognized network-client grammar, because a grant must never
+            # make an unbounded spelling approvable. A positive destination
+            # (IP literal, or a hostname the system resolver — honoring
+            # /etc/hosts — answers uniquely and non-locally) classifies ask
+            # as network.remote-exec with the exact granted destination
+            # attached, but only for a single standalone ssh invocation: the
+            # execution boundary pins the resolved address into the actual
+            # argv, which composed or wrapped calls cannot carry.
+            # v0.7.1 S4b2c: scp/rsync left the shipped denylist with the
+            # closed bounded transfer grammar (_remote_transfer.py), and the
+            # same seam classifies them through classify_remote_exec_call: a
+            # remote-bearing transfer with a positive destination and the
+            # closed option grammar classifies ask as the same
+            # network.remote-exec operation with the exact destination
+            # attached — the same destination-keyed grant model as ssh —
+            # while every other remote-bearing spelling (no user, remote-to-
+            # remote, daemon form, server-chosen names, transport overrides,
+            # local/ambiguous/failed resolution, hostile or unmodeled
+            # options) hard-denies with no approval path. A scp/rsync
+            # invocation with no remote operand is not a transfer: it stays
+            # routine and the ordinary path layer governs the local copy.
+            remote_exec = classify_remote_exec_call(tokens)
+            if remote_exec.kind == "deny":
+                return _denied(
+                    Diagnostic(
+                        "dangerous_guard",
+                        detail=remote_exec.reason,
+                        command_part=entry.text,
+                    )
+                )
+            if remote_exec.kind == "ask":
+                destination = remote_exec.destination
+                assert destination is not None  # ask always carries one
+                head = _split_command_tokens(entry.text)
+                if (
+                    len(expanded) != 1
+                    or not head
+                    or Path(head[0]).name not in REMOTE_EXEC_CLIENTS
+                ):
+                    return _denied(
+                        Diagnostic(
+                            "dangerous_guard",
+                            detail=(
+                                "remote execution admits only a single standalone "
+                                "ssh/scp/rsync invocation, pinned into the spawned argv at "
+                                "execution; composed, redirected, or wrapped calls "
+                                "are denied"
+                            ),
+                            command_part=entry.text,
+                        )
+                    )
+                if cwd_unknown:
+                    return _denied(
+                        Diagnostic(
+                            "dangerous_guard",
+                            detail=(
+                                "the working directory at this ssh invocation "
+                                "is not statically known, so its repository "
+                                "scope cannot be located"
+                            ),
+                            command_part=entry.text,
+                        )
+                    )
+                remote_exec_scopes: set[RepositoryScope] = set()
+                for cwd in possible_cwds:
+                    scope = resolve_repository_scope(cwd, GitRepositoryRelocation())
+                    if scope is None:
+                        return _denied(
+                            Diagnostic(
+                                "dangerous_guard",
+                                detail=(
+                                    "the repository scope for this ssh invocation "
+                                    "cannot be located"
+                                ),
+                                command_part=entry.text,
+                            )
+                        )
+                    remote_exec_scopes.add(scope)
+                covered = all(
+                    any(
+                        authority_admits(
+                            authority,
+                            REMOTE_EXEC_OPERATION_ID,
+                            scope,
+                            destination=destination,
+                        )
+                        for authority in authorities
+                    )
+                    for scope in remote_exec_scopes
+                )
+                if not covered and REMOTE_EXEC_OPERATION_ID not in missing:
+                    missing[REMOTE_EXEC_OPERATION_ID] = min(
+                        remote_exec_scopes, key=_scope_sort_key
+                    )
+                    remote_exec_destination = destination
             classification = classify_dangerous_git_command(tokens)
             if classification.kind == "routine":
                 continue
@@ -3284,6 +3684,7 @@ class ShellPermissionResolver:
             scope=next(iter(missing.values())),
             operations=tuple(operation.operation_id for operation in operations),
             consequence="; ".join(operation.consequence for operation in operations),
+            destination=remote_exec_destination,
         )
         return PermissionContext(
             permission=ToolPermission.NEVER,
@@ -3339,6 +3740,27 @@ class ShellPermissionResolver:
             scratchpad_roots=scratchpad_roots,
             workspace_roots=workspace_roots,
         )
+        # F1pkg3: an admitted quoted-variable word binds only to the literal
+        # argv transport. A caller that would hand the command string to a
+        # shell (the managed background launcher, a permission-only probe)
+        # does not declare that capability, so it keeps the expansion denial.
+        if analysis.admitted_quoted_words and not self.literal_quoted_word_transport:
+            return _denied(
+                Diagnostic(
+                    "quoted_word",
+                    detail=(
+                        "an admitted quoted-variable word binds only to the "
+                        "literal argv transport, which this caller does not "
+                        "consume"
+                    ),
+                    command_part=args.command,
+                    denial_class=DenialClass.SYNTAX,
+                    alternative=(
+                        "run the command with the foreground bash tool, which "
+                        "consumes the literal argv plan"
+                    ),
+                )
+            )
         command_parts = list(analysis.command_parts)
         try:
             expanded, inner_redirects, inner_errors = _expand_guardrail_parts(
@@ -3356,6 +3778,33 @@ class ShellPermissionResolver:
                     command_part=args.command,
                     denial_class=exc.denial_class,
                     alternative=exc.alternative,
+                )
+            )
+        # F1pkg1(b): an unknown executing shell has no pinned executor option
+        # contract, so its expansion cannot be modeled: fail closed for every
+        # expansion-bearing command (glob metacharacters or extended-glob
+        # syntax, detected even without *?[ characters).
+        if current_executor_contract() is None and (
+            _has_unquoted_extended_syntax(args.command)
+            or any(
+                _expansion_intent_tokens(
+                    list(entry.tokens)
+                    if entry.tokens is not None
+                    else _visit_tokens(entry.text, None)
+                )
+                for entry in expanded
+            )
+        ):
+            return _denied(
+                Diagnostic(
+                    "executor_contract",
+                    detail=(
+                        "the executing shell has no pinned executor "
+                        "option contract, so pathname expansion cannot "
+                        "be inspected"
+                    ),
+                    command_part=args.command,
+                    denial_class=DenialClass.POLICY,
                 )
             )
         expanded_command_parts = [entry.text for entry in expanded]
@@ -3461,6 +3910,38 @@ class ShellPermissionResolver:
         )
         if dangerous_permission is not None:
             return dangerous_permission
+        # F1pkg1(b) executor-option-contract denial, deferred to the very end
+        # so an earlier guard (the recursive-rm hard denial) keeps its reason:
+        # a shell invocation that changes options outside the pinned contract,
+        # or a nested shell re-entry with an expansion-bearing payload, fails
+        # closed even when nothing else denied the call.
+        for entry in expanded:
+            if entry.shell_option_change:
+                return _denied(
+                    Diagnostic(
+                        "executor_contract",
+                        detail=(
+                            "the shell invocation changes options outside the "
+                            "pinned executor option contract, so its expansion "
+                            "behavior cannot be inspected"
+                        ),
+                        command_part=entry.text,
+                        denial_class=DenialClass.POLICY,
+                    )
+                )
+            if entry.nested_expansion:
+                return _denied(
+                    Diagnostic(
+                        "executor_contract",
+                        detail=(
+                            "nested shell re-entry with an expansion-bearing "
+                            "payload: the inner shell's option state is not the "
+                            "pinned executor option contract"
+                        ),
+                        command_part=entry.text,
+                        denial_class=DenialClass.POLICY,
+                    )
+                )
         return PermissionContext(permission=ToolPermission.ALWAYS)
 
 
@@ -4136,3 +4617,129 @@ def shell_command_checkout_no_overwrite_ignore(
         raise CheckoutInjectionError(
             f"the executed string of {command!r} could not be rewritten safely"
         ) from exc
+
+
+def remote_exec_plan_for_command(
+    command: str,
+    *,
+    cwd: Path,
+    workspace: Workspace,
+    authority: PathAuthority,
+    scratchpad_roots: frozenset[Path],
+    workspace_roots: frozenset[Path],
+) -> RemoteExecPlan | None:
+    """Re-derive the pinned remote-exec plan at execution time (S4b1b + S4b2b + S4b2c).
+
+    Returns None when the command carries no remote invocation. Raises
+    :class:`RemoteExecDenial` for every form the closed grammar refuses —
+    ambiguous/local/failed hostname resolution, local/ambiguous literal,
+    hostile or unmodeled option, composed/redirected/wrapped call — so the
+    execution boundary fails closed exactly like the permission-time
+    classification. Returns the plan (pinned argv + pinned command text)
+    only for a single standalone ssh/scp/rsync invocation with a positive
+    destination (IP literal, or hostname resolved uniquely non-local), so
+    the approved address — the resolved address for a hostname — and the
+    fixed host-key identity ride into the actual argv every spawn point
+    receives. For a bounded transfer (S4b2c) the plan's ``client`` names the
+    transfer client and its pinned argv carries the same address and
+    host-key identity pins (scp as leading ``-o`` options, rsync as the
+    injected ``-e`` pinned ssh transport).
+
+    S4b2b: validation-to-spawn is one transaction here. The plan's validated
+    pinned address is re-observed once (``enforce_pinned_resolution_at_spawn``
+    / ``enforce_pinned_transfer_resolution_at_spawn``) before the argv is
+    built, and any CHANGED answer — a rebind to a
+    local/loopback/unspecified address, to another address, ambiguity, or a
+    resolution failure — raises, so the changed answer is never contacted.
+    """
+    analysis = _analyze_guardrail_source(
+        command, scratchpad_roots=scratchpad_roots, workspace_roots=workspace_roots
+    )
+    command_parts = list(analysis.command_parts)
+    expanded, _inner_redirects, inner_errors = _expand_guardrail_parts(
+        command_parts,
+        scratchpad_roots=scratchpad_roots,
+        redirect_operands=analysis.redirect_operands,
+        workspace_roots=workspace_roots,
+        command_assignments=analysis.command_assignments,
+    )
+    if inner_errors:
+        raise RemoteExecDenial(
+            "the command's nested analysis failed, so its remote invocation "
+            "cannot be re-derived safely"
+        )
+    ask: tuple[SshCall | TransferCall, list[str]] | None = None
+    for entry, tokens, _possible_cwds, _cwd_unknown in _scoped_guardrail_cwds(
+        expanded, cwd
+    ):
+        if entry.access is not None or not tokens:
+            continue  # Synthetic redirect operands are not executable commands.
+        classification = classify_remote_exec_call(tokens)
+        if classification.kind == "deny":
+            raise RemoteExecDenial(classification.reason or "remote invocation denied")
+        if classification.kind == "ask":
+            if ask is not None:
+                raise RemoteExecDenial(
+                    "remote execution admits only a single standalone remote "
+                    "invocation, pinned into the spawned argv at execution"
+                )
+            assert classification.call is not None
+            ask = (classification.call, list(tokens))
+    if ask is None:
+        return None
+    call, _tokens = ask
+    head = _split_command_tokens(expanded[0].text) if expanded else []
+    if len(expanded) != 1 or not head or Path(head[0]).name not in REMOTE_EXEC_CLIENTS:
+        raise RemoteExecDenial(
+            "remote execution admits only a single standalone ssh/scp/rsync "
+            "invocation, pinned into the spawned argv at execution; composed, "
+            "redirected, or wrapped calls are denied"
+        )
+    # S4b2b: the rebinding guard runs inside this same plan transaction,
+    # after the validated pin was resolved and before the argv is built —
+    # a changed answer (a rebind to a local/loopback/unspecified address,
+    # another address, ambiguity, or failure) denies here, so the changed
+    # answer is never contacted at any spawn point.
+    if isinstance(call, TransferCall):
+        call = enforce_pinned_transfer_resolution_at_spawn(call)
+        argv = pinned_transfer_argv(call)
+        return RemoteExecPlan(
+            destination=call.destination,
+            argv=argv,
+            command=pinned_transfer_command_text(call),
+            resolved_address=call.resolved_host,
+            client=call.client,
+        )
+    ssh_call = enforce_pinned_resolution_at_spawn(call)
+    argv = pinned_ssh_argv(ssh_call)
+    return RemoteExecPlan(
+        destination=ssh_call.destination,
+        argv=argv,
+        command=pinned_ssh_command_text(ssh_call),
+        resolved_address=ssh_call.resolved_host,
+    )
+
+
+def remote_exec_authority_admits(
+    authorities: tuple[DangerousCommandAuthority, ...],
+    cwd: Path,
+    destination: RemoteDestination,
+) -> bool:
+    """Whether the live authority snapshot admits remote exec at one cwd.
+
+    The scope is resolved exactly as the permission-time flow resolves it, so
+    authority and the execution-time pin coincide at the spawn. Any failure
+    fails closed: no scope, no grant.
+    """
+    try:
+        scope = resolve_repository_scope(cwd, GitRepositoryRelocation())
+    except Exception:
+        return False
+    if scope is None:
+        return False
+    return any(
+        authority_admits(
+            authority, REMOTE_EXEC_OPERATION_ID, scope, destination=destination
+        )
+        for authority in authorities
+    )

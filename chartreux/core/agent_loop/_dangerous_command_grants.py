@@ -263,6 +263,21 @@ class DangerousCommandGrantStore:
             self._bump_authority_generation()
         return changed
 
+    def remote_exec_scopes_for_destination(
+        self, destination: RemoteDestination
+    ) -> tuple[RepositoryScope, ...]:
+        """Every scope whose session grants currently hold *destination*."""
+        return tuple(
+            sorted(
+                (
+                    scope
+                    for scope, destinations in self._remote_exec_session.items()
+                    if destination in destinations
+                ),
+                key=_scope_sort_key,
+            )
+        )
+
     def install_remote_exec_once(
         self, requirements: frozenset[RemoteExecGrantRequirement]
     ) -> RemoteExecOncePermit:
@@ -326,6 +341,30 @@ class DangerousCommandGrantStore:
             ]
             invalidated += len(self._remote_exec_once) - len(kept_permits)
             self._remote_exec_once = kept_permits
+        if invalidated:
+            self._bump_authority_generation()
+        return invalidated
+
+    def invalidate_pending_destinations(
+        self, destinations: Iterable[RemoteDestination]
+    ) -> int:
+        """Invalidate every pending remote-exec once permit containing a destination.
+
+        A destination-scoped revocation drops each remote-exec once permit
+        that contains the revoked destination WHOLE — the permit covers one
+        invocation, so it is never trimmed to its remaining destinations —
+        mirroring the whole-permit invalidation of the scope-level rule.
+        """
+        wanted = set(destinations)
+        kept = [
+            permit
+            for permit in self._remote_exec_once
+            if not any(
+                requirement.destination in wanted for requirement in permit.requirements
+            )
+        ]
+        invalidated = len(self._remote_exec_once) - len(kept)
+        self._remote_exec_once = kept
         if invalidated:
             self._bump_authority_generation()
         return invalidated

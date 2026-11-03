@@ -1506,14 +1506,15 @@ def test_round3_outside_authority_destinations_are_denied(
         "strip evil",
         "objcopy evil copied",
         "as -o evil.o evil.s",
-        # Config-content writers to workspace targets; scp remote forms
-        # stay outside the local-metadata scope.
+        # Config-content writers to workspace targets. scp REMOTE forms no
+        # longer stay permitted: v0.7.1 S4b2c converted them out of this
+        # list — the bounded transfer grammar hard-denies them (no user in
+        # the remote spec), pinned in
+        # test_s4b2c_converted_remote_scp_forms_are_grammar_denied below.
         "gpg --batch --yes --pinentry-mode loopback --passphrase x --decrypt -o out.txt payload.gpg",
         "xmllint --output out.xml doc.xml",
         "scp seed.txt copied.txt",
         "scp -P 22 seed.txt copied2.txt",
-        "scp seed.txt host:x",
-        "scp host:x local.txt",
         # In-place compression mutators on workspace files.
         "bzip2 seed.txt",
         "xz seed.txt",
@@ -1539,6 +1540,28 @@ def test_round3_outside_authority_destinations_are_denied(
 )
 def test_round3_benign_forms_stay_permitted(bash_tool: Bash, command: str) -> None:
     assert_permitted(bash_tool, command)
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        # v0.7.1 S4b2c (converted, never deleted): these two scp remote forms
+        # were PERMITTED in the benign list above while scp was unmodeled
+        # beyond the (custom) denylist; with the bounded transfer grammar
+        # they hard-deny because the remote spec names no user. Local scp
+        # copies stay permitted — the path layer governs them.
+        "scp seed.txt host:x",
+        "scp host:x local.txt",
+    ],
+)
+def test_s4b2c_converted_remote_scp_forms_are_grammar_denied(
+    bash_tool: Bash, command: str
+) -> None:
+    context = bash_tool.resolve_permission(BashArgs(command=command))
+    assert context is not None, command
+    assert context.permission is ToolPermission.NEVER, f"{command}: {context.reason}"
+    assert "must name a user" in (context.reason or ""), command
+    assert "matches denylist pattern" not in (context.reason or ""), command
 
 
 def test_round3_new_commands_to_scratchpad_stay_permitted(

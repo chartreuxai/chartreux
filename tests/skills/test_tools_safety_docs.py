@@ -84,16 +84,34 @@ def test_documents_the_http_grammar_and_the_retained_denials() -> None:
     assert "`httpie` and `wget2` stay on the default denylist" in DOC
 
 
-def test_documents_the_https_entry_point_denial() -> None:
-    # The recorded doc-grep target for HTTPie's `https` entry point: it is the
-    # unmodeled twin of the modeled `http`, denied fail-closed under the same
-    # documented+corpus-tested prerequisite rule as wget2 and httpie, with
-    # grammar modeling deferred.
+def test_documents_the_https_entry_point_grammar() -> None:
+    # The recorded doc-grep target for HTTPie's `https` entry point (v0.7.1
+    # F2): it left the default denylist under the same restricted grammar as
+    # `http`, with the scheme forced onto a schemeless operand and an explicit
+    # non-https scheme hard-denied as cross-scheme. Each assert is a
+    # discriminating literal of THIS passage, so the retired
+    # "denied fail-closed until modeled" sentence cannot satisfy it.
     assert "### Network-client egress modeling (v0.7.0)" in DOC
-    assert "**`https`.** HTTPie's `https` entry point" in DOC
-    assert "it has no documented, corpus-tested grammar" in DOC
-    assert "every `https` spelling resolves denied fail-closed" in DOC
-    assert "deferred to the v0.8.0 backlog" in DOC
+    assert (
+        "**`https`.** HTTPie's `https` entry point is the same request client as" in DOC
+    )
+    assert "`https [METHOD] URL ITEM...`" in DOC
+    assert "forces `https://` onto a SCHEMELESS operand" in DOC
+    assert "keeps its `http://` and really" in DOC
+    assert "does issue a plain-HTTP request: it hard-denies as a cross-scheme" in DOC
+    assert "resolves ask-class rather than riding a loopback" in DOC
+    assert "every `https` spelling resolves denied fail-closed" not in DOC
+    assert "deferred to the v0.8.0 backlog" not in DOC
+
+
+def test_documents_the_executor_option_contract_and_extglob_residual() -> None:
+    # F1pkg1(b): the executor shell-option contract landed, so the extglob
+    # clause now names the pinned executor and the root-owned residual, not an
+    # under-inspection hazard in the user's environment.
+    assert "executor shell-option contract" in DOC
+    assert "Extglob environment residual" in DOC
+    assert "root-owned trust base" in DOC
+    assert "stays literal under the pinned contract" in DOC
 
 
 def test_documents_remote_exec_destination_grants() -> None:
@@ -108,3 +126,36 @@ def test_documents_remote_exec_destination_grants() -> None:
     assert "trusting the destination, not approving a contained payload" in DOC
     assert "an egress grant never admits a remote command" in DOC
     assert "Session grants do not propagate to children" in DOC
+
+
+def test_documents_the_s4b2a_ssh_denylist_exit_clause() -> None:
+    # S4b2a flip of the S4b1b passage-1 pin (the default-denylist paragraph;
+    # flipped, never dropped): ssh left the shipped denylist in v0.7.1 under
+    # the closed destination grammar — a positive destination is an IP literal
+    # or a hostname the system resolver (honoring /etc/hosts) answers with
+    # exactly one non-local address — classified as network.remote-exec with
+    # the exact GRANTED destination attached, the pin lands in the spawned
+    # argv at every execution transport, and for a hostname the pinned operand
+    # is the resolved address. Each assert is a discriminating literal of THIS
+    # passage.
+    assert "denylist in v0.7.1 under the closed destination grammar" in DOC
+    assert "exactly one non-local address" in DOC
+    assert "exact granted destination" in DOC
+    assert "pinned into the spawned argv at every execution" in DOC
+    assert "the pinned operand is the resolved address" in DOC
+
+
+def test_documents_the_s4b2a_ssh_retained_denials_clause() -> None:
+    # S4b2a flip of the S4b1b passage-2 pin (the retained-denials paragraph;
+    # flipped, never dropped): ssh is the exception since v0.7.1; a positive
+    # destination is an IP literal or a uniquely-non-locally-resolved hostname,
+    # the fixed HostKeyAlias/UserKnownHostsFile identity is pinned into the
+    # actual argv per spawn point, the resolved address rides as the hostname's
+    # destination operand while the HostKeyAlias stays bound to the granted
+    # hostname, and an ambiguous/local/failed resolution stays denied. Each
+    # assert is a discriminating literal of THIS passage.
+    assert "`ssh` is the exception since v0.7.1" in DOC
+    assert "fixed `HostKeyAlias`/`UserKnownHostsFile` host-key identity" in DOC
+    assert "answers uniquely and non-locally" in DOC
+    assert "the resolved address rides as the destination operand" in DOC
+    assert "failed hostname resolution stays denied" in DOC

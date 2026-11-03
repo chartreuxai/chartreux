@@ -47,12 +47,14 @@ def test_foreground_attribution_limit_is_explicitly_documented() -> None:
 
 def test_shell_caps_and_retained_overdenials_are_documented() -> None:
     assert "### Retained shell-policy limitations" in TOOLS_SAFETY
-    assert "Trailing-`**` over-denial" in TOOLS_SAFETY
+    assert "Trailing-`**` admission" in TOOLS_SAFETY
+    assert "never the recursive `**/` form" in TOOLS_SAFETY
     assert "executor shell-option contract" in TOOLS_SAFETY
-    assert "Extglob residual hazard" in TOOLS_SAFETY
-    assert "under-inspection hazard" in TOOLS_SAFETY
+    assert "Extglob environment residual" in TOOLS_SAFETY
+    assert "root-owned trust base" in TOOLS_SAFETY
     assert "Quoted-variable conservative denial" in TOOLS_SAFETY
-    assert "conservatively denied" in TOOLS_SAFETY
+    assert 'double-quoted `"$NAME"` or `"${NAME}"` word' in TOOLS_SAFETY
+    assert "prefixed assignment value" in TOOLS_SAFETY
     assert "directory-entry cap and a match-state cap" in TOOLS_SAFETY
     assert "fail-closed trade-off" in TOOLS_SAFETY
     assert "caps continued matching work," in TOOLS_SAFETY
@@ -164,4 +166,4 @@ def test_version_locations_and_release_heading_agree() -> None:
     heading = re.search(r"^## (\S+ \([^)]*\))", RELEASE_NOTES, re.MULTILINE)
     assert heading is not None
     assert pyproject_version == chartreux.__version__ == lock_version
-    assert heading.group(1) == f"{pyproject_version} (2026-11-01)"
+    assert heading.group(1) == f"{pyproject_version} (2026-11-03)"

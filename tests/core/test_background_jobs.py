@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import base64
 from dataclasses import dataclass
+import ipaddress
 from typing import Any
 from urllib.parse import quote
 
@@ -21,6 +22,12 @@ from chartreux.core.background_jobs import (
     OutputRecord,
 )
 from chartreux.core.tools import secret_redaction as sr
+from chartreux.core.tools.builtins import _remote_exec
+from chartreux.core.tools.builtins._remote_exec import (
+    RemoteExecDenial,
+    parse_ssh_call,
+    pinned_ssh_command_text,
+)
 
 
 @pytest.mark.asyncio
@@ -1019,4 +1026,188 @@ async def test_failed_precommit_recovery_keeps_handle_for_close_retry(
         adapter.spawn_gate.set()
         adapter.stop_gate.set()
         adapter.fail_stop = False
+        await registry.aclose()
+
+
+@pytest.mark.asyncio
+async def test_background_spawn_consumes_the_pinned_contract_and_rolls_back(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """F1pkg1(c): the background spawn site consumes the pinned executor
+    contract at execution — an unknown executor hard-denies before any process
+    starts, and the reservation rolls back.
+    """
+    from chartreux.core.utils.shell import UnknownShellExecutorError
+
+    monkeypatch.setenv("SHELL", "/nonexistent/chartreux-unknown-executor")
+    registry = BackgroundJobRegistry()
+    port = registry.root_port()
+    try:
+        with pytest.raises(UnknownShellExecutorError):
+            await port.start(BashStartArgs(command="printf hi"), cwd=tmp_path)
+        await asyncio.sleep(0)  # let the admission done-callback finish
+        assert registry.active_count == 0
+        assert not registry._jobs
+    finally:
+        await registry.aclose()
+
+
+@pytest.fixture
+def s4b1b_interfaces(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Hermetic locality and resolution for the spawn-site revalidation
+    (S4b1a + S4b2a seams): a fixed interface enumeration, and every hostname
+    resolving ambiguously (two answers) unless a test installs its own
+    resolver.
+    """
+    monkeypatch.setattr(
+        _remote_exec,
+        "_interface_addresses",
+        lambda: frozenset({ipaddress.ip_address("192.168.10.20")}),
+    )
+
+    def ambiguous_resolver(host: str) -> frozenset:
+        return frozenset({
+            ipaddress.ip_address("93.184.216.34"),
+            ipaddress.ip_address("1.1.1.1"),
+        })
+
+    monkeypatch.setattr(_remote_exec, "_hostname_resolver", ambiguous_resolver)
+
+
+def _unique_resolver(host: str) -> frozenset:
+    """The S4b2a hermetic answer: example.com resolves to one non-local address."""
+    if host == "example.com":
+        return frozenset({ipaddress.ip_address("93.184.216.34")})
+    raise OSError("Name or service not known")
+
+
+_S4B1B_PINNED_SSH = pinned_ssh_command_text(
+    parse_ssh_call(["ssh", "deploy@8.8.8.8", "uptime"])
+)
+_S4B2A_PINNED_SSH_CLASSIFICATION = _remote_exec.classify_ssh_call(
+    ["ssh", "deploy@example.com", "uptime"],
+    interface_addresses=lambda: frozenset({ipaddress.ip_address("192.168.10.20")}),
+    resolver=_unique_resolver,
+)
+assert _S4B2A_PINNED_SSH_CLASSIFICATION.kind == "ask"
+assert isinstance(_S4B2A_PINNED_SSH_CLASSIFICATION.call, _remote_exec.SshCall)
+_S4B2A_PINNED_SSH = pinned_ssh_command_text(_S4B2A_PINNED_SSH_CLASSIFICATION.call)
+
+
+@pytest.mark.asyncio
+async def test_background_spawn_runs_exactly_the_pinned_ssh_argv_text(
+    process_adapter: Any, monkeypatch: pytest.MonkeyPatch, tmp_path, s4b1b_interfaces
+) -> None:
+    """S4b1b: the registry spawn site is spawn-observing — the text the
+    adapter's spawn receives for a pinned remote-exec command carries the
+    approved address and the fixed host-key identity, and nothing else.
+    """
+    from chartreux.core import background_jobs as bg
+
+    adapter = process_adapter
+    adapter.spawn_gate.set()
+    spawned: list[str] = []
+    original_spawn = adapter.spawn
+
+    async def recording_spawn(command: str, **kwargs: Any) -> Any:
+        spawned.append(command)
+        return await original_spawn(command, **kwargs)
+
+    monkeypatch.setattr(bg, "spawn_shell_command", recording_spawn)
+
+    registry = BackgroundJobRegistry()
+    try:
+        start = await registry.root_port().start(
+            BashStartArgs(command=_S4B1B_PINNED_SSH), cwd=tmp_path
+        )
+        assert spawned == [_S4B1B_PINNED_SSH]
+        assert "HostKeyAlias=deploy@8.8.8.8:22" in spawned[0]
+        assert "UserKnownHostsFile=/dev/null/chartreux-pinned-known-hosts" in spawned[0]
+        assert registry.active_count == 1
+        job = registry._jobs[start.job.job_id]
+        assert job.process is not None
+    finally:
+        adapter.stop_gate.set()
+        await registry.aclose()
+
+
+@pytest.mark.asyncio
+async def test_background_spawn_runs_exactly_the_hostname_pinned_ssh_argv_text(
+    process_adapter: Any, monkeypatch: pytest.MonkeyPatch, tmp_path, s4b1b_interfaces
+) -> None:
+    """S4b2a: a hostname-pinned argv reaching the registry spawn carries the
+    RESOLVED address as the destination operand plus the fixed host-key
+    identity bound to the granted hostname — and revalidates that the operand
+    is still the granted host's unique non-local resolution (the fixture's
+    ambiguous resolver is replaced by the unique one here).
+    """
+    from chartreux.core import background_jobs as bg
+
+    monkeypatch.setattr(_remote_exec, "_hostname_resolver", _unique_resolver)
+    adapter = process_adapter
+    adapter.spawn_gate.set()
+    spawned: list[str] = []
+    original_spawn = adapter.spawn
+
+    async def recording_spawn(command: str, **kwargs: Any) -> Any:
+        spawned.append(command)
+        return await original_spawn(command, **kwargs)
+
+    monkeypatch.setattr(bg, "spawn_shell_command", recording_spawn)
+
+    registry = BackgroundJobRegistry()
+    try:
+        start = await registry.root_port().start(
+            BashStartArgs(command=_S4B2A_PINNED_SSH), cwd=tmp_path
+        )
+        assert spawned == [_S4B2A_PINNED_SSH]
+        assert "deploy@93.184.216.34" in spawned[0]
+        assert "HostKeyAlias=deploy@example.com:22" in spawned[0]
+        assert "UserKnownHostsFile=/dev/null/chartreux-pinned-known-hosts" in spawned[0]
+        assert registry.active_count == 1
+        job = registry._jobs[start.job.job_id]
+        assert job.process is not None
+    finally:
+        adapter.stop_gate.set()
+        await registry.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("command", "reason"),
+    [
+        # Unpinned: the tool layer pins the plan before the reservation; an
+        # ssh argv reaching the spawn without the pin never runs.
+        ("ssh deploy@8.8.8.8 uptime", "without the pinned address"),
+        # Hostname destination with an AMBIGUOUS hermetic resolution (the
+        # fixture resolver answers two addresses): denied by resolve-validate.
+        ("ssh deploy@example.com uptime", "resolves to multiple addresses"),
+        # Hostile option: ProxyCommand can redirect execution.
+        ("ssh -o ProxyCommand=evil deploy@8.8.8.8 uptime", "hostile ssh option"),
+        # Composed call: only a single standalone ssh invocation is pinnable.
+        ("true && ssh deploy@8.8.8.8 uptime", "single standalone ssh"),
+    ],
+    ids=["unpinned", "hostname", "hostile_option", "composed"],
+)
+async def test_background_spawn_denies_a_non_pinned_ssh_and_rolls_back(
+    process_adapter: Any, tmp_path, s4b1b_interfaces, command: str, reason: str
+) -> None:
+    """S4b1b: a denied, composed, or unpinned ssh argv raises inside the
+    spawn task, the launch recovery rolls the reservation back, and nothing
+    is spawned.
+    """
+    adapter = process_adapter
+    registry = BackgroundJobRegistry()
+    try:
+        with pytest.raises(RemoteExecDenial, match=reason):
+            await registry.root_port().start(
+                BashStartArgs(command=command), cwd=tmp_path
+            )
+        await asyncio.sleep(0)  # let the admission done-callback finish
+        assert registry.active_count == 0
+        assert not registry._jobs
+        assert adapter.processes == []
+    finally:
+        adapter.spawn_gate.set()
+        adapter.stop_gate.set()
         await registry.aclose()

@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 from pathlib import Path
 import time
+from typing import Any
 from unittest.mock import AsyncMock, Mock
 
 import pytest
@@ -17,11 +18,18 @@ from chartreux.app_server.models import (
     FailedEffectState,
     PublicEffectEntry,
 )
-from chartreux.app_server.protocol import ShellRunParams, ShellRunResponse
+from chartreux.app_server.protocol import (
+    AppServerResponseError,
+    ProtocolErrorCode,
+    ShellRunParams,
+    ShellRunResponse,
+)
 from chartreux.core.agent_loop._loop import ToolExecutionResponse
 from chartreux.core.llm_models import Role
 from chartreux.core.tools.base import ToolPermission
 from chartreux.core.tools.builtins.bash import BashArgs
+from chartreux.core.utils import shell as shell_utils
+from chartreux.core.utils.shell import shell_executor
 from chartreux.utils.tool_presentation import ToolEffectKind
 from tests.conftest import build_test_agent_loop
 from tests.stubs.app_server import create_test_app_server_session
@@ -56,7 +64,12 @@ def test_manual_shell_context_caps_stdout_and_stderr_independently() -> None:
 async def test_wp2_manual_shell_bypasses_model_outside_operand_denial(
     tmp_path: Path,
 ) -> None:
-    """Characterize WP2 GAP: manual shell is not the guarded model-tool path."""
+    """Characterize WP2 GAP: manual shell is not the guarded model-tool path.
+
+    F1pkg1(a) elected the design's REFUSAL lane, which is glob-bearing only:
+    this command carries no glob metacharacter, so the characterization below
+    stays exactly as the gap describes it.
+    """
     project = tmp_path / "project"
     project.mkdir()
     target = tmp_path / "outside.txt"
@@ -76,6 +89,102 @@ async def test_wp2_manual_shell_bypasses_model_outside_operand_denial(
     finally:
         await session.close()
         await agent_loop.aclose()
+
+
+@pytest.mark.asyncio
+async def test_terminal_glob_bearing_manual_shell_request_is_refused(
+    tmp_path: Path,
+) -> None:
+    """The session shell transport never hands pathname expansion to a shell.
+
+    The manual shell runs shell text under the ambient executor and no client
+    attests one, so an expansion-bearing command refuses before any effect
+    starts: no ``CompletedEffectState``, and the executor is never reached.
+    """
+    project = tmp_path / "project"
+    project.mkdir()
+    marker = project / "expanded.log"
+    agent_loop = build_test_agent_loop(cwd=project)
+    session = await create_test_app_server_session(agent_loop)
+    events: list[ShellTimelineEvent] = []
+    try:
+        with pytest.raises(AppServerResponseError) as excinfo:
+            async for event in session.resources.shell.run(f"touch {marker} *"):
+                events.append(event)
+        assert excinfo.value.error.code is ProtocolErrorCode.FORBIDDEN
+        assert "needs shell pathname expansion" in excinfo.value.error.message
+        assert events == []
+        assert not marker.exists()
+        assert not [
+            entry for entry in session.history if isinstance(entry, PublicEffectEntry)
+        ]
+    finally:
+        await session.close()
+        await agent_loop.aclose()
+
+
+@pytest.mark.asyncio
+async def test_session_shell_consumes_the_pinned_contract_at_execution(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """F1pkg1(c): the session-shell terminal transport consumes the pinned
+    executor contract at execution — an unknown ambient executor hard-denies
+    before the executor is reached: no CompletedEffectState, no side effect.
+    """
+    project = tmp_path / "project"
+    project.mkdir()
+    marker = project / "spawned.log"
+    agent_loop = build_test_agent_loop(cwd=project)
+    session = await create_test_app_server_session(agent_loop)
+    # The contract is consumed at the spawn, so the executor is read when the
+    # request runs, not at session setup.
+    monkeypatch.setenv("SHELL", "/nonexistent/chartreux-unknown-executor")
+    events: list[ShellTimelineEvent] = []
+    try:
+        with pytest.raises(AppServerResponseError) as excinfo:
+            async for event in session.resources.shell.run(f"touch {marker}"):
+                events.append(event)
+        assert excinfo.value.error.code is ProtocolErrorCode.INTERNAL_ERROR
+        assert "no pinned executor option contract" in excinfo.value.error.message
+        assert not isinstance(_final_effect(events).state, CompletedEffectState)
+        assert not marker.exists()
+    finally:
+        await session.close()
+        await agent_loop.aclose()
+
+
+@pytest.mark.asyncio
+async def test_shell_text_executor_identity_is_the_spawned_executable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Executor identification reads the binary the spawn actually runs."""
+    spawned: list[object] = []
+
+    async def create_subprocess_shell(*args: Any, **kwargs: Any) -> Any:
+        del args
+        spawned.append(kwargs["executable"])
+        return object()
+
+    async def spawn_registered_process(spawn: Any) -> Any:
+        await spawn
+        return object()
+
+    monkeypatch.setattr(
+        shell_utils.asyncio, "create_subprocess_shell", create_subprocess_shell
+    )
+    monkeypatch.setattr(
+        shell_utils, "spawn_registered_process", spawn_registered_process
+    )
+
+    monkeypatch.setenv("SHELL", "/bin/sh")
+    assert shell_executor() == "/bin/sh"
+    await shell_utils.spawn_shell_command("printf hello", cwd=tmp_path)
+    assert spawned == ["/bin/sh"]
+
+    monkeypatch.delenv("SHELL", raising=False)
+    assert shell_executor() is None
+    await shell_utils.spawn_shell_command("printf hello", cwd=tmp_path)
+    assert spawned == ["/bin/sh", None]
 
 
 @pytest.mark.asyncio
@@ -346,3 +455,113 @@ async def test_exited_leader_cleanup_terminates_descendant_and_readers(
             task.cancel()
         await asyncio.gather(task, return_exceptions=True)
         await controller.close()
+
+
+# --- S4b1b: the in-server session shell pins the literal-IP ssh spawn --------
+#
+# The session shell spawns in this process, so its executor is the server
+# itself — attested by construction. A standalone literal-IP ssh invocation
+# runs with the pinned command (approved address + fixed host-key identity)
+# at the spawn; every other ssh spelling hard-refuses before any effect
+# starts. The manual `!` path is direct user authority, so no model-side
+# grant flow applies — but the pin still lands at the spawn.
+
+_S4B1B_COMMAND = "ssh deploy@8.8.8.8 uptime"
+_S4B1B_PINNED_COMMAND = (
+    "ssh -o UserKnownHostsFile=/dev/null/chartreux-pinned-known-hosts"
+    " -o HostKeyAlias=deploy@8.8.8.8:22 -o StrictHostKeyChecking=yes"
+    " -o BatchMode=yes deploy@8.8.8.8 uptime"
+)
+
+
+@pytest.fixture
+def s4b1b_interfaces(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Hermetic locality: a fixed local-interface enumeration (S4b1a seam)."""
+    import socket
+
+    def fake_getaddrinfo(host, port):
+        return [
+            (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("192.168.10.20", 0)),
+            (socket.AF_INET6, socket.SOCK_STREAM, 6, "", ("::1", 0, 0, 0)),
+        ]
+
+    monkeypatch.setattr(socket, "getaddrinfo", fake_getaddrinfo)
+
+
+class _S4B1BStream:
+    async def read(self, n: int = -1) -> bytes:
+        return b""
+
+
+class _S4B1BProc:
+    def __init__(self) -> None:
+        self.stdout = _S4B1BStream()
+        self.stderr = _S4B1BStream()
+        self.returncode = 0
+
+    async def wait(self) -> int:
+        return 0
+
+
+@pytest.mark.asyncio
+async def test_session_shell_pins_the_literal_ip_ssh_command_at_the_spawn(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, s4b1b_interfaces
+) -> None:
+    """Spawn-observing: the text the session shell's spawn receives for a
+    standalone literal-IP ssh command is the pinned command — the approved
+    address and the fixed host-key identity — never the original string.
+    """
+    project = tmp_path / "project"
+    project.mkdir()
+    agent_loop = build_test_agent_loop(cwd=project)
+    spawned: list[str] = []
+
+    async def _record_spawn(command: str, **kwargs: Any) -> Any:
+        spawned.append(command)
+        return _S4B1BProc()
+
+    monkeypatch.setattr(_shell, "spawn_shell_command", _record_spawn)
+    session = await create_test_app_server_session(agent_loop)
+    try:
+        events = [event async for event in session.resources.shell.run(_S4B1B_COMMAND)]
+        assert isinstance(_final_effect(events).state, CompletedEffectState)
+    finally:
+        await session.close()
+        await agent_loop.aclose()
+    assert spawned == [_S4B1B_PINNED_COMMAND]
+
+
+@pytest.mark.asyncio
+async def test_session_shell_refuses_a_hostname_ssh_before_any_effect(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, s4b1b_interfaces
+) -> None:
+    """A hostname ssh whose hermetic resolution is ambiguous (the fake
+    getaddrinfo answers example.com with two addresses) is refused with
+    FORBIDDEN before the executor is reached; a unique non-local answer is
+    admitted-with-pinning (the S4b2a argv arms in test_bash_execution.py).
+    """
+    project = tmp_path / "project"
+    project.mkdir()
+    agent_loop = build_test_agent_loop(cwd=project)
+
+    async def _must_not_spawn(command: str, **kwargs: Any) -> Any:
+        raise AssertionError("the spawn site was reached for a denied form")
+
+    monkeypatch.setattr(_shell, "spawn_shell_command", _must_not_spawn)
+    session = await create_test_app_server_session(agent_loop)
+    events: list[ShellTimelineEvent] = []
+    try:
+        with pytest.raises(AppServerResponseError) as excinfo:
+            async for event in session.resources.shell.run(
+                "ssh deploy@example.com uptime"
+            ):
+                events.append(event)
+        assert excinfo.value.error.code is ProtocolErrorCode.FORBIDDEN
+        assert "resolves to multiple addresses" in excinfo.value.error.message
+        assert events == []
+        assert not [
+            entry for entry in session.history if isinstance(entry, PublicEffectEntry)
+        ]
+    finally:
+        await session.close()
+        await agent_loop.aclose()

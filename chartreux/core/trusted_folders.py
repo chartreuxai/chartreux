@@ -5,6 +5,7 @@ from enum import StrEnum
 from pathlib import Path
 import stat
 import tomllib
+from typing import TYPE_CHECKING
 
 import tomli_w
 
@@ -14,6 +15,9 @@ from chartreux.core.paths import (
     find_local_config_dirs,
 )
 from chartreux.observability.logging import logger
+
+if TYPE_CHECKING:
+    from chartreux.core.config.layers._checked_store import CheckedWriteResult
 
 
 class WorkspaceTrustDecision(StrEnum):
@@ -260,6 +264,46 @@ def apply_workspace_trust_decision(
             raise ValueError(f"Unsupported trust decision: {decision}")
 
 
+class TrustStoreState(StrEnum):
+    """Explicit read-path classification of the backing trust store."""
+
+    MISSING = "missing"
+    UNREADABLE = "unreadable"
+    MALFORMED = "malformed"
+    INVALID = "invalid"
+    READY = "ready"
+
+
+def parse_trust_store(data: bytes) -> dict[str, list[str]]:
+    """Parse and validate trust-store *data*.
+
+    ``UnicodeDecodeError``/``tomllib.TOMLDecodeError`` mark malformed bytes; the
+    shape check raises ``ValueError`` for a well-formed but invalid store.
+    """
+    document = tomllib.loads(data.decode("utf-8"))
+    trusted = document.get("trusted", [])
+    untrusted = document.get("untrusted", [])
+    if not all(
+        isinstance(entries, list) and all(isinstance(entry, str) for entry in entries)
+        for entries in (trusted, untrusted)
+    ):
+        raise ValueError("invalid trust decisions")
+    return {"trusted": list(trusted), "untrusted": list(untrusted)}
+
+
+def classify_trust_store(data: bytes | None) -> tuple[TrustStoreState, str | None]:
+    """Classify raw store bytes explicitly as missing/malformed/invalid/ready."""
+    if data is None:
+        return TrustStoreState.MISSING, None
+    try:
+        parse_trust_store(data)
+    except (tomllib.TOMLDecodeError, UnicodeDecodeError) as exc:
+        return TrustStoreState.MALFORMED, str(exc)
+    except ValueError as exc:
+        return TrustStoreState.INVALID, str(exc)
+    return TrustStoreState.READY, None
+
+
 class TrustedFoldersManager:
     def __init__(self) -> None:
         self._file_path = TRUSTED_FOLDERS_FILE.path
@@ -268,6 +312,7 @@ class TrustedFoldersManager:
         self._session_trusted: list[str] = []
         self._session_trust_grants: dict[str, list[str]] = {}
         self.load_error: str | None = None
+        self.store_state: TrustStoreState = TrustStoreState.MISSING
         self._load()
 
     def trust_for_session(
@@ -325,42 +370,107 @@ class TrustedFoldersManager:
 
     def _load(self) -> None:
         # Imports and diagnostic config loading must never create or repair files.
-        # Only explicit trust decisions persist through _save().
+        # Only explicit trust decisions persist through the checked write.
         self.load_error = None
-        if not self._file_path.is_file():
-            self._trusted = []
-            self._untrusted = []
+        self._trusted = []
+        self._untrusted = []
+        try:
+            data = self._file_path.read_bytes()
+        except FileNotFoundError:
+            self.store_state = TrustStoreState.MISSING
             self.load_error = "trust store missing"
             return
-
-        try:
-            with self._file_path.open("rb") as f:
-                data = tomllib.load(f)
-            trusted = data.get("trusted", [])
-            untrusted = data.get("untrusted", [])
-            if not all(
-                isinstance(entries, list)
-                and all(isinstance(entry, str) for entry in entries)
-                for entries in (trusted, untrusted)
-            ):
-                raise ValueError("invalid trust decisions")
-            self._trusted = list(trusted)
-            self._untrusted = list(untrusted)
-        except (OSError, ValueError):
-            self._trusted = []
-            self._untrusted = []
+        except OSError as exc:
+            self.store_state = TrustStoreState.UNREADABLE
+            self.load_error = f"trust store unreadable: {exc}"
+            return
+        state, _detail = classify_trust_store(data)
+        self.store_state = state
+        if state is not TrustStoreState.READY:
+            # Read-only load: a malformed or invalid store is never rewritten here.
             self.load_error = "trust store invalid or unreadable"
+            return
+        content = parse_trust_store(data)
+        self._trusted = content["trusted"]
+        self._untrusted = content["untrusted"]
 
-    def _save(self) -> None:
-        self._file_path.parent.mkdir(parents=True, exist_ok=True)
-        data = {"trusted": self._trusted, "untrusted": self._untrusted}
+    def _refresh_store_state(self) -> None:
+        """Re-classify the on-disk store after a write attempt (read-only)."""
         try:
-            with self._file_path.open("wb") as f:
-                tomli_w.dump(data, f)
+            data = self._file_path.read_bytes()
+        except FileNotFoundError:
+            self.store_state = TrustStoreState.MISSING
+            return
         except OSError:
-            pass
-        else:
+            self.store_state = TrustStoreState.UNREADABLE
+            return
+        state, _detail = classify_trust_store(data)
+        self.store_state = state
+
+    def _persist_decision(
+        self, normalized: str, *, grant_trusted: bool
+    ) -> CheckedWriteResult:
+        """Checked write of one trust decision onto the backing store.
+
+        The candidate state is computed inside the primitive's ``edit`` from
+        the store's current content and is published to the live in-memory
+        lists ONLY when the replace is confirmed (``SAVED``). A refused write
+        (malformed/invalid store, stale-revision conflict, lock timeout, or a
+        pre-replace failure) never publishes the candidate, so a failed grant
+        is never live in the process. A ``DURABILITY_UNCERTAIN`` result means
+        the replace happened but its durability is unconfirmed — the reported
+        outcome is that caveat (never "definitely not saved"), and the
+        in-memory grant is still not applied.
+        """
+        # Imported lazily: chartreux.core.config.layers.__init__ imports the
+        # project layer, which imports this module (circular at import time).
+        from chartreux.core.config.layers._checked_store import (
+            CheckedWriteOutcome,
+            CheckedWriteResult,
+            checked_write_store,
+            store_revision,
+        )
+
+        candidate_box: dict[str, dict[str, list[str]]] = {}
+
+        def edit(current: dict[str, list[str]]) -> bytes:
+            candidate = {
+                "trusted": list(current.get("trusted", [])),
+                "untrusted": list(current.get("untrusted", [])),
+            }
+            target = candidate["trusted"] if grant_trusted else candidate["untrusted"]
+            other = candidate["untrusted"] if grant_trusted else candidate["trusted"]
+            if normalized not in target:
+                target.append(normalized)
+            if normalized in other:
+                other.remove(normalized)
+            candidate_box["candidate"] = candidate
+            return tomli_w.dumps(candidate).encode("utf-8")
+
+        try:
+            revision = store_revision(self._file_path)
+            result = checked_write_store(
+                self._file_path,
+                edit,
+                parse=parse_trust_store,
+                missing_value={"trusted": [], "untrusted": []},
+                expected_revision=revision,
+            )
+        except OSError as exc:
+            # An unreadable store fails closed without raising into callers.
+            return CheckedWriteResult(
+                CheckedWriteOutcome.NOT_SAVED,
+                error=f"trust store unreadable, decision not saved: {exc}",
+            )
+        if result.outcome is CheckedWriteOutcome.SAVED:
+            candidate = candidate_box["candidate"]
+            self._trusted = candidate["trusted"]
+            self._untrusted = candidate["untrusted"]
+            self.store_state = TrustStoreState.READY
             self.load_error = None
+        else:
+            self._refresh_store_state()
+        return result
 
     def _closest_decision(self, path: Path) -> tuple[bool, Path] | None:
         """``(trusted, ancestor)`` for the closest decision, ``None`` if undecided."""
@@ -411,25 +521,17 @@ class TrustedFoldersManager:
 
     def add_trusted(
         self, path: Path, *, expected_identity: tuple[int, int] | None = None
-    ) -> None:
+    ) -> CheckedWriteResult:
         normalized = self._normalize_path(path)
         self._validate_normalized_identity(normalized, expected_identity)
-        if normalized not in self._trusted:
-            self._trusted.append(normalized)
-        if normalized in self._untrusted:
-            self._untrusted.remove(normalized)
-        self._save()
+        return self._persist_decision(normalized, grant_trusted=True)
 
     def add_untrusted(
         self, path: Path, *, expected_identity: tuple[int, int] | None = None
-    ) -> None:
+    ) -> CheckedWriteResult:
         normalized = self._normalize_path(path)
         self._validate_normalized_identity(normalized, expected_identity)
-        if normalized not in self._untrusted:
-            self._untrusted.append(normalized)
-        if normalized in self._trusted:
-            self._trusted.remove(normalized)
-        self._save()
+        return self._persist_decision(normalized, grant_trusted=False)
 
 
 trusted_folders_manager = TrustedFoldersManager()

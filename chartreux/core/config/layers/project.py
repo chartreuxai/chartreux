@@ -4,7 +4,11 @@ import asyncio
 import copy
 from pathlib import Path
 
-from chartreux.core.config.layer import ConfigLayer, RawConfig
+from chartreux.core.config.layer import (
+    ConfigLayer,
+    RawConfig,
+    require_answerable_trust_store,
+)
 from chartreux.core.config.layers._base import BaseTomlConfigLayer
 from chartreux.core.paths._vibe_home import CHARTREUX_HOME
 from chartreux.core.trusted_folders import (
@@ -110,6 +114,11 @@ class ProjectConfigLayer(BaseTomlConfigLayer):
         if self._config_file_path is None:
             return True
 
+        # ``is_trusted`` answers ``None`` for a path the store cannot judge,
+        # and ``None`` would collapse into "untrusted" below. The typed store
+        # state is surfaced instead, so a broken store never reads as an
+        # explicit refusal of this project's config.
+        require_answerable_trust_store(self._trust_store, self.name)
         return bool(self._trust_store.is_trusted(self._config_file_path.parent))
 
     async def _find_config_file(self) -> None:

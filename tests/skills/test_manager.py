@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import defaultdict
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
@@ -11,7 +12,8 @@ from chartreux.core.config.harness_files import HarnessFilesManager
 from chartreux.core.skills.builtins import BUILTIN_SKILLS
 from chartreux.core.skills.compatibility import SHIPPED_SKILL_WORKFLOW_CLASS
 from chartreux.core.skills.manager import SHIPPED_SKILLS_DIR, SkillManager
-from chartreux.core.skills.models import SkillSource
+from chartreux.core.skills.models import SkillMetadata, SkillSource
+from chartreux.core.skills.parser import parse_skill_markdown
 from chartreux.core.trusted_folders import trusted_folders_manager
 from tests.conftest import build_test_vibe_config
 from tests.skills.conftest import create_skill
@@ -25,6 +27,42 @@ CEREMONY_BEARING_SHIPPED_SKILLS = sorted(SHIPPED_SKILL_WORKFLOW_CLASS)
 ELIGIBLE_SHIPPED_SKILL_COUNT = SHIPPED_SKILL_COUNT - len(
     CEREMONY_BEARING_SHIPPED_SKILLS
 )
+
+
+def _shipped_skill_files(base: Path) -> list[Path]:
+    return sorted(path for path in base.glob("*/SKILL.md") if path.is_file())
+
+
+def duplicate_sources(base: Path) -> list[str]:
+    """Every duplicate skill source under one skills tree.
+
+    A tree is clean when each SKILL.md declares a name no sibling declares and
+    no two payloads are byte-identical. The check is a property of the tree,
+    not of the catalog's size, so a second copy of an existing payload is
+    caught at any skill count — the dynamic count is self-consistent and
+    cannot discriminate a bad dedup (design Z, C1).
+    """
+    names: dict[str, list[Path]] = defaultdict(list)
+    payloads: dict[bytes, list[Path]] = defaultdict(list)
+    for path in _shipped_skill_files(base):
+        frontmatter, _body = parse_skill_markdown(path.read_text(encoding="utf-8"))
+        names[SkillMetadata.model_validate(frontmatter).name].append(path)
+        payloads[path.read_bytes()].append(path)
+    problems = [
+        f"name '{name}' declared by {len(paths)} sources: {_path_list(paths)}"
+        for name, paths in sorted(names.items())
+        if len(paths) > 1
+    ]
+    problems.extend(
+        f"identical payload in {len(paths)} sources: {_path_list(paths)}"
+        for paths in payloads.values()
+        if len(paths) > 1
+    )
+    return problems
+
+
+def _path_list(paths: list[Path]) -> str:
+    return ", ".join(str(path) for path in paths)
 
 
 def ceremony_config(**kwargs: Any) -> ChartreuxConfigSchema:
@@ -359,6 +397,52 @@ class TestShippedSkillPrecedence:
         assert skill is not None
         assert skill.source is SkillSource.SHIPPED
         assert manager.custom_skills_count == 0
+
+
+class TestShippedSkillSources:
+    """C1 acceptance: shipped payloads load one-to-one from one source each."""
+
+    def test_every_shipped_skill_loads_through_the_manager(self) -> None:
+        manager = SkillManager(lambda: ceremony_config())
+        shipped_files = _shipped_skill_files(SHIPPED_SKILLS_DIR)
+        # An empty tree would make the per-skill loop below vacuous.
+        assert shipped_files
+        assert [
+            failure
+            for failure in manager.load_failures
+            if failure.source is SkillSource.SHIPPED
+        ] == []
+        for skill_file in shipped_files:
+            name = skill_file.parent.name
+            skill = manager.get_skill(name)
+            assert skill is not None, name
+            assert skill.description, name
+            assert skill.prompt, name
+            assert skill.source is SkillSource.SHIPPED, name
+            assert skill.skill_path is not None, name
+            assert skill.skill_path.resolve() == skill_file.resolve(), name
+            assert skill.skill_dir == skill_file.parent.resolve(), name
+
+    def test_no_duplicate_shipped_skill_sources(self) -> None:
+        assert duplicate_sources(SHIPPED_SKILLS_DIR) == []
+
+    def test_duplicate_source_check_discriminates_a_copy(self, tmp_path: Path) -> None:
+        # Positive control: one shipped payload copied verbatim into a second
+        # directory must fail the check, even though discovery would silently
+        # skip the second registration and leave the count looking healthy.
+        shipped_file = _shipped_skill_files(SHIPPED_SKILLS_DIR)[0]
+        name = shipped_file.parent.name
+        for directory in (name, f"{name}-copy"):
+            target = tmp_path / directory / "SKILL.md"
+            target.parent.mkdir(parents=True)
+            target.write_bytes(shipped_file.read_bytes())
+
+        problems = duplicate_sources(tmp_path)
+        assert problems
+        assert any(name in problem for problem in problems)
+
+        (tmp_path / f"{name}-copy" / "SKILL.md").unlink()
+        assert duplicate_sources(tmp_path) == []
 
 
 class TestSkillManagerGetSkill:

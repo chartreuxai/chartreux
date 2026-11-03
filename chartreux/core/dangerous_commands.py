@@ -15,18 +15,37 @@ persistence behavior, and no execution.
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 import ipaddress
 from pathlib import Path
 import re
+import socket
 from types import MappingProxyType
-from typing import Literal
+from typing import Literal, cast
+
+from chartreux.utils.remote_exec import (
+    REMOTE_EXEC_NETWORK_LOCALITY_CAPABILITY as REMOTE_EXEC_NETWORK_LOCALITY_CAPABILITY,
+    REMOTE_EXEC_OPERATION_ID,
+    REMOTE_EXEC_SSH_TRUST_CAPABILITY as REMOTE_EXEC_SSH_TRUST_CAPABILITY,
+    RemoteExecAttestation as RemoteExecAttestation,
+)
 
 DangerousCommandClass = Literal["publication", "consequential", "remote_exec"]
 GrantChoice = Literal["deny", "allow_once", "allow_session", "allow_project"]
 AuthoritySource = Literal["protected_config", "runtime_grant"]
 ClassificationKind = Literal["routine", "hard_denied", "grantable"]
+AddressLocality = Literal["local", "non_local"]
+# The fail-closed resolve-validate verdict for a hostname destination
+# (v0.7.1 S4b2a): only a unique, non-local answer admits; ambiguity (a
+# multi-answer resolution), any local answer, and any resolution failure
+# deny.
+HostnameResolution = Literal["unique_non_local", "ambiguous", "local", "failed"]
+# The rebinding verdict for re-observing a hostname's resolution against the
+# validated pinned address (v0.7.1 S4b2b): only "unchanged" — the fresh
+# answer is still the same unique non-local address — keeps the pin; every
+# other verdict denies, so a changed answer is never contacted.
+HostnameRebind = Literal["unchanged", "changed", "ambiguous", "local", "failed"]
 
 
 @dataclass(frozen=True)
@@ -192,8 +211,6 @@ def is_grant_choice_valid(operation_id: str, choice: GrantChoice) -> bool:
     return choice in _GRANT_CHOICES_BY_CLASS[operation.command_class]
 
 
-REMOTE_EXEC_OPERATION_ID = "network.remote-exec"
-
 # A destination is one explicit user, one concrete host (DNS name or IP
 # literal; IPv6 only in brackets), and an optional port. Wildcards, ranges,
 # and comma-separated alias groups never parse, so v1 admits exact
@@ -254,6 +271,205 @@ def canonical_remote_destination(value: str) -> RemoteDestination | None:
     if not 1 <= port <= _MAX_TCP_PORT:
         return None
     return RemoteDestination(user=match.group("user"), host=host, port=port)
+
+
+# Fail-closed local-address classification for remote-exec destinations
+# (S4b1a). Canonicalization above is NOT address validation: it lowercases
+# DNS names and compresses bracketed IPv6 but never proves a literal is
+# non-local, so the locality verdict is the classifier's own. The classifier
+# is INERT until S4b1b consumes it at the resolver seam — nothing here
+# changes any admission on its own.
+_IPAddress = ipaddress.IPv4Address | ipaddress.IPv6Address
+
+# The whole "this network" block, not just the unspecified 0.0.0.0: Linux
+# connects 0.x addresses to loopback, so every 0/8 form denies.
+_THIS_NETWORK_V4 = ipaddress.ip_network("0.0.0.0/8")
+# IPv4-mapped IPv6 (::ffff:0:0/96) resolves on the wire to the embedded IPv4
+# address, which may be local even when the embedding looks public
+# (::ffff:8.8.8.8 is globally routed as a literal), so the whole block denies.
+_IPV4_MAPPED_V6 = ipaddress.ip_network("::ffff:0:0/96")
+
+
+def _local_interface_addresses() -> frozenset[_IPAddress]:
+    """This host's interface addresses, enumerated through getaddrinfo.
+
+    Any failure raises, and an empty enumeration is equally "absence of
+    data": the classifier treats both as locality unknown and denies, so a
+    host whose own name does not resolve fails closed instead of skipping
+    the interface check.
+    """
+    addresses: set[_IPAddress] = set()
+    for info in socket.getaddrinfo(socket.gethostname(), None):
+        addresses.add(ipaddress.ip_address(info[4][0]))
+    return frozenset(addresses)
+
+
+def _parse_ip_literal(host: str) -> _IPAddress | None:
+    """Parse one host spelling as an IP literal, brackets tolerated.
+
+    Anything else — DNS names, inet_aton shorthand, malformed octets — is
+    not a literal and returns None: a classification failure.
+    """
+    if not isinstance(host, str):
+        return None
+    text = host.strip()
+    if text.startswith("[") and text.endswith("]"):
+        text = text[1:-1]
+    try:
+        return ipaddress.ip_address(text)
+    except ValueError:
+        return None
+
+
+def _is_local_form(address: _IPAddress) -> bool:
+    """Whether the literal itself is a local or unassignable form."""
+    if (
+        address.is_unspecified
+        or address.is_loopback
+        or address.is_link_local
+        or address.is_multicast
+    ):
+        return True
+    if address.is_private or address.is_reserved or not address.is_global:
+        return True
+    if isinstance(address, ipaddress.IPv4Address):
+        return address in _THIS_NETWORK_V4
+    return (
+        address in _IPV4_MAPPED_V6
+        or address.sixtofour is not None
+        or address.teredo is not None
+    )
+
+
+def classify_local_address(
+    host: str,
+    *,
+    interface_addresses: Callable[
+        [], frozenset[_IPAddress]
+    ] = _local_interface_addresses,
+) -> AddressLocality:
+    """Fail-closed locality verdict for one remote-exec host spelling.
+
+    ``"local"`` is the deny outcome and is returned for every form that must
+    never be contacted: loopback, link-local, unique-local, multicast,
+    unspecified (``0.0.0.0``, ``::``, and the whole ``0.0.0.0/8`` "this
+    network" block), IPv4-mapped and other IPv4-embedding IPv6, every
+    private, reserved or otherwise non-global range, any address owned by a
+    local interface, anything that does not parse as an IP literal (DNS
+    names are the S4b2 resolution arms and deny until then), and ANY failure
+    of the local-interface enumeration — getaddrinfo errors, unparseable
+    enumeration entries, and an empty enumeration deny rather than skip
+    the interface check. Only a literal that parses, is globally routable,
+    sits in no local or unassignable form, and is not owned by a local
+    interface classifies ``"non_local"``; a refuse-all classifier is wrong by
+    construction.
+    """
+    address = _parse_ip_literal(host)
+    if address is None:
+        return "local"
+    try:
+        interfaces = interface_addresses()
+    except Exception:
+        return "local"
+    if not interfaces or address in interfaces or _is_local_form(address):
+        return "local"
+    return "non_local"
+
+
+def _system_hostname_resolver(host: str) -> frozenset[_IPAddress]:
+    """Resolve one hostname through the system resolver.
+
+    ``getaddrinfo`` consults the nsswitch chain, so ``/etc/hosts`` is honored
+    ahead of DNS exactly as the design's resolve-validate-pin rule requires;
+    the answer set is the distinct resolved addresses. Any failure raises
+    (getaddrinfo errors, unparseable sockaddrs), and the caller fails closed.
+    """
+    addresses: set[_IPAddress] = set()
+    for info in socket.getaddrinfo(host, None):
+        addresses.add(ipaddress.ip_address(info[4][0]))
+    return frozenset(addresses)
+
+
+def classify_hostname_resolution(
+    host: str,
+    *,
+    resolver: Callable[[str], frozenset[_IPAddress]] = _system_hostname_resolver,
+    interface_addresses: Callable[
+        [], frozenset[_IPAddress]
+    ] = _local_interface_addresses,
+) -> tuple[HostnameResolution, _IPAddress | None]:
+    """Fail-closed resolve-validate verdict for one hostname destination.
+
+    Returns ``("unique_non_local", address)`` only when the system resolver
+    (which honors ``/etc/hosts``) yields exactly ONE distinct address and that
+    answer classifies ``non_local`` under the S4b1a classifier. Everything
+    else denies: a multi-answer resolution is ``("ambiguous", None)`` no
+    matter which families its answers are in, a single answer that
+    classifies local (loopback, private, mapped, interface-owned, or an
+    unestablishable locality) is ``("local", address)``, and any resolution
+    failure — resolver error, empty answer set, a non-string host, or an IP
+    literal (literals route through ``classify_local_address`` instead) —
+    is ``("failed", None)``. A refuse-all classifier is wrong by
+    construction: the unique-non-local arm is the only admission.
+    """
+    if not isinstance(host, str) or _parse_ip_literal(host) is not None:
+        return "failed", None
+    try:
+        answers = resolver(host)
+    except Exception:
+        return "failed", None
+    if not answers:
+        return "failed", None
+    if len(answers) != 1:
+        return "ambiguous", None
+    (address,) = tuple(answers)
+    if (
+        classify_local_address(str(address), interface_addresses=interface_addresses)
+        != "non_local"
+    ):
+        return "local", address
+    return "unique_non_local", address
+
+
+def classify_resolution_rebind(
+    host: str,
+    pinned_address: str,
+    *,
+    resolver: Callable[[str], frozenset[_IPAddress]] = _system_hostname_resolver,
+    interface_addresses: Callable[
+        [], frozenset[_IPAddress]
+    ] = _local_interface_addresses,
+) -> tuple[HostnameRebind, _IPAddress | None]:
+    """Fail-closed rebinding verdict: re-observe a hostname's resolution
+    against the validated pinned address (v0.7.1 S4b2b).
+
+    Returns ``("unchanged", address)`` only when the FRESH system-resolver
+    answer (honoring ``/etc/hosts``) is still unique, non-local, and exactly
+    the pinned address — address equality is by value, so IPv6 spelling
+    variants of the same address compare equal. Every other outcome denies:
+    another unique non-local address is ``("changed", address)``, while a
+    rebind to a local/loopback/unspecified answer, ambiguity, or any
+    resolution failure keeps the fresh resolve-validate verdict
+    (``"local"``/``"ambiguous"``/``"failed"``) with its address. A pinned
+    spelling that does not parse as an IP literal, a non-string host, and a
+    literal host (literals never resolve) all fail closed as
+    ``("failed", None)``. A refuse-all rebinding model is wrong by
+    construction: the unchanged arm is the only admission.
+    """
+    pinned = _parse_ip_literal(pinned_address)
+    if pinned is None:
+        return "failed", None
+    verdict, resolved = classify_hostname_resolution(
+        host, resolver=resolver, interface_addresses=interface_addresses
+    )
+    if verdict == "unique_non_local" and resolved is not None:
+        if resolved != pinned:
+            return "changed", resolved
+        return "unchanged", resolved
+    # Every other fresh verdict denies: "ambiguous"/"failed" carry no usable
+    # answer, and a "local" fresh answer is a rebind to a local address —
+    # none of them is ever contacted.
+    return cast("HostnameRebind", verdict), resolved
 
 
 @dataclass(frozen=True)

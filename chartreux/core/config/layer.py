@@ -72,6 +72,41 @@ class TrustResolutionError(ConfigLayerError):
         )
 
 
+class TrustStoreStateError(ConfigLayerError):
+    """Raised when a trust question is put to a store that cannot answer.
+
+    ``MISSING`` is the genuine first-run default — nothing persisted, nothing
+    trusted. An unreadable, malformed, or invalid store leaves every folder's
+    decision unknown; resolving that unknown as a definite "untrusted" would
+    silently disable the configuration, environment, or harness files of a
+    folder whose state the store could not report.
+    """
+
+    def __init__(self, consumer: str, store_state: str, detail: str | None) -> None:
+        message = f"{consumer}: trust store {store_state}"
+        if detail:
+            message = f"{message}: {detail}"
+        super().__init__(consumer, message)
+        self.store_state = store_state
+        self.detail = detail
+
+
+def require_answerable_trust_store(trust_store: Any, consumer: str) -> None:
+    """Raise ``TrustStoreStateError`` unless *trust_store* can answer a query.
+
+    A manager without a typed read state (an in-memory double) answers from
+    its own data and is left alone; the persisted store always carries one.
+    """
+    from chartreux.core.trusted_folders import TrustStoreState
+
+    state = getattr(trust_store, "store_state", None)
+    if state is None or state in {TrustStoreState.MISSING, TrustStoreState.READY}:
+        return
+    raise TrustStoreStateError(
+        consumer, state.value, getattr(trust_store, "load_error", None)
+    )
+
+
 class LayerImplementationError(ConfigLayerError):
     """Raised when a subclass-provided method fails."""
 
@@ -173,6 +208,8 @@ class ConfigLayer[S: BaseModel](ABC):
         """Call ``_check_trust`` and wrap any error."""
         try:
             return await self._check_trust()
+        except TrustStoreStateError:
+            raise
         except Exception as e:
             raise LayerImplementationError(self.name, "_check_trust") from e
 

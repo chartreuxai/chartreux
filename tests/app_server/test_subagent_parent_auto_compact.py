@@ -17,8 +17,12 @@ from chartreux.app_server.models import PublicCheckpointEntry
 from chartreux.app_server.server import AppServer
 from chartreux.core.agent_loop._transcript_integrity import archive_reference
 from chartreux.core.compaction import CompactionManager
+from chartreux.core.config import SessionLoggingConfig
 from chartreux.core.file_revision import FileRevision
 from chartreux.core.llm_models import Role
+from chartreux.core.session.session_loader import MESSAGES_FILENAME
+from chartreux.core.session.session_logger import SessionDiskFullError, SessionLogger
+from chartreux.core.session.transcript_archive import verify_archived_prefix_on_disk
 from chartreux.core.subagents import WaitStatus
 from tests.app_server._subagent_test_support import (
     GatedSequenceBackend,
@@ -320,4 +324,282 @@ async def test_parent_auto_compact_mid_run_keeps_the_active_invocation_intact(
         assert len(parent.messages) == len(list(parent.messages))
     finally:
         child_release.set()
+        await session.close()
+
+
+def _enabled_logging_config(tmp_path: Path) -> SessionLoggingConfig:
+    return SessionLoggingConfig(
+        enabled=True, save_dir=str(tmp_path / "sessions"), session_prefix="session"
+    )
+
+
+def _messages_path_of(parent: Any) -> Path:
+    session_dir = parent.session_logger.session_dir
+    assert session_dir is not None
+    return session_dir / MESSAGES_FILENAME
+
+
+def _trim_outcome_spy(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    """Record every post-turn trim completion outcome in call order."""
+    outcomes: list[str] = []
+    real_complete = SessionLogger.complete_post_turn_trim
+
+    async def _spy(self: SessionLogger, *args: Any, **kwargs: Any) -> Any:
+        result = await real_complete(self, *args, **kwargs)
+        outcomes.append(result.outcome)
+        return result
+
+    monkeypatch.setattr(SessionLogger, "complete_post_turn_trim", _spy)
+    return outcomes
+
+
+@pytest.mark.asyncio
+async def test_parent_auto_compact_post_turn_seal_publishes_and_keeps_child_deliverable(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """T1b positive post-turn arm: the parent's mid-run auto-compaction is
+    refused by the active-turn guard (spy), and the guarded post-finalization
+    entry then drains, fences, seals and publishes the pending trim at the
+    exclusive seam. The background child's run and result stay deliverable.
+    """
+    child_backend = GatedSequenceBackend([[mock_llm_chunk(content="child finished")]])
+    child_started, child_release = child_backend.add_gate()
+    monkeypatch.setattr(
+        "chartreux.core.agent_loop._loop.create_backend", lambda **_: child_backend
+    )
+    parent_backend = FakeBackend([
+        # Turn 1: launch the background subagent, then acknowledge it.
+        [mock_llm_chunk(content="", tool_calls=[_task_call(background=True)])],
+        [mock_llm_chunk(content="parent acknowledged the launch")],
+        # Turn 2: auto-compact fires first (summary), then the turn itself.
+        [mock_llm_chunk(content="<summary>parent compacted mid-run</summary>")],
+        [mock_llm_chunk(content="parent continued after compaction")],
+        # Notification turn after the child completes.
+        [mock_llm_chunk(content="notification acknowledged")],
+    ])
+    parent = build_test_agent_loop(
+        config=_config(session_logging=_enabled_logging_config(tmp_path)),
+        backend=parent_backend,
+        enable_streaming=True,
+    )
+
+    # The mid-run trim path is entered but the active-turn guard holds at
+    # every entry (the turn has ended by the time the assertions run).
+    trim_calls: list[bool] = []
+    original_trim = CompactionManager._trim_archived_prefix
+
+    async def _trim_spy(self: CompactionManager) -> None:
+        has_active_turn = self._has_active_turn
+        trim_calls.append(has_active_turn() if has_active_turn is not None else False)
+        return await original_trim(self)
+
+    monkeypatch.setattr(CompactionManager, "_trim_archived_prefix", _trim_spy)
+
+    client = start_test_app_server(parent)
+    run_peer = client._run_peer
+    assert run_peer is not None
+    server = cast(AppServer, cast(Any, run_peer).__self__)
+    session = await attach_test_app_server_session(client)
+
+    try:
+        await _consume(session.act("launch background work"))
+        await asyncio.wait_for(child_started.wait(), timeout=5)
+        registry = legacy_backend(server).children
+        summary = (await registry.check_agents())[0]
+        assert summary.availability.value == "running"
+        assert summary.current_run_id is not None
+        agent_id = summary.agent_id
+        run_id = summary.current_run_id
+
+        parent.stats.context_tokens = 500_000
+        await _consume(session.act("continue while the child works"))
+        assert any(
+            isinstance(entry, PublicCheckpointEntry) and entry.kind == "compaction"
+            for entry in session.history
+        )
+        # The active-turn guard held during the mid-run compaction.
+        assert trim_calls, "the activated trim path must be entered"
+        assert all(trim_calls), "the active-turn guard must hold at every entry"
+
+        # T1b: the post-turn seam sealed and published the pending trim.
+        descriptor = parent.messages.archive_descriptor
+        assert descriptor is not None
+        assert parent.session_logger.archive_descriptor is descriptor
+        assert descriptor.archived_count == 4  # turn 1's settled round
+        non_system = [m for m in parent.messages if m.role is not Role.system]
+        sealed = non_system[: descriptor.archived_count]
+        assert all(archive_reference(m) is descriptor for m in sealed)
+        assert all(
+            archive_reference(m) is None
+            for m in non_system[descriptor.archived_count :]
+        )
+        verify_archived_prefix_on_disk(descriptor, _messages_path_of(parent))
+
+        # The child run survived and its result is intact and deliverable.
+        child_release.set()
+        wait_disposition = await asyncio.wait_for(
+            registry.wait_for_agent(agent_id, run_id), timeout=5
+        )
+        assert wait_disposition.status is WaitStatus.COMPLETED
+        assert wait_disposition.result is not None
+        assert wait_disposition.result.completed
+        assert wait_disposition.result.response == "child finished"
+        await _wait_for_turn_completion(session)
+        # The notification turn's own post-turn seam found the boundary already
+        # published: no second seal/publication for the same boundary.
+        assert parent.messages.archive_descriptor is descriptor
+    finally:
+        child_release.set()
+        await session.close()
+
+
+@pytest.mark.asyncio
+async def test_parent_auto_compact_post_turn_failed_seal_retains_originals(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """T1b failed-finalization arm: the sealing persist fails at the post-turn
+    seam — no receipt, originals retained, nothing published, and the turn
+    still completes normally (act returned, boundary persisted).
+    """
+    parent_backend = FakeBackend([
+        [mock_llm_chunk(content="first answer")],
+        [mock_llm_chunk(content="<summary>compacted</summary>")],
+        [mock_llm_chunk(content="second answer")],
+    ])
+    parent = build_test_agent_loop(
+        config=_config(session_logging=_enabled_logging_config(tmp_path)),
+        backend=parent_backend,
+        enable_streaming=True,
+    )
+    outcomes = _trim_outcome_spy(monkeypatch)
+
+    def _disk_full(*args: Any, **kwargs: Any) -> Any:
+        raise SessionDiskFullError(_messages_path_of(parent), "seal persist")
+
+    monkeypatch.setattr(SessionLogger, "_seal_persist_sync", _disk_full)
+
+    client = start_test_app_server(parent)
+    session = await attach_test_app_server_session(client)
+    try:
+        await _consume(session.act("first question"))
+        parent.stats.context_tokens = 500_000
+        # The turn completes normally even though the post-turn seal failed.
+        await _consume(session.act("second question"))
+
+        assert outcomes == ["failed_seal"]
+        assert any(m.context_boundary == "compaction" for m in parent.messages)
+        assert parent.messages.archive_descriptor is None
+        assert parent.session_logger.archive_descriptor is None
+        assert all(archive_reference(m) is None for m in parent.messages)
+        raw = _messages_path_of(parent).read_bytes()
+        assert b'"context_boundary": "compaction"' in raw
+    finally:
+        await session.close()
+
+
+@pytest.mark.asyncio
+async def test_parent_auto_compact_post_turn_cannot_publish_keeps_originals(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """T1b seal-succeeds-but-cannot-publish arm: the seal at the post-turn
+    seam succeeds but the publication fails — the pre-seal descriptor (none
+    on a first seal) remains effective, the originals are retained, nothing is
+    partially published, and the outcome is reported as failed_publish.
+    """
+    parent_backend = FakeBackend([
+        [mock_llm_chunk(content="first answer")],
+        [mock_llm_chunk(content="<summary>compacted</summary>")],
+        [mock_llm_chunk(content="second answer")],
+    ])
+    parent = build_test_agent_loop(
+        config=_config(session_logging=_enabled_logging_config(tmp_path)),
+        backend=parent_backend,
+        enable_streaming=True,
+    )
+    outcomes = _trim_outcome_spy(monkeypatch)
+
+    def _cannot_publish(*args: Any, **kwargs: Any) -> Any:
+        raise ValueError("simulated cannot-publish (stale fence)")
+
+    monkeypatch.setattr(
+        SessionLogger, "fence_and_publish_archive_trim", _cannot_publish
+    )
+
+    client = start_test_app_server(parent)
+    session = await attach_test_app_server_session(client)
+    try:
+        await _consume(session.act("first question"))
+        parent.stats.context_tokens = 500_000
+        await _consume(session.act("second question"))
+
+        assert outcomes == ["failed_publish"]
+        # Rolled back to the pre-seal authority: no descriptor on either owner.
+        assert parent.session_logger.archive_descriptor is None
+        assert parent.messages.archive_descriptor is None
+        assert all(archive_reference(m) is None for m in parent.messages)
+        # The transcript on disk still holds the originals incl. the boundary.
+        raw = _messages_path_of(parent).read_bytes()
+        assert b'"context_boundary": "compaction"' in raw
+        assert b"first answer" in raw
+    finally:
+        await session.close()
+
+
+@pytest.mark.asyncio
+async def test_parent_auto_compact_post_turn_trim_excludes_repeat_attempt_for_same_boundary(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """T1b exclusivity arm at the app-server level: after the post-turn seam
+    published the boundary, a repeat completion attempt for the SAME boundary
+    is excluded (no concurrent/second seal and publication).
+    """
+    parent_backend = FakeBackend([
+        [mock_llm_chunk(content="first answer")],
+        [mock_llm_chunk(content="<summary>compacted</summary>")],
+        [mock_llm_chunk(content="second answer")],
+    ])
+    parent = build_test_agent_loop(
+        config=_config(session_logging=_enabled_logging_config(tmp_path)),
+        backend=parent_backend,
+        enable_streaming=True,
+    )
+    seal_calls = 0
+    real_seal = SessionLogger.seal_archive
+
+    async def _seal_spy(self: SessionLogger, *args: Any, **kwargs: Any) -> Any:
+        nonlocal seal_calls
+        seal_calls += 1
+        return await real_seal(self, *args, **kwargs)
+
+    monkeypatch.setattr(SessionLogger, "seal_archive", _seal_spy)
+
+    client = start_test_app_server(parent)
+    session = await attach_test_app_server_session(client)
+    try:
+        await _consume(session.act("first question"))
+        parent.stats.context_tokens = 500_000
+        await _consume(session.act("second question"))
+
+        descriptor = parent.messages.archive_descriptor
+        assert descriptor is not None
+        assert parent.session_logger.archive_descriptor is descriptor
+        assert seal_calls == 1
+        boundary_id = descriptor.boundary_message_id
+        assert boundary_id is not None
+
+        repeat = await parent.session_logger.complete_post_turn_trim(
+            parent.messages,
+            parent.stats,
+            parent.config,
+            parent.tool_manager,
+            session_id=parent.session_id,
+            message_epoch=parent.messages.message_epoch,
+            boundary_message_id=boundary_id,
+        )
+        assert repeat.outcome == "excluded_already_published"
+        # No second seal/publication for the same boundary.
+        assert seal_calls == 1
+        assert parent.messages.archive_descriptor is descriptor
+        verify_archived_prefix_on_disk(descriptor, _messages_path_of(parent))
+    finally:
         await session.close()

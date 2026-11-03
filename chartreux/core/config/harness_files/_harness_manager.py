@@ -11,6 +11,7 @@ from chartreux.core.config.harness_files._paths import (
     GLOBAL_SKILLS_DIR,
     GLOBAL_TOOLS_DIR,
 )
+from chartreux.core.config.layer import require_answerable_trust_store
 from chartreux.core.paths import (
     AGENTS_MD_FILENAME,
     CHARTREUX_HOME,
@@ -127,6 +128,16 @@ class HarnessFilesManager:
         if self.trust_store.is_trusted(cwd) is not True:
             return None
         return cwd
+
+    def _require_answerable_store(self) -> None:
+        """Surface a store that cannot answer a project-content question.
+
+        ``project_roots`` and the directory listings stay fail-closed — an
+        unknown trust state contributes no root — but loading a folder's
+        instructions from that unknown state would present project harness
+        files as if the store had answered "trusted".
+        """
+        require_answerable_trust_store(self.trust_store, "harness-files")
 
     @property
     def config_file(self) -> Path | None:
@@ -273,6 +284,7 @@ class HarnessFilesManager:
         Lazy, workspace-internal subdirectory discovery by read_file is separate
         and never contributes to this manifest. No local-file variant is loaded.
         """
+        self._require_answerable_store()
         documents: list[InstructionDocument] = []
         if "user" in self.sources:
             user = self._read_instruction_document(
@@ -376,6 +388,7 @@ class HarnessFilesManager:
         entries take priority. The same resolved directory is only emitted
         once across all roots.
         """
+        self._require_answerable_store()
         by_dir: dict[Path, tuple[Path, str]] = {}
         for root in self.project_roots:
             stop = self.trust_store.find_trust_root(root) or root

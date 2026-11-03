@@ -17,13 +17,16 @@ from chartreux.app_server.protocol import (
     ClientToolTerminalWaitResponse,
     ClientToolWriteTextFileParams,
     EmptyResponse,
+    remote_exec_attestation,
 )
+from chartreux.core.dangerous_commands import RemoteExecAttestation
 from chartreux.core.tools.io_port import (
     ShellCommandRequest,
     ShellCommandResult,
     ToolIOPort,
 )
 from chartreux.core.tools.secret_redaction import child_env_scrub_list
+from chartreux.core.utils.shell import terminal_shell_text_refusal
 from chartreux.observability.logging import logger
 from chartreux.utils.io import BoundedReadResult, ReadSafeResult, normalize_newlines
 
@@ -58,7 +61,24 @@ class ClientToolIO(ToolIOPort):
 
     @property
     def supports_terminal(self) -> bool:
+        # A ``terminal`` entry declares a capability; it is not an
+        # execution-bound executor attestation, so the client executor stays
+        # non-attesting for expansion and refuses in ``run_shell``. The
+        # remote-exec attestation entries (S4b1b) are read separately below.
         return "terminal" in self._client_bridge.client_capabilities().client_tools
+
+    @property
+    def remote_exec_attestation(self) -> RemoteExecAttestation:
+        """The client's execution-bound remote-exec attestation (S4b1b).
+
+        Read live from the initialize-time capabilities: the entries attest
+        that the client-owned terminal executor shares this server's network
+        namespace AND sees the same filesystem/SSH trust context. Only an
+        execution-bound statement admits remote execution through the
+        terminal transport; a client that sends no entries (every ACP client,
+        and any older client) is non-attesting and hard-denies.
+        """
+        return remote_exec_attestation(self._client_bridge.client_capabilities())
 
     async def read_lines(
         self, path: Path, *, start_line: int, limit: int, max_bytes: int
@@ -118,6 +138,11 @@ class ClientToolIO(ToolIOPort):
         )
 
     async def run_shell(self, request: ShellCommandRequest) -> ShellCommandResult:
+        # The client owns this spawn; the server never learns its executor, so
+        # shell text needing expansion never reaches the client terminal.
+        refusal = terminal_shell_text_refusal(request.command, args=request.args)
+        if refusal is not None:
+            raise RuntimeError(refusal)
         root_session_id = self._client_bridge.current_session_id()
         # The client owns the terminal spawn and inherits its own environment;
         # ask it to drop chartreux's credential variables by name.

@@ -502,12 +502,14 @@ class FakeAuthorityResource:
         expected_live_generation: int,
         expected_disk_revision: str | None,
         user_initiated: bool,
+        destination: str | None = None,
     ):
         self.revoke_calls.append({
             "operation_id": operation_id,
             "expected_live_generation": expected_live_generation,
             "expected_disk_revision": expected_disk_revision,
             "user_initiated": user_initiated,
+            "destination": destination,
         })
         return self.revoke
 

@@ -286,9 +286,6 @@ class TurnSupervisor:
         self.callback_delivery_uncertain = False
         self.pending_local_question: asyncio.Future[UserQuestionResult] | None = None
         self.active_turn_start: int | None = None
-        # Unsent drafts preserved locally when a question expires unanswered
-        # (plan U/OD1); keyed by callback id, never auto-delivered.
-        self.expired_question_drafts: dict[str, dict[int, str]] = {}
 
     def _bind_app(self, app: ChartreuxApp) -> None:
         """Bind the host app after construction."""
@@ -1128,14 +1125,12 @@ class TurnSupervisor:
         self._prune_expired_pending()
         active = self.active_callback
         if active is not None and active.callback_id == callback_id:
-            if entry.state.status == "expired":
-                await self._dismiss_closed_callback(
-                    active, "Unanswered — deferred", preserve_draft=True
-                )
-            else:
-                await self._dismiss_closed_callback(
-                    active, _CLOSED_CALLBACK_MESSAGE, preserve_draft=False
-                )
+            message = (
+                "Unanswered — deferred"
+                if entry.state.status == "expired"
+                else _CLOSED_CALLBACK_MESSAGE
+            )
+            await self._dismiss_closed_callback(active, message)
             return
         # A queued callback closed before it was ever displayed.
         self.pending_callbacks = deque(
@@ -1161,9 +1156,7 @@ class TurnSupervisor:
         callback_id = params.callback_id
         active = self.active_callback
         if active is not None and active.callback_id == callback_id:
-            await self._dismiss_closed_callback(
-                active, _CLOSED_CALLBACK_MESSAGE, preserve_draft=False
-            )
+            await self._dismiss_closed_callback(active, _CLOSED_CALLBACK_MESSAGE)
             return
         self.pending_callbacks = deque(
             pending
@@ -1172,16 +1165,15 @@ class TurnSupervisor:
         )
 
     async def _dismiss_closed_callback(
-        self, callback: PublicCallbackEntry, message: str, *, preserve_draft: bool
+        self, callback: PublicCallbackEntry, message: str
     ) -> None:
         """Close a terminal callback's widget and hand the surface to what is next.
 
         Mirrors the expiry advance (plan U): the queued callbacks the projection
         already closed are pruned, the widget is closed, and the next pending
-        callback — or the prompt — takes over. The draft is preserved locally
-        only for a closure whose draft could still be shown later; a dead
-        callback can never accept it, and its widget must not linger with a
-        resend hint that can only fail again.
+        callback — or the prompt — takes over. A dead callback can never accept
+        its draft, so its widget must not linger with a resend hint that can
+        only fail again.
         """
         from chartreux.cli.textual_ui.app import _get_question_app_class
 
@@ -1191,10 +1183,6 @@ class TurnSupervisor:
         except Exception:
             question = None
         if question is not None and question._callback_id == callback.callback_id:
-            if preserve_draft:
-                self.expired_question_drafts[callback.callback_id] = dict(
-                    question.other_texts
-                )
             question.close_for_expiry()
         self.active_callback = None
         self._app.notify(message, severity="warning")
@@ -1401,7 +1389,7 @@ class TurnSupervisor:
                 # definitely not a delivery of unknown outcome.
                 if self.active_callback is callback:
                     await self._dismiss_closed_callback(
-                        callback, _DEAD_CALLBACK_MESSAGE, preserve_draft=False
+                        callback, _DEAD_CALLBACK_MESSAGE
                     )
                 return
             # A protocol rejection is definite: the same draft may be corrected

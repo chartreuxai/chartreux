@@ -659,10 +659,39 @@ def test_ambiguous_cli_exits_two_with_candidates(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("contents", [None, "[malformed", 'trusted = "invalid"'])
-async def test_trust_store_load_is_read_only(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, contents: str | None
+@pytest.mark.parametrize(
+    ("contents", "state", "status", "reason_fragment"),
+    [
+        (None, "missing", "skipped", "no persisted trust decisions"),
+        ("[malformed", "malformed", "fail", "not valid TOML"),
+        (
+            'trusted = "invalid"',
+            "invalid",
+            "fail",
+            "trusted/untrusted lists are invalid",
+        ),
+    ],
+    ids=["missing", "malformed", "invalid"],
+)
+async def test_trust_store_states_split_into_distinct_checks(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    contents: str | None,
+    state: str,
+    status: str,
+    reason_fragment: str,
 ) -> None:
+    """Each read state is its own doctor check, never one merged row.
+
+    The old pin required a single "trust store"/"unverified" row for all
+    three states with the merged "invalid or unreadable" wording. Missing
+    (nothing persisted yet), malformed (not TOML) and invalid (well-formed
+    but the wrong shape) now render as distinct checks with distinct
+    statuses, so a corrupt store fails the run instead of hiding behind the
+    same row as a fresh install.
+
+    Loading stays read-only: the store is never created or rewritten.
+    """
     from chartreux.core.paths import TRUSTED_FOLDERS_FILE
 
     path = tmp_path / "trusted_folders.toml"
@@ -670,11 +699,109 @@ async def test_trust_store_load_is_read_only(
         path.write_text(contents)
     monkeypatch.setattr(type(TRUSTED_FOLDERS_FILE), "path", property(lambda _: path))
     _, _, checks = await doctor._load_config()
-    assert any(c.name == "trust store" and c.status == "unverified" for c in checks)
+    trust_checks = [c for c in checks if c.name.startswith("trust store")]
+    assert len(trust_checks) == 1
+    check = trust_checks[0]
+    assert (check.name, check.status) == (f"trust store ({state})", status)
+    assert reason_fragment in check.reason
+    assert "invalid or unreadable" not in check.reason
     if contents is None:
         assert not path.exists()
     else:
         assert path.read_text() == contents
+
+
+@pytest.mark.asyncio
+async def test_trust_store_states_render_as_three_distinct_rows(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The three states are three rows, not one status carrying all of them."""
+    from chartreux.core.paths import TRUSTED_FOLDERS_FILE
+
+    path = tmp_path / "trusted_folders.toml"
+    monkeypatch.setattr(type(TRUSTED_FOLDERS_FILE), "path", property(lambda _: path))
+    rendered: list[tuple[str, str]] = []
+    for contents in (None, "[malformed", 'trusted = "invalid"'):
+        if contents is None:
+            path.unlink(missing_ok=True)
+        else:
+            path.write_text(contents)
+        _, _, checks = await doctor._load_config()
+        rows = [c for c in checks if c.name.startswith("trust store")]
+        assert len(rows) == 1
+        rendered.append((rows[0].name, rows[0].status))
+    assert len(set(rendered)) == 3
+
+
+def test_corrupt_store_with_discovered_project_config_keeps_the_trust_row(
+    tmp_working_directory: Path, config_dir: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The combined corruption renders the typed trust row, not only the failure.
+
+    A discovered project config.toml puts the trust question to a store that
+    cannot answer, which fails config load before the trust row is built. The
+    row must still render beside the config failure, and the run still exits 1.
+    """
+    project_config = tmp_working_directory / ".chartreux" / "config.toml"
+    project_config.parent.mkdir()
+    project_config.write_text("[malformed")
+    (config_dir / "trusted_folders.toml").write_text("[malformed")
+    code, result = invoke(capsys)
+    assert code == 1
+    checks = {c["name"]: c for c in result["checks"]}
+    trust = checks["trust store (malformed)"]
+    assert trust["status"] == "fail"
+    assert "not valid TOML" in trust["reason"]
+    assert checks["config"]["status"] == "fail"
+
+
+@pytest.mark.usefixtures("allow_dotenv_load")
+@pytest.mark.parametrize(
+    ("launcher", "argv", "expected_exit", "expected_text"),
+    [
+        ("doctor", ["--json"], 1, "trust store (malformed)"),
+        ("skills", ["diff"], 2, "trust store malformed"),
+        ("entrypoint-doctor", ["doctor", "--json"], 1, "trust store (malformed)"),
+        ("entrypoint-skills", ["skills", "diff"], 2, "trust store malformed"),
+    ],
+    ids=["doctor", "skills", "entrypoint-doctor", "entrypoint-skills"],
+)
+def test_group_a_consumer_never_reswallows_a_corrupt_trust_store(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    config_dir: Path,
+    launcher: str,
+    argv: list[str],
+    expected_exit: int,
+    expected_text: str,
+) -> None:
+    """OBSERVABLE: no group-A consumer reports a corrupt trust store as healthy.
+
+    A malformed store must reach the process exit status through the consumer
+    itself: doctor renders the typed state as a failing check and exits 1;
+    ``skills diff`` refuses the report as an operational error (exit 2); and
+    the CLI entrypoint lets both statuses through its dispatch. Re-swallowing
+    the error in any consumer (the old merged "unverified" row, an ignored
+    store state, or a caught ``SystemExit``) fails this node.
+    """
+    (config_dir / "trusted_folders.toml").write_text("[malformed")
+    if launcher == "doctor":
+        with pytest.raises(SystemExit) as exc:
+            doctor.run_doctor_cli(argv)
+    elif launcher == "skills":
+        from chartreux.cli import skills_command
+
+        with pytest.raises(SystemExit) as exc:
+            skills_command.run_skills_cli(argv)
+    else:
+        from chartreux.cli import entrypoint
+
+        monkeypatch.setattr("sys.argv", ["chartreux", *argv])
+        with pytest.raises(SystemExit) as exc:
+            entrypoint.main()
+    captured = capsys.readouterr()
+    assert exc.value.code == expected_exit
+    assert expected_text in captured.out + captured.err
 
 
 @pytest.mark.asyncio

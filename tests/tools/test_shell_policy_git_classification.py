@@ -1220,9 +1220,10 @@ def test_round3_write_operand_metadata_writes_are_denied(
         "scp seed.txt copied.txt",
         "scp -P 22 seed.txt copied2.txt",
         "scp -i fake-id seed.txt copied3.txt",
-        # scp remote forms stay outside the local-metadata scope.
-        "scp seed.txt host:x",
-        "scp host:x local.txt",
+        # scp REMOTE forms no longer stay permitted: v0.7.1 S4b2c converted
+        # them out of this list — the bounded transfer grammar now hard-denies
+        # them (no user in the remote spec), pinned in
+        # test_s4b2c_converted_remote_scp_forms_are_grammar_denied below.
         # In-place compression mutators on workspace files.
         "bzip2 seed.txt",
         "bunzip2 seed.txt.bz2",
@@ -1278,6 +1279,29 @@ def test_round3_write_operand_benign_forms_stay_permitted(
     context = bash_tool.resolve_permission(BashArgs(command=command))
     assert context is not None, command
     assert context.permission is ToolPermission.ALWAYS, f"{command}: {context.reason}"
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        # v0.7.1 S4b2c (converted, never deleted): these two scp remote forms
+        # were PERMITTED here while scp was unmodeled beyond the (custom)
+        # denylist; with the bounded transfer grammar they hard-deny because
+        # the remote spec names no user. Local scp copies above stay
+        # permitted — the path layer governs them.
+        "scp seed.txt host:x",
+        "scp host:x local.txt",
+    ],
+)
+def test_s4b2c_converted_remote_scp_forms_are_grammar_denied(
+    bash_tool: Bash, command: str
+) -> None:
+    _git_dir_with_bare_markers(bash_tool.cwd)
+    context = bash_tool.resolve_permission(BashArgs(command=command))
+    assert context is not None, command
+    assert context.permission is ToolPermission.NEVER, f"{command}: {context.reason}"
+    assert "must name a user" in (context.reason or ""), command
+    assert "matches denylist pattern" not in (context.reason or ""), command
 
 
 @pytest.mark.parametrize(

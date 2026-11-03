@@ -611,14 +611,7 @@ def test_absolute_redirect_target_needs_canonical_roots(tmp_path) -> None:
 
 @pytest.mark.parametrize(
     "command",
-    [
-        "hash -r",
-        "alias ll='ls -la'",
-        "shopt -s expand_aliases",
-        "unalias ll",
-        "enable -n printf",
-        "source ./file",
-    ],
+    ["hash -r", "alias ll='ls -la'", "unalias ll", "enable -n printf", "source ./file"],
 )
 def test_nested_source_rejects_command_lookup_mutation(command: str) -> None:
     assert any(
@@ -631,6 +624,23 @@ def test_nested_source_rejects_command_lookup_mutation(command: str) -> None:
         assert analyze_shell_command(command).requires_approval
     else:
         assert not analyze_shell_command(command).requires_approval
+
+
+def test_shopt_option_change_fails_closed_under_the_executor_contract() -> None:
+    # F1pkg1(b) re-decision: a nested `shopt` keeps its retained lookup-
+    # mutation denial, while a top-level option-changing `shopt` now fails
+    # closed under the pinned executor option contract — the recorded
+    # replacement for the retired top-level admission of that form.
+    nested = analyze_shell_command("shopt -s expand_aliases", nested_source=True)
+    assert any(
+        "command lookup modification" in reason for reason in nested.approval_reasons
+    )
+    top = analyze_shell_command("shopt -s expand_aliases")
+    assert top.requires_approval
+    assert any(
+        "outside the pinned executor option contract" in reason
+        for reason in top.approval_reasons
+    )
 
 
 @pytest.mark.parametrize(
@@ -1309,11 +1319,6 @@ def test_read_only_positions_inline_the_resolved_literal(
             "grep -m $X lit lines.txt",
             "variable expansion (unsupported in v0.1 because it can change arguments)",
         ),
-        # Quoted expansion text is not an unquoted word.
-        (
-            'X=5; grep -m "$X" lit lines.txt',
-            "variable expansion (unsupported in v0.1 because it can change arguments)",
-        ),
         # A boolean option before the expansion: the position is ambiguous
         # (option-arg:-c is unclassified), so it fails closed.
         (
@@ -1335,6 +1340,18 @@ def test_unresolvable_or_write_position_expansions_deny_unchanged(
     assert analysis.requires_approval
     assert reason in analysis.approval_reasons
     assert analysis.approval_diagnostic.denial_class is DenialClass.SYNTAX
+
+
+# v0.7.1 F1pkg3: a whole double-quoted "$NAME" in a whitelisted reader's
+# read-only option-value position binds one literal word once a preceding
+# statement assigns the name, so this shape is admitted by design. Every other
+# quoted spelling keeps the denial pinned by the table above.
+def test_quoted_word_in_read_only_option_value_is_admitted(locate_workspace) -> None:
+    analysis = analyze_shell_command('X=5; grep -m "$X" lit lines.txt')
+
+    assert not analysis.requires_approval
+    assert analysis.admitted_quoted_words == 1
+    assert analysis.command_parts == ("grep -m 5 lit lines.txt",)
 
 
 def test_for_loop_body_expansion_stays_denied(locate_workspace) -> None:

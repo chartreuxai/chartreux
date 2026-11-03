@@ -313,8 +313,13 @@ class ConfigResource:
         expected_live_generation: int,
         expected_disk_revision: str | None,
         user_initiated: bool,
+        destination: str | None = None,
     ) -> DangerousCommandRevokeResponse:
-        """Explicit user action only; revokes live and saved authority."""
+        """Explicit user action only; revokes live and saved authority.
+
+        *destination* scopes a ``network.remote-exec`` revocation to one
+        exact canonical destination; absent means the whole-scope revoke.
+        """
         if user_initiated is not True:
             raise ValueError(
                 "Dangerous-command revocation requires an explicit user action"
@@ -329,6 +334,7 @@ class ConfigResource:
                     operation_id=operation_id,
                     expected_live_generation=expected_live_generation,
                     expected_disk_revision=expected_disk_revision,
+                    destination=destination,
                     user_initiated=True,
                 ),
             ),

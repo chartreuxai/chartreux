@@ -145,7 +145,11 @@ class TestRound5YPersistenceRoundTrip:
             assert validate_transcript(loaded, live_tail_exempt=True) == []
             assert validate_provider_ready(loaded) == []
             # The resume install is a clean no-op (no migration, no artifact).
-            assert _install_transcript_repair(session_dir, loaded, metadata) is loaded
+            installed, repair_pending = _install_transcript_repair(
+                session_dir, loaded, metadata
+            )
+            assert installed is loaded
+            assert repair_pending is False
             assert not list(session_dir.glob(f"{MESSAGES_FILENAME}.recovered-*"))
         finally:
             await loop.aclose()
@@ -212,7 +216,11 @@ class TestRound5YPersistenceRoundTrip:
                 restored[0]._context_injection_origin == CONTEXT_INJECTION_TOOL_PAIR_V1
             )
             assert find_persistence_violations(loaded) == []
-            assert _install_transcript_repair(session_dir, loaded, metadata) is loaded
+            installed, repair_pending = _install_transcript_repair(
+                session_dir, loaded, metadata
+            )
+            assert installed is loaded
+            assert repair_pending is False
             assert not list(session_dir.glob(f"{MESSAGES_FILENAME}.recovered-*"))
         finally:
             await loop.aclose()

@@ -21,9 +21,10 @@ is re-validated on logger rebind (reset_session / apply_resumed_session).
 
 from __future__ import annotations
 
-from dataclasses import FrozenInstanceError
+from dataclasses import FrozenInstanceError, replace
 import hashlib
 import json
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -43,9 +44,11 @@ from chartreux.core.session.transcript_archive import (
     ArchiveSaveSnapshot,
     ArchiveSealError,
     ArchiveSealReceipt,
+    ReboundHydrationProof,
     eligible_archive_prefix,
     hydrate_archived_messages,
     iter_archived_records,
+    prove_rebound_hydration,
     read_archived_records,
     verify_archived_prefix_on_disk,
 )
@@ -542,6 +545,214 @@ class TestSaveSnapshotCapture:
         assert snapshot.descriptor is None
         assert snapshot.message_epoch is None
         assert not snapshot.is_authoritative
+
+
+# ---------------------------------------------------------------------------
+# T2a: the warm-resume hydration proof on the shared archive read interface
+# (beside the :513/:524 rebind/proof tests above), plus the clear-and-reseal
+# transaction's failed-proof (changed archived prefix) and staged-repair arms.
+# ---------------------------------------------------------------------------
+
+
+class TestReboundHydrationProof:
+    """T2a: ``prove_rebound_hydration`` — the rebound list fully hydrated from
+    the target disk, fail-closed on foreign/trimmed/changed inputs.
+    """
+
+    @staticmethod
+    def _transcript_messages() -> list[LLMMessage]:
+        return [
+            LLMMessage(role=Role.user, content="u1", message_id="u1"),
+            LLMMessage(role=Role.assistant, content="a1", message_id="a1"),
+            _boundary(),
+            LLMMessage(role=Role.user, content="u2", message_id="u2"),
+            LLMMessage(role=Role.assistant, content="a2", message_id="a2"),
+        ]
+
+    def test_hydration_proof_rejects_foreign_and_trimmed_inputs(
+        self, tmp_path: Path
+    ) -> None:
+        messages = self._transcript_messages()
+        messages_path = tmp_path / "messages.jsonl"
+        raw = b"".join(_record_line(m) for m in messages)
+        messages_path.write_bytes(raw)
+        descriptor, _archived = _make_descriptor("sess-1", messages[:2])
+        loaded_records = [SessionLogger._message_record(m) for m in messages]
+
+        # Positive control: the matching descriptor over the intact target
+        # disk proves the rebound list fully hydrated.
+        proof = prove_rebound_hydration(
+            descriptor,
+            session_id="sess-1",
+            messages_path=messages_path,
+            loaded_records=loaded_records,
+        )
+        assert isinstance(proof, ReboundHydrationProof)
+        assert proof.session_id == "sess-1"
+        assert proof.descriptor is descriptor
+        assert proof.archived_count == 2
+        assert proof.loaded_count == 5
+        assert proof.transcript_bytes == len(raw)
+        assert proof.transcript_sha256 == hashlib.sha256(raw).hexdigest()
+
+        # A foreign-session descriptor is rejected.
+        foreign = replace(descriptor, session_id="some-other-session")
+        with pytest.raises(ArchiveIntegrityError, match="foreign-session"):
+            prove_rebound_hydration(
+                foreign,
+                session_id="sess-1",
+                messages_path=messages_path,
+                loaded_records=loaded_records,
+            )
+
+        # A trimmed-prefix variant — the archived prefix on disk lost its
+        # first record — is rejected: the prefix bytes no longer verify.
+        first_line = _record_line(messages[0])
+        trimmed_path = tmp_path / "trimmed.jsonl"
+        trimmed_raw = raw[len(first_line) :]
+        trimmed_path.write_bytes(trimmed_raw)
+        with pytest.raises(ArchiveIntegrityError):
+            prove_rebound_hydration(
+                descriptor,
+                session_id="sess-1",
+                messages_path=trimmed_path,
+                loaded_records=loaded_records,
+            )
+
+        # The proof is read-only: both failed proofs left the bytes untouched.
+        assert messages_path.read_bytes() == raw
+        assert trimmed_path.read_bytes() == trimmed_raw
+
+    @pytest.mark.asyncio
+    async def test_failed_proof_on_a_repairable_transcript_keeps_bytes_and_authority(
+        self,
+        session_config: SessionLoggingConfig,
+        mock_vibe_config: ChartreuxConfigSchema,
+        mock_tool_manager: ToolManager,
+    ) -> None:
+        """T2a changed-archived-prefix arm (Amendment M): a repairable
+        transcript whose archived prefix changed on disk fails the proof
+        closed — the on-disk bytes stay BYTE-IDENTICAL, the retained archive
+        authority stays, and no repair is staged.
+        """
+        logger = SessionLogger(session_config, "t2a-changed-prefix")
+        messages = MessageList([
+            LLMMessage(role=Role.system, content="prompt"),
+            _user("u1"),
+            _assistant_text("a1"),
+            _boundary(),
+            _user("u2"),
+            _assistant_text("a2"),
+            _user("trailing"),
+        ])
+        receipt = await _seal(logger, messages, mock_vibe_config, mock_tool_manager)
+        descriptor = receipt.descriptor
+        assert logger.archive_descriptor is descriptor
+        messages_path = logger.messages_filepath
+        raw_before = messages_path.read_bytes()
+        prefix_before = raw_before[: descriptor.prefix_end_byte]
+
+        # Warm-resume rebind of the list (epoch bumps, list authority clears).
+        loaded = [m for m in messages if m.role is not Role.system]
+        messages.reset_preserving_system(list(loaded))
+        assert messages.message_epoch == 1
+
+        # The archived prefix changed on disk (one record's content byte).
+        corrupted_prefix = prefix_before.replace(b"u1", b"uX", 1)
+        assert corrupted_prefix != prefix_before
+        messages_path.write_bytes(
+            corrupted_prefix + raw_before[descriptor.prefix_end_byte :]
+        )
+        bytes_at_refusal = messages_path.read_bytes()
+
+        save_generation = logger._transcript_cursor_generation
+        reset_generation = logger._archive_generation
+        snapshot_before = logger.last_save_archive_snapshot
+        # The repair is pending (it would drop the trailing record), but the
+        # changed archived prefix fails the proof BEFORE any staging.
+        result = await logger.clear_and_reseal_warm_resume(
+            messages, session_id=logger.session_id, repair_messages=loaded[:-1]
+        )
+
+        assert result.outcome == "refused_proof"
+        assert result.proof is None
+        assert result.artifact_path is None
+        # Per-arm outcome ASSERTED: on-disk bytes byte-identical, authority
+        # retained, fence/rebind generations unmoved, nothing staged.
+        assert messages_path.read_bytes() == bytes_at_refusal
+        assert logger.archive_descriptor is descriptor
+        assert logger.last_save_archive_snapshot is snapshot_before
+        assert logger._transcript_cursor_generation == save_generation
+        assert logger._archive_generation == reset_generation
+        assert logger.session_dir is not None
+        assert not list(logger.session_dir.glob("messages.jsonl.recovered-*"))
+
+    @pytest.mark.asyncio
+    async def test_proved_resume_stages_the_repair_preserving_prefix_and_clears_authority(
+        self,
+        session_config: SessionLoggingConfig,
+        mock_vibe_config: ChartreuxConfigSchema,
+        mock_tool_manager: ToolManager,
+    ) -> None:
+        """T2a positive arm: the proof holds, the staged repair preserves the
+        exact archived prefix bytes (asserted on disk), the original is kept
+        as a verified artifact, and both archive authorities are cleared
+        (clear-and-reseal, never re-pinned) under the save lock.
+        """
+        logger = SessionLogger(session_config, "t2a-proved")
+        messages = MessageList([
+            LLMMessage(role=Role.system, content="prompt"),
+            _user("u1"),
+            _assistant_text("a1"),
+            _boundary(),
+            _user("u2"),
+            _assistant_text("a2"),
+            _user("trailing"),
+        ])
+        receipt = await _seal(logger, messages, mock_vibe_config, mock_tool_manager)
+        descriptor = receipt.descriptor
+        messages_path = logger.messages_filepath
+        raw_before = messages_path.read_bytes()
+        prefix_before = raw_before[: descriptor.prefix_end_byte]
+
+        loaded = [m for m in messages if m.role is not Role.system]
+        messages.reset_preserving_system(list(loaded))
+        assert messages.message_epoch == 1
+
+        repaired = loaded[:-1]  # the pending repair drops the trailing record
+        save_generation = logger._transcript_cursor_generation
+        reset_generation = logger._archive_generation
+        result = await logger.clear_and_reseal_warm_resume(
+            messages, session_id=logger.session_id, repair_messages=repaired
+        )
+
+        assert result.outcome == "proved_and_transitioned"
+        assert result.proof is not None
+        assert result.proof.loaded_count == len(loaded)
+        assert result.proof.archived_count == descriptor.archived_count
+        assert result.artifact_path is not None
+        # Clear-and-reseal: both authorities cleared, never re-pinned.
+        assert logger.archive_descriptor is None
+        assert messages.archive_descriptor is None
+        # The fence + rebind generations moved under the one save-lock hold.
+        assert logger._transcript_cursor_generation == save_generation + 1
+        assert logger._archive_generation == reset_generation + 1
+        snapshot = logger.last_save_archive_snapshot
+        assert snapshot is not None
+        assert snapshot.descriptor is None
+        assert snapshot.message_epoch == 1
+        # The staged repair preserved the EXACT archived prefix bytes and
+        # wrote the repaired tail; the original is preserved verbatim in the
+        # recovery artifact.
+        raw_after = messages_path.read_bytes()
+        assert raw_after[: descriptor.prefix_end_byte] == prefix_before
+        repaired_records = [SessionLogger._message_record(m) for m in repaired]
+        expected_tail = b"".join(
+            (json.dumps(record, ensure_ascii=False) + "\n").encode("utf-8")
+            for record in repaired_records[descriptor.archived_count :]
+        )
+        assert raw_after == prefix_before + expected_tail
+        assert result.artifact_path.read_bytes() == raw_before
 
 
 class TestArchiveSaveSnapshot:

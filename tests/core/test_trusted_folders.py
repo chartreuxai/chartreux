@@ -1,15 +1,23 @@
 from __future__ import annotations
 
+import fcntl
 from pathlib import Path
+import subprocess
+import sys
+import threading
 import tomllib
+from typing import Any
 from unittest.mock import patch
 
 import pytest
 import tomli_w
 
+from chartreux.core.config.layers import _base, _checked_store
+from chartreux.core.config.layers._checked_store import CheckedWriteOutcome
 from chartreux.core.paths import AGENTS_MD_FILENAME, TRUSTED_FOLDERS_FILE
 from chartreux.core.trusted_folders import (
     TrustedFoldersManager,
+    TrustStoreState,
     filesystem_identity,
     find_git_repo_ancestor,
     find_repo_trustable_files_for_cwd,
@@ -17,6 +25,40 @@ from chartreux.core.trusted_folders import (
     find_untrusted_config_dirs,
     has_agents_md_file,
 )
+
+ORIGINAL_STORE = b'trusted = ["/a"]\nuntrusted = []\n'
+EXTERNAL_STORE = b'trusted = ["/external"]\nuntrusted = []\n'
+MALFORMED_STORE = b"trusted = [ not valid toml \n"
+INVALID_STORE = b'trusted = "not-a-list"\n'
+
+_CHILD_TRUST_WRITE = """
+import sys
+import tomllib
+from pathlib import Path
+import tomli_w
+from chartreux.core.config.layers._checked_store import (
+    checked_write_store,
+    store_revision,
+)
+path = Path(sys.argv[1])
+def edit(current):
+    data = dict(current)
+    trusted = list(data.get("trusted", []))
+    if "/child" not in trusted:
+        trusted.append("/child")
+    data["trusted"] = trusted
+    return tomli_w.dumps(data).encode()
+def parse(data):
+    return tomllib.loads(data.decode())
+result = checked_write_store(
+    path, edit, parse=parse, expected_revision=store_revision(path)
+)
+print(result.outcome.value, flush=True)
+"""
+
+
+def _store_tmp_files(path: Path) -> list[Path]:
+    return list(path.parent.glob(f".{path.name}.*.tmp"))
 
 
 class TestTrustedFoldersManager:
@@ -52,30 +94,71 @@ class TestTrustedFoldersManager:
         assert manager.load_error == "trust store invalid or unreadable"
         assert trusted_file.read_text(encoding="utf-8") == "invalid toml content {["
 
-    @pytest.mark.parametrize("contents", [None, "[malformed"])
     @pytest.mark.parametrize("trusted", [False, True])
     def test_successful_save_clears_load_error(
-        self, tmp_path: Path, contents: str | None, trusted: bool
+        self, tmp_path: Path, trusted: bool
     ) -> None:
-        if contents is not None:
-            TRUSTED_FOLDERS_FILE.path.write_text(contents)
+        # Plan O4a2 amended pin: a MISSING store is created by the checked
+        # write; the confirmed save clears the load error.
         manager = TrustedFoldersManager()
         assert manager.load_error is not None
         if trusted:
-            manager.add_trusted(tmp_path)
+            result = manager.add_trusted(tmp_path)
         else:
-            manager.add_untrusted(tmp_path)
+            result = manager.add_untrusted(tmp_path)
+        assert result.outcome == CheckedWriteOutcome.SAVED
         assert manager.load_error is None
         reloaded = TrustedFoldersManager()
         assert reloaded.load_error is None
         assert reloaded.is_trusted(tmp_path) is trusted
 
+    @pytest.mark.parametrize(
+        "contents,expected_state",
+        [
+            ("[malformed", TrustStoreState.MALFORMED),
+            ('trusted = "invalid"', TrustStoreState.INVALID),
+        ],
+    )
+    @pytest.mark.parametrize("trusted", [False, True])
+    def test_malformed_or_invalid_save_is_refused_and_preserves_load_error(
+        self,
+        tmp_path: Path,
+        contents: str,
+        expected_state: TrustStoreState,
+        trusted: bool,
+    ) -> None:
+        # Plan O4a2 amended pin: a malformed/invalid store is never rewritten.
+        # The refused write is reported as MALFORMED, leaves the on-disk store
+        # bytes byte-identical, keeps the load error, and grants nothing.
+        trusted_file = TRUSTED_FOLDERS_FILE.path
+        raw = contents.encode("utf-8")
+        trusted_file.write_bytes(raw)
+        manager = TrustedFoldersManager()
+        assert manager.load_error is not None
+        assert manager.store_state is expected_state
+        if trusted:
+            result = manager.add_trusted(tmp_path)
+        else:
+            result = manager.add_untrusted(tmp_path)
+        assert result.outcome == CheckedWriteOutcome.MALFORMED
+        assert trusted_file.read_bytes() == raw
+        assert manager.load_error is not None
+        assert manager.store_state is expected_state
+        assert manager.is_trusted(tmp_path) is not True
+        reloaded = TrustedFoldersManager()
+        assert reloaded.load_error is not None
+        assert reloaded.is_trusted(tmp_path) is not True
+
     def test_failed_save_preserves_load_error(self, tmp_path: Path) -> None:
+        # Plan O4a2 amended pin: a save that cannot run is a typed NOT_SAVED
+        # refusal, not a silent in-memory grant; the load error is preserved.
         manager = TrustedFoldersManager()
         error = manager.load_error
         with patch.object(Path, "open", side_effect=OSError("cannot write")):
-            manager.add_trusted(tmp_path)
+            result = manager.add_trusted(tmp_path)
+        assert result.outcome == CheckedWriteOutcome.NOT_SAVED
         assert manager.load_error == error
+        assert manager.is_trusted(tmp_path) is not True
 
     def test_normalizes_paths_to_absolute(
         self, tmp_working_directory, monkeypatch: pytest.MonkeyPatch
@@ -301,15 +384,199 @@ class TestTrustedFoldersManager:
         assert manager.is_trusted(tmp_path) is True
 
     def test_handles_missing_file_during_save(self, tmp_path: Path) -> None:
+        # Plan O4a2 amended pin (design P): a save that cannot run is refused
+        # as a typed NOT_SAVED outcome — the failed grant is NOT live in the
+        # process and nothing is published to disk.
+        trusted_file = TRUSTED_FOLDERS_FILE.path
         manager = TrustedFoldersManager()
 
         def mock_open(*args, **kwargs):
             raise OSError("Permission denied")
 
         with patch("pathlib.Path.open", side_effect=mock_open):
-            manager.add_trusted(tmp_path)
+            result = manager.add_trusted(tmp_path)
 
-        assert manager.is_trusted(tmp_path) is True
+        assert result.outcome == CheckedWriteOutcome.NOT_SAVED
+        assert manager.is_trusted(tmp_path) is not True
+        assert not trusted_file.exists()
+        assert manager.load_error == "trust store missing"
+
+
+class TestCheckedWriteWriters:
+    """Plan O4a2: both add writers run on the O4a1 checked-store primitive."""
+
+    @pytest.mark.parametrize("writer", ["add_trusted", "add_untrusted"])
+    def test_missing_store_write_is_saved_and_published(
+        self, tmp_path: Path, writer: str
+    ) -> None:
+        trusted_file = TRUSTED_FOLDERS_FILE.path
+        manager = TrustedFoldersManager()
+        assert manager.store_state is TrustStoreState.MISSING
+
+        result = getattr(manager, writer)(tmp_path)
+
+        assert result.outcome == CheckedWriteOutcome.SAVED
+        assert trusted_file.is_file()
+        assert manager.load_error is None
+        assert manager.store_state is TrustStoreState.READY
+        expected = writer == "add_trusted"
+        assert manager.is_trusted(tmp_path) is expected
+        assert TrustedFoldersManager().is_trusted(tmp_path) is expected
+
+    @pytest.mark.parametrize("writer", ["add_trusted", "add_untrusted"])
+    @pytest.mark.parametrize(
+        "raw,state",
+        [
+            (MALFORMED_STORE, TrustStoreState.MALFORMED),
+            (INVALID_STORE, TrustStoreState.INVALID),
+        ],
+    )
+    def test_malformed_or_invalid_store_write_is_refused_byte_identical(
+        self, tmp_path: Path, writer: str, raw: bytes, state: TrustStoreState
+    ) -> None:
+        # No malformed rewrite: a refused write leaves the on-disk store
+        # bytes BYTE-IDENTICAL, and missing/malformed/invalid are distinct.
+        trusted_file = TRUSTED_FOLDERS_FILE.path
+        trusted_file.write_bytes(raw)
+        manager = TrustedFoldersManager()
+        assert manager.store_state is state
+
+        result = getattr(manager, writer)(tmp_path)
+
+        assert result.outcome == CheckedWriteOutcome.MALFORMED
+        assert trusted_file.read_bytes() == raw
+        assert manager.store_state is state
+        assert manager.is_trusted(tmp_path) is not True
+        assert _store_tmp_files(trusted_file) == []
+
+    @pytest.mark.parametrize("writer", ["add_trusted", "add_untrusted"])
+    def test_failed_pre_replace_candidate_is_never_published(
+        self, tmp_path: Path, writer: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Mutation target (plan O4a2, design P/JJJ): removing the candidate
+        rollback — publishing the candidate on a refused write — fails the
+        ``is_trusted(...) is not True`` assertion below.
+        """
+        trusted_file = TRUSTED_FOLDERS_FILE.path
+        trusted_file.write_bytes(ORIGINAL_STORE)
+        manager = TrustedFoldersManager()
+        assert manager.store_state is TrustStoreState.READY
+
+        def boom(fd: int) -> None:
+            raise OSError("simulated disk full during temp fsync")
+
+        monkeypatch.setattr(_checked_store, "_fsync", boom)
+        result = getattr(manager, writer)(tmp_path)
+
+        assert result.outcome == CheckedWriteOutcome.NOT_SAVED
+        assert trusted_file.read_bytes() == ORIGINAL_STORE
+        assert _store_tmp_files(trusted_file) == []
+        # The failed pre-replace candidate is never published.
+        assert manager.is_trusted(tmp_path) is not True
+        assert manager.load_error is None
+
+    @pytest.mark.parametrize("writer", ["add_trusted", "add_untrusted"])
+    def test_forced_conflict_refuses_the_stale_writer(
+        self, tmp_path: Path, writer: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Plan O4a2 forced-conflict node: the revision changed while the writer
+        waited on the held lock, so it is refused as CONFLICT (no stale
+        resurrection) and effective trust is NOT granted for its payload.
+        """
+        trusted_file = TRUSTED_FOLDERS_FILE.path
+        trusted_file.write_bytes(ORIGINAL_STORE)
+        manager = TrustedFoldersManager()
+        box: dict[str, Any] = {}
+        pre_read = threading.Event()
+        real_store_revision = _checked_store.store_revision
+
+        def recording_store_revision(path: Path) -> str:
+            revision = real_store_revision(path)
+            pre_read.set()
+            return revision
+
+        monkeypatch.setattr(_checked_store, "store_revision", recording_store_revision)
+
+        def stale_writer() -> None:
+            box["result"] = getattr(manager, writer)(tmp_path)
+
+        with _base._write_lock_path(trusted_file).open("a") as held:
+            fcntl.flock(held.fileno(), fcntl.LOCK_EX)
+            writer_thread = threading.Thread(target=stale_writer)
+            writer_thread.start()
+            # The stale writer took its stable revision read, then waits for
+            # the cooperating lock holder.
+            assert pre_read.wait(timeout=5)
+            assert writer_thread.is_alive()
+            # An external writer moves the store while the stale writer waits.
+            trusted_file.write_bytes(EXTERNAL_STORE)
+            fcntl.flock(held.fileno(), fcntl.LOCK_UN)
+            writer_thread.join(timeout=5)
+
+        result = box["result"]
+        assert result.outcome == CheckedWriteOutcome.CONFLICT
+        # The external writer's content survives; no stale resurrection.
+        assert trusted_file.read_bytes() == EXTERNAL_STORE
+        # Effective trust is NOT granted for the refused payload.
+        assert manager.is_trusted(tmp_path) is not True
+
+    @pytest.mark.parametrize("writer", ["add_trusted", "add_untrusted"])
+    def test_post_replace_uncertain_outcome_is_reported_and_not_granted(
+        self, tmp_path: Path, writer: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Plan round-5 arm split (design P): the post-replace UNCERTAIN arm
+        asserts the REPORTED OUTCOME — a durability caveat, never "definitely
+        not saved" — and effective trust is not falsely granted by it.
+        """
+        trusted_file = TRUSTED_FOLDERS_FILE.path
+        trusted_file.write_bytes(ORIGINAL_STORE)
+        manager = TrustedFoldersManager()
+
+        def boom_dir(directory: Path) -> None:
+            raise OSError("simulated directory fsync failure")
+
+        monkeypatch.setattr(_checked_store, "_fsync_directory", boom_dir)
+        result = getattr(manager, writer)(tmp_path)
+
+        assert result.outcome == CheckedWriteOutcome.DURABILITY_UNCERTAIN
+        assert result.outcome != CheckedWriteOutcome.NOT_SAVED
+        assert result.error is not None and "fsync" in result.error
+        # The replace did happen (only its durability is unconfirmed)...
+        with trusted_file.open("rb") as f:
+            stored = tomllib.load(f)
+        key = "trusted" if writer == "add_trusted" else "untrusted"
+        assert str(tmp_path.resolve()) in stored[key]
+        # ...but the uncertain result does not falsely grant effective trust.
+        assert manager.is_trusted(tmp_path) is not True
+        assert _store_tmp_files(trusted_file) == []
+
+    def test_two_process_write_requires_restart_characterization(
+        self, tmp_path: Path
+    ) -> None:
+        """CHARACTERIZATION ONLY (plan O4a2): the restart-required two-process
+        arm passes before and after this row and is NOT discriminating
+        acceptance. A second process's checked write lands on the store; the
+        already-loaded manager's in-memory authority stays stale until a
+        restart, and only a fresh manager observes the other process's grant.
+        """
+        trusted_file = TRUSTED_FOLDERS_FILE.path
+        trusted_file.write_bytes(ORIGINAL_STORE)
+        manager = TrustedFoldersManager()
+        assert manager.is_trusted(Path("/child")) is None
+
+        child = subprocess.run(
+            [sys.executable, "-c", _CHILD_TRUST_WRITE, str(trusted_file)],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=True,
+        )
+        assert child.stdout.strip() == CheckedWriteOutcome.SAVED.value
+
+        # The live manager's in-memory lists are stale: restart required.
+        assert manager.is_trusted(Path("/child")) is None
+        # A fresh read (restart) observes the other process's write.
+        assert TrustedFoldersManager().is_trusted(Path("/child")) is True
 
 
 class TestIsTrustedInheritance:

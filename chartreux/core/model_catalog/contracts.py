@@ -68,13 +68,15 @@ class ProviderDraft:
 class ModelEdits:
     """Optional per-model metadata edits, preserving untouched versus cleared."""
 
-    input_price: OptionalEdit[float] = field(default_factory=OptionalEdit)
-    output_price: OptionalEdit[float] = field(default_factory=OptionalEdit)
-    cached_input_price: OptionalEdit[float] = field(default_factory=OptionalEdit)
-    thinking: OptionalEdit[str] = field(default_factory=OptionalEdit)
-    temperature: OptionalEdit[float] = field(default_factory=OptionalEdit)
-    supports_images: OptionalEdit[bool] = field(default_factory=OptionalEdit)
-    auto_compact_threshold: OptionalEdit[float] = field(default_factory=OptionalEdit)
+    input_price: OptionalEdit[float] = field(default_factory=OptionalEdit[float])
+    output_price: OptionalEdit[float] = field(default_factory=OptionalEdit[float])
+    cached_input_price: OptionalEdit[float] = field(default_factory=OptionalEdit[float])
+    thinking: OptionalEdit[str] = field(default_factory=OptionalEdit[str])
+    temperature: OptionalEdit[float] = field(default_factory=OptionalEdit[float])
+    supports_images: OptionalEdit[bool] = field(default_factory=OptionalEdit[bool])
+    auto_compact_threshold: OptionalEdit[float] = field(
+        default_factory=OptionalEdit[float]
+    )
 
 
 @dataclass(frozen=True, slots=True)

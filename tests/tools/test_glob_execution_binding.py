@@ -28,14 +28,22 @@ from __future__ import annotations
 from dataclasses import FrozenInstanceError
 import os
 from pathlib import Path
+from typing import Any
 
 import pytest
 
 from chartreux.core.background_jobs import BashStartArgs
-from chartreux.core.tools.base import BaseToolState, ToolError, ToolPermission
+from chartreux.core.tools.base import (
+    BaseToolState,
+    InvokeContext,
+    ToolError,
+    ToolPermission,
+)
 from chartreux.core.tools.builtins._shell_permission_resolver import (
     GlobExecutionPlan,
+    QuotedWordPlanDenial,
     glob_execution_plan_for_command,
+    quoted_word_execution_plan_for_command,
 )
 import chartreux.core.tools.builtins.bash as bash_module
 from chartreux.core.tools.builtins.bash import (
@@ -177,6 +185,40 @@ def test_managed_background_launcher_keeps_the_glob_denial(work: Path) -> None:
     assert context is not None
     assert context.permission is ToolPermission.NEVER
     assert _plan(work, "cat *.txt") is not None
+
+
+@pytest.mark.asyncio
+async def test_background_execution_hard_denies_the_bound_plan(work: Path) -> None:
+    """F1pkg1(c): the execution-time check, not only the permission layer.
+
+    The background transport cannot consume a literal argv plan, so at
+    execution it re-derives the bound plan and hard-denies — it never falls
+    back to running the original shell text in the background shell.
+    """
+    tool = BashStart(
+        config_getter=lambda: BashToolConfig(), state=BaseToolState(), cwd=work
+    )
+    started: list[str] = []
+
+    class _RecordingPort:
+        async def start(
+            self,
+            args: object,
+            *,
+            cwd: object = None,
+            execute_command: str | None = None,
+        ) -> object:
+            started.append(str(execute_command))
+            raise AssertionError("the background transport must not run a bound plan")
+
+    port: Any = _RecordingPort()
+    ctx = InvokeContext(tool_call_id="call-1", background_jobs=port)
+
+    with pytest.raises(ToolError) as err:
+        await collect_result(tool.run(BashStartArgs(command="cat *.txt"), ctx))
+
+    assert "literal argv plan" in str(err.value)
+    assert started == []
 
 
 def test_plan_is_immutable(work: Path) -> None:
@@ -366,3 +408,87 @@ def test_quoted_and_escaped_equals_marker_admissions_are_unaffected(work: Path) 
     assert _permission(work, "echo '=ls'").permission is ToolPermission.ALWAYS
     assert _permission(work, "echo \\=ls").permission is ToolPermission.ALWAYS
     assert _plan(work, "echo '=ls'") is None
+
+
+# --- F1pkg3: an admitted quoted word never runs as shell text -----------------
+
+
+def _quoted_plan(command: str):
+    return quoted_word_execution_plan_for_command(command)
+
+
+@pytest.mark.asyncio
+async def test_quoted_word_transport_never_invokes_the_shell(
+    work: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The admitted quoted word executes through the literal argv plan, and
+    the shell-string transport is never invoked for the call.
+    """
+    shell_calls: list[tuple[object, ...]] = []
+
+    async def _record(*args: object, **kwargs: object) -> None:
+        shell_calls.append(args)
+        raise AssertionError("the quoted-word transport must not use a shell")
+
+    monkeypatch.setattr(bash_module, "spawn_shell_command", _record)
+
+    result = await collect_result(
+        _tool(work).run(BashArgs(command='X=alpha.txt; cat "$X"'))
+    )
+
+    assert result.exit_code == 0
+    assert "alpha" in result.stdout
+    assert shell_calls == []
+
+
+@pytest.mark.asyncio
+async def test_unbindable_quoted_word_admission_hard_denies(
+    work: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An admission the execution boundary cannot re-derive refuses.
+
+    The transport never falls back to running the shell text the admission
+    replaced — the words that run must be the words that were inspected.
+    """
+
+    def _deny(*args: object, **kwargs: object):
+        raise QuotedWordPlanDenial("the invocation changed shape")
+
+    monkeypatch.setattr(bash_module, "quoted_word_execution_plan_for_command", _deny)
+    shell_calls: list[tuple[object, ...]] = []
+
+    async def _record(*args: object, **kwargs: object) -> None:
+        shell_calls.append(args)
+        raise AssertionError("a refused quoted word must not use a shell")
+
+    monkeypatch.setattr(bash_module, "spawn_shell_command", _record)
+
+    with pytest.raises(ToolError) as err:
+        await collect_result(_tool(work).run(BashArgs(command='X=alpha.txt; cat "$X"')))
+
+    assert "the invocation changed shape" in str(err.value)
+    assert shell_calls == []
+
+
+def test_all_literal_call_is_not_the_quoted_word_transport(work: Path) -> None:
+    """A call without an admitted quoted word keeps its shell execution."""
+    assert _quoted_plan("cat alpha.txt") is None
+    assert _permission(work, "cat alpha.txt").permission is ToolPermission.ALWAYS
+
+
+def test_managed_background_launcher_keeps_the_quoted_word_denial(work: Path) -> None:
+    """Only a transport that consumes the literal plan may admit the word.
+
+    ``bash_start`` hands the command string to a shell, so at permission time
+    it keeps the expansion denial even though the foreground tool admits the
+    same call.
+    """
+    tool = BashStart(
+        config_getter=lambda: BashToolConfig(), state=BaseToolState(), cwd=work
+    )
+    context = tool.resolve_permission(BashStartArgs(command='X=alpha.txt; cat "$X"'))
+
+    assert context is not None
+    assert context.permission is ToolPermission.NEVER
+    assert "literal argv transport" in str(context.reason)
+    assert _quoted_plan('X=alpha.txt; cat "$X"') is not None

@@ -1549,19 +1549,15 @@ class TestShippedDenylistMigration:
         # v0.5.9 P1-e2: the probed egress clients and the watch repeater
         # ship on the denylist until they are modeled.
         denylist = _get_default_denylist()
-        for entry in (
-            "ssh",
-            "scp",
-            "rsync",
-            "ftp",
-            "telnet",
-            "httpie",
-            "wget2",
-            "aria2c",
-            "lftp",
-            "watch",
-        ):
+        for entry in ("ftp", "telnet", "httpie", "wget2", "aria2c", "lftp", "watch"):
             assert entry in denylist
+        # v0.7.1 S4b1b/S4b2c: ssh, scp, and rsync left the shipped denylist
+        # once their bounded remote-exec / transfer grammars were modeled;
+        # their converted rows now pin the specific modeled outcomes in
+        # tests/tools/test_bash_permissions.py (TestS4b1bIpLiteralSsh and
+        # TestS4b2cBoundedTransfers), not a denylist pattern.
+        for modeled in ("ssh", "scp", "rsync"):
+            assert modeled not in denylist
         # v0.7.0 S3: HTTPie's request client `http` left the shipped denylist
         # under its restricted grammar. `httpie` and `wget2` stayed because
         # their admission prerequisites are not established (the installed
@@ -1572,10 +1568,13 @@ class TestShippedDenylistMigration:
     @pytest.mark.parametrize(
         "command",
         [
-            "ssh host 'git push'",
+            # v0.7.1 S4b1b/S4b2c (converted, not deleted): "ssh host 'git
+            # push'", "scp file host:backup", and "rsync -a src/ host:dst/"
+            # no longer hit the shipped denylist — they now pin their
+            # specific grammar outcomes in tests/tools/test_bash_permissions.py
+            # (TestS4b1bIpLiteralSsh.test_converted_ssh_row_is_denied_by_grammar_not_denylist
+            # and TestS4b2cBoundedTransfers.test_converted_rows_and_denied_forms_pin_the_grammar_outcome).
             "watch -n 1 git push",
-            "scp file host:backup",
-            "rsync -a src/ host:dst/",
             "ftp host",
             "telnet host",
             # v0.7.0 S3: `http` is modeled, so its non-loopback destination is

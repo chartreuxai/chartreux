@@ -36,6 +36,12 @@ from pydantic import (
 from chartreux.core.env import project_env_for_cwd
 from chartreux.core.events import BackgroundJobsChangedEvent
 from chartreux.core.tools import secret_redaction
+from chartreux.core.tools.builtins._remote_exec import RemoteExecDenial
+from chartreux.core.tools.builtins._remote_transfer import (
+    REMOTE_EXEC_CLIENTS,
+    classify_remote_exec_call,
+)
+from chartreux.core.tools.builtins._shell_argv import split_shell_tokens
 from chartreux.core.tools.secret_redaction import (
     REDACTED_PLACEHOLDER,
     IncrementalRedactor,
@@ -454,6 +460,57 @@ class BackgroundJobRegistry:
             else:
                 task.exception()
 
+    def _check_remote_exec_spawn(self, command: str) -> None:
+        """Revalidate the remote-exec grammar at the background spawn (S4b1b + S4b2a + S4b2c).
+
+        The tool layer derives and pins the plan before the reservation
+        starts, so an ssh/scp/rsync command reaching this spawn must already
+        carry the pinned address + fixed host-key identity in its argv. A
+        denied form (ambiguous/local/failed hostname resolution,
+        local/ambiguous literal, hostile option, an unbounded transfer
+        spelling), a composed or wrapped call, or an unpinned argv raises
+        RemoteExecDenial — the spawn never runs the original text. A
+        hostname-pinned argv (resolved address as operand, HostKeyAlias
+        bound to the granted hostname) revalidates that the operand is still
+        the granted host's unique non-local resolution.
+        """
+        try:
+            tokens = split_shell_tokens(command)
+        except ValueError as exc:
+            raise RemoteExecDenial(
+                f"the spawn text could not be tokenized for remote-exec "
+                f"revalidation: {exc}"
+            ) from exc
+        if not any(Path(token).name in REMOTE_EXEC_CLIENTS for token in tokens):
+            return
+        classification = classify_remote_exec_call(tokens)
+        if classification.kind == "deny":
+            raise RemoteExecDenial(
+                classification.reason or "the remote invocation is denied"
+            )
+        if classification.kind == "routine":
+            # A remote client appears but not as the head of the single
+            # spawn command: a composed or wrapped call, which only the
+            # pinning tool layer could have admitted — and it refuses those.
+            raise RemoteExecDenial(
+                "remote execution admits only a single standalone ssh/scp/rsync "
+                "invocation, pinned into the spawned argv at execution"
+            )
+        if not classification.is_pinned:
+            raise RemoteExecDenial(
+                "a remote invocation reached the background spawn without the "
+                "pinned address and host-key identity in its argv"
+            )
+
+    async def _spawn_checked(
+        self, command: str, *, cwd: Path | None, extra_env: dict[str, str]
+    ) -> asyncio.subprocess.Process:
+        """The background spawn with the S4b1b remote-exec revalidation first."""
+        self._check_remote_exec_spawn(command)
+        return await spawn_shell_command(
+            command, cwd=cwd, merge_stderr=True, extra_env=extra_env
+        )
+
     async def _launch(self, job_id: str, command: str, cwd: Path | None) -> StartResult:
         # The trust-gated env injection keys to the caller's cwd — the same
         # root the session registered its redaction set for. A missing cwd
@@ -462,9 +519,16 @@ class BackgroundJobRegistry:
         # session redaction set. Fail-safe, not fail-hang: inject nothing.
         extra_env = project_env_for_cwd(cwd) if cwd is not None else {}
         spawn = asyncio.create_task(
-            spawn_shell_command(
-                command, cwd=cwd, merge_stderr=True, extra_env=extra_env
-            )
+            # F1pkg1(c): the background transport consumes the pinned executor
+            # contract at execution — spawn_shell_command binds the executor in
+            # one read and hard-denies an unknown one before any process
+            # starts; the launch recovery below rolls the reservation back.
+            # S4b1b: the same spawn task first revalidates the remote-exec
+            # grammar and requires the pin (the approved address + fixed
+            # host-key identity in the argv); a denied or unpinned ssh argv
+            # raises inside this task, so the launch recovery rolls the
+            # reservation back and nothing is spawned.
+            self._spawn_checked(command, cwd=cwd, extra_env=extra_env)
         )
         try:
             proc = await asyncio.shield(spawn)

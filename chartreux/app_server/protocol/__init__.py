@@ -44,6 +44,7 @@ from chartreux.app_server._connection_protocol import (
     InitializeResponse as InitializeResponse,
     ServerInfo as ServerInfo,
     TransportKind as TransportKind,
+    remote_exec_attestation as remote_exec_attestation,
 )
 from chartreux.app_server._model import ProtocolModel as ProtocolModel
 from chartreux.app_server.config import (

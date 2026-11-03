@@ -604,6 +604,7 @@ class SessionRuntimeRegistry(SubagentRunnerPort):  # noqa: PLR0904
         operation_id: str,
         expected_live_generation: int,
         expected_disk_revision: str | None,
+        destination: str | None = None,
     ) -> DangerousCommandRevokeResponse:
         """Delegate the grant revocation to the authority collaborator."""
         return await self._dangerous_command_authority.revoke_dangerous_command_grant(
@@ -611,6 +612,7 @@ class SessionRuntimeRegistry(SubagentRunnerPort):  # noqa: PLR0904
             operation_id=operation_id,
             expected_live_generation=expected_live_generation,
             expected_disk_revision=expected_disk_revision,
+            destination=destination,
         )
 
     async def replace_policy(
