@@ -42,7 +42,6 @@ from chartreux.core.tools.manager import ToolManager
 from chartreux.core.tools.permissions import PermissionContext
 from chartreux.core.tools.utils import (
     DEFAULT_SENSITIVE_PATTERNS,
-    PathAccess,
     matches_sensitive_pattern,
 )
 from tests.conftest import build_test_vibe_config
@@ -871,14 +870,6 @@ def test_instruction_capability_is_read_only_and_tool_name_scoped(
         assert decision.reason is not None
         assert decision.reason.startswith(
             "Injected instruction files are readable only"
-        )
-        tool.plan_file_write_scope_getter = lambda: workspace / "plan.md"
-        assert "Plan mode" in (_permission(tool.resolve_permission(args)).reason or "")
-        shared = _permission(
-            tool.path_authority.resolve(str(instructions), PathAccess.WRITE)
-        )
-        assert shared.permission == ToolPermission.NEVER and "Plan mode" in (
-            shared.reason or ""
         )
 
 

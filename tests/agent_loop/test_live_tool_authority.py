@@ -62,31 +62,6 @@ async def test_retained_resolution_and_prepared_invocation_are_retired(
         await loop.aclose()
 
 
-async def test_inherited_plan_refresh_retires_retained_instance(tmp_path: Path) -> None:
-    loop = await make_loop(tmp_path)
-    old = loop.tool_manager.get("write_file")
-    target = tmp_path / "ordinary.txt"
-    args = WriteFileArgs(file_path=str(target), content="fixture")
-    try:
-        context = old.resolve_permission(args)
-        assert context is not None and context.permission == ToolPermission.ALWAYS
-        # Simulate the private local adoption step, not a public tree mutation API.
-        loop._inherited_plan_write_scopes = ((tmp_path / "plan.md", None),)
-        await loop.reload_with_initial_messages()
-        context = old.resolve_permission(args)
-        assert context is not None and context.permission == ToolPermission.NEVER
-        current = loop.tool_manager.get("write_file")
-        context = current.resolve_permission(args)
-        assert context is not None and context.permission == ToolPermission.NEVER
-        assert context.reason and "Parent Plan" in context.reason
-        context = current.resolve_permission(
-            WriteFileArgs(file_path=str(tmp_path / "plan.md"), content="fixture")
-        )
-        assert context is not None and context.permission == ToolPermission.ALWAYS
-    finally:
-        await loop.aclose()
-
-
 @pytest.mark.parametrize("failure", ["prepare", "stale"])
 async def test_failed_preparation_keeps_retained_authority(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str

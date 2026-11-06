@@ -7,7 +7,10 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, cast
 
 from chartreux.core.config.models import ModelConfig, ThinkingLevel
-from chartreux.core.llm.thinking_levels import get_thinking_levels
+from chartreux.core.llm.thinking_levels import (
+    get_thinking_levels,
+    thinking_level_is_known,
+)
 from chartreux.core.model_catalog.loader import CatalogSnapshot
 from chartreux.core.model_catalog.schema import (
     BaseModelDefinition,
@@ -49,12 +52,50 @@ def _role_error(expression: str, valid_roles: Sequence[str]) -> ModelResolutionE
 def supports_thinking(
     provider: ProviderDefinition, deployment: DeploymentDefinition, thinking: str
 ) -> bool:
-    """Check declared deployment limits and known backend wire capabilities."""
+    """Check declared deployment limits and known backend wire capabilities.
+
+    This is exact membership, not admission: the UI and catalog use it to list
+    the levels a deployment actually declares. Admission resolves a known level
+    the deployment lacks to the nearest declared level instead of refusing.
+    """
     declared = deployment.supported_thinking_levels
     if declared is not None and thinking not in declared:
         return False
     levels = get_thinking_levels(provider.backend, provider.api_style, deployment.name)
     return levels is None or thinking in levels
+
+
+def validate_thinking_selection(
+    provider: ProviderDefinition, deployment: DeploymentDefinition, thinking: str
+) -> None:
+    """Reject only what nearest-level fallback cannot repair.
+
+    An unknown level name, or a declaration contradicting the deployment's
+    encodable levels, is a configuration error. A known level the deployment
+    simply lacks is not: it resolves to the nearest declared level.
+    """
+    if not thinking_level_is_known(thinking):
+        raise ModelResolutionError(
+            "unknown_thinking_level",
+            f"Unknown thinking level {thinking!r}; valid levels: "
+            "off, low, medium, high, xhigh, max",
+        )
+    declared = deployment.supported_thinking_levels
+    if declared is None:
+        return
+    levels = get_thinking_levels(provider.backend, provider.api_style, deployment.name)
+    if levels is None:
+        raise ModelResolutionError(
+            "thinking_unsupported",
+            f"{deployment.provider}/{deployment.name} declares thinking levels its "
+            "provider cannot encode; remove the declaration",
+        )
+    if any(level not in levels for level in declared):
+        raise ModelResolutionError(
+            "thinking_unsupported",
+            f"{deployment.provider}/{deployment.name} declares a thinking level its "
+            "model cannot encode; remove the declaration",
+        )
 
 
 @dataclass(frozen=True)
@@ -91,13 +132,9 @@ class ResolvedModel:
             if thinking is not None
             else self.thinking or self.definition.thinking
         )
-        if validate_thinking and not supports_thinking(
-            self.provider, self.deployment, selected_thinking
-        ):
-            raise ModelResolutionError(
-                "thinking_unsupported",
-                f"Thinking level {selected_thinking!r} is unsupported by "
-                f"{self.deployment.provider}/{self.deployment.name}; edit the preset thinking level",
+        if validate_thinking:
+            validate_thinking_selection(
+                self.provider, self.deployment, selected_thinking
             )
         prices = self.deployment.prices
         return ModelConfig(
@@ -296,17 +333,28 @@ class ModelResolver:
                     f"Model {base!r} has no deployment permitted by allowed_models",
                 )
                 continue
-            thinking_compatible = False
-            for deployment in allowed:
-                if role is not None and not supports_thinking(
-                    self.snapshot.catalog.providers[deployment.provider],
-                    deployment,
-                    thinking_override
-                    if thinking_override is not None
-                    else role.thinking,
-                ):
-                    continue
-                thinking_compatible = True
+            # A preset level the deployment cannot encode still resolves: the
+            # deployment serves the launch at its nearest declared level, so an
+            # exact-match deployment is merely preferred, never required.
+            role_thinking = (
+                thinking_override
+                if thinking_override is not None
+                else (role.thinking if role is not None else None)
+            )
+            candidates = allowed
+            if role_thinking is not None:
+                requested_level = role_thinking
+                candidates = sorted(
+                    allowed,
+                    key=lambda deployment: (
+                        not supports_thinking(
+                            self.snapshot.catalog.providers[deployment.provider],
+                            deployment,
+                            requested_level,
+                        )
+                    ),
+                )
+            for deployment in candidates:
                 resolved = ResolvedModel(
                     base,
                     definition,
@@ -318,17 +366,8 @@ class ModelResolver:
                 if candidate_filter is None or candidate_filter(resolved):
                     return resolved
             last_error = ModelResolutionError(
-                "thinking_unsupported"
-                if role is not None and not thinking_compatible
-                else "no_compatible_deployment",
-                (
-                    f"Preset {expression!r} has no deployment of model {base!r} "
-                    f"supporting thinking level "
-                    f"{(thinking_override if thinking_override is not None else role.thinking)!r}; "
-                    "edit its thinking level"
-                    if role is not None and not thinking_compatible
-                    else f"Model {base!r} has no compatible available deployment"
-                ),
+                "no_compatible_deployment",
+                f"Model {base!r} has no compatible available deployment",
             )
         if last_error is not None:
             raise last_error
@@ -377,13 +416,13 @@ class ModelResolver:
                 "allowlist_excluded",
                 f"Committed deployment {label!r} is not permitted by allowed_models",
             )
-        if identity.thinking is not None and not supports_thinking(
-            provider, deployment, identity.thinking
+        if identity.thinking is not None and not thinking_level_is_known(
+            identity.thinking
         ):
             raise ModelResolutionError(
-                "committed_thinking_unsupported",
-                f"Committed thinking level {identity.thinking!r} is no longer "
-                f"supported by {label!r}; edit the preset thinking level",
+                "committed_thinking_unknown",
+                f"Committed thinking level {identity.thinking!r} is not a known "
+                f"level; edit the preset thinking level",
             )
         return ResolvedModel(
             identity.base_model,

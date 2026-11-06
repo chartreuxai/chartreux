@@ -65,12 +65,6 @@ class SessionCompactedParams(SessionHandoffParams):
     summary_length: int = Field(ge=0)
 
 
-class SessionContextClearedParams(SessionHandoffParams):
-    NOTIFICATION_METHOD: ClassVar[str] = "session/contextCleared"
-
-    plan_file_path: str | None = None
-
-
 class SessionUpdatedParams(EventNotificationParams):
     NOTIFICATION_METHOD: ClassVar[str] = "session/updated"
 

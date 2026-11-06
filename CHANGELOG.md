@@ -2,6 +2,110 @@
 
 All notable changes to Chartreux are documented in this file.
 
+## 0.7.3 (2026-11-05)
+
+Thinking levels gain a six-level vocabulary declared per deployment, `/plan`
+turns planning into a consent-gated mode with a real executor handoff, and the
+harness secret scan that systematically blocked subagent submissions on ordinary
+repository content is fixed.
+
+### Added
+
+- The thinking vocabulary now has six levels: `off`, `low`, `medium`, `high`,
+  `xhigh`, and `max`. A deployment may declare the levels it can encode with
+  `supported_thinking_levels` (Mistral Large 4 declares `low`/`medium`/`high`,
+  GLM-5.3 declares `low`/`high`/`max`); the declaration constrains admission and
+  the effort encoded on the wire, so a level the deployment does not declare is
+  never sent to the provider.
+- `/plan` mode: `/plan` applies the configured planner's model and thinking as
+  session overrides, reloads the runtime, and posts the planner seed, which
+  queues behind an active turn. `/plan accept` reads the plan document,
+  snapshots the configured executor selection, and shows a consent screen with
+  the plan path, summary, and that selection before handing off to a fresh
+  executor session seeded with the planner summary and absolute plan path.
+  `/plan cancel` restores the pre-entry model and thinking selections and leaves
+  the plan document in place.
+- `ask_user_question` settlement is server-authoritative: the terminal callback
+  patch is published inside the resolution lock before the settlement RPC
+  answers, so the client reconciles its own in-flight answer by callback
+  identity and exact output instead of reporting a spurious closure. A closure
+  the user did not cause is presented quietly with outcome-specific copy; the
+  unchanged expiry warning still reads "Unanswered — deferred".
+- Inline edit and write results collapse by default, with `+N`/`-M` headers
+  computed from the same diff rows the expanded view renders; `write_file` keeps
+  its plain call line. Expansion state is session-local: rebuilds and rewinds
+  preserve it, while `/resume` and restart reset it.
+
+### Fixed
+
+- **The harness secret-scan defect behind the systematic submission blocks.**
+  A touched path that is a directory — what a plain extraction, an in-place
+  patch, a bare `git apply`, or a copy to a directory collects as `.` or the
+  destination — is still enumerated in full, but only files modified at or after
+  the run began are inspected; an explicitly named file path is inspected
+  unconditionally. A session that merely wrote into an existing tree therefore
+  no longer blocks on pre-session content such as over-cap binaries or the
+  repository's own seeded-secret tests. The generic-keyword assignment rule no
+  longer accepts `::` as a separator, so pytest node ids are not read as
+  credentials. Symlink handling is tightened — a link's own mtime joins its
+  target's, directory links are walked under cycle detection, and unreadable
+  metadata fails closed as `scan-incomplete` — while the per-file cap, binary
+  inspection, and block wording are unchanged.
+- The submission scan is path-class aware (S4). Runtime-owned transient
+  content — the parent-shared scratchpad and tempdir paths outside the
+  session's authorized roots — is skipped with a single harness log notice
+  instead of blocking the submission, vendored and cache directories (`.git`,
+  `.venv`, `__pycache__`, the tool caches, `node_modules`, `dist`, `site`) are
+  no longer walked, and the walk budget counts only the entries the run's
+  write window can inspect, with an absolute enumeration cap still bounding
+  the walk. Repository content stays scanned and fail-closed, an unestablished
+  write surface still blocks, and the pre-commit hook, which scans staged
+  blobs, is unchanged.
+- Declared-set thinking reaches the wire (REV5). Backend encoding narrows by
+  the deployment's declared levels, so an undeclared effort is never sent; on
+  the Anthropic-style path, retained reasoning resolves the forced level among
+  the declared enabled levels (nearest by vocabulary position), and a
+  deployment that declares no enabled level raises a typed configuration error
+  instead of emitting an undeclared `medium`.
+- Manual compaction settles a `CancelledError` in the post-publication hand-off
+  path: the published boundary (checkpoint or replacement publication and the
+  lifecycle reserve release) is settled before the exception is re-raised, never
+  swallowed.
+- A terminal retryable provider failure now mounts a plain, non-retryable error
+  message with a one-line hint — "/retry or Ctrl+R to retry this turn" — instead
+  of a retry button whose handle could be stranded in the transcript when the
+  user typed a new prompt. Retry stays available through `/retry` and Ctrl+R,
+  armed by the presentation rather than the widget.
+- Review amendments: the plan hand-off re-raises `CancelledError` after its
+  cleanup instead of converting it to an internal error (REV1), the `/plan`
+  entry path reloads the runtime after its write and reverts on failure (REV1),
+  and `/plan` is a side-channel command whose entry seed is enqueued (REV3).
+
+### Changed
+
+- A requested level the deployment does not declare is no longer a typed error.
+  Admission resolves it to the declared level nearest to it in vocabulary order
+  — a tie resolves upward, toward more thinking — and reports the substitution
+  once per deployment, requested level, and effective level. Mistral Large 4's
+  `off` therefore resolves to `low`, and GLM-5.3's `medium` resolves to `high`.
+  Unknown level names remain typed errors, as do a declaration naming a level
+  outside the vocabulary and a declaration the selected model cannot encode.
+
+### Retained limitations
+
+- The scan's run cutoff is a write-window filter, not a provenance check:
+  content backdated before the run — including content extracted with preserved
+  timestamps — is not inspected (the documented blind spot), and a directory
+  tree past the walk's entry budget still fails closed as `scan-incomplete`.
+- The projected effective thinking level can still diverge from the Anthropic
+  wire in a narrow corner: when the declared set's nearest level disables
+  thinking and retained reasoning forces it on, the wire re-enables within the
+  declared set while the projection reports the disabled level (deferred to
+  0.8.0).
+- The suite retains one pre-existing failure,
+  `tests/tools/test_ui_bash_execution.py::test_ui_handles_non_utf8_stderr`,
+  which fails identically at the v0.7.2 base and is not a v0.7.3 regression.
+
 ## 0.7.2 (2026-11-03)
 
 Reliability and workflow follow-ups: a manual `/compact` can no longer wedge a

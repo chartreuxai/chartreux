@@ -21,7 +21,11 @@ from chartreux.core.model_catalog.loader import (
     load_catalog,
     merge_catalog_overlay,
 )
-from chartreux.core.model_catalog.resolver import ModelResolutionError, ModelResolver
+from chartreux.core.model_catalog.resolver import (
+    ModelResolutionError,
+    ModelResolver,
+    supports_thinking,
+)
 from chartreux.core.model_catalog.schema import ModelCatalog, Prices, ProviderDefinition
 
 
@@ -401,16 +405,20 @@ def test_invalid_preset_thinking_and_legacy_overlay_are_actionable() -> None:
         )
 
 
-def test_preset_thinking_must_be_supported_by_selected_deployment() -> None:
+def test_preset_thinking_resolves_to_the_nearest_declared_level() -> None:
     raw = _minimal()
     raw["models"]["base"]["deployments"][0]["supported_thinking_levels"] = ["low"]  # type: ignore[index]
     raw["roles"] = {"planner": {"model": "base", "thinking": "high"}}
     resolver = ModelResolver(CatalogSnapshot(ModelCatalog.model_validate(raw), "test"))
-    with pytest.raises(
-        ModelResolutionError, match="supporting thinking level"
-    ) as error:
-        resolver.resolve("@planner")
-    assert error.value.code == "thinking_unsupported"
+
+    resolved = resolver.resolve("@planner")
+    model = resolved.materialize(auto_compact_threshold=100)
+
+    # The preset keeps the level it asked for; admission serves it at the
+    # deployment's nearest declared level. Exact membership stays the
+    # UI/catalog predicate, not the admission rule.
+    assert model.thinking == "high"
+    assert supports_thinking(resolved.provider, resolved.deployment, "high") is False
     overridden = resolver.resolve("@planner", thinking_override="low")
     assert (
         overridden.materialize(auto_compact_threshold=100, thinking="low").thinking
@@ -418,7 +426,7 @@ def test_preset_thinking_must_be_supported_by_selected_deployment() -> None:
     )
 
 
-def test_committed_preset_pair_revalidates_after_deployment_capability_change() -> None:
+def test_committed_preset_pair_survives_a_deployment_capability_change() -> None:
     raw = _minimal()
     raw["roles"] = {"planner": {"model": "base", "thinking": "high"}}
     committed = (
@@ -428,9 +436,26 @@ def test_committed_preset_pair_revalidates_after_deployment_capability_change() 
     )
     raw["models"]["base"]["deployments"][0]["supported_thinking_levels"] = ["low"]  # type: ignore[index]
     changed = ModelResolver(CatalogSnapshot(ModelCatalog.model_validate(raw), "after"))
-    with pytest.raises(ModelResolutionError, match="Committed thinking level") as error:
-        changed.resolve_committed(committed)
-    assert error.value.code == "committed_thinking_unsupported"
+
+    resolved = changed.resolve_committed(committed)
+
+    assert resolved.materialize(auto_compact_threshold=100).thinking == "high"
+
+
+def test_committed_preset_with_an_unknown_level_name_is_still_a_typed_error() -> None:
+    raw = _minimal()
+    raw["roles"] = {"planner": {"model": "base", "thinking": "high"}}
+    committed = (
+        ModelResolver(CatalogSnapshot(ModelCatalog.model_validate(raw), "before"))
+        .resolve("@planner")
+        .identity
+    ).model_copy(update={"thinking": "absurd"})
+
+    with pytest.raises(ModelResolutionError, match="not a known") as error:
+        ModelResolver(
+            CatalogSnapshot(ModelCatalog.model_validate(raw), "before")
+        ).resolve_committed(committed)
+    assert error.value.code == "committed_thinking_unknown"
 
 
 def test_preset_candidate_filter_rejection_is_not_a_thinking_error() -> None:

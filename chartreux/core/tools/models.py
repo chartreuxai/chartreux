@@ -35,7 +35,6 @@ class PermissionContext(BaseModel):
             "out_of_root",
             "sensitive",
             "path_rule",
-            "plan_scope",
             "parent_ceiling",
             "tool_policy",
             "dangerous_command",

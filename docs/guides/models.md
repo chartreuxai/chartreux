@@ -164,8 +164,13 @@ orchestration is never inferred from the roster size.
 Base-model definitions set a default `thinking` level for direct model
 selection; role presets each carry their own level. Deployments may restrict
 levels with `supported_thinking_levels`. Available levels are `off`, `low`,
-`medium`, `high`, and `max`; a deployment's supported list limits what
-Chartreux can encode, not what a remote provider will ultimately accept.
+`medium`, `high`, `xhigh`, and `max`; a deployment's supported list limits what
+Chartreux can encode, not what a remote provider will ultimately accept. A
+requested level the deployment does not declare is not an error: it resolves to
+the declared level nearest by vocabulary position — a tie resolves upward,
+toward more thinking — and the substitution is reported once per deployment,
+requested level, and effective level. The declared set also bounds the effort
+encoded on the wire, so an undeclared level is never sent to the provider.
 Use `/thinking` during a session or an explicit spawn `config.thinking` to
 override the selected preset in that scope. Persisted
 `[thinking_overrides]` in user or project `config.toml` are rejected; set the

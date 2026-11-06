@@ -9,5 +9,12 @@ FALLBACK_THEME = DARK_THEME
 DEFAULT_THEME = AUTO_THEME
 DEFAULT_LOG_LEVEL = "WARNING"
 
-type ThinkingLevel = Literal["off", "low", "medium", "high", "max"]
-THINKING_LEVELS: tuple[ThinkingLevel, ...] = ("off", "low", "medium", "high", "max")
+type ThinkingLevel = Literal["off", "low", "medium", "high", "xhigh", "max"]
+THINKING_LEVELS: tuple[ThinkingLevel, ...] = (
+    "off",
+    "low",
+    "medium",
+    "high",
+    "xhigh",
+    "max",
+)

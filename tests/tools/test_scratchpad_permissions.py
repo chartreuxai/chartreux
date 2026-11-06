@@ -205,7 +205,7 @@ def test_scratch_chain_fails_closed(tmp_path, failure, name):
 
 
 @pytest.mark.parametrize("ancestor", [0, 1])
-@pytest.mark.parametrize("ceiling", ["never", "denylist", "sensitive", "plan"])
+@pytest.mark.parametrize("ceiling", ["never", "denylist", "sensitive"])
 def test_inherited_scratch_never_bypasses_ancestor_ceiling(tmp_path, ancestor, ceiling):
     parent, child, grandchild, scratch = scratch_chain(tmp_path)
     owner = (parent, child)[ancestor]
@@ -221,8 +221,6 @@ def test_inherited_scratch_never_bypasses_ancestor_ceiling(tmp_path, ancestor, c
         }
     )
     owner._config_getter = lambda: config
-    if ceiling == "plan":
-        owner._inherited_plan_write_scopes = ((tmp_path / "plan.md", None),)
     result = grandchild.get("write_file").resolve_permission(
         WriteFileArgs(file_path=str(scratch / "notes.txt"), content="x")
     )
@@ -272,22 +270,6 @@ def test_executor_inherited_scratch_symlink_escape_denied(
         BashArgs(command=template.format(path=scratch / "escape.py"))
     )
     assert result is not None and result.permission is ToolPermission.NEVER
-
-
-def test_scratch_grants_obey_creating_ancestors_plan_ceiling(tmp_path):
-    parent, child, grandchild, scratch = scratch_chain(tmp_path)
-    parent._plan_file_write_scope_getter = lambda: tmp_path / "plan.md"
-    borrowed = tmp_path / "child-scratch"
-    child.set_scratchpad_dir(borrowed)
-    tool = grandchild.get("write_file")
-    for root, expected in (
-        (scratch, ToolPermission.ALWAYS),
-        (borrowed, ToolPermission.NEVER),
-    ):
-        result = tool.resolve_permission(
-            WriteFileArgs(file_path=str(root / "notes.txt"), content="x")
-        )
-        assert result is not None and result.permission == expected
 
 
 def test_inherited_scratch_symlink_escape_and_root_retarget_denied(tmp_path):

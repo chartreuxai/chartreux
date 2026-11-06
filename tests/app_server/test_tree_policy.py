@@ -140,9 +140,6 @@ async def test_transitive_refresh_preserves_own_assertions_and_mode(
         modes = [
             r.agent_loop.runtime_policy.inherited_mode_restrictions for r in runtimes
         ]
-        scopes = [
-            r.agent_loop.runtime_policy.inherited_plan_write_scopes for r in runtimes
-        ]
         source_ids = [r.agent_loop.config_orchestrator.policy_owner for r in runtimes]
         for runtime in runtimes:
             assert not hasattr(runtime.agent_loop, "_permission_store")
@@ -157,7 +154,6 @@ async def test_transitive_refresh_preserves_own_assertions_and_mode(
                 assert "other" in denied
                 assert not hasattr(loop, "_permission_store")
                 assert loop.runtime_policy.inherited_mode_restrictions == modes[index]
-                assert loop.runtime_policy.inherited_plan_write_scopes == scopes[index]
                 assert loop.config_orchestrator.policy_owner == source_ids[index]
                 with pytest.raises(ToolPermissionError, match="retired"):
                     _ = old[index].config

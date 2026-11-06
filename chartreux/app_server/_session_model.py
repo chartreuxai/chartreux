@@ -6,12 +6,47 @@ from typing import Any
 from pydantic import JsonValue
 
 from chartreux.core.config.chartreux_schema import ChartreuxConfigSchema
+from chartreux.core.config.layer import ConfigLayer, RawConfig
 from chartreux.core.config.layers.overrides import OverridesLayer
 from chartreux.core.config.orchestrator import ConfigOrchestrator
 from chartreux.core.config.patch import AddOperationPatch, RemoveOperationPatch
 
 ACTIVE_MODEL_PATH = "/active_model"
 THINKING_OVERRIDES_PATH = "/thinking_overrides"
+AGENT_IDENTITY_PATH = "/agent/identity"
+
+
+def _escape_pointer_token(value: str) -> str:
+    return value.replace("~", "~0").replace("/", "~1")
+
+
+def _overrides_layer(
+    orchestrator: ConfigOrchestrator[ChartreuxConfigSchema],
+) -> ConfigLayer[RawConfig] | None:
+    return next(
+        (layer for layer in orchestrator.layers if layer.name == OverridesLayer.NAME),
+        None,
+    )
+
+
+def _canonical_model_key(
+    orchestrator: ConfigOrchestrator[ChartreuxConfigSchema], alias: str
+) -> str:
+    """Map an alias to the canonical base-model key thinking overrides store.
+
+    The orchestrator canonicalizes ``/thinking_overrides/<alias>`` writes the
+    same way, so the read-back must use the same key; without a catalog
+    snapshot the raw alias is the key.
+    """
+    snapshot = getattr(orchestrator.config, "catalog_snapshot", None)
+    if snapshot is None:
+        return alias
+    from chartreux.core.model_catalog.resolver import ModelResolver
+
+    try:
+        return ModelResolver(snapshot).canonicalize(alias)
+    except Exception:
+        return alias
 
 
 def stored_session_active_model(config: Mapping[str, JsonValue] | None) -> str | None:
@@ -73,6 +108,119 @@ async def clear_session_active_model_override(
         [
             RemoveOperationPatch(
                 path=ACTIVE_MODEL_PATH, target_layer_name=OverridesLayer.NAME
+            )
+        ],
+        reason=reason,
+    )
+
+
+def override_thinking_level(
+    orchestrator: ConfigOrchestrator[ChartreuxConfigSchema], alias: str
+) -> str | None:
+    """Return the session-scoped thinking override stored for ``alias``."""
+    layer = _overrides_layer(orchestrator)
+    if layer is None:
+        return None
+    data = layer.cached_data
+    if data is None:
+        return None
+    overrides = getattr(data, "thinking_overrides", None)
+    if not isinstance(overrides, dict):
+        return None
+    level = overrides.get(_canonical_model_key(orchestrator, alias))
+    if level is None:
+        level = overrides.get(alias)
+    return level if isinstance(level, str) and level else None
+
+
+async def set_session_thinking_override(
+    orchestrator: ConfigOrchestrator[ChartreuxConfigSchema],
+    alias: str,
+    level: str,
+    *,
+    reason: str,
+) -> list[BaseException]:
+    """Per-key thinking override at ``/thinking_overrides/<alias>``.
+
+    Unlike ``restore_session_thinking_overrides`` this never replaces the
+    whole map, so other aliases' session overrides survive.
+    """
+    if override_thinking_level(orchestrator, alias) == level:
+        return []
+    return await orchestrator.apply_patch(
+        [
+            AddOperationPatch(
+                path=f"{THINKING_OVERRIDES_PATH}/{_escape_pointer_token(alias)}",
+                value=level,
+                target_layer_name=OverridesLayer.NAME,
+            )
+        ],
+        reason=reason,
+    )
+
+
+async def remove_session_thinking_override(
+    orchestrator: ConfigOrchestrator[ChartreuxConfigSchema], alias: str, *, reason: str
+) -> list[BaseException]:
+    if override_thinking_level(orchestrator, alias) is None:
+        return []
+    return await orchestrator.apply_patch(
+        [
+            RemoveOperationPatch(
+                path=f"{THINKING_OVERRIDES_PATH}/{_escape_pointer_token(alias)}",
+                target_layer_name=OverridesLayer.NAME,
+            )
+        ],
+        reason=reason,
+    )
+
+
+def override_agent_identity(
+    orchestrator: ConfigOrchestrator[ChartreuxConfigSchema],
+) -> str | None:
+    layer = _overrides_layer(orchestrator)
+    if layer is None:
+        return None
+    data = layer.cached_data
+    if data is None:
+        return None
+    agent = getattr(data, "agent", None)
+    if isinstance(agent, dict):
+        identity = agent.get("identity")
+    else:
+        identity = getattr(agent, "identity", None) if agent is not None else None
+    return identity if isinstance(identity, str) and identity else None
+
+
+async def set_session_agent_identity_override(
+    orchestrator: ConfigOrchestrator[ChartreuxConfigSchema],
+    identity: str,
+    *,
+    reason: str,
+) -> list[BaseException]:
+    if override_agent_identity(orchestrator) == identity:
+        return []
+    return await orchestrator.apply_patch(
+        [
+            AddOperationPatch(
+                path=AGENT_IDENTITY_PATH,
+                value=identity,
+                target_layer_name=OverridesLayer.NAME,
+            )
+        ],
+        reason=reason,
+    )
+
+
+async def clear_session_agent_identity_override(
+    orchestrator: ConfigOrchestrator[ChartreuxConfigSchema], *, reason: str
+) -> list[BaseException]:
+    if override_agent_identity(orchestrator) is None:
+        return []
+    return await orchestrator.apply_patch(
+        [
+            RemoveOperationPatch(
+                path=AGENT_IDENTITY_PATH, target_layer_name=OverridesLayer.NAME
             )
         ],
         reason=reason,

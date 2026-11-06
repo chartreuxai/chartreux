@@ -51,7 +51,6 @@ from chartreux.app_server.events import (
     ServerError,
     ServerWarning,
     SessionCompacted,
-    SessionContextCleared,
     SessionSnapshot,
     SessionUpdated,
     StatsUpdated,
@@ -88,6 +87,7 @@ from chartreux.app_server.models import (
 from chartreux.app_server.protocol import (
     AgentSummaryModel,
     AppServerResponseError,
+    ConfigFieldWire,
     ConfigReadResponse,
     ConfigWriteOpWire,
     ProtocolError,
@@ -125,6 +125,21 @@ from chartreux.cli.textual_ui.message_queue import (
     SideChannelPorts,
 )
 from chartreux.cli.textual_ui.notifications import TextualNotificationAdapter
+from chartreux.cli.textual_ui.plan_mode import (
+    ExecutorSelection,
+    PlanDocumentBrief,
+    PlanModeState,
+    allocate_workspace,
+    clear_ops,
+    entry_ops,
+    executor_seed,
+    handoff_failed_before_replacement,
+    plan_section,
+    planner_seed,
+    pre_entry_snapshot,
+    read_document,
+    restore_ops,
+)
 from chartreux.cli.textual_ui.program_status import ProgramStatusEmitter
 from chartreux.cli.textual_ui.provider_services import (
     _ProviderConfigService,
@@ -194,7 +209,6 @@ from chartreux.cli.textual_ui.widgets.messages import (
     CustomToolsDeprecationMessage,
     ErrorMessage,
     ErrorRetryRequested,
-    PlanFileMessage,
     ReasoningMessage,
     SlashCommandMessage,
     StreamingMessageBase,
@@ -246,6 +260,7 @@ _DIAGNOSTIC_HEARTBEAT_DRIFT_WARNING_SECONDS = 0.25
 if TYPE_CHECKING:
     from chartreux.app_server.session import AppServerSession, SessionExitSummary
     from chartreux.cli.textual_ui.quit_manager import ExitConsequencesScreen
+    from chartreux.cli.textual_ui.screens.plan_consent import PlanConsentScreen
     from chartreux.cli.textual_ui.screens.routes import RoutesSnapshot, RoutesUpdate
     from chartreux.cli.textual_ui.screens.settings import SettingsScreen
     from chartreux.cli.textual_ui.widgets.debug_console import DebugConsole
@@ -345,6 +360,12 @@ def _get_word_select_screen_class() -> type[WordSelectScreen]:
     from chartreux.cli.textual_ui.word_selection import WordSelectScreen
 
     return WordSelectScreen
+
+
+def _get_plan_consent_screen_class() -> type[PlanConsentScreen]:
+    from chartreux.cli.textual_ui.screens.plan_consent import PlanConsentScreen
+
+    return PlanConsentScreen
 
 
 def is_progress_event(event: AppServerEvent) -> bool:
@@ -639,9 +660,6 @@ class ChartreuxApp(App):  # noqa: PLR0904
         Binding(
             "shift+down", "scroll_chat_down", "Scroll Down", show=False, priority=True
         ),
-        Binding(
-            "ctrl+g", "open_plan_in_editor", "Edit Plan", show=False, priority=False
-        ),
         Binding("ctrl+backslash", "toggle_debug_console", "Debug Console", show=False),
         Binding(
             "ctrl+shift+a", "toggle_agent_browser", "Background Agents", show=False
@@ -673,7 +691,7 @@ class ChartreuxApp(App):  # noqa: PLR0904
         """
         super().open_url(normalize_url(url), new_tab=new_tab)
 
-    def __init__(
+    def __init__(  # noqa: PLR0915 - app-wide state and controller wiring
         self,
         history_file: Path,
         app_server: AppServerSource,
@@ -773,6 +791,11 @@ class ChartreuxApp(App):  # noqa: PLR0904
         self._pending_picker_reload: tuple[str, str] | None = None
         self._picker_update_pending = False
         self._proxy_save_pending = False
+        # Plan mode is in-memory session state: the workspace plus the
+        # pre-entry override snapshot cancel restores. A process restart loses
+        # it; the plan document on disk survives.
+        self._plan_mode: PlanModeState | None = None
+        self._plan_accept_worker: Worker[None] | None = None
         self._current_version = current_version
         self._configure_startup_options(startup)
         self._quit_manager = QuitManager(self)
@@ -1820,7 +1843,6 @@ class ChartreuxApp(App):  # noqa: PLR0904
             on_user_message=self._queue.reconcile_history_entry,
             mounted_entry_widgets=self._transcript_presenter.mounted_timing_widgets,
             update_retained_entry=self._transcript.update_entry,
-            on_context_cleared=self._on_context_cleared,
             on_session_title_changed=self._on_session_title_changed,
             entry_expansion_state=self._entry_expansion_state,
             group_expansion_state=self._tool_group_expansion_state,
@@ -3214,11 +3236,9 @@ class ChartreuxApp(App):  # noqa: PLR0904
             self._graduation.state.compacted()
             self.call_after_refresh(self._maybe_show_graduation)
             self._root_context_unknown = True
-        elif isinstance(event, SessionContextCleared):
-            self._root_context_unknown = False
         if isinstance(event, (SessionSnapshot, SessionUpdated)):
             self._refresh_context_progress()
-        if isinstance(event, (TurnCompleted, SessionCompacted, SessionContextCleared)):
+        if isinstance(event, (TurnCompleted, SessionCompacted)):
             self._root_compacting = False
             self._refresh_context_progress()
         if isinstance(event, TurnStarted):
@@ -4334,9 +4354,9 @@ class ChartreuxApp(App):  # noqa: PLR0904
     async def _reset_message_widgets(self) -> None:
         """Tear down the on-screen conversation widgets and UI state.
 
-        Shared by ``/clear`` and the clear-context-on-plan-accept flow. Does not
-        touch the agent loop's message history — callers decide whether the core
-        history also needs clearing.
+        Shared by ``/clear`` and the ``/plan accept`` handoff. Does not touch the
+        agent loop's message history — callers decide whether the core history
+        also needs clearing.
         """
         self._entry_expansion_state.reset(default_collapsed=self._tools_collapsed)
         self._tool_group_expansion_state.reset(default_collapsed=self._tools_collapsed)
@@ -4356,6 +4376,15 @@ class ChartreuxApp(App):  # noqa: PLR0904
         session_log = self.app_server.resources.runtime.session_log
         resumable = session_log.enabled and session_log.persisted
         prompt = cmd_args.strip()
+        # /clear exits plan mode entirely: the pins /plan wrote are removed
+        # unconditionally (the saved restore snapshot is voided, not applied).
+        plan_state = self._plan_mode
+        plan_removal_failure: str | None = None
+        if plan_state is not None:
+            self._plan_mode = None
+            plan_removal_failure = await self._plan_write(
+                clear_ops(plan_state), reason="plan mode cleared"
+            )
         try:
             await self.app_server.clear_history()
             await self._queue.clear_server_queue()
@@ -4380,6 +4409,18 @@ class ChartreuxApp(App):  # noqa: PLR0904
                 await self._mount_and_scroll(
                     UserCommandMessage("New conversation started.")
                 )
+            if plan_state is not None:
+                await self._mount_and_scroll(
+                    UserCommandMessage(
+                        "Plan mode ended. The plan document was left in place: "
+                        f"`{plan_state.plan_path}`"
+                    )
+                )
+                if plan_removal_failure is not None:
+                    await self._plan_error(
+                        "The planner model and thinking selections may remain "
+                        f"active for this session: {plan_removal_failure}"
+                    )
             self._chat_widget.scroll_home(animate=False)
             self._sync_terminal_title()
 
@@ -4399,23 +4440,254 @@ class ChartreuxApp(App):  # noqa: PLR0904
         if prompt:
             await self._handle_user_message(prompt)
 
-    async def _on_context_cleared(self, plan_file_path: Path | None = None) -> None:
-        """React to a session handoff emitted during plan accept.
+    # --- Plan mode (/plan, /plan accept, /plan cancel) ---
 
-        Core already cleared the agent loop's history, so this only resets the
-        on-screen widgets and posts a notice that implementation is starting. The
-        approved plan is re-mounted so it stays visible in the discussion.
-        """
-        # The handoff replaces the session, so the record changes owner too.
-        self._advance_record_epoch(clear_retired=True)
-        self._program_status.emit("idle")
-        await self._reset_message_widgets()
-        if plan_file_path is not None:
-            await self._mount_and_scroll(PlanFileMessage(file_path=plan_file_path))
+    async def _plan_command(self, cmd_args: str = "", **kwargs: Any) -> None:
+        action = cmd_args.strip().lower()
+        if action == "":
+            await self._plan_enter()
+        elif action == "accept":
+            await self._plan_start_accept()
+        elif action == "cancel":
+            await self._plan_cancel()
+        else:
+            await self._plan_error(
+                f"Unknown /plan action: {action}. "
+                "Use /plan, /plan accept, or /plan cancel."
+            )
+
+    async def _plan_error(self, message: str) -> None:
         await self._mount_and_scroll(
-            UserCommandMessage("Context cleared. Implementing the approved plan...")
+            ErrorMessage(message, collapsed=self._tools_collapsed)
+        )
+
+    async def _plan_fields(self) -> list[ConfigFieldWire]:
+        response = await self.app_server.resources.config.read_fields()
+        return list(response.fields)
+
+    async def _plan_write(
+        self, ops: list[ConfigWriteOpWire], *, reason: str
+    ) -> str | None:
+        """Apply one per-key session-override write; the failure detail or None."""
+        try:
+            response = await self.app_server.resources.config.write(ops, reason=reason)
+        except Exception as exc:
+            return str(exc)
+        if response.rejected or response.failures:
+            return response.failures[0] if response.failures else "rejected"
+        if response.application != "applied":
+            return f"not applied ({response.application})"
+        return None
+
+    async def _plan_enter(self) -> None:
+        """Switch this conversation to the configured planner and allocate a plan."""
+        if self._plan_mode is not None:
+            await self._mount_and_scroll(
+                UserCommandMessage(
+                    "Plan mode is already active. Plan document: "
+                    f"`{self._plan_mode.plan_path}`"
+                )
+            )
+            return
+        try:
+            fields = await self._plan_fields()
+            selection = plan_section(fields)
+        except Exception as exc:
+            await self._plan_error(f"Failed to read the plan configuration: {exc}")
+            return
+        planner = selection.planner
+        if await self._is_active_model_enforced():
+            await self._plan_error(
+                "Plan mode cannot switch the model: 'active_model' is enforced "
+                "by your administrator. Contact your admin to change it."
+            )
+            return
+        workspace, workspace_error = allocate_workspace(
+            self.app_server.session_id, project_root=Path(self.app_server.cwd)
+        )
+        if workspace is None:
+            await self._plan_error(
+                f"Failed to create the plan workspace: {workspace_error}"
+            )
+            return
+        pre_entry_active_model, pre_entry_thinking = pre_entry_snapshot(
+            fields, planner.model, self.config.models
+        )
+        state = PlanModeState(
+            workspace=workspace,
+            planner=planner,
+            pre_entry_active_model=pre_entry_active_model,
+            pre_entry_planner_thinking=pre_entry_thinking,
+        )
+        failure = await self._plan_write(entry_ops(planner), reason="plan mode entry")
+        if failure is None:
+            reload_error = await self._reload_config()
+            if reload_error is not None:
+                failure = f"runtime reload failed ({reload_error})"
+        if failure is not None:
+            revert = await self._plan_write(
+                restore_ops(state), reason="plan mode entry revert"
+            )
+            detail = (
+                "the previous selections were restored"
+                if revert is None
+                else "a planner selection may remain active; inspect it with "
+                f"/model or /thinking ({revert})"
+            )
+            await self._plan_error(f"Failed to enter plan mode: {failure} ({detail})")
+            return
+        self._plan_mode = state
+        seed = planner_seed(workspace)
+        if self._is_busy() or self._queue.paused:
+            await self._enqueue_prompt_with_resources(seed)
+        else:
+            await self._handle_user_message(seed)
+
+    async def _plan_start_accept(self) -> None:
+        if self._plan_mode is None:
+            await self._plan_error(
+                "Not in plan mode. Use /plan to start planning first."
+            )
+            return
+        if (
+            self._plan_accept_worker is not None
+            and not self._plan_accept_worker.is_finished
+        ):
+            return
+        self._plan_accept_worker = self.run_worker(
+            self._plan_accept(), exclusive=False, name="plan-accept"
+        )
+
+    async def _plan_accept(self) -> None:
+        """Read the plan, snapshot the executor, and ask for explicit consent."""
+        state = self._plan_mode
+        if state is None:
+            await self._plan_error(
+                "Not in plan mode. Use /plan to start planning first."
+            )
+            return
+        document, document_error = read_document(state.workspace.document_path)
+        if document is None:
+            await self._plan_error(f"Cannot accept the plan: {document_error}")
+            return
+        try:
+            executor = plan_section(await self._plan_fields()).executor
+        except Exception as exc:
+            await self._plan_error(f"Failed to read the plan configuration: {exc}")
+            return
+        if not await self._plan_request_consent(document, executor):
+            await self._mount_and_scroll(
+                UserCommandMessage(
+                    "Plan execution cancelled. Plan mode is still active. "
+                    f"Plan document: `{state.plan_path}`"
+                )
+            )
+            return
+        await self._plan_handoff(document, executor, state)
+
+    async def _plan_request_consent(
+        self, document: PlanDocumentBrief, executor: ExecutorSelection
+    ) -> bool:
+        screen_class = _get_plan_consent_screen_class()
+        confirmed = await self.push_screen_wait(
+            screen_class(
+                plan_path=str(document.path),
+                summary=document.summary,
+                executor_model=executor.model,
+                executor_thinking=executor.thinking,
+                executor_identity=executor.identity,
+                executor_display_name=self.config.model_display_name(executor.model),
+            )
+        )
+        return confirmed is True
+
+    async def _plan_handoff(
+        self,
+        document: PlanDocumentBrief,
+        executor: ExecutorSelection,
+        state: PlanModeState,
+    ) -> None:
+        """Start the consented executor session with exactly the shown selection."""
+        try:
+            await self.app_server.plan_handoff(
+                executor_model=executor.model,
+                executor_thinking=executor.thinking,
+                executor_identity=executor.identity,
+                plan_path=str(document.path),
+                planner_thinking_alias=state.planner.model,
+                planner_thinking_value=state.pre_entry_planner_thinking,
+            )
+        except AppServerResponseError as exc:
+            if handoff_failed_before_replacement(exc.error):
+                await self._plan_error(
+                    "Failed to start plan execution: "
+                    f"{exc.error.message} Plan mode is still active; retry "
+                    "/plan accept or /plan cancel."
+                )
+                return
+            self._plan_mode = None
+            await self._plan_error(
+                "Failed to start plan execution: "
+                f"{exc.error.message}\n"
+                "The executor conversation may already be active; the plan "
+                f"document is at `{state.plan_path}`. Resume from that path if "
+                "the brief did not arrive."
+            )
+            return
+        except Exception as exc:
+            self._plan_mode = None
+            await self._plan_error(
+                f"Failed to start plan execution: {exc}\n"
+                "The executor conversation may already be active; the plan "
+                f"document is at `{state.plan_path}`. Resume from that path if "
+                "the brief did not arrive."
+            )
+            return
+        # The handoff replaced the session: mirror /clear's post-reset UI.
+        self._plan_mode = None
+        self._root_recovery.cancel_local(reason="session_changed")
+        await self._queue.clear_server_queue()
+        self._refresh_context_progress()
+        self._refresh_banner()
+        await self._reset_message_widgets()
+        await self._messages_area.mount(SlashCommandMessage("plan accept"))
+        await self._mount_and_scroll(
+            UserCommandMessage(
+                f"Plan execution started. Plan document: `{state.plan_path}`"
+            )
         )
         self._chat_widget.scroll_home(animate=False)
+        self._sync_terminal_title()
+        self._advance_record_epoch(clear_retired=True)
+        self._program_status.emit("idle")
+        await self._handle_user_message(executor_seed(document))
+
+    async def _plan_cancel(self) -> None:
+        """Exit plan mode, restoring the pre-entry override snapshot."""
+        state = self._plan_mode
+        if state is None:
+            await self._plan_error(
+                "Not in plan mode. Use /plan to start planning first."
+            )
+            return
+        self._plan_mode = None
+        failure = await self._plan_write(
+            restore_ops(state), reason="plan mode cancel restore"
+        )
+        if failure is not None:
+            await self._plan_error(
+                "Plan mode cancelled, but the previous model and thinking "
+                f"selections could not be fully restored: {failure}. Inspect them "
+                "with /model or /thinking."
+            )
+            return
+        await self._mount_and_scroll(
+            UserCommandMessage(
+                "Plan mode cancelled. The previous model and thinking selections "
+                "were restored; the plan document was left in place at "
+                f"`{state.plan_path}`."
+            )
+        )
 
     async def _show_log_path(self, **kwargs: Any) -> None:
         session_log = await self.app_server.resources.sessions.read_log()
@@ -5307,13 +5579,6 @@ class ChartreuxApp(App):  # noqa: PLR0904
         self._terminal_notifier.on_focus()
         if self._chat_input_container and self._chat_input_container.input_widget:
             self._chat_input_container.input_widget.set_app_focus(True)
-
-    def action_open_plan_in_editor(self) -> None:
-        if self.event_handler is None:
-            return
-
-        if plan_file_message := self.event_handler.plan_file_message:
-            plan_file_message.open_in_editor()
 
     def action_suspend_with_message(self) -> None:
         if self._driver is None or not self._driver.can_suspend:

@@ -293,14 +293,14 @@ assistant's preset is `[roles.main]`); use `/thinking` for a session choice or
 | `extra_headers` | `{}` string-to-string map. |
 | `disabled` | `false`; valid on providers, models, and deployments. |
 | `[models."base"]` | Base-model definition; it must have at least one deployment. |
-| `thinking` | `"medium"`; `off`, `low`, `medium`, `high`, or `max`. |
+| `thinking` | `"medium"`; `off`, `low`, `medium`, `high`, `xhigh`, or `max`. |
 | `temperature` | Optional model-level key; when omitted, requests use the runtime default of `1.0`. |
 | `[[models."base".deployments]]` | Deployment definition. `provider` and `name` are required. |
 | `supports_images` | `false`. |
-| `supported_thinking_levels` | Unset, or a list of known thinking levels. |
+| `supported_thinking_levels` | Unset, or a list of the public levels (`off`, `low`, `medium`, `high`, `xhigh`, `max`). A level outside that vocabulary, or one the selected model cannot encode, is a typed configuration error; a requested level the list omits resolves to the nearest declared level and the substitution is reported. |
 | `auto_compact_threshold` | Unset, or a positive whole integer token threshold. Fractional values and `0` are rejected; unset uses the global fallback, which allows `0` to disable automatic compaction. |
 | `[models."base".deployments.prices]` | `input`, `output`, and `cached_input`: non-negative price per million tokens. Omit an unknown price; zero means explicitly free. |
-| `[roles."name"]` | Default preset: `model` is one canonical base-model name; `thinking` is one of `off`, `low`, `medium`, `high`, or `max`; `description` is optional. Old `models` lists are rejected. |
+| `[roles."name"]` | Default preset: `model` is one canonical base-model name; `thinking` is one of `off`, `low`, `medium`, `high`, `xhigh`, or `max`; `description` is optional. Old `models` lists are rejected. |
 
 The shipped role presets are `main` (the main assistant), `worker`, `scout`,
 and `heavy`. Roles are model/thinking presets used as launch targets; they

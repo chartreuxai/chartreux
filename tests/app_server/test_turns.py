@@ -22,12 +22,13 @@ from chartreux.app_server.events import (
 from chartreux.app_server.models import (
     AnsweredCallbackState,
     CancelledCallbackState,
+    OpenCallbackState,
     PublicRetryCategory,
     UserAnswer,
     UserInputCallbackOutput,
     UserQuestionResult,
 )
-from chartreux.app_server.protocol import HistoryEntryUpdatedParams
+from chartreux.app_server.protocol import CallbackResultError, HistoryEntryUpdatedParams
 from chartreux.app_server.transport import memory_transport_pair
 from chartreux.core.config import SessionLoggingConfig
 from chartreux.core.events import AssistantEvent, UserMessageEvent
@@ -540,6 +541,104 @@ async def test_close_never_overwrites_an_answered_callback() -> None:
         # answered record keeps exactly one terminal result.
         assert observed == []
         assert record.future.result() == answer
+    finally:
+        await _drain(events)
+        await session.close()
+        await agent_loop.aclose()
+
+
+@pytest.mark.asyncio
+async def test_answer_records_the_settlement_before_publishing_the_terminal_patch() -> (
+    None
+):
+    """Server-authoritative settlement under the resolution lock (plan U).
+
+    The record carries the terminal disposition while the answered patch goes
+    out, and the core waiter resolves only afterwards. A concurrent expiry,
+    cancellation, or reconnect therefore observes a settled callback, never a
+    ghost open one.
+    """
+    session, turns, agent_loop = await _open_question_session()
+    events = session.act("read todos")
+    try:
+        requested = await _next_event(events, CallbackRequested)
+        callback_id = requested.callback.callback_id
+        record = turns._callbacks[callback_id]
+        observed, future_states = _record_callback_patches(turns, callback_id, record)
+        answer = _question_answer()
+
+        assert await turns.answer_callback(callback_id, answer) == "accepted"
+
+        assert len(observed) == 1
+        terminal_before_publish, state = observed[0]
+        assert terminal_before_publish is True
+        assert isinstance(state, AnsweredCallbackState)
+        assert future_states == ["pending"]
+        assert record.future.result() == answer
+        assert record.core_resolved is True
+    finally:
+        await _drain(events)
+        await session.close()
+        await agent_loop.aclose()
+
+
+@pytest.mark.asyncio
+async def test_reject_callback_publishes_the_terminal_entry_before_settling() -> None:
+    """A rejected delivery is a server settlement with a visible terminal state."""
+    session, turns, agent_loop = await _open_question_session()
+    events = session.act("read todos")
+    try:
+        requested = await _next_event(events, CallbackRequested)
+        callback_id = requested.callback.callback_id
+        record = turns._callbacks[callback_id]
+        observed, future_states = _record_callback_patches(turns, callback_id, record)
+
+        status = await turns.reject_callback(
+            callback_id, CallbackResultError(message="client refused")
+        )
+
+        assert status == "accepted"
+        assert len(observed) == 1
+        terminal_before_publish, state = observed[0]
+        assert terminal_before_publish is True
+        assert isinstance(state, CancelledCallbackState)
+        assert state.reason == "client refused"
+        assert future_states == ["pending"]
+        assert isinstance(record.future.exception(), CallbackRejectedError)
+        assert record.core_resolved is True
+        entry = next(
+            item for item in turns.callbacks if item.callback_id == callback_id
+        )
+        assert isinstance(entry.state, CancelledCallbackState)
+    finally:
+        await _drain(events)
+        await session.close()
+        await agent_loop.aclose()
+
+
+@pytest.mark.asyncio
+async def test_answer_and_cancellation_race_publishes_one_terminal_state() -> None:
+    """Answer/expiry/cancel arbitration has exactly one winner and no ghost."""
+    session, turns, agent_loop = await _open_question_session()
+    events = session.act("read todos")
+    try:
+        requested = await _next_event(events, CallbackRequested)
+        callback_id = requested.callback.callback_id
+        record = turns._callbacks[callback_id]
+        observed, _ = _record_callback_patches(turns, callback_id, record)
+
+        await asyncio.gather(
+            turns.answer_callback(callback_id, _question_answer()),
+            turns._cancel_callbacks("Turn ended"),
+            return_exceptions=True,
+        )
+
+        entry = next(
+            item for item in turns.callbacks if item.callback_id == callback_id
+        )
+        assert not isinstance(entry.state, OpenCallbackState)
+        assert len(observed) == 1
+        assert record.core_resolved is True
     finally:
         await _drain(events)
         await session.close()

@@ -356,7 +356,6 @@ class _AgentLoopBlueprint:
             inherited_workspace=self.policy.inherited_workspace,
             inherited_restrictions=self.policy.inherited_restrictions,
             inherited_mode_restrictions=self.policy.inherited_mode_restrictions,
-            inherited_plan_write_scopes=self.policy.inherited_plan_write_scopes,
             inherited_root_grants=self.policy.inherited_root_grants,
             parent_authority_getter=self.policy.parent_authority_getter,
             parent_authority_revision_getter=self.policy.parent_authority_revision_getter,

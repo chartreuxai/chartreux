@@ -149,7 +149,7 @@ async def test_generic_error_header_uses_ran_fallback() -> None:
 
 
 @pytest.mark.asyncio
-async def test_non_collapsible_error_updates_visible_call_display() -> None:
+async def test_failed_edit_folds_into_muted_header_and_escalates() -> None:
     file_path = "/workspace/example.py"
     call = ToolCallEvent(
         tool_name="edit",
@@ -167,13 +167,28 @@ async def test_non_collapsible_error_updates_visible_call_display() -> None:
     async with app.run_test() as pilot:
         await pilot.pause()
         call_widget = app.call_widget
-        assert call_widget is not None
+        result_widget = app.result_widget
+        assert call_widget is not None and result_widget is not None
 
-        assert call_widget.display
-        assert call_widget._verb_widget is not None
-        assert call_widget._text_widget is not None
-        assert _rendered(call_widget._verb_widget).plain == "Edited"
-        assert _rendered(call_widget._text_widget).plain == file_path
+        # Edit results fold (E2): the section header carries the settled call
+        # display and the call row is hidden.
+        assert result_widget._is_collapsible
+        assert call_widget.display is False
+        verb = result_widget.query_one(".collapsible-header-verb", NoMarkupStatic)
+        message = result_widget.query_one(".status-indicator-text", NoMarkupStatic)
+        assert _rendered(verb).plain == "Edited"
+        assert _rendered(message).plain == f"Failed: {file_path}"
+
+        # The verdict is still unknown, so the arrow stays muted; escalation
+        # recolours it once no recovery follows.
+        triangle = result_widget.query_one(CollapsibleSection)._triangle
+        assert not triangle.has_class("success")
+        assert not triangle.has_class("error")
+
+        result_widget.escalate_error()
+        await pilot.pause()
+
+        assert triangle.has_class("error")
 
 
 @pytest.mark.asyncio

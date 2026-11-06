@@ -15,25 +15,44 @@ or unreadable — the scanner's ``scan-incomplete`` sentinel). The result
 carries a redacted block message instead of the agent's response — the agent
 is told the artifact failed the scan, never what matched (no rule id, no
 matched line, no secret value; :class:`SecretFinding` carries no matched
-value by construction). The invocation is harness-side and automatic; there
-is deliberately no tool registration or other model-visible surface for this
-module.
+value by construction).
+
+Scope policy (S4): the touched paths are partitioned by path class before the
+scan runs. Repository content — the case the block policy above governs — is
+scanned unchanged and fail-closed, with vendored and cache directories pruned
+from its walks. Runtime-owned transient content, classified by
+:func:`classify_scan_path`, is skipped with a single bounded harness log
+notice (:func:`transient_skip_notice`): it is never a finding, never a block,
+and never model-visible. The pre-commit hook is unaffected and still scans
+every staged blob, so no secret reaches a commit unexamined.
+
+The invocation is harness-side and automatic; there is deliberately no tool
+registration or other model-visible surface for this module.
 """
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Iterable, Sequence
+from pathlib import Path
+import tempfile
+from typing import Literal
 
 from chartreux.core.events import ToolResultEvent
 from chartreux.core.tools.secret_scan import SCAN_INCOMPLETE_RULE_ID, SecretFinding
+from chartreux.core.tools.utils import resolve_tool_path
 from chartreux.utils.tool_presentation import ToolEffectKind
 
 __all__ = [
     "BLOCK_MESSAGE_MAX_PATHS",
+    "PRUNED_NAMES",
+    "TRANSIENT_NOTICE_MAX_PATHS",
     "UNKNOWN_WRITE_FOOTPRINT",
+    "ScanPathClass",
     "bash_write_paths_from_result_event",
     "blocked_submission_response",
+    "classify_scan_path",
     "touched_path_from_result_event",
+    "transient_skip_notice",
 ]
 
 #: Effect kinds whose successful results created or edited a file.
@@ -54,6 +73,154 @@ BLOCK_MESSAGE_MAX_PATHS = 8
 #: not be established. The scan cannot cover an unknown footprint, so the
 #: submission gate blocks on it exactly like a scan-incomplete artifact.
 UNKNOWN_WRITE_FOOTPRINT = "<shell command with an unestablished write surface>"
+
+#: Directory names the submission scan's walks never descend into: version
+#: control metadata, virtualenvs, and tool caches hold no session-authored
+#: repository content, and walking them costs the scan its bounded budget (a
+#: single packfile can exceed the per-file cap, a virtualenv is mostly
+#: binaries). Pruning applies during walks only — a top-level touched path is
+#: never pruned by name, though it is excluded when it resolves under an
+#: excluded root. The pre-commit hook scans staged blobs and is unaffected by
+#: this list, so nothing reaches a commit unexamined.
+PRUNED_NAMES: frozenset[str] = frozenset({
+    ".git",
+    ".hg",
+    ".svn",
+    ".venv",
+    "venv",
+    "__pycache__",
+    ".pytest_cache",
+    ".ruff_cache",
+    ".mypy_cache",
+    ".tox",
+    "node_modules",
+    "dist",
+    "site",
+})
+
+#: Cap on the transient paths named in the skip notice's single log line.
+TRANSIENT_NOTICE_MAX_PATHS = 8
+
+#: The submission scan's two path classes: repository content stays in the
+#: scan (``"repo"``), runtime-owned transient content is skipped with a
+#: notice (``"transient"``).
+ScanPathClass = Literal["repo", "transient"]
+
+
+def classify_scan_path(
+    path: str | Path,
+    scratchpad_roots: Iterable[str | Path] = (),
+    authorized_roots: Iterable[str | Path] = (),
+    *,
+    cwd: str | Path | None = None,
+) -> ScanPathClass:
+    """Classify one touched path for the submission scan's scope (S4).
+
+    ``"transient"`` marks a path the submission scan deliberately leaves
+    alone: content under a runtime-owned scratchpad root (the roots the
+    parent and the child both write), or under the operating system's
+    temporary directory while outside every authorized workspace root.
+    Everything else classifies ``"repo"`` and stays in the scan.
+
+    The path is RESOLVED first, with the same resolver the file tools use, so
+    a scratchpad symlink pointing into a repository resolves into the
+    repository and classifies ``"repo"``: only content that is really
+    transient is skipped. The tempdir branch is the fallback for paths no
+    runtime owns, and the authorized-root precedence guard applies inside it:
+    a session workspace rooted under the tempdir keeps its own subtree in the
+    scan (that subtree is repository content for that session), while its
+    siblings are transient.
+
+    The tempdir branch is armed only under an ESTABLISHED workspace context.
+    With no authorized root to compare against, a path under the tempdir
+    cannot be proved outside the session's authorized roots, so it classifies
+    ``"repo"`` (see :func:`_tempdir_classification`). Any classification
+    failure — a non-path value, an unresolvable root, an OS error — also
+    classifies ``"repo"``: the skip is fail-closed, never fail-open.
+    """
+    try:
+        if isinstance(path, Path):
+            raw = str(path)
+        elif isinstance(path, str):
+            raw = path
+        else:
+            return "repo"
+        base = Path(cwd) if isinstance(cwd, (str, Path)) and str(cwd) else Path.cwd()
+        resolved = resolve_tool_path(raw, base)
+        for scratch_root in _resolved_roots(scratchpad_roots):
+            if resolved.is_relative_to(scratch_root):
+                return "transient"
+        return _tempdir_classification(resolved, authorized_roots)
+    except (OSError, RuntimeError, ValueError):
+        return "repo"
+
+
+def transient_skip_notice(paths: Sequence[str], total: int) -> str:
+    """The bounded one-line notice naming the paths the scan skipped (S4).
+
+    The gate logs this at INFO: the paths and their class are harness
+    diagnostic detail, never a finding, never model-visible, and the list is
+    capped so one submission cannot emit an unbounded line.
+    """
+    named = list(paths[:TRANSIENT_NOTICE_MAX_PATHS])
+    listing = "; ".join(f"{path} [transient]" for path in named)
+    hidden = len(paths) - len(named)
+    if hidden > 0:
+        listing += f"; ... {hidden} more"
+    return (
+        f"{len(paths)} of {total} touched path(s) skipped by the secret scan "
+        f"as transient non-repo content: {listing}"
+    )
+
+
+def _resolved_roots(roots: Iterable[str | Path]) -> tuple[Path, ...]:
+    """The resolvable roots in *roots*, in the order given.
+
+    A single root value (not a collection of roots) reads as no roots, and a
+    root that cannot be resolved is skipped: both readings leave the path
+    unclassified, which the caller resolves toward the scan.
+    """
+    if isinstance(roots, (str, Path)):
+        return ()
+    resolved: list[Path] = []
+    for root in roots:
+        if not isinstance(root, (str, Path)) or not str(root):
+            continue
+        try:
+            resolved.append(Path(root).expanduser().resolve())
+        except (OSError, RuntimeError):
+            continue
+    return tuple(resolved)
+
+
+def _system_temp_directory() -> Path | None:
+    """The resolved OS tempdir, or ``None`` when it cannot be established."""
+    try:
+        return Path(tempfile.gettempdir()).resolve()
+    except (OSError, RuntimeError):
+        return None
+
+
+def _tempdir_classification(
+    resolved: Path, authorized_roots: Iterable[str | Path]
+) -> ScanPathClass:
+    """The tempdir branch of :func:`classify_scan_path` for a resolved path.
+
+    A path outside the OS tempdir is repo. Inside it, the branch needs an
+    established workspace context to compare against: an authorized root's
+    own subtree is repo (the precedence guard), anything else under the
+    tempdir is transient, and with no authorized root established the path
+    stays in the scan.
+    """
+    temp_root = _system_temp_directory()
+    if temp_root is None or not resolved.is_relative_to(temp_root):
+        return "repo"
+    authorized = _resolved_roots(authorized_roots)
+    if not authorized:
+        return "repo"
+    if any(resolved.is_relative_to(root) for root in authorized):
+        return "repo"
+    return "transient"
 
 
 def touched_path_from_result_event(event: ToolResultEvent) -> str | None:

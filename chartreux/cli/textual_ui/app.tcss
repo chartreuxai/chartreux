@@ -534,35 +534,6 @@ Markdown {
     width: 100%;
 }
 
-.plan-file-message {
-    margin-top: 1;
-    margin-bottom: 0;
-    height: auto;
-    width: 100%;
-
-    .plan-file-wrapper {
-        height: auto;
-        width: 100%;
-        border: solid $foreground-muted;
-        padding: 0 1;
-    }
-
-    Markdown {
-        width: 100%;
-        height: auto;
-        padding: 0;
-        margin: 0;
-
-        & > MarkdownBlock:first-child {
-            margin: 0 0 1 0;
-        }
-
-        & > MarkdownBlock:last-child {
-            margin: 1 0 0 0;
-        }
-    }
-}
-
 .interrupt-container,
 .error-container,
 .warning-container,

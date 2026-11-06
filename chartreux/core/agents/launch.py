@@ -16,7 +16,12 @@ from chartreux.core.config.models import ModelConfig, ThinkingLevel
 from chartreux.core.config.orchestrator import ConfigOrchestrator
 from chartreux.core.dispatch.route_models import ReplacementCapability
 from chartreux.core.llm.backend.anthropic import REASONING_BLOCK_TYPES
-from chartreux.core.llm.thinking_levels import get_thinking_levels
+from chartreux.core.llm.thinking_levels import (
+    ThinkingResolution,
+    get_thinking_levels,
+    note_thinking_fallback,
+    resolve_thinking_level,
+)
 from chartreux.core.llm_models import LLMMessage
 from chartreux.core.recovery_models import PackageTier, canonical_endpoint_identity
 from chartreux.core.recovery_override import CooldownOverrideLedger, OverridePermit
@@ -177,13 +182,16 @@ def _resolved_model(
     )
 
 
-def _validate_thinking(
-    config: ChartreuxConfigSchema,
-    model: ModelConfig,
-    thinking: ThinkingLevel,
-    *,
-    explicit: bool,
-) -> None:
+def _resolve_thinking(
+    config: ChartreuxConfigSchema, model: ModelConfig, thinking: ThinkingLevel
+) -> ThinkingResolution:
+    """Resolve the launch's thinking level on the selected deployment.
+
+    A known level the deployment cannot encode falls back to the nearest
+    declared level and is reported once per (deployment, requested, effective).
+    Only an unknown level name, or a declaration its provider cannot encode,
+    stays a typed configuration error.
+    """
     try:
         provider = config.get_provider_for_model(model)
     except ValueError as exc:
@@ -199,28 +207,27 @@ def _validate_thinking(
                 "config.thinking",
                 "Declared thinking levels cannot be encoded by provider",
             )
-        if explicit:
-            raise InvalidLaunchThinkingError(
-                "config.thinking", "Selected provider cannot encode thinking settings"
-            )
-        return
-
+        # The provider cannot encode thinking at all, so "off" is the only
+        # level that exists — the nearest one for any other request.
+        resolution = ThinkingResolution(thinking, "off", None)
+        note_thinking_fallback(f"{model.provider}/{model.name}", resolution)
+        return resolution
     if declared is not None and any(level not in levels for level in declared):
         raise InvalidLaunchThinkingError(
             "config.thinking",
             "Declared thinking level is unsupported by the selected model",
         )
-    if thinking not in levels:
-        message = (
-            "Selected model cannot disable thinking"
-            if thinking == "off"
-            else "Configured thinking level is unsupported by the selected model"
-        )
-        raise InvalidLaunchThinkingError("config.thinking", message)
-    if explicit and declared is not None and thinking not in declared:
-        raise InvalidLaunchThinkingError(
-            "config.thinking", "Thinking level is unsupported by the selected model"
-        )
+    available = (
+        levels
+        if declared is None
+        else {level: levels[level] for level in declared if level in levels}
+    )
+    try:
+        resolution = resolve_thinking_level(available, thinking)
+    except InvalidLaunchThinkingError as exc:
+        raise InvalidLaunchThinkingError("config.thinking", str(exc)) from exc
+    note_thinking_fallback(f"{model.provider}/{model.name}", resolution)
+    return resolution
 
 
 def _history_has_anthropic_thinking(history: Sequence[LLMMessage]) -> bool:
@@ -491,7 +498,6 @@ def resolve_launch(  # noqa: PLR0913, PLR0914, PLR0915
     selected_alias = staged_config.active_model
     if not selected_alias:
         selected_alias = "@main"
-    explicit_thinking = "thinking" in semantic.model_fields_set
 
     def assignment_candidate(candidate: Any) -> bool:
         from chartreux.core.model_catalog.availability import (
@@ -528,7 +534,6 @@ def resolve_launch(  # noqa: PLR0913, PLR0914, PLR0915
                 model=candidate_model,
                 history=history,
                 thinking=candidate_thinking,
-                thinking_explicit=explicit_thinking,
             )
             is None
         )
@@ -552,12 +557,7 @@ def resolve_launch(  # noqa: PLR0913, PLR0914, PLR0915
         staged_config = orchestrator.config
     thinking = model.thinking
     assert thinking is not None
-    _validate_thinking(
-        staged_config,
-        model,
-        thinking,
-        explicit=explicit_thinking or resolved_identity.thinking is not None,
-    )
+    _resolve_thinking(staged_config, model, thinking)
     _validate_history(staged_config, model, history)
 
     known_tools = frozenset(tool_inventory)

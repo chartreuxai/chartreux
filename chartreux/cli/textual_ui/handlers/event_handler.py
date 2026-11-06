@@ -1,9 +1,8 @@
 from __future__ import annotations
 
-from collections.abc import Awaitable, Callable
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime
-from pathlib import Path
 from typing import TYPE_CHECKING
 from weakref import WeakValueDictionary
 
@@ -19,14 +18,11 @@ from chartreux.app_server.events import (
 from chartreux.app_server.models import (
     CancelledEffectState,
     CompletedEffectState,
-    ContextClearedNoticeDetail,
     FailedEffectState,
     HookNoticeDetail,
     HookScope,
     HookSeverity,
     JsonPatchOperation,
-    PlanReviewEndedNoticeDetail,
-    PlanReviewStartedNoticeDetail,
     PublicCallbackEntry,
     PublicCheckpointEntry,
     PublicEffectEntry,
@@ -53,7 +49,6 @@ from chartreux.cli.textual_ui.widgets.messages import (
     ErrorMessage,
     HookRunContainer,
     HookSystemMessageLine,
-    PlanFileMessage,
     ReasoningMessage,
     SlashCommandMessage,
     UserCommandMessage,
@@ -82,12 +77,11 @@ class _RetryPresentation:
 
 
 class EventHandler:
-    def __init__(  # noqa: PLR0913
+    def __init__(
         self,
         mount_callback: Callable,
         get_tools_collapsed: Callable[[], bool],
         get_show_thinking: Callable[[], bool] | None = None,
-        on_context_cleared: Callable[[Path | None], Awaitable[None]] | None = None,
         on_session_title_changed: Callable[[str], None] | None = None,
         entry_expansion_state: EntryExpansionState | None = None,
         group_expansion_state: ToolGroupExpansionState | None = None,
@@ -109,7 +103,6 @@ class EventHandler:
         self.get_show_thinking = get_show_thinking or (lambda: True)
         self.get_show_message_timestamps = get_show_message_timestamps or (lambda: True)
         self.on_user_message = on_user_message or (lambda _entry: None)
-        self.on_context_cleared = on_context_cleared
         self.on_session_title_changed = on_session_title_changed
         self.tool_calls: dict[str, ToolCallMessage] = {}
         self.current_compact: CompactMessage | None = None
@@ -118,7 +111,6 @@ class EventHandler:
         self.current_streaming_reasoning: ReasoningMessage | None = None
         self.current_tool_group: ToolGroup | None = None
         self._finalized_tool_group: ToolGroup | None = None
-        self.plan_file_message: PlanFileMessage | None = None
         self._hook_containers: dict[str, HookRunContainer] = {}
         self._tool_call_anchors: dict[str, Widget] = {}
         self._tool_group_call_positions: dict[str, tuple[ToolGroup, int]] = {}
@@ -473,15 +465,6 @@ class EventHandler:
         match entry.detail:
             case HookNoticeDetail() as detail:
                 await self._handle_hook_notice(detail, loading_widget)
-            case ContextClearedNoticeDetail(plan_file_path=plan_file_path):
-                await self.finalize_streaming()
-                if self.on_context_cleared is not None:
-                    path = Path(plan_file_path) if plan_file_path is not None else None
-                    await self.on_context_cleared(path)
-            case PlanReviewStartedNoticeDetail(file_path=file_path):
-                await self._handle_start_plan_review(Path(file_path))
-            case PlanReviewEndedNoticeDetail():
-                self._handle_stop_plan_review()
             case WaitingForInputNoticeDetail():
                 await self.finalize_streaming()
             case ScheduledLoopFiredNoticeDetail():
@@ -670,7 +653,6 @@ class EventHandler:
             self._turn_assistant_message,
             self.current_streaming_reasoning,
             self.current_tool_group,
-            self.plan_file_message,
         ):
             if widget is not None:
                 retained.add(widget)
@@ -702,18 +684,6 @@ class EventHandler:
         if self.current_compact:
             self.current_compact.stop_spinning(success=False)
             self.current_compact = None
-
-    async def _handle_start_plan_review(self, file_path: Path) -> None:
-        file_path.touch()
-        message = PlanFileMessage(file_path=file_path)
-        self.plan_file_message = message
-        await self.mount_callback(message)
-
-    def _handle_stop_plan_review(self) -> None:
-        if self.plan_file_message is None:
-            return
-        self.plan_file_message.stop_watching()
-        self.plan_file_message = None
 
 
 def _appended_text(patch: list[JsonPatchOperation], path: str) -> str:

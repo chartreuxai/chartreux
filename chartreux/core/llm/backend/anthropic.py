@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 import json
 import re
 from typing import Any, ClassVar
@@ -16,6 +16,7 @@ from chartreux.core.llm.exceptions import BackendError, ModelCall
 from chartreux.core.llm.thinking_levels import (
     ANTHROPIC_THINKING_LEVELS,
     get_thinking_levels,
+    resolve_enabled_thinking_level,
 )
 from chartreux.core.llm_models import (
     AvailableTool,
@@ -323,22 +324,32 @@ class AnthropicAdapter(APIAdapter):
         messages: list[dict[str, Any]],
         max_tokens: int | None,
         thinking: str,
+        thinking_levels: Mapping[str, str | None] | None = None,
     ) -> None:
         has_thinking = self._has_thinking_content(messages)
-        thinking_level = thinking
 
-        if thinking_level == "off" and not has_thinking:
+        if thinking == "off" and not has_thinking:
             payload["max_tokens"] = (
                 max_tokens if max_tokens is not None else self.DEFAULT_MAX_TOKENS
             )
             return
 
-        # Resolve effective level: use config, or fallback to "medium" when
-        # forced by thinking content in history
-        effective_level = thinking_level if thinking_level != "off" else "medium"
-
-        levels = get_thinking_levels("generic", "anthropic", model_name)
+        levels = (
+            thinking_levels
+            if thinking_levels is not None
+            else get_thinking_levels("generic", "anthropic", model_name)
+        )
         assert levels is not None
+        # Retained thinking forces the request on. A level that disables it, or
+        # one this deployment does not declare, resolves among enabled declared
+        # levels so the wire effort is always one the model can encode.
+        effective_level = thinking
+        if effective_level == "off":
+            effective_level = resolve_enabled_thinking_level(levels).effective
+        elif effective_level not in levels or levels[effective_level] is None:
+            effective_level = resolve_enabled_thinking_level(
+                levels, effective_level
+            ).effective
         wire_level = get_thinking_wire_value(levels, effective_level)
         assert wire_level is not None
         payload["thinking"] = {"type": "adaptive", "display": "summarized"}
@@ -358,6 +369,7 @@ class AnthropicAdapter(APIAdapter):
         tool_choice: dict[str, Any] | None,
         stream: bool,
         thinking: str,
+        thinking_levels: Mapping[str, str | None] | None = None,
     ) -> dict[str, Any]:
         payload: dict[str, Any] = {"model": model_name, "messages": messages}
 
@@ -367,6 +379,7 @@ class AnthropicAdapter(APIAdapter):
             messages=messages,
             max_tokens=max_tokens,
             thinking=thinking,
+            thinking_levels=thinking_levels,
         )
 
         if system_blocks := self._build_system_blocks(system_prompt):
@@ -385,7 +398,7 @@ class AnthropicAdapter(APIAdapter):
 
         return payload
 
-    def prepare_request(
+    def prepare_request(  # noqa: PLR0913
         self,
         *,
         model_name: str,
@@ -398,6 +411,7 @@ class AnthropicAdapter(APIAdapter):
         provider: ProviderConfig,
         api_key: str | None = None,
         thinking: str = "off",
+        thinking_levels: Mapping[str, str | None] | None = None,
     ) -> PreparedRequest:
         system_prompt, converted_messages = self._mapper.prepare_messages(messages)
         converted_tools = self._mapper.prepare_tools(tools)
@@ -412,6 +426,7 @@ class AnthropicAdapter(APIAdapter):
             tool_choice=converted_tool_choice,
             stream=enable_streaming,
             thinking=thinking,
+            thinking_levels=thinking_levels,
         )
 
         headers = {

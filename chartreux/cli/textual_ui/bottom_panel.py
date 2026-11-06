@@ -255,9 +255,12 @@ class BottomPanelController:
 
         from chartreux.cli.textual_ui.app import _get_thinking_picker_app_class
 
+        # The picker offers exactly the levels this deployment declares; the
+        # full vocabulary is the fallback when the projection carried none.
+        levels = tuple(self._app.config.active_model.thinking_levels)
         await self._app._switch_from_input(
             _get_thinking_picker_app_class()(
-                thinking_levels=THINKING_LEVELS,
+                thinking_levels=levels or THINKING_LEVELS,
                 current_thinking=self._app.config.active_model.thinking,
                 effective=self._app.config.effective_thinking,
             )

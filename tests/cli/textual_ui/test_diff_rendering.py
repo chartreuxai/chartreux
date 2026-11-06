@@ -12,10 +12,12 @@ from textual.selection import Selection
 
 from chartreux.cli.textual_ui.widgets.diff_rendering import (
     DiffOccurrence,
+    DiffStats,
     DiffView,
     _build_diff_body,
     _build_diff_gutter,
     _DiffLine,
+    count_diff_rows,
     diff_border_colors,
     language_for_path,
     render_edit_diff,
@@ -269,6 +271,33 @@ class TestBorderColors:
         lines = _render("x = 100", "x = 200", "py", 1, ansi=False)
         view = DiffView(lines, ansi=False, dark=True)
         assert view.border_row_colors == diff_border_colors(lines)
+
+
+class TestDiffStats:
+    def test_counts_match_rendered_rows(self) -> None:
+        occurrences = [DiffOccurrence(2, "x = 100", "x = 200")]
+        lines = render_edit_diff(occurrences, "py", ansi=False, dark=True)
+        added = sum(line.css_class == "diff-added" for line in lines)
+        removed = sum(line.css_class == "diff-removed" for line in lines)
+        assert count_diff_rows(occurrences) == DiffStats(added, removed)
+        assert (added, removed) == (1, 1)
+
+    def test_context_rows_are_not_counted(self) -> None:
+        occurrences = [DiffOccurrence(1, "a\nb\nc\nd\ne\nf", "a\nb\nX\nd\ne\nf")]
+        assert count_diff_rows(occurrences) == DiffStats(1, 1)
+
+    def test_every_occurrence_contributes_its_rows(self) -> None:
+        occurrences = [
+            DiffOccurrence(3, "foo", "bar"),
+            DiffOccurrence(10, "foo", "bar"),
+        ]
+        assert count_diff_rows(occurrences) == DiffStats(2, 2)
+
+    def test_unchanged_occurrence_counts_nothing(self) -> None:
+        assert count_diff_rows([DiffOccurrence(1, "same", "same")]) == DiffStats(0, 0)
+
+    def test_no_occurrences_count_nothing(self) -> None:
+        assert count_diff_rows([]) == DiffStats(0, 0)
 
 
 class TestDiffViewSelection:

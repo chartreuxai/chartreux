@@ -249,14 +249,20 @@ protocol is intentionally deprecated, not migrated.
 
 `supported_thinking_levels` in a catalog model narrows the selected deployment's
 encodable levels; omitting it does not disable thinking. A declaration inconsistent
-with its effective model entry or provider is rejected as a typed configuration error.
-Provider admission describes wire encodability, not a guarantee that an undeclared
-model accepts every admitted effort. GLM-5.2 maps both `low` and `medium` to `high`,
-so that escalation is a no-op. GLM-5.3 models require a non-`off` configured
-thinking default because they cannot disable thinking; `off` is rejected as a typed
-configuration error. Anthropic history can force requested `off` to effective
-`medium` even when a narrowing declaration excludes `medium`, because declarations
-constrain requested levels only.
+with its effective model entry or provider is rejected as a typed configuration error,
+and so is a level name outside the public vocabulary
+(`off`, `low`, `medium`, `high`, `xhigh`, `max`). A known level the deployment does
+not declare is not an error: admission resolves it to the declared level nearest by
+vocabulary position — a tie resolves upward, toward more thinking — and reports the
+substitution once per deployment, requested level, and effective level. Mistral
+Large 4 declares `low`/`medium`/`high` and always reasons, so `off` resolves to
+`low`. GLM-5.3 declares `low`/`high`/`max`, so `medium` resolves to `high` and
+`off` resolves to `low`. Retained Anthropic reasoning forces thinking on, but the
+forced level is resolved within the declared set: an `off` request resolves among
+the enabled declared levels (a deployment declaring only `off` and `max` sends
+`max`), an undeclared level resolves to the nearest enabled declared level, and a
+deployment that declares no enabled level raises the typed configuration error, so
+an undeclared effort is never sent on the wire.
 
 ### Tool Configuration
 
@@ -756,6 +762,18 @@ The evidence is per-run and bounded: the chronology caps at 128 entries, and evi
   commented template when absent and reloads configuration after editing if the
   file changed
 - `/clear`, `/new` - Start a new conversation. Optionally pass a prompt to seed it
+- `/plan`, `/plan accept`, `/plan cancel` - Plan first, then execute the accepted
+  plan in a fresh session. `/plan` switches this conversation to the configured
+  planner model (default: GLM high) with unchanged permissions and allocates a
+  `plan.md` in this project's task workspace; the planner writes it with a
+  `## Summary` section. `/plan accept` shows the plan path, the summary, and the
+  snapshotted executor selection (default: ML4 medium with the orchestrator
+  identity) in a consent modal; Start execution replaces this conversation with
+  an executor session seeded with the summary and the absolute plan path, while
+  Cancel or Escape stays in plan mode. `/plan cancel` exits plan mode and restores
+  the model and thinking selections that were active before `/plan`. `/clear`
+  while planning ends plan mode as well. Configure the selections in `[plan.planner]`
+  and `[plan.executor]`.
 - `/log` - Show path to current interaction log file
 - `/log-level` - Show the effective log-level chain (session, environment,
   configuration, effective).

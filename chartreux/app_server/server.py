@@ -128,6 +128,7 @@ _SESSION_ATTACHMENT_CANDIDATES = frozenset({
     "session/continue",
     "session/rewind",
     "session/history/clear",
+    "session/plan/handoff",
 })
 
 _SESSION_BACKEND_HOST_LIFECYCLE_METHODS = frozenset({

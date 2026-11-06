@@ -179,11 +179,9 @@ class ToolManager:  # noqa: PLR0904 - reviewed authority lookup joins the full m
         cwd: Path | None = None,
         harness_files: HarnessFilesManager | None = None,
         scratchpad_dir: Path | None = None,
-        plan_file_write_scope_getter: Callable[[], Path | None] | None = None,
         restriction_getter: Callable[[], tuple[SourceRestrictions, ...]] | None = None,
         inherited_restrictions: tuple[SourceRestrictions, ...] = (),
         inherited_workspace: Workspace | None = None,
-        inherited_plan_write_scopes: tuple[tuple[Path, Path | None], ...] = (),
         parent_authority_getter: Callable[[], ToolManager] | None = None,
         parent_authority_revision_getter: Callable[[], int] | None = None,
         accepted_token_getter: Callable[[], object] | None = None,
@@ -204,7 +202,6 @@ class ToolManager:  # noqa: PLR0904 - reviewed authority lookup joins the full m
         self._cwd = (cwd or Path.cwd()).resolve()
         self._harness_files = harness_files or get_harness_files_manager()
         self._scratchpad_dir = scratchpad_dir
-        self._plan_file_write_scope_getter = plan_file_write_scope_getter
         self._session_root_grants = session_root_grants
         # Runtime-owned dangerous-command grants (session/once lifetimes); the
         # runtime approval lifecycle implements this port.
@@ -216,7 +213,6 @@ class ToolManager:  # noqa: PLR0904 - reviewed authority lookup joins the full m
         self._restriction_getter = restriction_getter
         self._inherited_workspace = inherited_workspace
         self._inherited_restrictions = tuple(inherited_restrictions)
-        self._inherited_plan_write_scopes = tuple(inherited_plan_write_scopes)
         # Parent authority is resolved live so a child never retains a superseded
         # manager after the parent refreshes or tightens policy.
         self._parent_authority_getter = parent_authority_getter
@@ -1049,17 +1045,6 @@ class ToolManager:  # noqa: PLR0904 - reviewed authority lookup joins the full m
             self._scratchpad_dir,
             self.scratchpad_roots,
             self.instruction_read_files,
-            plan_file_write_scope=(
-                self._plan_file_write_scope_getter()
-                if tool_name in {"write_file", "edit"}
-                and self._plan_file_write_scope_getter is not None
-                else None
-            ),
-            inherited_plan_write_scopes=(
-                self._inherited_plan_write_scopes
-                if tool_name in {"write_file", "edit"}
-                else ()
-            ),
         )
 
     def _delegated_path_authority(
@@ -1094,17 +1079,6 @@ class ToolManager:  # noqa: PLR0904 - reviewed authority lookup joins the full m
             self._scratchpad_dir,
             self.scratchpad_roots,
             self.instruction_read_files,
-            plan_file_write_scope=(
-                self._plan_file_write_scope_getter()
-                if tool_name in {"write_file", "edit"}
-                and self._plan_file_write_scope_getter is not None
-                else None
-            ),
-            inherited_plan_write_scopes=(
-                self._inherited_plan_write_scopes
-                if tool_name in {"write_file", "edit"}
-                else ()
-            ),
         )
 
     def snapshot_path_authority(
@@ -2195,9 +2169,6 @@ class ToolManager:  # noqa: PLR0904 - reviewed authority lookup joins the full m
         runtime_config_setter = getattr(instance, "_set_runtime_config_getter", None)
         if runtime_config_setter is not None:
             runtime_config_setter(self._config_getter)
-        if self._plan_file_write_scope_getter is not None:
-            instance.plan_file_write_scope_getter = self._plan_file_write_scope_getter
-        instance.inherited_plan_write_scopes = self._inherited_plan_write_scopes
         if delegated:
             is_current = lambda: self._delegated_tool_authority_is_current(
                 tool_name, tool_class, selected_class

@@ -41,7 +41,17 @@ from chartreux.app_server._runtime import (
     RuntimeSessionNotFoundError,
     close_agent_loop,
 )
-from chartreux.app_server._session_model import clear_session_active_model_override
+from chartreux.app_server._session_model import (
+    clear_session_active_model_override,
+    clear_session_agent_identity_override,
+    override_active_model,
+    override_agent_identity,
+    override_thinking_level,
+    remove_session_thinking_override,
+    set_session_active_model_override,
+    set_session_agent_identity_override,
+    set_session_thinking_override,
+)
 from chartreux.app_server._sessions import (
     SessionRuntime,
     SessionRuntimeRegistry,
@@ -126,6 +136,8 @@ from chartreux.app_server.protocol import (
     SessionHistoryListResponse,
     SessionLogReadParams,
     SessionLogReadResponse,
+    SessionPlanHandoffParams,
+    SessionPlanHandoffResponse,
     SessionReadParams,
     SessionReadResponse,
     SessionReadyReadParams,
@@ -172,6 +184,8 @@ from chartreux.app_server.protocol import (
 from chartreux.core.agent_loop import AgentLoop, AgentLoopStateError
 from chartreux.core.compaction import CompactionFailedError
 from chartreux.core.compaction.manager import CompactionSettlementError
+from chartreux.core.config.chartreux_schema import ChartreuxConfigSchema
+from chartreux.core.config.orchestrator import ConfigOrchestrator
 from chartreux.core.git.worktree import (
     TransferAttempt,
     abort_transfer,
@@ -655,6 +669,10 @@ class CoreRequestHandler:
             case "session/history/clear":
                 response, after_response = await self._history_clear(
                     validate_wire(SessionHistoryClearParams, raw_params)
+                )
+            case "session/plan/handoff":
+                response, after_response = await self._plan_handoff(
+                    validate_wire(SessionPlanHandoffParams, raw_params)
                 )
             case _:
                 raise method_not_found(method)
@@ -1473,6 +1491,206 @@ class CoreRequestHandler:
             after_response,
         )
 
+    async def _plan_handoff(
+        self, params: SessionPlanHandoffParams
+    ) -> tuple[SessionPlanHandoffResponse, Callable[[], None] | None]:
+        """Start the consented executor session for an accepted plan.
+
+        Admission mirrors the clear route: an active turn or a live background
+        job refuses the handoff with an actionable message, and the job check
+        is re-run inside the reserve, right before the reset retires jobs. The
+        consent snapshot in ``params`` is applied exactly — any patch failure
+        or a read-back that cannot match the displayed selection is reported
+        and execution is not started.
+        """
+        self._require_session(params.session_id)
+        if self._turns.active_turn is not None:
+            raise RequestFailure(
+                ProtocolErrorCode.CONFLICT,
+                "Cannot start plan execution while a turn is active; "
+                "finish or stop the work first",
+            )
+        with self._execution.reserve(
+            SessionExecutionKind.LIFECYCLE, f"plan/handoff:{params.session_id}"
+        ):
+            # Re-checked at handoff: the reset below retires background jobs.
+            try:
+                self._agent_loop.require_background_jobs_idle()
+            except AgentLoopStateError as exc:
+                raise RequestFailure(
+                    ProtocolErrorCode.CONFLICT,
+                    f"Cannot start plan execution while background work is "
+                    f"active: {exc}. Finish or stop the work first.",
+                ) from exc
+            orchestrator = self._agent_loop.config_orchestrator
+            # The executor identity rides as a session-scoped override written
+            # BEFORE the fresh root bind, so the reset binds it; the bound
+            # bundle freezes it and the pin is removed again after the bind.
+            identity_failures = await set_session_agent_identity_override(
+                orchestrator,
+                params.executor_identity,
+                reason="plan handoff executor identity",
+            )
+            if identity_failures:
+                raise RequestFailure(
+                    ProtocolErrorCode.INTERNAL_ERROR,
+                    f"Failed to install plan executor identity: {identity_failures[0]}",
+                )
+            previous_history = self._turns.history
+            session_model_pinned = (
+                self._agent_loop.session_logger.active_model is not None
+            )
+            try:
+                await self._agent_loop.clear_history()
+            except BaseException as exc:
+                # The reset failed after the identity write: best-effort
+                # removal of the leftover pin, reported honestly.
+                cleanup = await clear_session_agent_identity_override(
+                    orchestrator, reason="plan handoff reset failure cleanup"
+                )
+                if not isinstance(exc, Exception):
+                    raise
+                detail = (
+                    "leftover identity pin removed"
+                    if not cleanup
+                    else f"leftover identity pin could not be removed: {cleanup[0]}"
+                )
+                raise RequestFailure(
+                    ProtocolErrorCode.INTERNAL_ERROR,
+                    f"Plan handoff reset failed: {exc} ({detail})",
+                ) from exc
+            unpin_failures = await clear_session_agent_identity_override(
+                orchestrator, reason="plan handoff identity unpin after bind"
+            )
+            if unpin_failures:
+                raise RequestFailure(
+                    ProtocolErrorCode.INTERNAL_ERROR,
+                    f"Failed to remove plan executor identity pin: {unpin_failures[0]}",
+                )
+            if session_model_pinned:
+                failures = await clear_session_active_model_override(
+                    orchestrator, reason="plan handoff active model unpin"
+                )
+                if failures:
+                    raise RequestFailure(
+                        ProtocolErrorCode.INTERNAL_ERROR,
+                        f"Failed to clear session active model: {failures[0]}",
+                    )
+            # Restore the planner-alias thinking key /plan wrote at entry
+            # BEFORE the executor install, so the executor install stays the
+            # final write on its own alias even when both share it.
+            restore_failures = await self._plan_handoff_restore_planner_key(
+                orchestrator, params
+            )
+            if restore_failures:
+                raise RequestFailure(
+                    ProtocolErrorCode.INTERNAL_ERROR,
+                    f"Failed to restore planner thinking key: {restore_failures[0]}",
+                )
+            # Executor install, pinned between the unpin above and the reload
+            # below so the reload refreshes the prompt with post-install
+            # values instead of reset-time config.
+            model_failures = await set_session_active_model_override(
+                orchestrator,
+                params.executor_model,
+                reason="plan handoff executor model",
+            )
+            thinking_failures = await set_session_thinking_override(
+                orchestrator,
+                params.executor_model,
+                params.executor_thinking,
+                reason="plan handoff executor thinking",
+            )
+            install_failures = [*model_failures, *thinking_failures]
+            if install_failures:
+                raise RequestFailure(
+                    ProtocolErrorCode.INTERNAL_ERROR,
+                    f"Failed to install plan executor selection: {install_failures[0]}",
+                )
+            # Apply-exactly-or-fail: read the installed session state back and
+            # compare with the consented snapshot before starting execution.
+            mismatch = self._plan_handoff_selection_mismatch(orchestrator, params)
+            if mismatch is not None:
+                raise RequestFailure(
+                    ProtocolErrorCode.CONFLICT,
+                    "Plan handoff could not apply the consented executor "
+                    "selection exactly; execution was not started",
+                    mismatch,
+                )
+            # Prompt refresh: reload_with_initial_messages is the only refresh
+            # hook, and the clear route reaches it solely inside its
+            # logger-gated pinned branch — so for the unpinned case this call
+            # is the named refresh step, and it runs after the executor
+            # install in both cases.
+            await self._agent_loop.reload_with_initial_messages()
+            after_response = await self._turns.reset()
+            handoff = self._root_session.replace_idle(
+                params.session_id,
+                current_history=previous_history,
+                checkpoint_kind="plan",
+                checkpoint_message="Plan execution started",
+                checkpoint_details=(
+                    {"planPath": params.plan_path} if params.plan_path else None
+                ),
+            )
+        return (
+            SessionPlanHandoffResponse(
+                state=handoff.state, session_log=handoff.session_log
+            ),
+            after_response,
+        )
+
+    async def _plan_handoff_restore_planner_key(
+        self,
+        orchestrator: ConfigOrchestrator[ChartreuxConfigSchema],
+        params: SessionPlanHandoffParams,
+    ) -> list[BaseException]:
+        """Restore the planner-alias thinking key to its pre-entry value.
+
+        Per-key only: a key absent pre-entry (``planner_thinking_value=None``)
+        is removed, never whole-map replaced.
+        """
+        if not params.planner_thinking_alias:
+            return []
+        if params.planner_thinking_value is None:
+            return await remove_session_thinking_override(
+                orchestrator,
+                params.planner_thinking_alias,
+                reason="plan handoff planner thinking key removal",
+            )
+        return await set_session_thinking_override(
+            orchestrator,
+            params.planner_thinking_alias,
+            params.planner_thinking_value,
+            reason="plan handoff planner thinking key restore",
+        )
+
+    def _plan_handoff_selection_mismatch(
+        self,
+        orchestrator: ConfigOrchestrator[ChartreuxConfigSchema],
+        params: SessionPlanHandoffParams,
+    ) -> dict[str, Any] | None:
+        """Read back the installed selection; None when it matches the consent.
+
+        The bound identity is included: the fresh bind froze the executor
+        identity, and the session-scoped identity pin must be gone again.
+        """
+        applied_model = override_active_model(orchestrator)
+        applied_thinking = override_thinking_level(orchestrator, params.executor_model)
+        bound_identity = self._agent_loop._bound_identity
+        if (
+            applied_model == params.executor_model
+            and applied_thinking == params.executor_thinking
+            and bound_identity == params.executor_identity
+            and override_agent_identity(orchestrator) is None
+        ):
+            return None
+        return {
+            "appliedModel": applied_model,
+            "appliedThinking": applied_thinking,
+            "boundIdentity": bound_identity,
+        }
+
     async def _compact(
         self, params: SessionCompactParams
     ) -> tuple[SessionCompactResponse, Callable[[], None] | None]:
@@ -1597,6 +1815,23 @@ class CoreRequestHandler:
                 checkpoint_message="Context compacted",
                 checkpoint_details={"summaryLength": len(summary)},
             )
+        except asyncio.CancelledError:
+            # The boundary is already live, so a cancelled hand-off still owes
+            # its settlement: the reset and the idle replacement publish the
+            # state a client reconciles with, and only then does the
+            # cancellation go on. It is never turned into a response.
+            if after_response is not None:
+                with suppress(Exception):
+                    after_response()
+            # A settlement fault of its own must not replace the cancellation.
+            with suppress(Exception):
+                await self._settle_published_compaction(
+                    params,
+                    previous_history,
+                    summary_length=len(summary),
+                    reset_settled=reset_settled,
+                )
+            raise
         except Exception as exc:
             if after_response is not None:
                 # The typed error carries no deferred callback, so the queue
@@ -1613,21 +1848,19 @@ class CoreRequestHandler:
             ) from exc
         return handoff, after_response
 
-    async def _published_compaction_failure(
+    async def _settle_published_compaction(
         self,
         params: SessionCompactParams,
         previous_history: list[PublicHistoryEntry],
-        cause: CompactionSettlementError | None,
         *,
         summary_length: int | None = None,
         reset_settled: bool = False,
-    ) -> RequestFailure:
-        """Settle what a published-but-unsettled manual compaction still owes.
+    ) -> dict[str, Any]:
+        """Publish the state a live compaction boundary still owes a client.
 
-        The boundary is already live, so the reset and the idle replacement run
-        regardless of the failure: they publish the state a client needs to
-        reconcile. The failure is typed as persistence rather than compaction
-        so a client does not retry a summarization that already happened.
+        The boundary is in the live message list, so the reset and the idle
+        replacement run whatever interrupted the hand-off. Failures are logged,
+        not raised: the caller already owns the error it is reporting.
         """
         if not reset_settled:
             try:
@@ -1651,8 +1884,6 @@ class CoreRequestHandler:
                             "Published compaction could not run the deferred reset",
                             exc_info=exc,
                         )
-        if summary_length is None and cause is not None:
-            summary_length = cause.summary_length
         data: dict[str, Any] = {"reason": "persistence"}
         try:
             handoff = self._root_session.replace_idle(
@@ -1674,6 +1905,32 @@ class CoreRequestHandler:
             )
         else:
             data["state"] = handoff.state.model_dump(mode="json", by_alias=True)
+        return data
+
+    async def _published_compaction_failure(
+        self,
+        params: SessionCompactParams,
+        previous_history: list[PublicHistoryEntry],
+        cause: CompactionSettlementError | None,
+        *,
+        summary_length: int | None = None,
+        reset_settled: bool = False,
+    ) -> RequestFailure:
+        """Settle what a published-but-unsettled manual compaction still owes.
+
+        The boundary is already live, so the reset and the idle replacement run
+        regardless of the failure: they publish the state a client needs to
+        reconcile. The failure is typed as persistence rather than compaction
+        so a client does not retry a summarization that already happened.
+        """
+        if summary_length is None and cause is not None:
+            summary_length = cause.summary_length
+        data = await self._settle_published_compaction(
+            params,
+            previous_history,
+            summary_length=summary_length,
+            reset_settled=reset_settled,
+        )
         detail = (
             str(cause)
             if cause is not None

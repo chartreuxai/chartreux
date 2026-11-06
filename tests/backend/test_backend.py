@@ -24,6 +24,7 @@ from mistralai.client.utils.retries import BackoffStrategy, RetryConfig
 import pytest
 import respx
 
+from chartreux.config_values import ThinkingLevel
 from chartreux.core.config import ModelConfig, ProviderConfig
 from chartreux.core.llm.backend.base import build_chat_payload
 from chartreux.core.llm.backend.factory import BACKEND_FACTORY, create_backend
@@ -978,6 +979,75 @@ class TestGenericResponseContracts:
         assert failure.retry_eligible is True
         assert failure.failover_eligible is True
 
+    @staticmethod
+    def _anthropic_declared_model(declared: list[ThinkingLevel]) -> ModelConfig:
+        return ModelConfig(
+            name="claude-sonnet-4-20250514",
+            provider="fireworks",
+            alias="claude",
+            thinking="off",
+            supported_thinking_levels=declared,
+        )
+
+    @staticmethod
+    def _anthropic_history() -> list[LLMMessage]:
+        return [
+            LLMMessage(role=Role.user, content="Hi"),
+            LLMMessage(
+                role=Role.assistant,
+                content="Answered",
+                reasoning_content="considering",
+                reasoning_payloads=[
+                    {"type": "thinking", "thinking": "considering", "signature": "sig"}
+                ],
+            ),
+            LLMMessage(role=Role.user, content="Follow up"),
+        ]
+
+    @pytest.mark.asyncio
+    async def test_declared_thinking_history_encodes_a_declared_effort(self) -> None:
+        with respx.mock(base_url="https://api.fireworks.ai") as api:
+            route = api.post("/v1/messages").mock(
+                return_value=httpx.Response(
+                    200,
+                    json={
+                        "content": [{"type": "text", "text": "hi"}],
+                        "usage": {"input_tokens": 1, "output_tokens": 1},
+                    },
+                )
+            )
+            async with self._backend(api_style="anthropic") as backend:
+                await backend.complete(
+                    model=self._anthropic_declared_model(["off", "max"]),
+                    messages=self._anthropic_history(),
+                )
+
+        payload = json.loads(route.calls.last.request.content)
+        assert payload["output_config"] == {"effort": "max"}
+
+    @pytest.mark.asyncio
+    async def test_declared_off_only_with_reasoning_history_raises(self) -> None:
+        with respx.mock(
+            base_url="https://api.fireworks.ai", assert_all_called=False
+        ) as api:
+            route = api.post("/v1/messages").mock(
+                return_value=httpx.Response(
+                    200,
+                    json={
+                        "content": [{"type": "text", "text": "hi"}],
+                        "usage": {"input_tokens": 1, "output_tokens": 1},
+                    },
+                )
+            )
+            async with self._backend(api_style="anthropic") as backend:
+                with pytest.raises(InvalidLaunchThinkingError):
+                    await backend.complete(
+                        model=self._anthropic_declared_model(["off"]),
+                        messages=self._anthropic_history(),
+                    )
+
+        assert not route.calls
+
 
 class TestBackendFactory:
     def test_create_backend_passes_retry_budget_to_mistral_backend(self):
@@ -1600,6 +1670,35 @@ class TestMistralSdkReasoningEffortSerialization:
         )
 
     @pytest.mark.asyncio
+    async def test_declared_subset_matches_admission_on_wire(self) -> None:
+        from chartreux.core.agents.launch import _resolve_thinking
+        from tests.conftest import build_test_vibe_config
+
+        bodies: list[dict[str, object]] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            bodies.append(json.loads(request.content))
+            return httpx.Response(200, json=MISTRAL_SIMPLE_CONVERSATION_PARAMS[0][1])
+
+        backend = self._backend()
+        model = ModelConfig(
+            name="mistral-large-4",
+            provider="mistral",
+            alias="mistral-large-4",
+            thinking="medium",
+            supported_thinking_levels=["low", "high"],
+        )
+        config = build_test_vibe_config(providers=[backend._provider], models=[model])
+        admission = _resolve_thinking(config, model, "medium")
+        with self._serving(handler):
+            try:
+                await self._complete(backend, model)
+            finally:
+                await backend.aclose()
+        assert admission.effective == "high"
+        assert bodies[0]["reasoning_effort"] == admission.effective
+
+    @pytest.mark.asyncio
     @pytest.mark.parametrize(
         ("model_name", "thinking", "expected_effort"),
         [
@@ -1666,10 +1765,23 @@ class TestMistralSdkReasoningEffortSerialization:
         assert captured[0]["reasoning_effort"] == expected_effort
 
     @pytest.mark.asyncio
-    async def test_flash_thinking_off_is_a_typed_configuration_error(self) -> None:
+    async def test_flash_thinking_off_resolves_to_its_lowest_declared_level(
+        self,
+    ) -> None:
+        captured: list[dict[str, object]] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            captured.append(json.loads(request.content))
+            return httpx.Response(200, json=MISTRAL_SIMPLE_CONVERSATION_PARAMS[0][1])
+
         backend = self._backend()
-        with pytest.raises(InvalidLaunchThinkingError, match="cannot disable"):
-            await self._complete(backend, self._model("zai-glm-5-3-flash", "off"))
+        with self._serving(handler):
+            try:
+                await self._complete(backend, self._model("zai-glm-5-3-flash", "off"))
+            finally:
+                await backend.aclose()
+
+        assert captured[0]["reasoning_effort"] == "low"
 
     def test_supports_thinking_rejects_off_for_flash(self) -> None:
         provider = ProviderDefinition(
@@ -1695,11 +1807,28 @@ class TestMistralSdkReasoningEffortSerialization:
         assert MISTRAL_THINKING_LEVELS["low"] == "none"
 
     @pytest.mark.asyncio
-    async def test_direct_glm_5_3_off_is_a_typed_configuration_error(self) -> None:
-        backend = self._backend()
-        with pytest.raises(InvalidLaunchThinkingError, match="cannot disable thinking"):
-            await self._complete(backend, self._model("zai-glm-5-3", "off"))
+    async def test_direct_glm_5_3_off_resolves_to_its_lowest_declared_level(
+        self,
+    ) -> None:
+        captured: list[dict[str, object]] = []
 
+        def handler(request: httpx.Request) -> httpx.Response:
+            captured.append(json.loads(request.content))
+            return httpx.Response(200, json=MISTRAL_SIMPLE_CONVERSATION_PARAMS[0][1])
+
+        backend = self._backend()
+        with self._serving(handler):
+            try:
+                await self._complete(backend, self._model("zai-glm-5-3", "off"))
+            finally:
+                await backend.aclose()
+
+        assert captured[0]["reasoning_effort"] == "low"
+
+    @pytest.mark.asyncio
+    async def test_model_without_a_configured_level_omits_reasoning_effort(
+        self,
+    ) -> None:
         bodies: list[dict[str, object]] = []
 
         def handler(request: httpx.Request) -> httpx.Response:

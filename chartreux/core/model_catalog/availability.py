@@ -10,7 +10,10 @@ import time
 from chartreux.core.config.models import ModelConfig, ThinkingLevel
 from chartreux.core.llm.backend.anthropic import REASONING_BLOCK_TYPES
 from chartreux.core.llm.failures import FailureCategory, FailureInfo
-from chartreux.core.llm.thinking_levels import get_thinking_levels
+from chartreux.core.llm.thinking_levels import (
+    get_thinking_levels,
+    thinking_level_is_known,
+)
 from chartreux.core.llm_models import LLMMessage
 from chartreux.core.model_catalog.loader import CatalogSnapshot
 from chartreux.core.model_catalog.resolver import ModelResolver, ResolvedModel
@@ -401,7 +404,6 @@ def compatibility_exclusion(
     model: ModelConfig,
     history: Sequence[LLMMessage],
     thinking: ThinkingLevel,
-    thinking_explicit: bool,
     images_only: bool = False,
 ) -> tuple[ExclusionReason, str] | None:
     """Return why a concrete deployment cannot serve the exact request."""
@@ -441,15 +443,18 @@ def compatibility_exclusion(
 
     levels = get_thinking_levels(str(provider.backend), provider.api_style, model.name)
     declared = model.supported_thinking_levels
+    # A known level the deployment cannot encode is not an exclusion: the
+    # encoder resolves it to the nearest declared level. Only an unusable
+    # declaration, or a level name outside the vocabulary, disqualifies a
+    # candidate.
     incompatible = not images_only and (
-        (levels is None and (declared is not None or thinking_explicit))
+        (levels is None and declared is not None)
         or (
             levels is not None
             and declared is not None
             and any(level not in levels for level in declared)
         )
-        or (levels is not None and thinking not in levels)
-        or (declared is not None and thinking not in declared)
+        or not thinking_level_is_known(thinking)
     )
     if incompatible:
         return (
@@ -489,7 +494,6 @@ def eligible_deployments(  # noqa: PLR0912, PLR0913, PLR0914, PLR0915
     config: object,
     history: Sequence[LLMMessage] = (),
     thinking: ThinkingLevel,
-    thinking_explicit: bool = True,
     compaction_base: str | None = None,
     compaction_only: bool = False,
     allowed_models: Sequence[str] = (),
@@ -658,7 +662,6 @@ def eligible_deployments(  # noqa: PLR0912, PLR0913, PLR0914, PLR0915
                         model=model,
                         history=history,
                         thinking=thinking,
-                        thinking_explicit=thinking_explicit,
                         images_only=compaction_only,
                     )
                     if problem is not None:
@@ -702,7 +705,6 @@ def eligible_deployments(  # noqa: PLR0912, PLR0913, PLR0914, PLR0915
                             model=compaction_model,
                             history=history,
                             thinking=compaction_model.thinking or "off",
-                            thinking_explicit=False,
                         )
                         if compaction_problem is not None:
                             _, detail = compaction_problem

@@ -39,6 +39,7 @@ from chartreux.core.config.models import (
     MCPServer,
     MissingAPIKeyError,
     ModelConfig,
+    PlanSectionConfig,
     ProjectContextConfig,
     ProviderConfig,
     PurposeRoute,
@@ -474,6 +475,13 @@ class ChartreuxConfigSchema(ConfigSchema):
     # top-level sections stay ignored.
     completion: Annotated[CompletionSectionConfig, WithDeepMerge()] = Field(
         default_factory=CompletionSectionConfig
+    )
+
+    # PM1: the [plan] section carries the /plan-mode selections —
+    # [plan.planner] model+thinking and [plan.executor] model+thinking+identity.
+    # An ordinary typed section: deep-merge semantics, no resolution machinery.
+    plan: Annotated[PlanSectionConfig, WithDeepMerge()] = Field(
+        default_factory=PlanSectionConfig
     )
 
     def _resolve_main_model(self) -> ResolvedModel:

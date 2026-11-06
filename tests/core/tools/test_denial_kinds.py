@@ -22,7 +22,6 @@ from chartreux.core.workspace import Workspace
         ("tool_policy", "tool_policy"),
         ("path_rule", "path_rule"),
         ("sensitive", "sensitive"),
-        ("plan_scope", "plan_scope"),
         ("out_of_root", "out_of_root"),
         ("parent_ceiling", "parent_ceiling"),
     ],
@@ -34,7 +33,6 @@ def test_denial_kind_classification(case: str, expected: str, tmp_path: Path) ->
     sensitive = []
     denylist = []
     permission = ToolPermission.ALWAYS
-    plan_scope = None
     if case == "tool_policy":
         permission = ToolPermission.NEVER
     elif case == "path_rule":
@@ -42,8 +40,6 @@ def test_denial_kind_classification(case: str, expected: str, tmp_path: Path) ->
         sensitive = ["**/.env"]
     elif case == "sensitive":
         sensitive = ["**/.env"]
-    elif case == "plan_scope":
-        plan_scope = tmp_path / "plan.md"
     elif case == "parent_ceiling":
         workspace = Workspace.for_session(tmp_path, authorized_roots=[target.parent])
         workspace = Workspace(
@@ -57,7 +53,6 @@ def test_denial_kind_classification(case: str, expected: str, tmp_path: Path) ->
         config_permission=permission,
         sensitive_patterns=sensitive,
         workspace=workspace,
-        plan_file_write_scope=plan_scope,
     )
     assert result is not None
     assert result.permission is ToolPermission.NEVER
@@ -146,14 +141,7 @@ def test_dangerous_command_kind_requires_a_grantable_proposal() -> None:
 
 @pytest.mark.parametrize(
     "denial_kind",
-    [
-        "out_of_root",
-        "sensitive",
-        "path_rule",
-        "plan_scope",
-        "parent_ceiling",
-        "tool_policy",
-    ],
+    ["out_of_root", "sensitive", "path_rule", "parent_ceiling", "tool_policy"],
 )
 def test_other_denial_kinds_never_carry_a_proposal(denial_kind: str) -> None:
     with pytest.raises(ValueError, match="dangerous_command_proposal requires"):

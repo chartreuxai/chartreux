@@ -143,10 +143,13 @@ def test_failover_uses_attempted_model_thinking_for_compaction() -> None:
         candidate.resolved.deployment.provider
         for candidate in agent._failover_candidates(agent.messages, compaction_model)
     ] == ["test-first", "test-second"]
+    # The conversation model's thinking level no longer filters candidates: a
+    # deployment that does not declare "high" serves it at its nearest declared
+    # level, so both deployments stay eligible.
     assert [
         candidate.resolved.deployment.provider
         for candidate in agent._failover_candidates(agent.messages, active_model)
-    ] == ["test-first"]
+    ] == ["test-first", "test-second"]
 
 
 def test_compaction_failover_uses_compactor_thinking_not_conversation_model() -> None:

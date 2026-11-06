@@ -1094,23 +1094,9 @@ class HookNoticeDetail(ProtocolModel):
     content: str | None = None
 
 
-class ContextClearedNoticeDetail(ProtocolModel):
-    kind: Literal["context_cleared"] = "context_cleared"
-    plan_file_path: str | None = None
-
-
 class SessionTitleUpdatedNoticeDetail(ProtocolModel):
     kind: Literal["session_title_updated"] = "session_title_updated"
     title: str
-
-
-class PlanReviewStartedNoticeDetail(ProtocolModel):
-    kind: Literal["plan_review_started"] = "plan_review_started"
-    file_path: str
-
-
-class PlanReviewEndedNoticeDetail(ProtocolModel):
-    kind: Literal["plan_review_ended"] = "plan_review_ended"
 
 
 class WaitingForInputNoticeDetail(ProtocolModel):
@@ -1175,10 +1161,7 @@ class RouteTableAppliedNoticeDetail(ProtocolModel):
 
 NoticeDetail = Annotated[
     HookNoticeDetail
-    | ContextClearedNoticeDetail
     | SessionTitleUpdatedNoticeDetail
-    | PlanReviewStartedNoticeDetail
-    | PlanReviewEndedNoticeDetail
     | WaitingForInputNoticeDetail
     | ScheduledLoopFiredNoticeDetail
     | RootRecoveryNoticeDetail

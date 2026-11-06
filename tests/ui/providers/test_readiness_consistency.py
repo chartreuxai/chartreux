@@ -273,22 +273,29 @@ def test_thinking_overrides_match_runtime_resolution(
         assert selected.provider.api_key_env_var in reason
 
 
-def test_unsupported_thinking_override_reports_the_effective_level() -> None:
+def test_undeclared_thinking_override_resolves_at_the_nearest_declared_level() -> None:
     draft = _limited_levels_state(("low", "medium"), ("low",))
     overrides = {"a": "high"}
     candidate = draft._candidate_snapshot()
-    with pytest.raises(ValueError, match="thinking level 'high'"):
-        _runtime_selected(candidate, "orchestrator", thinking_overrides=overrides)
+    # Runtime admission serves an undeclared override at the nearest declared
+    # level and keeps the requested level, instead of failing the launch.
+    selected = _runtime_selected(
+        candidate, "orchestrator", thinking_overrides=overrides
+    )
+    assert (
+        selected.materialize(auto_compact_threshold=100, thinking="high").thinking
+        == "high"
+    )
 
+    # Readiness follows admission, so the preset is reported ready.
     reason = draft.validate_preset(
         "orchestrator", lambda env: "key", thinking_overrides=overrides
     )
-    assert reason is not None
-    assert "thinking high is unsupported" in reason
+    assert reason is None
     finish = draft.validate(
         credential_resolver=lambda env: "key", thinking_overrides=overrides
     )
-    assert "orchestrator" in finish.unusable_roles
+    assert "orchestrator" not in finish.unusable_roles
 
 
 def test_usable_canonical_models_honor_allowed_models_restrictions() -> None:

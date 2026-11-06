@@ -112,7 +112,6 @@ def test_compaction_checks_actual_destination_deployment_capabilities() -> None:
             config=_config(snapshot),
             history=history,
             thinking="off",
-            thinking_explicit=False,
             compaction_base="compact",
         )
     assert [item.reason for item in error.value.exclusions] == [
@@ -120,7 +119,7 @@ def test_compaction_checks_actual_destination_deployment_capabilities() -> None:
     ]
 
 
-def test_compaction_destination_declared_thinking_restriction_excludes_requested_level() -> (
+def test_compaction_destination_thinking_restriction_resolves_to_nearest_level() -> (
     None
 ):
     snapshot = CatalogSnapshot(
@@ -144,25 +143,26 @@ def test_compaction_destination_declared_thinking_restriction_excludes_requested
     )
     config = _config(snapshot, thinking_overrides={"compact": "high"})
 
-    with pytest.raises(AllDeploymentsUnavailableError) as error:
-        eligible_deployments(
-            snapshot=snapshot,
-            committed=CommittedModelIdentity(
-                base_model="base",
-                provider="test-first",
-                wire_name="base",
-                catalog_revision="compaction",
-            ),
-            registry=AvailabilityRegistry(),
-            config=config,
-            thinking="off",
-            thinking_explicit=False,
-            compaction_base="compact",
-        )
+    result = eligible_deployments(
+        snapshot=snapshot,
+        committed=CommittedModelIdentity(
+            base_model="base",
+            provider="test-first",
+            wire_name="base",
+            catalog_revision="compaction",
+        ),
+        registry=AvailabilityRegistry(),
+        config=config,
+        thinking="off",
+        compaction_base="compact",
+    )
 
-    assert [item.reason for item in error.value.exclusions] == [
-        ExclusionReason.COMPACTION_INCOMPATIBLE
+    # A compaction destination that declares only "off" serves the override at
+    # that nearest declared level instead of disqualifying the candidate.
+    assert [item.resolved.deployment.provider for item in result.candidates] == [
+        "test-first"
     ]
+    assert result.exclusions == ()
 
 
 def test_compaction_canonical_base_for_eligibility() -> None:
@@ -691,7 +691,7 @@ def test_revalidation_exclusions_preserve_history_and_thinking() -> None:
 
 
 @pytest.mark.parametrize(
-    ("history", "thinking", "reason"),
+    ("history", "reason"),
     [
         pytest.param(
             [
@@ -707,21 +707,18 @@ def test_revalidation_exclusions_preserve_history_and_thinking() -> None:
                     ],
                 )
             ],
-            "off",
             ExclusionReason.IMAGES_UNSUPPORTED,
             id="images",
         ),
         pytest.param(
             [LLMMessage(role=Role.assistant, reasoning_payloads=[{"type": "opaque"}])],
-            "off",
             ExclusionReason.REASONING_UNSUPPORTED,
             id="reasoning",
         ),
-        pytest.param([], "max", ExclusionReason.THINKING_UNSUPPORTED, id="thinking"),
     ],
 )
-def test_revalidation_matrix_never_strips_history_or_lowers_thinking(
-    history: list[LLMMessage], thinking: str, reason: ExclusionReason
+def test_revalidation_matrix_never_strips_history(
+    history: list[LLMMessage], reason: ExclusionReason
 ) -> None:
     snapshot = _catalog()
     before = [message.model_dump(mode="json") for message in history]
@@ -732,16 +729,10 @@ def test_revalidation_matrix_never_strips_history_or_lowers_thinking(
             registry=AvailabilityRegistry(),
             config=_config(snapshot),
             history=history,
-            thinking=cast(Any, thinking),
+            thinking="off",
         )
     assert reason in {item.reason for item in error.value.exclusions}
     assert [message.model_dump(mode="json") for message in history] == before
-    assert (
-        thinking
-        == {"images": "off", "reasoning": "off", "thinking": "max"}[
-            reason.value.split("-")[0]
-        ]
-    )
     snapshot = _catalog()
     result = eligible_deployments(
         snapshot=snapshot,
@@ -758,3 +749,26 @@ def test_revalidation_matrix_never_strips_history_or_lowers_thinking(
         ("test-first", ExclusionReason.COMPACTION_INCOMPATIBLE),
         ("test-disabled", ExclusionReason.DISABLED),
     ]
+
+
+def test_requested_level_outside_every_declaration_resolves_instead_of_excluding() -> (
+    None
+):
+    """Every base deployment declares only ``off``; ``max`` is served at ``off``."""
+    snapshot = _catalog()
+
+    result = eligible_deployments(
+        snapshot=snapshot,
+        committed=_committed(),
+        registry=AvailabilityRegistry(),
+        config=_config(snapshot),
+        thinking=cast(Any, "max"),
+    )
+
+    assert [item.resolved.deployment.provider for item in result.candidates] == [
+        "test-first",
+        "test-second",
+    ]
+    assert ExclusionReason.THINKING_UNSUPPORTED not in {
+        item.reason for item in result.exclusions
+    }

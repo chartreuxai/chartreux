@@ -408,12 +408,12 @@ def test_allowlist_restriction_is_still_excluded_with_a_permit(
     ]
 
 
-def test_thinking_restriction_is_still_excluded_with_a_permit(
+def test_thinking_restriction_resolves_instead_of_excluding_with_a_permit(
     fake_clock: FakeClock,
 ) -> None:
-    """The cooldown bypass does not skip the compatibility check: a
-    deployment that cannot serve the requested thinking level stays
-    excluded even with a live matching permit.
+    """A requested level no deployment declares is served at the nearest
+    declared level, so thinking availability never excludes a candidate —
+    the cooldown bypass is what decides here.
     """
     snapshot = CatalogSnapshot(
         ModelCatalog.model_validate({
@@ -446,12 +446,9 @@ def test_thinking_restriction_is_still_excluded_with_a_permit(
     ledger = CooldownOverrideLedger(clock=fake_clock)
     permit = _reserved_permit(ledger)
 
-    with pytest.raises(AllDeploymentsUnavailableError) as exc_info:
-        _select(snapshot, registry, override_permit=permit, override_ledger=ledger)
-    assert [exclusion.reason for exclusion in exc_info.value.exclusions] == [
-        ExclusionReason.THINKING_UNSUPPORTED,
-        ExclusionReason.THINKING_UNSUPPORTED,
-    ]
+    result = _select(snapshot, registry, override_permit=permit, override_ledger=ledger)
+    assert _providers(result) == ["test-first", "test-second"]
+    assert result.exclusions == ()
 
 
 def test_history_restriction_is_still_excluded_with_a_permit(
@@ -753,12 +750,12 @@ def test_launch_assignment_rejects_wrong_expired_and_used_permits(
         _launch(config, armed_parent(), override_permit=used, override_ledger=ledger)
 
 
-def test_launch_compatibility_is_still_enforced_with_a_permit(
+def test_launch_thinking_falls_back_instead_of_rejecting_with_a_permit(
     fake_clock: FakeClock,
 ) -> None:
-    """The permit bypasses the cooldown but not the thinking
-    compatibility: an explicitly unsupported thinking level is still
-    rejected at launch.
+    """The permit bypasses the cooldown; a requested level the deployment does
+    not declare resolves to the nearest declared level instead of rejecting
+    the launch.
     """
     config = _launch_config(thinking="high")
     parent: FakeConfigOrchestrator[ChartreuxConfigSchema] = FakeConfigOrchestrator(
@@ -770,15 +767,16 @@ def test_launch_compatibility_is_still_enforced_with_a_permit(
     ledger = CooldownOverrideLedger(clock=fake_clock)
     permit = _reserved_permit(ledger, endpoint=LAUNCH_ENDPOINT_URL)
 
-    # The permit bypasses the cooldown: the default thinking is compatible.
+    # The permit bypasses the cooldown: the default thinking is declared.
     candidate = _launch(config, parent, override_permit=permit, override_ledger=ledger)
     assert candidate.effective_model.alias == "small"
-    # ...but an explicitly unsupported thinking level is still rejected.
-    with pytest.raises(InvalidLaunchModelError):
-        _launch(
-            config,
-            parent,
-            launch=LaunchConfig(thinking="off"),
-            override_permit=permit,
-            override_ledger=ledger,
-        )
+    # ...and an undeclared level is admitted at the nearest declared level,
+    # while the preset keeps the level it asked for.
+    fell_back = _launch(
+        config,
+        parent,
+        launch=LaunchConfig(thinking="off"),
+        override_permit=permit,
+        override_ledger=ledger,
+    )
+    assert fell_back.effective_model.thinking == "off"

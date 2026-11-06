@@ -1,0 +1,64 @@
+#plan-consent-screen {
+    align: center middle;
+    background: $background 85%;
+}
+#plan-consent-dialog {
+    width: 90%;
+    max-width: 92;
+    height: auto;
+    max-height: 90%;
+    padding: 0 1;
+    background: $surface;
+    border: solid $foreground-muted;
+    color: $foreground;
+}
+#plan-consent-title {
+    height: 1;
+    text-style: bold;
+    color: $primary;
+}
+#plan-consent-body {
+    height: auto;
+    max-height: 60vh;
+    overflow-y: auto;
+}
+.plan-consent-label {
+    height: 1;
+    margin-top: 1;
+    color: $text-muted;
+}
+.plan-consent-value {
+    height: auto;
+    text-wrap: wrap;
+}
+#plan-consent-hint {
+    height: 1;
+    margin-top: 1;
+    text-wrap: nowrap;
+    text-overflow: ellipsis;
+    color: $text-muted;
+}
+#plan-consent-actions {
+    height: 1;
+    align-horizontal: right;
+}
+#plan-consent-actions Button {
+    width: auto;
+    min-width: 0;
+    height: 1;
+    background: $surface;
+    border: none;
+    color: $foreground;
+    padding: 0 1;
+    margin-left: 2;
+}
+#plan-consent-actions Button:focus {
+    text-style: bold reverse;
+}
+#plan-consent-start {
+    color: $primary;
+    text-style: bold;
+}
+#plan-consent-start:focus {
+    text-style: bold reverse;
+}

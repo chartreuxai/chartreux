@@ -1,12 +1,10 @@
 from __future__ import annotations
 
-import asyncio
 from dataclasses import dataclass
 from datetime import datetime
 import os
 from pathlib import Path
 import re
-import subprocess
 from time import monotonic
 from typing import TYPE_CHECKING, ClassVar, cast
 
@@ -16,8 +14,6 @@ from chartreux.app_server.models import (
     ImageAttachment,
     InlineImageSource,
 )
-from chartreux.observability.logging import logger
-from chartreux.utils.io import read_safe_async
 
 if TYPE_CHECKING:
     from rich.style import Style as RichStyle
@@ -43,10 +39,8 @@ from textual.app import ComposeResult
 from textual.color import Color
 from textual.containers import Horizontal, Vertical
 from textual.content import Content
-from textual.css.query import NoMatches
 from textual.geometry import Size
 from textual.message import Message
-from textual.reactive import reactive
 from textual.strip import Strip
 from textual.style import Style
 from textual.visual import RenderOptions, Visual
@@ -1500,84 +1494,3 @@ class WarningMessage(Static):
             yield NoMarkupStatic(
                 f"! Warning: {self._message}", classes="warning-content"
             )
-
-
-class PlanFileMessage(Widget):
-    content: reactive[str] = reactive("")
-
-    def __init__(self, file_path: Path) -> None:
-        super().__init__()
-        self.add_class("plan-file-message")
-        self._file_path = file_path
-        self._watch_task: asyncio.Task | None = None
-
-    def compose(self) -> ComposeResult:
-        from textual.widgets import Markdown
-
-        with Vertical(classes="plan-file-wrapper"):
-            yield Markdown(self.content, classes="plan-file-content")
-
-    def watch_content(self, new_content: str) -> None:
-        from textual.widgets import Markdown
-
-        try:
-            self.query_one(Markdown).update(new_content)
-        except NoMatches:
-            pass
-
-    async def on_mount(self) -> None:
-        self.content = (await read_safe_async(self._file_path)).text
-        self._watch_task = asyncio.create_task(self._watch_file())
-
-    async def _watch_file(self) -> None:
-        from watchfiles import awatch
-
-        try:
-            async for _ in awatch(self._file_path):
-                self.content = (await read_safe_async(self._file_path)).text
-        except (asyncio.CancelledError, FileNotFoundError):
-            pass
-
-    def open_in_editor(self) -> None:
-        from chartreux.cli.textual_ui.external_editor import ExternalEditor
-
-        try:
-            ExternalEditor.resolve_command()
-        except (OSError, ValueError):
-            editor = ExternalEditor.get_editor()
-            logger.warning(
-                "Failed to resolve editor command: %s", editor, exc_info=True
-            )
-            self.app.notify(
-                f"Could not start editor: {editor}", severity="error", timeout=6
-            )
-            return
-
-        try:
-            self._file_path.parent.mkdir(parents=True, exist_ok=True)
-            edit_error: Exception | None = None
-            with self.app.suspend():
-                try:
-                    ExternalEditor.edit_file(self._file_path)
-                except (OSError, ValueError, subprocess.CalledProcessError) as exc:
-                    edit_error = exc
-            if edit_error is not None:
-                raise edit_error
-        except OSError:
-            logger.warning(
-                "Failed to open plan file in editor: %s", self._file_path, exc_info=True
-            )
-            self.app.notify(
-                f"Could not open plan in editor: {self._file_path}",
-                severity="error",
-                timeout=6,
-            )
-
-    def stop_watching(self) -> None:
-        if self._watch_task is None:
-            return
-
-        if not self._watch_task.done():
-            self._watch_task.cancel()
-
-        self._watch_task = None

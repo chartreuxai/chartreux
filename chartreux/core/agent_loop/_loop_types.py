@@ -68,7 +68,6 @@ class AgentRuntimePolicy:
     inherited_workspace: Workspace | None = None
     inherited_restrictions: tuple[SourceRestrictions, ...] = ()
     inherited_mode_restrictions: tuple[SourceRestrictions, ...] = ()
-    inherited_plan_write_scopes: tuple[tuple[Path, Path | None], ...] = ()
     # Bare canonical roots granted to the launching session at dispatch time.
     # A dedicated slot, never a synthesized config-source authority, so policy
     # replacement and partitioning never treat session grants as policy.

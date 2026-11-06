@@ -285,7 +285,6 @@ async def test_child_denies_the_ask_and_never_saves_a_project_root(
             inherited_workspace=policy.inherited_workspace,
             inherited_restrictions=policy.inherited_restrictions,
             inherited_mode_restrictions=policy.inherited_mode_restrictions,
-            inherited_plan_write_scopes=policy.inherited_plan_write_scopes,
             inherited_root_grants=policy.inherited_root_grants,
             user_input_capability=True,
             parent_authority_getter=policy.parent_authority_getter,

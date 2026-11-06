@@ -1088,6 +1088,11 @@ class TurnController:  # noqa: PLR0904
                 raise CallbackClosedError(f"Callback expired unanswered: {callback_id}")
             if record.core_resolved and record.resolution is None:
                 raise CallbackClosedError(f"Callback is closed: {callback_id}")
+            if record.future.done() and record.resolution is None:
+                # The waiter is gone (its turn was cancelled) but cancellation
+                # has not published yet: no answer can land, so this is closed
+                # rather than a settlement that would strand the turn's state.
+                raise CallbackClosedError(f"Callback is closed: {callback_id}")
             if record.resolution is not None:
                 if record.resolution.model_dump(mode="json") == output.model_dump(
                     mode="json"
@@ -1099,14 +1104,22 @@ class TurnController:  # noqa: PLR0904
                     pass
                 case _:
                     raise CallbackConflictError("Callback answer has the wrong type")
-            if self._projector is not None:
-                for update in self._projector.resolve_callback(callback_id, output):
-                    await self._emit_projected(update)
-            await self._emit_status("running")
+            # Settlement is authoritative under the resolution lock: the record
+            # carries the terminal disposition and the terminal patch is
+            # published BEFORE the core waiter resolves (plan U). Presentation
+            # failure never loses an accepted settlement — the answer is
+            # recorded even when the terminal patch cannot be delivered.
             record.resolution = output
+            record.core_resolved = True
             self._cancel_expiry_timer(record)
-            if not record.future.done():
-                record.future.set_result(output)
+            try:
+                if self._projector is not None:
+                    for update in self._projector.resolve_callback(callback_id, output):
+                        await self._emit_projected(update)
+                await self._emit_status("running")
+            finally:
+                if not record.future.done():
+                    record.future.set_result(output)
             return "accepted"
 
     async def reject_callback(
@@ -1126,8 +1139,18 @@ class TurnController:  # noqa: PLR0904
                 ):
                     return "duplicate"
                 raise CallbackConflictError("Callback already has a different answer")
+            # Settlement is authoritative under the resolution lock: publish
+            # the terminal cancelled state BEFORE the waiter settles (mirrors
+            # answer_callback), so a client or a reconnect sees a closed entry,
+            # never a ghost open callback. A delivery failure still rejects the
+            # core waiter — the rejection is authoritative, presentation is not.
             record.resolution = error
-            self._reject_callback_record(record, CallbackRejectedError(error.message))
+            try:
+                await self._publish_callback_closed(callback_id, error.message)
+            finally:
+                self._reject_callback_record(
+                    record, CallbackRejectedError(error.message)
+                )
             return "accepted"
 
     async def keep_waiting_callback(
@@ -2388,16 +2411,21 @@ class TurnController:  # noqa: PLR0904
 
     async def _cancel_callbacks(self, reason: str) -> None:
         for record in list(self._callbacks.values()):
-            # Terminal projection BEFORE the future resolves (mirrors
-            # _expire_callback): a reconnect, or a client answering a dead
-            # callback, must see a closed entry, never a ghost open callback.
-            was_open = not record.core_resolved
-            await self._publish_callback_closed(record.event.request_id, reason)
-            if was_open:
-                await self._publish_child_callback_closed(
-                    record.event.request_id, reason
-                )
-            self._reject_callback_record(record, CallbackRejectedError(reason))
+            # Settle under the record's resolution lock (plan U): an answer,
+            # expiry, or rejection that won the race owns the callback, so a
+            # cancellation can neither publish a second terminal state over it
+            # nor race the entry-state check that guards the patch.
+            async with record.resolution_lock:
+                # Terminal projection BEFORE the future resolves (mirrors
+                # _expire_callback): a reconnect, or a client answering a dead
+                # callback, must see a closed entry, never a ghost open callback.
+                was_open = not record.core_resolved
+                await self._publish_callback_closed(record.event.request_id, reason)
+                if was_open:
+                    await self._publish_child_callback_closed(
+                        record.event.request_id, reason
+                    )
+                self._reject_callback_record(record, CallbackRejectedError(reason))
 
     async def _publish_callback_closed(self, callback_id: str, reason: str) -> None:
         projector = self._projector

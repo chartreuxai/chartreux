@@ -16,6 +16,7 @@ def _effective(
     *,
     requested: str = "medium",
     semantic: str | None = "medium",
+    effective: str | None = None,
     api_effort: str | None = "high",
     known: bool = True,
     matches: bool | None = False,
@@ -23,6 +24,7 @@ def _effective(
     return EffectiveThinkingView.model_validate({
         "requested": requested,
         "semantic": semantic,
+        "effective": effective,
         "api_effort": api_effort,
         "known": known,
         "matches_requested": matches,
@@ -112,3 +114,26 @@ async def test_picker_explains_history_forced_thinking() -> None:
         assert explanation is not None
         assert "Selected off" in explanation
         assert "retained thinking history keeps this model at medium" in explanation
+
+
+@pytest.mark.asyncio
+async def test_picker_explains_the_declared_level_fallback() -> None:
+    app = build_test_chartreux_app()
+    async with app.run_test() as pilot:
+        await app._session_ready.wait()
+        picker = await _open_picker(
+            app,
+            pilot,
+            _effective(
+                requested="medium",
+                semantic="medium",
+                effective="high",
+                api_effort="high",
+            ),
+        )
+
+        explanation = _explanation(picker)
+        assert explanation is not None
+        assert "Selected medium" in explanation
+        assert "this model has no medium level" in explanation
+        assert "the next request uses high" in explanation

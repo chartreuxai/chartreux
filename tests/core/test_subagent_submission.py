@@ -16,6 +16,7 @@ secret, the rule id, or the matched line.
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 import subprocess
 from types import SimpleNamespace
@@ -1042,3 +1043,97 @@ async def test_completed_run_with_an_eligible_checkout_is_not_blocked_by_it(
     assert passed.completed is True
     assert passed.response == "checked out"
     assert "could not be fully inspected" not in passed.response
+
+
+# S1-S2 (v0.7.3): the per-run scan cutoff. A "."-rooted write surface — a
+# plain extraction, an in-place patch, a bare `git apply`, or a copy whose
+# destination is a directory — makes the whole working tree a touched path.
+# The gate still enumerates that tree, but now inspects only what the RUN
+# wrote: the cutoff is captured when the accumulator is constructed, and every
+# run admission (foreground, background, replacement, resume successor)
+# constructs its own, so the filter is per run and never per retained-agent
+# lifetime. These tests drive hand-built shell results — the exact shape the
+# resolver produces — because only the gate's behavior is under test and no
+# shell command needs to run.
+
+
+def _directory_root_event(directory: Path) -> ToolResultEvent:
+    """The resolver's collected "." write root, as a bash result carries it."""
+    return _bash_event(str(directory), command="cp -r payload/. .")
+
+
+def _backdate(path: Path, mtime_ns: int) -> None:
+    """Pin a file's mtime, leaving its access time alone."""
+    current = path.stat()
+    os.utime(path, ns=(current.st_atime_ns, mtime_ns))
+
+
+def test_directory_write_root_skips_pre_session_content(tmp_path: Path) -> None:
+    pre_session = tmp_path / "vendored.py"
+    pre_session.write_text(f"{SECRET_LINE}\n", encoding="utf-8")
+    accumulator = SubagentRunAccumulator()
+    _backdate(pre_session, accumulator._scan_cutoff_ns - 1)
+    accumulator.observe(
+        AssistantEvent(content="extracted the payload"), tool_call_id="task"
+    )
+    accumulator.observe(_directory_root_event(tmp_path), tool_call_id="task")
+
+    result = accumulator.build_result(turns_used=2)
+
+    # The pre-session file is not the run's artifact: the submission passes.
+    assert result.completed is True
+    assert result.response == "extracted the payload"
+
+
+def test_directory_write_root_blocks_the_runs_own_secret(tmp_path: Path) -> None:
+    accumulator = SubagentRunAccumulator()
+    in_run = tmp_path / "written.py"
+    in_run.write_text(f"{SECRET_LINE}\n", encoding="utf-8")
+    accumulator.observe(
+        AssistantEvent(content="extracted the payload"), tool_call_id="task"
+    )
+    accumulator.observe(_directory_root_event(tmp_path), tool_call_id="task")
+
+    result = accumulator.build_result(turns_used=2)
+
+    assert result.completed is False
+    assert "failed the secret scan" in result.response
+    assert str(in_run) in result.response
+    assert GITHUB_TOKEN not in result.response
+
+
+def test_explicit_file_path_is_unconditional_inside_the_run(tmp_path: Path) -> None:
+    # The cutoff qualifies DIRECTORY paths only: a file the session names is
+    # its own artifact whatever its mtime.
+    artifact = tmp_path / "adopted.py"
+    artifact.write_text(f"{SECRET_LINE}\n", encoding="utf-8")
+    accumulator = SubagentRunAccumulator()
+    _backdate(artifact, accumulator._scan_cutoff_ns - 1)
+    accumulator.observe(AssistantEvent(content="adopted the file"), tool_call_id="task")
+    accumulator.observe(_write_event(str(artifact)), tool_call_id="task")
+
+    result = accumulator.build_result(turns_used=1)
+
+    assert result.completed is False
+    assert "failed the secret scan" in result.response
+    assert str(artifact) in result.response
+
+
+def test_scan_cutoff_is_per_run_not_per_retained_identity(tmp_path: Path) -> None:
+    # The same retained agent's next run does not re-inspect the previous
+    # run's artifacts: each accumulator carries its own construction instant,
+    # so a lifetime-scoped cutoff (which would block both runs) is ruled out.
+    artifact = tmp_path / "deploy.py"
+    artifact.write_text(f"{SECRET_LINE}\n", encoding="utf-8")
+    first = SubagentRunAccumulator()
+    _backdate(artifact, first._scan_cutoff_ns + 1)
+    second = SubagentRunAccumulator()
+    assert second._scan_cutoff_ns > artifact.stat().st_mtime_ns
+    for accumulator in (first, second):
+        accumulator.observe(AssistantEvent(content="wrote it"), tool_call_id="task")
+        accumulator.observe(_directory_root_event(tmp_path), tool_call_id="task")
+
+    assert first.build_result(turns_used=1).completed is False
+    passed = second.build_result(turns_used=1)
+    assert passed.completed is True
+    assert passed.response == "wrote it"

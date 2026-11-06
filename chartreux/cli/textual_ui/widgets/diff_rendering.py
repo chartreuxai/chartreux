@@ -57,6 +57,11 @@ class DiffOccurrence(NamedTuple):
     new_lines: str
 
 
+class DiffStats(NamedTuple):
+    added: int
+    removed: int
+
+
 def language_for_path(file_path: str) -> str:
     """Return the syntax-highlight language guessed from the file extension."""
     return Path(file_path).suffix.lstrip(".") or "text"
@@ -242,6 +247,21 @@ async def render_edit_diff_async(
     )
 
 
+def _occurrence_diff_lines(occurrence: DiffOccurrence) -> list[str]:
+    """Return one occurrence's unified-diff body lines (no file headers)."""
+    # rstrip only: a trailing newline yields a phantom next-line element to
+    # drop, but a leading newline is a real (empty) first line anchored at
+    # start_line, so stripping it would desync the gutter line numbers.
+    return list(
+        difflib.unified_diff(
+            occurrence.old_lines.rstrip("\n").split("\n"),
+            occurrence.new_lines.rstrip("\n").split("\n"),
+            lineterm="",
+            n=2,
+        )
+    )[2:]
+
+
 def render_edit_diff(
     occurrences: Sequence[DiffOccurrence], language: str, *, ansi: bool, dark: bool
 ) -> list[_DiffLine]:
@@ -253,23 +273,34 @@ def render_edit_diff(
     for index, occurrence in enumerate(occurrences):
         if index > 0:
             lines.append(_gap_line(ansi=ansi))
-        # rstrip only: a trailing newline yields a phantom next-line element to
-        # drop, but a leading newline is a real (empty) first line anchored at
-        # start_line, so stripping it would desync the gutter line numbers.
-        diff_lines = list(
-            difflib.unified_diff(
-                occurrence.old_lines.rstrip("\n").split("\n"),
-                occurrence.new_lines.rstrip("\n").split("\n"),
-                lineterm="",
-                n=2,
-            )
-        )[2:]
         lines.extend(
             _render_occurrence(
-                diff_lines, occurrence.start_line, language, ansi=ansi, theme=theme
+                _occurrence_diff_lines(occurrence),
+                occurrence.start_line,
+                language,
+                ansi=ansi,
+                theme=theme,
             )
         )
     return lines
+
+
+def count_diff_rows(occurrences: Sequence[DiffOccurrence]) -> DiffStats:
+    """Count the added and removed rows the expanded view renders.
+
+    Uses the renderer's own occurrence normalization so a collapsed header's
+    ``+N/-M`` matches the diff row count exactly: context rows are excluded and
+    each occurrence contributes its own rows (a replace_all occurrence can add
+    a row per location).
+    """
+    added = removed = 0
+    for occurrence in occurrences:
+        for line in _occurrence_diff_lines(occurrence):
+            if line.startswith("+"):
+                added += 1
+            elif line.startswith("-"):
+                removed += 1
+    return DiffStats(added, removed)
 
 
 def _render_occurrence(

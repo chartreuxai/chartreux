@@ -21,12 +21,14 @@ from chartreux.app_server._tool_projection import (
 from chartreux.app_server._utils import now_ms
 from chartreux.app_server._worktree_effects import WorktreeEffect
 from chartreux.app_server.config import (
+    THINKING_LEVELS,
     ConfigView,
     EffectiveThinkingView,
     ModelConfigView,
     RouteTargetView,
     RouteView,
     StatusLineConfigView,
+    ThinkingLevel,
 )
 from chartreux.app_server.models import (
     COMMITTED_MODEL_RECOVERY_ISSUE_FILE,
@@ -65,8 +67,12 @@ from chartreux.app_server.models import (
 from chartreux.core.agent_loop import AgentLoop
 from chartreux.core.config import ChartreuxConfigSchema, ModelConfig
 from chartreux.core.llm.thinking_levels import (
+    declared_thinking_levels,
     get_thinking_levels,
-    get_thinking_wire_value,
+    narrow_thinking_levels,
+    note_thinking_fallback,
+    resolve_enabled_thinking_level,
+    resolve_thinking_level,
 )
 from chartreux.core.llm_models import (
     ImageAttachment as CoreImageAttachment,
@@ -132,9 +138,10 @@ def project_effective_thinking(agent_loop: AgentLoop) -> EffectiveThinkingView:
 
     Computed from the committed identity and the loop's current message
     history — the same inputs the next request resolves against — so a
-    history-dependent coercion appears as soon as the entry lands. An
-    unresolvable deployment reports unknown instead of claiming the
-    requested level is effective.
+    history-dependent coercion appears as soon as the entry lands. The
+    declared-level fallback is resolved and reported here too, at the
+    effective-selection boundary. An unresolvable deployment reports unknown
+    instead of claiming the requested level is effective.
     """
     config = agent_loop.config
     model = config.get_active_model()
@@ -147,11 +154,14 @@ def project_effective_thinking(agent_loop: AgentLoop) -> EffectiveThinkingView:
         return EffectiveThinkingView(requested=requested)
     levels = get_thinking_levels(str(provider.backend), provider.api_style, model.name)
     if levels is None:
+        if model.supported_thinking_levels is not None:
+            return EffectiveThinkingView(requested=requested)
         # The provider cannot encode thinking at all, so only "off" resolves.
         disabled = requested == "off"
         return EffectiveThinkingView(
             requested=requested,
             semantic="off" if disabled else None,
+            effective="off" if disabled else None,
             api_effort=None,
             known=disabled,
             matches_requested=True if disabled else None,
@@ -161,18 +171,30 @@ def project_effective_thinking(agent_loop: AgentLoop) -> EffectiveThinkingView:
     from chartreux.core.agents.launch import _effective_thinking
 
     semantic = _effective_thinking(config, model, requested, agent_loop.messages)
+    narrowed = narrow_thinking_levels(levels, model.supported_thinking_levels)
     try:
-        api_effort = get_thinking_wire_value(levels, semantic)
+        if semantic != requested:
+            # The retained-reasoning coercion must keep thinking enabled, so the
+            # estimate matches the wire even when the semantic level is undeclared.
+            resolution = resolve_enabled_thinking_level(narrowed, semantic)
+        else:
+            resolution = resolve_thinking_level(narrowed, semantic)
     except InvalidLaunchThinkingError:
         return EffectiveThinkingView(requested=requested)
+    note_thinking_fallback(f"{model.provider}/{model.name}", resolution)
     return EffectiveThinkingView(
         requested=requested,
         semantic=semantic,
-        api_effort=api_effort,
+        effective=cast(ThinkingLevel, resolution.effective),
+        api_effort=resolution.wire_value,
         known=True,
         matches_requested=(
-            semantic == requested
-            and (api_effort == requested or (requested == "off" and api_effort is None))
+            resolution.effective == requested
+            and semantic == requested
+            and (
+                resolution.wire_value == requested
+                or (requested == "off" and resolution.wire_value is None)
+            )
         ),
     )
 
@@ -185,7 +207,7 @@ def project_config_view(
 ) -> ConfigView:
     routes, routes_error = _project_routes(config)
     return ConfigView(
-        active_model=_project_model_config(config.get_active_model()),
+        active_model=_project_model_config(config, config.get_active_model()),
         active_model_expression=config.active_model,
         allowed_models=list(config.allowed_models),
         active_model_pinned=active_model_pinned,
@@ -213,7 +235,8 @@ def project_config_view(
         emit_program_status=config.emit_program_status,
         enable_system_trust_store=config.enable_system_trust_store,
         models=[
-            _project_model_config(model) for model in config.available_models().values()
+            _project_model_config(config, model)
+            for model in config.available_models().values()
         ],
         validation_warnings=[
             *config.validation_warnings,
@@ -293,13 +316,36 @@ def project_workdir(agent_loop: AgentLoop) -> str:
     return agent_loop.config.displayed_workdir or str(agent_loop.cwd)
 
 
-def _project_model_config(model: ModelConfig) -> ModelConfigView:
+def project_thinking_levels(
+    config: ChartreuxConfigSchema, model: ModelConfig
+) -> tuple[ThinkingLevel, ...]:
+    """The levels a deployment declares, in vocabulary order.
+
+    Clients offer exactly these levels, so a picker never lists a level the
+    model would have to fall back from. The full vocabulary is the fallback
+    only when the deployment cannot be resolved at all.
+    """
+    try:
+        provider = config.get_provider_for_model(model)
+    except ValueError:
+        return THINKING_LEVELS
+    levels = get_thinking_levels(str(provider.backend), provider.api_style, model.name)
+    if levels is None:
+        return ("off",)
+    declared = declared_thinking_levels(levels, model.supported_thinking_levels)
+    return cast(tuple[ThinkingLevel, ...], declared) or THINKING_LEVELS
+
+
+def _project_model_config(
+    config: ChartreuxConfigSchema, model: ModelConfig
+) -> ModelConfigView:
     return ModelConfigView(
         name=model.name,
         alias=model.alias,
         thinking=model.thinking,
         supports_images=model.supports_images,
         display_name=format_model_display_name(model.provider, model.name),
+        thinking_levels=list(project_thinking_levels(config, model)),
     )
 
 

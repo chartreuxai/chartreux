@@ -28,6 +28,7 @@ from chartreux.cli.textual_ui.widgets.collapsible import (
     DisclosureHeader,
     HeaderCollapsibleSection,
 )
+from chartreux.cli.textual_ui.widgets.entry_expansion import EntryExpansionState
 from chartreux.cli.textual_ui.widgets.messages import AssistantMessage, UserMessage
 from chartreux.cli.textual_ui.widgets.tools import (
     ToolCallMessage,
@@ -36,9 +37,9 @@ from chartreux.cli.textual_ui.widgets.tools import (
 )
 from chartreux.cli.textual_ui.windowing.transcript import TranscriptWindow
 from chartreux.ui.duration_display import format_duration
+from tests.cli.textual_ui.test_edit_diff_widgets import _edit_entry
 from tests.cli.textual_ui.test_history_grouping import (
     _effect as _history_effect,
-    _file_edit_effect,
     _message,
 )
 from tests.cli.textual_ui.test_tool_stream_message import _effect
@@ -523,9 +524,12 @@ async def test_later_result_mount_preserves_individual_expansion_and_focus() -> 
 
 @pytest.mark.asyncio
 async def test_unchanged_timing_preference_keeps_edit_review_visible() -> None:
-    entry = _file_edit_effect(0)
+    entry = _edit_entry()
+    state = EntryExpansionState()
+    state.register(entry.id)
+    state.set_collapsed(entry.id, False)  # The review was opened individually.
     call = ToolCallMessage(entry)
-    result = ToolResultMessage(entry, call)
+    result = ToolResultMessage(entry, call, expansion_state=state)
     group = ToolGroup(show_message_timestamps=True)
     group.add_content_child(call)
     group.add_content_child(result)
@@ -533,11 +537,15 @@ async def test_unchanged_timing_preference_keeps_edit_review_visible() -> None:
     async with app.run_test() as pilot:
         await app.mount(group)
         await pilot.pause()
-        assert not result._is_collapsible
-        result.display = True  # A mounted review opened individually.
+        # Edit results fold like every other tool result (E2); timing mode leaves
+        # the individual expansion choice alone instead of hiding the row.
+        assert result._is_collapsible
+        section = result.query_one(HeaderCollapsibleSection)
+        assert not section.is_collapsed
         group.set_show_message_timestamps(True)
         await pilot.pause()
         assert result.display
+        assert not section.is_collapsed
         assert not group.header.display
 
 

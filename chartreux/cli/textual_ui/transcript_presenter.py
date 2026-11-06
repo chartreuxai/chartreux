@@ -390,7 +390,6 @@ class TranscriptPresenter:
         self._history_widget_indices = WeakKeyDictionary()
         if self._app.event_handler is not None:
             self._app.event_handler._finalize_tool_group()
-            self._app.event_handler._handle_stop_plan_review()
             self._app.event_handler.cancel_retry_presentation()
 
     async def rebuild_transcript_from_current_session(self) -> None:

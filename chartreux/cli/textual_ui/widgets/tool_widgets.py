@@ -6,7 +6,7 @@ from pathlib import Path
 import re
 from typing import Any, ClassVar
 
-from pydantic import BaseModel, JsonValue, TypeAdapter
+from pydantic import BaseModel, JsonValue, TypeAdapter, ValidationError
 from textual.app import ComposeResult
 from textual.containers import Vertical
 from textual.content import Content
@@ -32,6 +32,7 @@ from chartreux.app_server.models import (
 from chartreux.cli.textual_ui.widgets.diff_rendering import (
     DiffOccurrence,
     DiffView,
+    count_diff_rows,
     language_for_path,
     render_edit_diff_async,
 )
@@ -117,7 +118,8 @@ class ToolResultWidget[TResult: BaseModel](Static):
             return self.result_widget
 
     # When True the whole result collapses into a one-line header; when False it
-    # is always rendered in full (used by diff-style results like edit/write).
+    # is always rendered in full (used by one-line results, e.g. an answered
+    # question, whose text belongs on the call row).
     COLLAPSIBLE: ClassVar[bool] = True
 
     def __init__(
@@ -221,8 +223,6 @@ class BashResultWidget(ToolResultWidget[ShellOutput]):
 
 
 class WriteFileResultWidget(ToolResultWidget[FileWriteOutput]):
-    COLLAPSIBLE = False
-
     def compose(self) -> ComposeResult:
         if not self.result:
             yield from self._footer()
@@ -234,9 +234,42 @@ class WriteFileResultWidget(ToolResultWidget[FileWriteOutput]):
         yield from self._footer()
 
 
-class EditResultWidget(ToolResultWidget[FileEditOutput]):
-    COLLAPSIBLE = False
+def edit_diff_occurrences(result: FileEditOutput | None) -> list[DiffOccurrence]:
+    """The diff occurrences for an edit output, including the legacy pair."""
+    if result is None:
+        return []
+    if result.occurrences:
+        return [
+            DiffOccurrence(item.start_line, item.old_text, item.new_text)
+            for item in result.occurrences
+        ]
+    if result.old_string is not None and result.new_string is not None:
+        return [DiffOccurrence(None, result.old_string, result.new_string)]
+    return []
 
+
+def edit_result_stats(output: JsonValue | None) -> str:
+    """The collapsed edit header's ``+N/-M`` for an edit effect output.
+
+    Counts come from the same occurrences (and normalization) the expanded diff
+    renders, so the header never disagrees with the body. An output that does not
+    fit the edit shape (e.g. a hook-replaced result) carries no counts rather
+    than fabricated ones.
+    """
+    if output is None:
+        return ""
+    try:
+        result = FileEditOutput.model_validate(output)
+    except ValidationError:
+        return ""
+    occurrences = edit_diff_occurrences(result)
+    if not occurrences:
+        return ""
+    stats = count_diff_rows(occurrences)
+    return f"+{stats.added}/-{stats.removed}"
+
+
+class EditResultWidget(ToolResultWidget[FileEditOutput]):
     def __init__(
         self,
         result: FileEditOutput | None,
@@ -248,19 +281,7 @@ class EditResultWidget(ToolResultWidget[FileEditOutput]):
         self._diff_view = DiffView([], ansi=False, dark=True)
         self._requested_render_theme: tuple[bool, bool] | None = None
         self._render_worker: Worker[None] | None = None
-        if result is None:
-            self._occurrences = []
-        elif result.occurrences:
-            self._occurrences = [
-                DiffOccurrence(item.start_line, item.old_text, item.new_text)
-                for item in result.occurrences
-            ]
-        elif result.old_string is not None and result.new_string is not None:
-            self._occurrences = [
-                DiffOccurrence(None, result.old_string, result.new_string)
-            ]
-        else:
-            self._occurrences = []
+        self._occurrences = edit_diff_occurrences(result)
 
     def compose(self) -> ComposeResult:
         if not self.result:

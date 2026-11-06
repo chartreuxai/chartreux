@@ -19,7 +19,7 @@ from chartreux.core.config._defaults import (
 from chartreux.core.config.models import MissingAPIKeyError
 from chartreux.core.llm.backend._image import to_data_uri as _to_data_uri
 from chartreux.core.llm.backend._tool_images import has_tool_images, project_tool_images
-from chartreux.core.llm.backend.anthropic import AnthropicAdapter
+from chartreux.core.llm.backend.anthropic import REASONING_BLOCK_TYPES, AnthropicAdapter
 from chartreux.core.llm.backend.base import (
     MODEL_HTTP_KEEPALIVE_EXPIRY_SECONDS,
     APIAdapter,
@@ -36,7 +36,11 @@ from chartreux.core.llm.backend.openai_responses import (
 from chartreux.core.llm.exceptions import BackendError, BackendErrorBuilder, ModelCall
 from chartreux.core.llm.thinking_levels import (
     OPENAI_THINKING_LEVELS,
+    ThinkingLevels,
     get_thinking_levels,
+    narrow_thinking_levels,
+    resolve_enabled_thinking_level,
+    resolve_thinking_level,
 )
 from chartreux.core.llm_models import (
     CONTEXT_INJECTION_ORIGIN_KEY,
@@ -317,6 +321,42 @@ def _merge_headers(*layers: dict[str, str] | None) -> dict[str, str]:
     return merged
 
 
+def _declared_thinking_levels(
+    model: ModelConfig, provider: ProviderConfig
+) -> ThinkingLevels | None:
+    """The encodable levels the model declares, or None when it declares none."""
+    if model.supported_thinking_levels is None:
+        return None
+    levels = get_thinking_levels(str(provider.backend), provider.api_style, model.name)
+    assert levels is not None
+    return narrow_thinking_levels(levels, model.supported_thinking_levels)
+
+
+def _declared_request_thinking(
+    model: ModelConfig,
+    provider: ProviderConfig,
+    messages: Sequence[LLMMessage],
+    levels: ThinkingLevels | None,
+) -> str:
+    if levels is None:
+        return model.thinking
+    requested = model.thinking
+    if (
+        requested == "off"
+        and provider.api_style == "anthropic"
+        and any(
+            block.get("type") in REASONING_BLOCK_TYPES
+            for message in messages
+            for block in message.reasoning_payloads or ()
+        )
+    ):
+        # Retained reasoning keeps the request thinking. Never return "off":
+        # the adapter would have to re-enable an effort the model may not
+        # declare, so resolve the forced level among enabled declared ones.
+        return resolve_enabled_thinking_level(levels).effective
+    return resolve_thinking_level(levels, requested).effective
+
+
 class GenericBackend:
     def __init__(  # noqa: PLR0913
         self,
@@ -507,18 +547,37 @@ class GenericBackend:
         )
         adapter = _get_adapter(api_style, model_call)
 
-        req = adapter.prepare_request(
-            model_name=model.name,
-            messages=messages,
-            temperature=temperature,
-            tools=tools,
-            max_tokens=max_tokens,
-            tool_choice=tool_choice,
-            enable_streaming=False,
-            provider=self._provider,
-            api_key=api_key,
-            thinking=model.thinking,
+        thinking_levels = _declared_thinking_levels(model, self._provider)
+        request_thinking = _declared_request_thinking(
+            model, self._provider, messages, thinking_levels
         )
+        if isinstance(adapter, AnthropicAdapter):
+            req = adapter.prepare_request(
+                model_name=model.name,
+                messages=messages,
+                temperature=temperature,
+                tools=tools,
+                max_tokens=max_tokens,
+                tool_choice=tool_choice,
+                enable_streaming=False,
+                provider=self._provider,
+                api_key=api_key,
+                thinking=request_thinking,
+                thinking_levels=thinking_levels,
+            )
+        else:
+            req = adapter.prepare_request(
+                model_name=model.name,
+                messages=messages,
+                temperature=temperature,
+                tools=tools,
+                max_tokens=max_tokens,
+                tool_choice=tool_choice,
+                enable_streaming=False,
+                provider=self._provider,
+                api_key=api_key,
+                thinking=request_thinking,
+            )
 
         # Provider defaults apply to every backend call. Per-call headers override
         # them case-insensitively; adapter headers are applied last so generated
@@ -617,18 +676,37 @@ class GenericBackend:
         )
         adapter = _get_adapter(api_style, model_call)
 
-        req = adapter.prepare_request(
-            model_name=model.name,
-            messages=messages,
-            temperature=temperature,
-            tools=tools,
-            max_tokens=max_tokens,
-            tool_choice=tool_choice,
-            enable_streaming=True,
-            provider=self._provider,
-            api_key=api_key,
-            thinking=model.thinking,
+        thinking_levels = _declared_thinking_levels(model, self._provider)
+        request_thinking = _declared_request_thinking(
+            model, self._provider, messages, thinking_levels
         )
+        if isinstance(adapter, AnthropicAdapter):
+            req = adapter.prepare_request(
+                model_name=model.name,
+                messages=messages,
+                temperature=temperature,
+                tools=tools,
+                max_tokens=max_tokens,
+                tool_choice=tool_choice,
+                enable_streaming=True,
+                provider=self._provider,
+                api_key=api_key,
+                thinking=request_thinking,
+                thinking_levels=thinking_levels,
+            )
+        else:
+            req = adapter.prepare_request(
+                model_name=model.name,
+                messages=messages,
+                temperature=temperature,
+                tools=tools,
+                max_tokens=max_tokens,
+                tool_choice=tool_choice,
+                enable_streaming=True,
+                provider=self._provider,
+                api_key=api_key,
+                thinking=request_thinking,
+            )
 
         # Provider defaults apply to every backend call. Per-call headers override
         # them case-insensitively; adapter headers are applied last so generated

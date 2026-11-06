@@ -26,7 +26,6 @@ from chartreux.app_server.events import (
     EventSequenceError,
     HistoryEntryAdded,
     SessionCompacted,
-    SessionContextCleared,
     SessionUpdated,
     StatsUpdated,
     TurnCompleted,
@@ -98,6 +97,8 @@ from chartreux.app_server.protocol import (
     SessionContinueResponse,
     SessionKind,
     SessionOptions,
+    SessionPlanHandoffParams,
+    SessionPlanHandoffResponse,
     SessionReadParams,
     SessionReadResponse,
     SessionResumeParams,
@@ -1020,6 +1021,35 @@ class AppServerSession:  # noqa: PLR0904
         await self.resources.sessions.clear_history()
         await self.resources.refresh()
 
+    async def plan_handoff(
+        self,
+        *,
+        executor_model: str,
+        executor_thinking: str,
+        executor_identity: str,
+        plan_path: str,
+        planner_thinking_alias: str | None,
+        planner_thinking_value: str | None,
+    ) -> SessionPlanHandoffResponse:
+        """Start the consented executor session for an accepted plan.
+
+        The consent snapshot is sent verbatim; the server applies exactly these
+        values or fails without starting execution.
+        """
+        response = await self.resources.sessions.plan_handoff(
+            SessionPlanHandoffParams(
+                session_id=self.session_id,
+                executor_model=executor_model,
+                executor_thinking=executor_thinking,
+                executor_identity=executor_identity,
+                plan_path=plan_path,
+                planner_thinking_alias=planner_thinking_alias,
+                planner_thinking_value=planner_thinking_value,
+            )
+        )
+        await self.resources.refresh()
+        return response
+
     def begin_close(self) -> None:
         """Signal an intentional shutdown before ``close()``.
 
@@ -1234,9 +1264,7 @@ class AppServerSession:  # noqa: PLR0904
         if isinstance(event, StatsUpdated):
             self._state.stats = event.params.stats
             self._state.context_window = event.params.context_window
-        if isinstance(event, SessionContextCleared):
-            self._state.reset_usage_baseline()
-        if isinstance(event, SessionCompacted | SessionContextCleared):
+        if isinstance(event, SessionCompacted):
             self._state.session_log = event.params.session_log
             self._connection.mark_session_attached()
             self._callback_sessions = {

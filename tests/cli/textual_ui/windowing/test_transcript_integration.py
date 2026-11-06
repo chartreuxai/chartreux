@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
 from unittest.mock import Mock
@@ -663,24 +662,14 @@ async def test_terminal_tool_group_admission_defensively_extends_finalized_group
 
 
 @pytest.mark.asyncio
-async def test_session_replacement_stops_plan_watcher_and_drops_detached_widgets(
-    tmp_path: Path,
-) -> None:
+async def test_session_replacement_drops_detached_widgets() -> None:
     app = build_test_chartreux_app()
     async with app.run_test():
         handler = app.event_handler
         assert handler is not None
-        await handler._handle_start_plan_review(tmp_path / "plan.md")
-        plan = handler.plan_file_message
-        assert plan is not None and plan.parent is app._messages_area
-        stop = Mock(wraps=plan.stop_watching)
-        plan.stop_watching = stop
         handler.current_tool_group = ToolGroup(key=ToolGroupKey("current"))
         handler._finalized_tool_group = ToolGroup(key=ToolGroupKey("finalized"))
         await app._rebuild_transcript_from_current_session()
-        assert handler.plan_file_message is None
-        assert plan.parent is None
-        stop.assert_called_once()
         assert handler.current_tool_group is None
         assert handler._finalized_tool_group is None
 

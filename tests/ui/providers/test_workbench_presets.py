@@ -8,7 +8,7 @@ from textual.widgets import Input, OptionList
 from chartreux.core.model_catalog.loader import CatalogSnapshot
 from chartreux.core.model_catalog.presets import ProviderPreset
 from chartreux.core.model_catalog.schema import ModelCatalog
-from chartreux.ui.providers.workbench import WorkbenchView
+from tests.conftest import wait_until
 from tests.ui.providers._workbench_support import Host, add_preset, press_option, setup
 
 
@@ -97,7 +97,7 @@ async def test_preset_thinking_picker_lists_only_supported_levels() -> None:
 
 
 @pytest.mark.asyncio
-async def test_management_save_keeps_invalid_preset_pair_in_editor() -> None:
+async def test_management_save_accepts_a_preset_level_served_by_fallback() -> None:
     screen, services = setup()
     catalog = services.catalog.catalog.model_dump()
     catalog["models"]["a"]["deployments"][0]["supported_thinking_levels"] = [
@@ -113,10 +113,11 @@ async def test_management_save_keeps_invalid_preset_pair_in_editor() -> None:
         await press_option(
             pilot, screen.query_one("#wb-presets-actions", OptionList), "finish"
         )
-        assert screen.view == WorkbenchView.PRESETS
-        assert screen._feedback_kind == "error"
-        assert not services.writes
-        assert screen.query_one("#wb-presets").has_focus
+        await wait_until(pilot, lambda: bool(services.writes))
+        # "high" is undeclared by model "a"; admission serves it at the nearest
+        # declared level, so the preset pair saves instead of being held back.
+        assert screen._feedback_kind != "error"
+        assert services.writes
 
 
 @pytest.mark.asyncio

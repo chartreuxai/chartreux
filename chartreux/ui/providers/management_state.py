@@ -6,7 +6,7 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from typing import Literal
 
-from chartreux.core.llm.thinking_levels import get_thinking_levels
+from chartreux.core.llm.thinking_levels import THINKING_LEVEL_ORDER, get_thinking_levels
 from chartreux.core.model_catalog.contracts import (
     ApiStyle,
     CatalogChanges,
@@ -421,7 +421,7 @@ class ManagementState:
             raise ValueError(f"Unknown preset {role}.")
         if not model or "@" in model:
             raise ValueError("Choose one canonical model for the preset.")
-        if thinking not in {"off", "low", "medium", "high", "max"}:
+        if thinking not in THINKING_LEVEL_ORDER:
             raise ValueError(f"Unknown thinking level {thinking} for {role}.")
         self.role_presets[role] = (model, thinking)
 
@@ -452,15 +452,11 @@ class ManagementState:
                 connection.api_style if connection else provider.api_style,
                 wire_name,
             )
-            supported = set(declared or ("off", "low", "medium", "high", "max"))
+            supported = set(declared or THINKING_LEVEL_ORDER)
             if levels is not None:
                 supported.intersection_update(levels)
             available.update(supported)
-        return tuple(
-            level
-            for level in ("off", "low", "medium", "high", "max")
-            if level in available
-        )
+        return tuple(level for level in THINKING_LEVEL_ORDER if level in available)
 
     def validate_preset(
         self,
@@ -676,8 +672,9 @@ class ManagementState:
     ) -> str | None:
         """Resolve first using runtime ordering, then inspect only its credential.
 
-        A role expression filters deployments by the staged thinking level, as
-        the runtime does. A bare (model, thinking) pair instead selects the
+        Readiness follows admission: a staged level the deployment does not
+        declare still resolves (to the nearest declared level), so it is not a
+        readiness failure. A bare (model, thinking) pair instead selects the
         first deployment supporting that level: the deployment a preset staged
         with the pair would resolve to at runtime.
         """
@@ -697,12 +694,6 @@ class ManagementState:
                 ),
             )
         except ValueError as exc:
-            if getattr(exc, "code", None) == "thinking_unsupported":
-                # The host override replaces the staged level, as at runtime.
-                return (
-                    f"thinking {effective} is unsupported by enabled "
-                    f"deployments of {model}"
-                )
             return str(exc)
         env_var = resolved.provider.api_key_env_var
         if (

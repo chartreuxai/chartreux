@@ -19,6 +19,7 @@ from pydantic import (
     ConfigDict,
     Field,
     HttpUrl,
+    ValidationError,
     field_validator,
     model_validator,
 )
@@ -536,6 +537,71 @@ class CompletionSectionConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     mode: Literal["stamp", "enforce"] = "enforce"
+
+
+DEFAULT_PLAN_PLANNER_MODEL = "glm-5-3"
+DEFAULT_PLAN_PLANNER_THINKING: ThinkingLevel = "high"
+DEFAULT_PLAN_EXECUTOR_MODEL = "mistral-large-4"
+DEFAULT_PLAN_EXECUTOR_THINKING: ThinkingLevel = "medium"
+DEFAULT_PLAN_EXECUTOR_IDENTITY = "orchestrator"
+
+
+class PlanPlannerConfig(BaseModel):
+    """The ``[plan.planner]`` selection: the model and thinking level of ``/plan``.
+
+    The shipped default is GLM high (requirement R3). Planning keeps the
+    ordinary agent permissions so exploration and research are not restricted
+    (requirement R4); nothing here narrows them.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    model: str = Field(default=DEFAULT_PLAN_PLANNER_MODEL, min_length=1)
+    thinking: ThinkingLevel = DEFAULT_PLAN_PLANNER_THINKING
+
+
+class PlanExecutorConfig(BaseModel):
+    """The ``[plan.executor]`` selection for the handed-off execution session.
+
+    The shipped default is ML4 medium with the orchestrator identity
+    (requirement R3). The selected values are snapshotted when the consent
+    modal opens and applied exactly as displayed, or not at all.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    model: str = Field(default=DEFAULT_PLAN_EXECUTOR_MODEL, min_length=1)
+    thinking: ThinkingLevel = DEFAULT_PLAN_EXECUTOR_THINKING
+    identity: str = DEFAULT_PLAN_EXECUTOR_IDENTITY
+
+    @field_validator("identity")
+    @classmethod
+    def _validate_identity(cls, value: str) -> str:
+        # ONE definition of identity ids: reuse the [agent].identity rule so a
+        # typo fails at config load instead of at handoff.
+        try:
+            AgentSelectionConfig(identity=value)
+        except ValidationError as error:
+            raise ValueError(f"invalid plan executor identity: {value!r}") from error
+        return value
+
+
+class PlanSectionConfig(BaseModel):
+    """The ``[plan]`` config section: the ``/plan``-mode model selections.
+
+    One subsection per role, deep-mergeable across layers like every other
+    container section, so a layer that names only ``[plan.executor] identity``
+    preserves the typed defaults of everything else.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    planner: Annotated[PlanPlannerConfig, WithDeepMerge()] = Field(
+        default_factory=PlanPlannerConfig
+    )
+    executor: Annotated[PlanExecutorConfig, WithDeepMerge()] = Field(
+        default_factory=PlanExecutorConfig
+    )
 
 
 type StatusLineSegment = Literal[

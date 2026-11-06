@@ -686,13 +686,17 @@ def test_shared_model_roles_keep_distinct_thinking_and_explicit_override(
     assert explicit.orchestrator.config.get_active_model().thinking == "high"
 
 
-def test_explicit_thinking_can_repair_unavailable_preset_level_for_spawn(
+def test_undeclared_preset_thinking_resolves_instead_of_failing(
     config: ChartreuxConfigSchema,
 ) -> None:
     _with_role(config, "unavailable", ("small",), "max")
 
-    with pytest.raises(InvalidLaunchModelError, match="thinking"):
-        resolve(config, LaunchConfig(model="@unavailable"))
+    # The preset keeps the level it asked for; the deployment serves it at the
+    # nearest declared level, so the explicit override is no longer needed to
+    # "repair" an undeclared level.
+    fell_back = resolve(config, LaunchConfig(model="@unavailable"))
+    assert fell_back.effective_thinking == "max"
+    assert fell_back.committed_model.thinking == "max"
 
     repaired = resolve(config, LaunchConfig(model="@unavailable", thinking="high"))
     assert repaired.effective_thinking == "high"

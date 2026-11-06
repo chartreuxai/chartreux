@@ -403,7 +403,7 @@ def test_credential_status_labels() -> None:
     assert credential_status("ONE", lambda _: None) == "Key Required"
 
 
-def test_finish_reports_unsupported_thinking_for_one_preset() -> None:
+def test_finish_accepts_a_preset_level_served_at_the_nearest_declared_level() -> None:
     draft = state()
     catalog_data = draft.catalog.model_dump()
     catalog_data["models"]["c"]["deployments"][0]["supported_thinking_levels"] = ["low"]
@@ -413,5 +413,7 @@ def test_finish_reports_unsupported_thinking_for_one_preset() -> None:
     draft.set_role_preset("cross", "c", "high")
     assert draft.validate(completion=False).errors == ()
     result = draft.validate(completion=True, credential_resolver=lambda _: "key")
-    assert result.unusable_roles == ("cross",)
-    assert any("thinking high is unsupported" in error for error in result.errors)
+    # "high" is not declared by "c"; admission serves it at the nearest declared
+    # level, so the preset stays usable instead of being reported unsupported.
+    assert result.unusable_roles == ()
+    assert result.errors == ()

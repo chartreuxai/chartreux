@@ -47,7 +47,6 @@ from chartreux.utils.io import read_safe
 if TYPE_CHECKING:
     from chartreux.core.agents.manager import AgentManager
     from chartreux.core.background_jobs import BackgroundJobsPort
-    from chartreux.core.callbacks import ClearContextCallback
     from chartreux.core.config import ChartreuxConfigSchema
     from chartreux.core.dangerous_commands import DangerousCommandAuthority
     from chartreux.core.hooks.models import HookConfigResult
@@ -90,8 +89,6 @@ class InvokeContext:
     subagent_manager: SubagentManagementPort | None = field(default=None)
     session_dir: Path | None = field(default=None)
     launch_context: dict[str, object] | None = field(default=None)
-    plan_file_path: Path | None = field(default=None)
-    request_clear_context_callback: ClearContextCallback | None = field(default=None)
     skill_manager: SkillManager | None = field(default=None)
     is_skill_loaded: Callable[[str], bool] | None = field(default=None)
     scratchpad_dir: Path | None = field(default=None)
@@ -233,9 +230,8 @@ class BaseTool[
         self.scratchpad_roots_getter: Callable[[], frozenset[Path]] | None = None
         self.owned_scratchpad_getter: Callable[[], Path | None] | None = None
         # Installed by the runtime independently of tool config and session grants.
-        # A live getter avoids stale scope after profile switches or plan resets.
+        # A live getter avoids stale scope after profile switches.
         self.instruction_read_files_getter: Callable[[], frozenset[Path]] = frozenset
-        self.plan_file_write_scope_getter: Callable[[], Path | None] = lambda: None
         self.path_authority_getter: Callable[[], PathAuthority] | None = None
         # Installed by the runtime alongside the other live getters; the shell
         # resolver reads it per invocation so authority changes invalidate
@@ -243,7 +239,6 @@ class BaseTool[
         self.dangerous_command_authorities_getter: Callable[
             [], tuple[DangerousCommandAuthority, ...]
         ] = _no_dangerous_command_authorities
-        self.inherited_plan_write_scopes: tuple[tuple[Path, Path | None], ...] = ()
 
     @classmethod
     def path_sensitive_patterns(cls, config: BaseToolConfig) -> tuple[str, ...]:
@@ -270,12 +265,6 @@ class BaseTool[
                 self.owned_scratchpad_dir,
                 self.scratchpad_roots,
                 self.instruction_read_files,
-            )
-        if self.get_name() in {"write_file", "edit"}:
-            authority = replace(
-                authority,
-                plan_file_write_scope=self.plan_file_write_scope_getter(),
-                inherited_plan_write_scopes=self.inherited_plan_write_scopes,
             )
         return authority
 

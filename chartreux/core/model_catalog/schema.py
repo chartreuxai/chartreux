@@ -19,22 +19,13 @@ from pydantic import (
     model_validator,
 )
 
-from chartreux.core.llm.thinking_levels import (
-    ANTHROPIC_THINKING_LEVELS,
-    GLM_5_3_THINKING_LEVELS,
-    MISTRAL_THINKING_LEVELS,
-    OPENAI_RESPONSES_THINKING_LEVELS,
-    OPENAI_THINKING_LEVELS,
-)
+from chartreux.core.llm.thinking_levels import THINKING_LEVEL_ORDER
 
 _ENV_VAR_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
-_THINKING_LEVELS = frozenset().union(
-    MISTRAL_THINKING_LEVELS,
-    OPENAI_THINKING_LEVELS,
-    OPENAI_RESPONSES_THINKING_LEVELS,
-    ANTHROPIC_THINKING_LEVELS,
-    GLM_5_3_THINKING_LEVELS,
-)
+# Catalog declarations name public levels; whether a named level is encodable
+# by a deployment is a launch-admission fact, resolved by nearest-level
+# fallback rather than rejected here.
+_THINKING_LEVELS = frozenset(THINKING_LEVEL_ORDER)
 
 
 def _mutable_catalog_value(value: Any) -> Any:

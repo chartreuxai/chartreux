@@ -21,7 +21,10 @@ from chartreux.core.compaction.context import (
 from chartreux.core.deferred_questions import DeferredQuestionStore
 from chartreux.core.errors import ContextTooLongError
 from chartreux.core.file_state import FileStateStore
-from chartreux.core.llm.thinking_levels import get_thinking_levels
+from chartreux.core.llm.thinking_levels import (
+    get_thinking_levels,
+    resolve_thinking_level,
+)
 from chartreux.core.llm_models import (
     LLMMessage,
     PersistedToolResult,
@@ -551,7 +554,7 @@ class CompactionManager:
     async def _fallback(self, history: list[LLMMessage], request: str) -> str | None:
         # Dedicated summarizer call: fresh system prompt, no tools, and no more
         # thinking than the model can encode. Models that cannot disable thinking
-        # retain their configured level (or their lowest supported level).
+        # keep the level nearest their configured one among the declared levels.
         config = self._config()
         model = config.get_compaction_model()
         provider = config.get_provider_for_model(model)
@@ -560,19 +563,19 @@ class CompactionManager:
         )
         fallback_thinking = "off"
         if levels is not None:
-            available_levels = levels
-            if model.supported_thinking_levels is not None:
-                available_levels = {
+            available_levels = (
+                levels
+                if model.supported_thinking_levels is None
+                else {
                     level: levels[level]
                     for level in model.supported_thinking_levels
                     if level in levels
                 }
-            if fallback_thinking not in available_levels:
-                fallback_thinking = (
-                    model.thinking
-                    if model.thinking in available_levels
-                    else next(iter(available_levels))
-                )
+            )
+            if "off" not in available_levels:
+                fallback_thinking = resolve_thinking_level(
+                    available_levels, model.thinking
+                ).effective
         model = model.model_copy(update={"thinking": fallback_thinking})
         result, _ = await self._summarize_call(
             list(history),

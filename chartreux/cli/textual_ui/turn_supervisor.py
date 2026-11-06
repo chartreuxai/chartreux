@@ -7,7 +7,7 @@ from collections import deque
 from collections.abc import AsyncGenerator, Awaitable, Callable
 from contextlib import aclosing, suppress
 from enum import StrEnum
-from typing import TYPE_CHECKING, Any, TypedDict
+from typing import TYPE_CHECKING, Any, Literal, TypedDict
 from uuid import uuid4
 
 from chartreux.app_server.events import (
@@ -18,6 +18,8 @@ from chartreux.app_server.events import (
     TurnStarted,
 )
 from chartreux.app_server.models import (
+    AnsweredCallbackState,
+    ExpiredCallbackState,
     PublicCallbackEntry,
     PublicMessageEntry,
     PublicTurnStatus,
@@ -97,15 +99,16 @@ _RETRYABLE_TURN_ERROR_CODES = {
     TurnErrorCode.INCOMPLETE_STREAM,
 }
 
-# R1 (plan v0.5.6-recovery): the terminal root-failure codes that display the
-# keyboard-accessible "Retry — new turn" affordance. The affordance's
-# retryable set is the existing retryable set PLUS exhaustion-after-cooldown
-# (ALL_DEPLOYMENTS_UNAVAILABLE): the user pressing Retry is a genuine user
-# action, and the existing manual retry operation's intentional cooldown reset
-# (the only path allowed to reset it, ``_loop.py``) is exactly what makes a
-# retry meaningful once every deployment was excluded. The error text stays
-# honest that deployments were unavailable and that a manual retry resets the
-# model's cooldowns (``_exhaustion_retry_hint``).
+# R1 (plan v0.5.6-recovery): the terminal root-failure codes that arm the
+# manual retry presentation. The retryable set is the existing retryable set
+# PLUS exhaustion-after-cooldown (ALL_DEPLOYMENTS_UNAVAILABLE): the user
+# pressing Retry is a genuine user action, and the existing manual retry
+# operation's intentional cooldown reset (the only path allowed to reset it,
+# ``_loop.py``) is exactly what makes a retry meaningful once every deployment
+# was excluded. E1: the error is a plain transcript message — the retry is
+# offered as a text hint (/retry or Ctrl+R), never as a mounted widget. The
+# text stays honest that deployments were unavailable and that a manual retry
+# resets the model's cooldowns (``_exhaustion_retry_hint``).
 _RETRY_AFFORDANCE_TURN_ERROR_CODES = _RETRYABLE_TURN_ERROR_CODES | {
     TurnErrorCode.ALL_DEPLOYMENTS_UNAVAILABLE
 }
@@ -154,6 +157,9 @@ _DEAD_CALLBACK_ERROR_CODES = frozenset({
 # nowhere left to deliver the draft.
 _CLOSED_CALLBACK_MESSAGE = "This question was closed; it can no longer be answered."
 _DEAD_CALLBACK_MESSAGE = "This question is no longer open; it cannot be answered."
+_ANSWERED_ELSEWHERE_MESSAGE = (
+    "This question was answered elsewhere; it can no longer be answered here."
+)
 
 
 def _truncate_error_payload(message: str) -> str:
@@ -212,6 +218,25 @@ def _message_matches_active_callback(
         active_callback is not None
         and active_callback.callback_id == message.callback_id
     )
+
+
+def _closed_callback_presentation(
+    entry: PublicCallbackEntry,
+) -> tuple[str, Literal["information", "warning"]]:
+    """Outcome-specific copy and severity for a server-terminal callback (plan U).
+
+    The server is the settlement authority, so the terminal entry state is the
+    outcome: an expiry keeps its existing "Unanswered — deferred" warning
+    (plan U/OD1 semantics unchanged), while a closure the user did not cause
+    is reported quietly as information — never as a warning about a question
+    the user just answered.
+    """
+    state = entry.state
+    if isinstance(state, ExpiredCallbackState):
+        return "Unanswered — deferred", "warning"
+    if isinstance(state, AnsweredCallbackState):
+        return _ANSWERED_ELSEWHERE_MESSAGE, "information"
+    return _CLOSED_CALLBACK_MESSAGE, "information"
 
 
 class TurnSupervisor:
@@ -284,6 +309,12 @@ class TurnSupervisor:
         self.pending_callbacks: deque[PublicCallbackEntry] = deque()
         self.callback_submitting = False
         self.callback_delivery_uncertain = False
+        # The settlement RPC this client has in flight, keyed by callback
+        # identity and carrying the exact output submitted (plan U). The server
+        # publishes the terminal patch before answering the RPC, so the event
+        # usually arrives first; this record lets that echo be recognized as
+        # this client's own settlement instead of an out-of-band closure.
+        self.settling_callback: tuple[str, UserInputCallbackOutput] | None = None
         self.pending_local_question: asyncio.Future[UserQuestionResult] | None = None
         self.active_turn_start: int | None = None
 
@@ -383,6 +414,7 @@ class TurnSupervisor:
 
         self.active_callback = None
         self.callback_delivery_uncertain = False
+        self.settling_callback = None
         self.pending_callbacks.clear()
         self._app._indicate_pending_action()
         self._cancel_pending_question(UserQuestionResult(answers=[], cancelled=True))
@@ -892,21 +924,22 @@ class TurnSupervisor:
             and error.error.code == TurnErrorCode.INVALID_API_KEY
         ):
             event_handler.cancel_retry_presentation()
-        # R1: an authoritative terminal retryable root failure displays the
-        # keyboard-accessible "Retry — new turn" affordance on the error
-        # widget and arms the retry presentation, so the affordance invokes
-        # the EXISTING retry operation (never resume_agent, never automatic).
+        # E1: a terminal retryable root failure arms the retry presentation and
+        # states the manual retry paths as a text hint. The error itself is a
+        # plain transcript message: a mounted retryable widget's only removal
+        # handle is discarded when the presentation is cancelled, which left a
+        # stranded widget behind on every failed retryable turn.
         offer_retry = (
             event_handler is not None
             and isinstance(error, AppServerTurnError)
             and error.error.code in _RETRY_AFFORDANCE_TURN_ERROR_CODES
         )
         widget = ErrorMessage(
-            message, collapsed=self._app._tools_collapsed, retryable=offer_retry
+            message, collapsed=self._app._tools_collapsed, retryable=False
         )
         await self._app._mount_and_scroll(widget)
         if offer_retry and event_handler is not None:
-            event_handler.offer_retry(widget)
+            event_handler.offer_retry()
             self._app._refresh_command_registry()
         # The token is opaque here (the app owns the type): a real frozen
         # token speaks only while its epoch and session still own the record;
@@ -958,9 +991,8 @@ class TurnSupervisor:
     @staticmethod
     def _retry_hint() -> str:
         return (
-            "\n\nRetry — new turn: use the button below, press Ctrl+R, or run "
-            "/retry [additional instructions]. Completed tool results are "
-            "kept; recent actions may repeat."
+            "\n\n/retry or Ctrl+R to retry this turn. Completed tool results "
+            "are kept; recent actions may repeat."
         )
 
     @staticmethod
@@ -969,9 +1001,8 @@ class TurnSupervisor:
         # unavailable, and only a manual user retry resets the model's
         # cooldowns (the sole path allowed to do so).
         return (
-            "\n\nAll deployments for this model were unavailable. Retry — new "
-            "turn: use the button below, press Ctrl+R, or run /retry "
-            "[additional instructions]; a manual retry is your request and "
+            "\n\nAll deployments for this model were unavailable. /retry or "
+            "Ctrl+R to retry this turn; a manual retry is your request and "
             "resets the model's cooldowns. Completed tool results are kept; "
             "recent actions may repeat."
         )
@@ -1114,23 +1145,52 @@ class TurnSupervisor:
                 severity="warning",
             )
 
+    def _own_settlement_echo(self, entry: PublicCallbackEntry) -> bool:
+        """Whether ``entry`` is the server echo of this client's settlement.
+
+        Reconciliation is by callback identity and exact output (plan U): the
+        server publishes the terminal patch before it answers the settlement
+        RPC, so that event usually arrives while the RPC is still in flight.
+        It is not an out-of-band closure — the submitting path owns the
+        presentation — and must never be reported as a closed question.
+        """
+        settled = self.settling_callback
+        if settled is None or settled[0] != entry.callback_id:
+            return False
+        state = entry.state
+        if not isinstance(state, AnsweredCallbackState):
+            return False
+        return state.output.model_dump(mode="json") == settled[1].model_dump(
+            mode="json"
+        )
+
     async def _question_closed(self, entry: PublicCallbackEntry) -> None:
-        """Close the UI for a callback the server reported terminal.
+        """Present a callback the server reported terminal.
 
         Covers every non-open state: expired unanswered (plan U/OD1), answered
-        elsewhere, and cancelled (including a child closure, Q2b). Any terminal
-        state closes the live widget: it can no longer be resolved.
+        — here or elsewhere — and cancelled (including a child closure, Q2b).
+        The server is the settlement authority; this path only presents its
+        outcome, quietly and outcome-specifically. The echo of this client's
+        own settlement is left to the submitting RPC path, which presents it
+        once, without reopening the question.
         """
         callback_id = entry.callback_id
         self._prune_expired_pending()
         active = self.active_callback
         if active is not None and active.callback_id == callback_id:
-            message = (
-                "Unanswered — deferred"
-                if entry.state.status == "expired"
-                else _CLOSED_CALLBACK_MESSAGE
-            )
-            await self._dismiss_closed_callback(active, message)
+            if self._own_settlement_echo(entry):
+                # The echo of this client's own settlement. While the RPC is
+                # still in flight the submitting path owns the transition;
+                # after an uncertain delivery the echo proves the answer did
+                # land, so the widget closes with no notice at all.
+                if self.callback_submitting:
+                    return
+                self.settling_callback = None
+                self.callback_delivery_uncertain = False
+                await self._dismiss_closed_callback(active, None)
+                return
+            message, severity = _closed_callback_presentation(entry)
+            await self._dismiss_closed_callback(active, message, severity=severity)
             return
         # A queued callback closed before it was ever displayed.
         self.pending_callbacks = deque(
@@ -1165,7 +1225,11 @@ class TurnSupervisor:
         )
 
     async def _dismiss_closed_callback(
-        self, callback: PublicCallbackEntry, message: str
+        self,
+        callback: PublicCallbackEntry,
+        message: str | None,
+        *,
+        severity: Literal["information", "warning", "error"] = "warning",
     ) -> None:
         """Close a terminal callback's widget and hand the surface to what is next.
 
@@ -1173,7 +1237,10 @@ class TurnSupervisor:
         already closed are pruned, the widget is closed, and the next pending
         callback — or the prompt — takes over. A dead callback can never accept
         its draft, so its widget must not linger with a resend hint that can
-        only fail again.
+        only fail again. ``message``/``severity`` belong to the caller's
+        outcome-specific presentation: an expiry warns, a closure the user did
+        not cause is informational, and this client's own settlement is silent
+        (``message=None``).
         """
         from chartreux.cli.textual_ui.app import _get_question_app_class
 
@@ -1185,7 +1252,8 @@ class TurnSupervisor:
         if question is not None and question._callback_id == callback.callback_id:
             question.close_for_expiry()
         self.active_callback = None
-        self._app.notify(message, severity="warning")
+        if message is not None:
+            self._app.notify(message, severity=severity)
         generation = self._app._program_status.generation
         if self.pending_callbacks:
             await self._app._show_callback(self.pending_callbacks.popleft())
@@ -1376,6 +1444,14 @@ class TurnSupervisor:
         # return emission below would overwrite it with `idle`/`working`.
         generation = self._app._program_status.generation
         self.callback_submitting = True
+        # Record the settlement identity before the RPC (plan U): the server
+        # publishes the terminal patch first, so its echo can arrive while this
+        # RPC is still in flight and must be reconciled as this client's own
+        # settlement, not as an out-of-band closure. A definite outcome clears
+        # the record; an uncertain delivery keeps it, so a later matching echo
+        # still proves the answer landed.
+        self.settling_callback = (callback.callback_id, output)
+        keep_settlement = False
         question = self._app.query_one(_get_question_app_class())
         question.set_submission_status("Running: Sending answer")
         try:
@@ -1399,6 +1475,7 @@ class TurnSupervisor:
             )
             return
         except (AppServerConnectionClosed, OSError, TimeoutError) as exc:
+            keep_settlement = True
             self.callback_delivery_uncertain = True
             question.set_submission_status(
                 "Warning: Answer delivery is uncertain. Draft kept; do not resend. "
@@ -1407,6 +1484,7 @@ class TurnSupervisor:
             )
             return
         except Exception as exc:
+            keep_settlement = True
             self.callback_delivery_uncertain = True
             logger.warning("Callback delivery outcome unknown", exc_info=exc)
             question.set_submission_status(
@@ -1416,6 +1494,8 @@ class TurnSupervisor:
             return
         finally:
             self.callback_submitting = False
+            if not keep_settlement:
+                self.settling_callback = None
         if self.active_callback is callback:
             question.disabled = True
             self.active_callback = None

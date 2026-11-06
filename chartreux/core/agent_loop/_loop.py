@@ -178,7 +178,6 @@ from chartreux.core.middleware import (
     TurnLimitMiddleware,
 )
 from chartreux.core.model_catalog.availability import EligibleDeployment
-from chartreux.core.plan_session import PlanSession
 from chartreux.core.policy.bundle import (
     ActivatedPolicy,
     BundleStore,
@@ -467,7 +466,6 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
         inherited_workspace: Workspace | None = None,
         inherited_restrictions: tuple[SourceRestrictions, ...] = (),
         inherited_mode_restrictions: tuple[SourceRestrictions, ...] = (),
-        inherited_plan_write_scopes: tuple[tuple[Path, Path | None], ...] = (),
         inherited_root_grants: tuple[Path, ...] = (),
         parent_authority_getter: Callable[[], ToolManager] | None = None,
         parent_authority_revision_getter: Callable[[], int] | None = None,
@@ -502,7 +500,6 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
         self._detached_accounting_producers: set[asyncio.Task[None]] = set()
         self._inherited_restrictions = tuple(inherited_restrictions)
         self._inherited_mode_restrictions = tuple(inherited_mode_restrictions)
-        self._inherited_plan_write_scopes = tuple(inherited_plan_write_scopes)
         self._parent_authority_getter = parent_authority_getter
         self._parent_authority_revision_getter = parent_authority_revision_getter
         self._authority_revision = 0
@@ -680,7 +677,6 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
             accepted_token_getter=lambda: self.config_orchestrator.accepted_token,
             inherited_restrictions=self._inherited_restrictions,
             inherited_workspace=self._inherited_workspace,
-            inherited_plan_write_scopes=self._inherited_plan_write_scopes,
             parent_authority_getter=self._parent_authority_getter,
             parent_authority_revision_getter=self._parent_authority_revision_getter,
             cwd=self.cwd,
@@ -712,8 +708,6 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
         self._max_session_tokens = max_session_tokens
         self._run_max_price = run_max_price
         self._run_max_session_tokens = run_max_session_tokens
-        self._plan_session = PlanSession()
-        self._user_plan: str | None = None
 
         self.format_handler = APIToolFormatHandler()
         self._llm_gateway = LLMGateway()
@@ -1013,7 +1007,6 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
         # The pending injected-message buffer and the tracked steering tasks
         # are owned by the context injector; the loop keeps compatibility
         # views (see the properties below).
-        self._pending_clear_context: bool = False
 
         self.session_logger = SessionLogger(
             config.session_logging,
@@ -1301,7 +1294,6 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
             inherited_restrictions=self._inherited_restrictions,
             inherited_mode_restrictions=self._inherited_mode_restrictions,
             inherited_workspace=self._inherited_workspace,
-            inherited_plan_write_scopes=self._inherited_plan_write_scopes,
             parent_authority_getter=self._parent_authority_getter,
             parent_authority_revision_getter=self._parent_authority_revision_getter,
         )
@@ -2204,12 +2196,6 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
         )
 
     @property
-    def user_plan(self) -> str | None:
-        # The legacy ``_user_plan`` field is a fallback for paths that resolve a
-        # plan without an explicit user selection.
-        return self._user_plan
-
-    @property
     def file_state(self) -> FileStateStore:
         """The working-set file state store (path -> last-seen revision + outline)."""
         return self.file_state_context.store
@@ -2279,9 +2265,6 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
                 )
             )
 
-    def set_user_plan(self, user_plan: str | None) -> None:
-        self._user_plan = user_plan
-
     def _should_self_heal(self) -> bool:
         # Recover from an overflow at most once per turn; strict mode surfaces it.
         return (
@@ -2304,8 +2287,6 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
             metadata["parent_session_id"] = self.parent_session_id
         if self._current_user_message_id is not None:
             metadata["message_id"] = self._current_user_message_id
-        if self.user_plan is not None:
-            metadata["user_plan"] = self.user_plan
         if isinstance(self.launch_context, dict):
             for key in (
                 "agent_entrypoint",
@@ -2760,8 +2741,6 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
                 if self._is_subagent
                 else cast(SubagentManagementPort, self._turn.subagent_runner)
             ),
-            plan_file_path=self._plan_session.plan_file_path,
-            request_clear_context_callback=self._request_clear_context,
             skill_manager=self.skill_manager,
             is_skill_loaded=self._context_injector.skill_already_loaded,
             scratchpad_dir=self.scratchpad_dir,
@@ -3259,8 +3238,8 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
         stats, and the session-logger binding.
 
         Reset so nothing leaks across the session boundary: tool-permission
-        approvals, checkpoint/rewind state, the plan session, per-turn middleware
-        and tool state, and the scratchpad directory.
+        approvals, checkpoint/rewind state, per-turn middleware and tool state,
+        and the scratchpad directory.
 
         Atomicity: the only intentionally fail-able work (scratchpad creation)
         runs before any mutation. The commit section is designed to be infallible
@@ -3358,10 +3337,7 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
         self.checkpoint_recorder.reset()
         self.middleware_pipeline.reset()
         self.tool_manager.reset_all()
-        self._plan_session = PlanSession()
-        self._user_plan = None
         self._pending_injected_messages = []
-        self._pending_clear_context = False
         self._current_user_message_id = None
         self._is_user_prompt_call = False
         self._reactive_recovery_used = False
@@ -3426,14 +3402,6 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
                 # failed retry save must not mask it.
                 logger.debug("compaction settlement retry save failed: %s", save_error)
             raise
-
-    async def _request_clear_context(self) -> None:
-        """Signal that the context should be cleared at the next turn boundary.
-
-        The actual clear is deferred so the in-flight tool turn can finish
-        appending its tool-result before ``self.messages`` is wiped.
-        """
-        self._pending_clear_context = True
 
     @requires_init
     async def relocate(self, cwd: Path) -> None:

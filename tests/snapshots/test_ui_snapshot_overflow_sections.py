@@ -9,6 +9,7 @@ from textual.widget import Widget
 from textual.worker import WorkerState
 
 from chartreux.cli.textual_ui.handlers.event_handler import EventHandler
+from chartreux.cli.textual_ui.widgets.collapsible import HeaderCollapsibleSection
 from chartreux.cli.textual_ui.widgets.diff_rendering import DiffView
 from chartreux.cli.textual_ui.widgets.tool_widgets import EditResultWidget
 from chartreux.core.events import ToolCallEvent, ToolResultEvent
@@ -114,6 +115,12 @@ class EditResultApp(_SnapshotApp):
 async def _populated_edit(pilot: Pilot) -> None:
     app = cast(_SnapshotApp, pilot.app)
     await app.populate()
+    await pilot.pause(0.3)
+    # The settled edit result mounts collapsed, so unfold it: this snapshot's job
+    # is the rendered diff, not the one-line header.
+    section = pilot.app.query_one(HeaderCollapsibleSection)
+    assert section.is_collapsed
+    section.set_collapsed(False)
     await pilot.pause(0.3)
     widget = pilot.app.query_one(EditResultWidget)
     assert widget._render_worker is not None

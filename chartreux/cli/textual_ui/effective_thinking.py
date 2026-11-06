@@ -38,6 +38,12 @@ def picker_explanation(effective: EffectiveThinkingView | None) -> str | None:
             f"this model at {effective.semantic} (API effort "
             f"{api_effort_label(effective)}) for the next request."
         )
+    if effective.effective is not None and effective.effective != effective.requested:
+        return (
+            f"Selected {effective.requested}; this model has no "
+            f"{effective.requested} level, so the next request uses "
+            f"{effective.effective} (API effort {api_effort_label(effective)})."
+        )
     return (
         f"Selected {effective.requested}; this model's API effort is "
         f"{api_effort_label(effective)} for the next request."

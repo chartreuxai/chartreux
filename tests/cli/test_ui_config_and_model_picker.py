@@ -7,7 +7,6 @@ import pytest
 from rich.text import Text
 from textual.widgets import OptionList
 
-from chartreux.app_server.config import THINKING_LEVELS
 from chartreux.app_server.protocol import (
     ConfigFieldKind,
     ConfigFieldsReadResponse,
@@ -517,7 +516,7 @@ async def test_thinking_opens_thinking_picker() -> None:
 
 
 @pytest.mark.asyncio
-async def test_thinking_picker_shows_all_levels() -> None:
+async def test_thinking_picker_shows_the_deployment_declared_levels() -> None:
     app = build_test_chartreux_app(config=_make_config_with_models())
     async with app.run_test() as pilot:
         await pilot.pause(0.1)
@@ -525,8 +524,26 @@ async def test_thinking_picker_shows_all_levels() -> None:
         await pilot.pause(0.2)
 
         picker = app.query_one(ThinkingPickerApp)
-        assert picker._thinking_levels == THINKING_LEVELS
+        # An unlisted mistral wire name declares the provider table's levels.
+        assert picker._thinking_levels == ("off", "low", "medium", "high", "max")
         assert picker._current_thinking == "off"
+
+
+@pytest.mark.asyncio
+async def test_thinking_picker_offers_only_the_declared_levels() -> None:
+    config = build_test_vibe_config(
+        models=[ModelConfig(name="zai-glm-5-3", provider="mistral", alias="glm")],
+        active_model="glm",
+    )
+    app = build_test_chartreux_app(config=config)
+    async with app.run_test() as pilot:
+        await pilot.pause(0.1)
+        await app._show_thinking()
+        await pilot.pause(0.2)
+
+        picker = app.query_one(ThinkingPickerApp)
+        # GLM-5.3 declares low/high/max; it cannot disable thinking.
+        assert picker._thinking_levels == ("low", "high", "max")
 
 
 @pytest.mark.asyncio

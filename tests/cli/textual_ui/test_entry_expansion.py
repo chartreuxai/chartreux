@@ -16,6 +16,8 @@ from chartreux.app_server.models import (
     EffectResultDisplay,
     FailedEffectState,
     FileEditEffectDetail,
+    FileEditEffectOccurrence,
+    FileEditEffectOutput,
     GenericEffectDetail,
     PublicEffectEntry,
     PublicEntryGenerationStatus,
@@ -97,6 +99,32 @@ def _build(
         tools_collapsed=True,
         expansion_state=group_state,
         entry_expansion_state=entry_state,
+    )
+
+
+def _completed_edit(entry_id: str = "edit") -> PublicEffectEntry:
+    output = FileEditEffectOutput(
+        file="app.py",
+        occurrences=[
+            FileEditEffectOccurrence(start_line=1, old_text="a = 1", new_text="a = 2")
+        ],
+    )
+    return PublicEffectEntry(
+        id=entry_id,
+        session_id="session",
+        turn_id="turn",
+        created_at=2,
+        updated_at=3,
+        generation_status=PublicEntryGenerationStatus.COMPLETED,
+        title="tool",
+        detail=FileEditEffectDetail(
+            tool_name="edit",
+            display=EffectCallDisplay(summary="Editing app.py", status_text="Editing"),
+        ),
+        state=CompletedEffectState(
+            output=output.model_dump(mode="json", by_alias=True),
+            display=EffectResultDisplay(success=True, verb="Edited", message="app.py"),
+        ),
     )
 
 
@@ -279,6 +307,39 @@ async def test_app_session_replacement_resets_expansion() -> None:
         await app._reset_presentation_after_resume()
         assert app._entry_expansion_state.is_collapsed("old-id")
         assert not app._entry_expansion_state.entry_ids
+
+
+@pytest.mark.asyncio
+async def test_edit_result_expansion_choice_is_session_local() -> None:
+    state = EntryExpansionState()
+    groups = ToolGroupExpansionState()
+    entries: list[PublicReasoningEntry | PublicEffectEntry] = [_completed_edit()]
+    app = _HistoryApp()
+    async with app.run_test() as pilot:
+        history = app.query_one("#history", Vertical)
+        await history.mount_all(_build(entries, state, groups))
+        await pilot.pause()
+        section = app.query_one(ToolResultMessage).query_one(CollapsibleSection)
+        # A settled edit result is collapsed by default and registered.
+        assert section.is_collapsed
+        assert state.is_collapsed("edit")
+
+        section.set_collapsed(False)
+        await pilot.pause()
+        assert not state.is_collapsed("edit")
+
+        # Rebuild (rewind / transcript rewrite) keeps the choice.
+        await history.remove_children()
+        await history.mount_all(_build(entries, state, groups))
+        await pilot.pause()
+        assert not app.query_one(CollapsibleSection).is_collapsed
+
+        # Resume / process restart resets the session-local store to collapsed.
+        state.reset()
+        await history.remove_children()
+        await history.mount_all(_build(entries, state, groups))
+        await pilot.pause()
+        assert app.query_one(CollapsibleSection).is_collapsed
 
 
 @pytest.mark.asyncio

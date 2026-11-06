@@ -106,8 +106,8 @@ is the same for subagents, which share the main agent's availability state.
 - **All deployments unavailable.** When every deployment of the model is
   excluded, the turn ends with a visible error that names the model and each
   deployment's exclusion reason. There is no automatic retry storm and no
-  hidden continuation behind it — but the error offers the manual retry
-  affordance described next.
+  hidden continuation behind it — but the error ends with the manual retry
+  hint described next.
 - **Automatic root recovery (default on).** Since v0.5.6 `[recovery.root]` is
   enabled by default (see
   [configuration](configuration.md#automatic-root-recovery)); a terminal root
@@ -128,26 +128,25 @@ is the same for subagents, which share the main agent's availability state.
   excluded for a transient reason the recovery waits and rechecks; permanent
   incompatibility (disabled, allowlist, images, thinking, compaction) is not
   auto-retried. When the budget or deadline is exhausted, the failure surfaces
-  with the manual retry affordance described next.
+  with the manual retry hint described next.
 - **Interrupted streams.** A stream that ends without a stop reason is
   continued by that same automatic root recovery — at most twice per user
   turn, each continuation a new injected turn — but ONLY while
   `[recovery.root]` is enabled. With it disabled (`enabled = false`), an
   interrupted stream is NOT continued automatically: the failure is visible
-  immediately, and the manual retry affordance starts a new turn with the
-  usual warning that completed actions may repeat.
-- **Manual retry affordance.** When a turn ends with a retryable terminal
-  failure — a backend error, a rate limit, an over-long response, an
-  interrupted stream, or every deployment being unavailable — the error shows
-  a "Retry — new turn" button and offers the same action on `Ctrl+R` (the
-  error text names both, plus `/retry`). Either one starts exactly one new
-  turn through the existing manual retry: completed tool results are kept and
-  recent actions may repeat. The affordance is manual — it never starts a turn
-  on its own — and it is suppressed while a turn is stopping or active, or
-  while a runtime approval is still unresolved. A manual retry is a genuine
-  user request and is the only action that resets the model's cooldowns, which
-  is what makes retrying meaningful once every deployment was excluded; the
-  error text says so honestly.
+  immediately, and `/retry` (or `Ctrl+R`) starts a new turn with the usual
+  warning that completed actions may repeat.
+- **Manual retry.** When a turn ends with a retryable terminal failure — a
+  backend error, a rate limit, an over-long response, an interrupted stream,
+  or every deployment being unavailable — the error is an ordinary transcript
+  message that ends with a one-line hint: `/retry or Ctrl+R to retry this
+  turn`. Either one starts exactly one new turn through the existing manual
+  retry: completed tool results are kept and recent actions may repeat. The
+  retry is manual — it never starts a turn on its own — and it is suppressed
+  while a turn is stopping or active, or while a runtime approval is still
+  unresolved. A manual retry is a genuine user request and is the only action
+  that resets the model's cooldowns, which is what makes retrying meaningful
+  once every deployment was excluded; the error text says so honestly.
 - **Transport disconnects.** If the connection to the app server is lost (or a
   turn stalls on the transport), the error offers inspection and reconnect
   guidance instead of a retry: the client reconnects automatically, and a new
@@ -167,12 +166,12 @@ automatically — automatic recovery always continues on the same base model,
 possibly a different deployment of it. Automatic root recovery requires a
 healthy process and event loop; a process crash stays on the manual
 fresh-process resume. With `[recovery.root]` disabled (`enabled = false`) there
-is no automatic continuation at all — the manual retry affordance, `/retry`,
-or a new message is the recovery. A retry also cannot interrupt a request
-that is still in flight; interrupting stops the turn instead. The affordance
-is not a watchdog: a turn that stalls without a terminal failure shows no
-affordance at all, and a retry promises no reconciliation of remote effects —
-check completed tool results before acting, because recent actions may repeat.
+is no automatic continuation at all — manual `/retry` (or `Ctrl+R`), or a new
+message is the recovery. A retry also cannot interrupt a request that is still
+in flight; interrupting stops the turn instead. The retry hint is not a
+watchdog: a turn that stalls without a terminal failure shows no retry hint at
+all, and a retry promises no reconciliation of remote effects — check
+completed tool results before acting, because recent actions may repeat.
 
 ### Session transcript message-order errors
 

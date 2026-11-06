@@ -763,18 +763,6 @@ class TestAppEmissionLifecycle:
             assert app._record_epoch == epoch + 1
 
     @pytest.mark.asyncio
-    async def test_context_cleared_reports_idle_and_bumps_the_epoch(self) -> None:
-        app, emitter = _app_with_mock_emitter()
-        async with app.run_test():
-            app._reset_message_widgets = AsyncMock()
-            app._mount_and_scroll = AsyncMock()
-            emitter.reset_mock()
-            epoch = app._record_epoch
-            await app._on_context_cleared()
-            assert _emitted_states(emitter) == ["idle"]
-            assert app._record_epoch == epoch + 1
-
-    @pytest.mark.asyncio
     async def test_resume_bumps_the_epoch_and_its_idle_collapses(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -3226,9 +3214,6 @@ async def _run_hook(
     elif hook == "compact":
         monkeypatch.setattr(app.app_server, "compact", AsyncMock())
         await app._run_compact(CompactMessage())
-    elif hook == "context-cleared":
-        monkeypatch.setattr(app, "_reset_message_widgets", AsyncMock())
-        await app._on_context_cleared()
     elif hook == "session-change":
         monkeypatch.setattr(app._session_flow, "resume_local_session", AsyncMock())
         await app._resume_local_session("abcd1234")
@@ -3739,9 +3724,7 @@ class TestRecoveryHooks:
             assert _error_mounts(mount) == 0
 
     @pytest.mark.asyncio
-    @pytest.mark.parametrize(
-        "hook", ["clear", "compact", "context-cleared", "session-change"]
-    )
+    @pytest.mark.parametrize("hook", ["clear", "compact", "session-change"])
     async def test_owner_change_between_schedule_and_fire(
         self, hook: str, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -3758,9 +3741,9 @@ class TestRecoveryHooks:
             await _fire(app)
             # Exactly one idle from the hook; never a predecessor error.
             assert _wire_states(host) == ["idle"]
-            # /compact and the context handoff do not cancel the schedule, so
-            # their fallback fires and is suppressed after the mount await.
-            expected_errors = 1 if hook in {"compact", "context-cleared"} else 0
+            # /compact does not cancel the schedule, so its fallback fires and
+            # is suppressed after the mount await.
+            expected_errors = 1 if hook == "compact" else 0
             assert _error_mounts(mount) == expected_errors
 
     @pytest.mark.asyncio

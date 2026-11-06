@@ -94,7 +94,6 @@ def test_runtime_policy_copy_and_child_policy_inherit_capability() -> None:
     loop._inherited_restrictions = ()
     loop._inherited_mode_restrictions = ()
     loop._inherited_workspace = None
-    loop._inherited_plan_write_scopes = ()
     loop._parent_authority_getter = None
     loop._parent_authority_revision_getter = None
     loop._config_orchestrator = cast(

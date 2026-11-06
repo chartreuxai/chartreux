@@ -24,14 +24,13 @@ from chartreux.cli.textual_ui.app import ChartreuxApp
 from chartreux.cli.textual_ui.external_editor import ExternalEditor
 from chartreux.cli.textual_ui.program_status import ProgramStatusEmitter, encode_clear
 from chartreux.cli.textual_ui.widgets.chat_input import ChatTextArea
-from chartreux.cli.textual_ui.widgets.messages import ErrorMessage, PlanFileMessage
+from chartreux.cli.textual_ui.widgets.messages import ErrorMessage
 from chartreux.utils.paths import get_chartreux_home
 from tests.conftest import build_test_chartreux_app, build_test_vibe_config
 
 INVALID_EDITOR_TEXT = "Invalid editor command: check the quotes in $VISUAL or $EDITOR"
 EDITOR_RESOLUTION_PREFIX = "Could not start editor: "
 CONFIG_READ_ERROR_PREFIX = "Could not open or read config file: "
-PLAN_OPEN_ERROR_PREFIX = "Could not open plan in editor: "
 MALFORMED_EDITOR = "unmatched '"
 WHITESPACE_EDITOR = "   "
 MISSING_EDITOR = "chartreux-editor-that-does-not-exist"
@@ -115,17 +114,6 @@ async def _run_config_command(app: ChartreuxApp, pilot: Pilot[None]) -> list[str
     await app._handle_command("/open-config-file")
     await pilot.pause()
     return [str(error._error) for error in app.query(ErrorMessage)]
-
-
-async def _mount_plan(
-    app: ChartreuxApp, pilot: Pilot[None], tmp_path: Path
-) -> PlanFileMessage:
-    plan_file = tmp_path / "plan.md"
-    plan_file.write_text("# plan\n", "utf-8")
-    widget = PlanFileMessage(file_path=plan_file)
-    await app._mount_and_scroll(widget)
-    await pilot.pause()
-    return widget
 
 
 def _fail_run(monkeypatch: pytest.MonkeyPatch, error: Exception) -> None:
@@ -235,82 +223,6 @@ async def test_config_site_missing_editor_never_suspends(
 
 
 @pytest.mark.asyncio
-async def test_plan_site_malformed_quoting_never_suspends(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    monkeypatch.setenv("VISUAL", MALFORMED_EDITOR)
-    app, slot = _app_with_substrate(monkeypatch)
-    notifications: list[tuple[str, dict[str, object]]] = []
-
-    def _record_notify(message: str, **kwargs: object) -> None:
-        notifications.append((message, kwargs))
-
-    async with app.run_test() as pilot:
-        driver = slot.driver
-        assert driver is not None
-        widget = await _mount_plan(app, pilot, tmp_path)
-        monkeypatch.setattr(app, "notify", _record_notify)
-        widget.open_in_editor()
-        assert driver.suspend_calls == 0
-        widget.stop_watching()
-
-    assert [message for message, _ in notifications] == [
-        f"{EDITOR_RESOLUTION_PREFIX}{MALFORMED_EDITOR}"
-    ]
-    assert notifications[0][1]["severity"] == "error"
-
-
-@pytest.mark.asyncio
-async def test_plan_site_whitespace_only_editor_never_suspends(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    monkeypatch.setenv("VISUAL", WHITESPACE_EDITOR)
-    app, slot = _app_with_substrate(monkeypatch)
-    notifications: list[tuple[str, dict[str, object]]] = []
-
-    def _record_notify(message: str, **kwargs: object) -> None:
-        notifications.append((message, kwargs))
-
-    async with app.run_test() as pilot:
-        driver = slot.driver
-        assert driver is not None
-        widget = await _mount_plan(app, pilot, tmp_path)
-        monkeypatch.setattr(app, "notify", _record_notify)
-        widget.open_in_editor()
-        assert driver.suspend_calls == 0
-        widget.stop_watching()
-
-    assert [message for message, _ in notifications] == [
-        f"{EDITOR_RESOLUTION_PREFIX}{WHITESPACE_EDITOR}"
-    ]
-
-
-@pytest.mark.asyncio
-async def test_plan_site_missing_editor_never_suspends(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    monkeypatch.setenv("VISUAL", MISSING_EDITOR)
-    app, slot = _app_with_substrate(monkeypatch)
-    notifications: list[tuple[str, dict[str, object]]] = []
-
-    def _record_notify(message: str, **kwargs: object) -> None:
-        notifications.append((message, kwargs))
-
-    async with app.run_test() as pilot:
-        driver = slot.driver
-        assert driver is not None
-        widget = await _mount_plan(app, pilot, tmp_path)
-        monkeypatch.setattr(app, "notify", _record_notify)
-        widget.open_in_editor()
-        assert driver.suspend_calls == 0
-        widget.stop_watching()
-
-    assert [message for message, _ in notifications] == [
-        f"{EDITOR_RESOLUTION_PREFIX}{MISSING_EDITOR}"
-    ]
-
-
-@pytest.mark.asyncio
 async def test_config_site_well_formed_command_still_suspends(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -331,33 +243,6 @@ async def test_config_site_well_formed_command_still_suspends(
 
 
 @pytest.mark.asyncio
-async def test_plan_site_well_formed_command_still_suspends(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    monkeypatch.setenv("VISUAL", WORKING_EDITOR)
-    monkeypatch.setattr(
-        ExternalEditor, "edit_file", staticmethod(lambda *_a, **_k: None)
-    )
-    app, slot = _app_with_substrate(monkeypatch)
-    notifications: list[tuple[str, dict[str, object]]] = []
-
-    def _record_notify(message: str, **kwargs: object) -> None:
-        notifications.append((message, kwargs))
-
-    async with app.run_test() as pilot:
-        driver = slot.driver
-        assert driver is not None
-        widget = await _mount_plan(app, pilot, tmp_path)
-        monkeypatch.setattr(app, "notify", _record_notify)
-        widget.open_in_editor()
-        assert driver.suspend_calls == 1
-        assert driver.resume_calls == 1
-        widget.stop_watching()
-
-    assert notifications == []
-
-
-@pytest.mark.asyncio
 async def test_config_site_spawn_failure_restores_driver_and_clear_delivers(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -375,37 +260,6 @@ async def test_config_site_spawn_failure_restores_driver_and_clear_delivers(
         app._program_status.emit("working")
 
     assert errors == [f"{CONFIG_READ_ERROR_PREFIX}`{_config_path()}`"]
-    assert _exit_clears(slot) == [encode_clear()]
-
-
-@pytest.mark.asyncio
-async def test_plan_site_spawn_failure_restores_driver_and_clear_delivers(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    """H1b (iii): the same spawn failure at the plan editor site."""
-    monkeypatch.setenv("VISUAL", WORKING_EDITOR)
-    _fail_run(monkeypatch, OSError("editor failed to spawn"))
-    app, slot = _app_with_substrate(monkeypatch)
-    notifications: list[tuple[str, dict[str, object]]] = []
-
-    def _record_notify(message: str, **kwargs: object) -> None:
-        notifications.append((message, kwargs))
-
-    async with app.run_test() as pilot:
-        driver = slot.driver
-        assert driver is not None
-        widget = await _mount_plan(app, pilot, tmp_path)
-        monkeypatch.setattr(app, "notify", _record_notify)
-        widget.open_in_editor()
-        assert driver.suspend_calls == 1
-        assert driver.resume_calls == 1
-        widget.stop_watching()
-        app._program_status.emit("working")
-
-    assert [message for message, _ in notifications] == [
-        f"{PLAN_OPEN_ERROR_PREFIX}{tmp_path / 'plan.md'}"
-    ]
-    assert notifications[0][1]["severity"] == "error"
     assert _exit_clears(slot) == [encode_clear()]
 
 

@@ -465,6 +465,56 @@ async def test_external_cancellation_before_publication_settles_and_propagates(
 
 
 @pytest.mark.asyncio
+async def test_external_cancellation_during_handoff_settles_the_boundary(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A published boundary is settled even when the hand-off is cancelled."""
+    rig = build_rig()
+    set_deadline(monkeypatch, LIVE_DEADLINE_SECONDS)
+    entered = asyncio.Event()
+
+    async def compact(extra: str = "", *, manual: bool = False) -> str:
+        rig.loop.compaction_outcome.published = True
+        return SUMMARY
+
+    install_compact(monkeypatch, rig, compact)
+    order: list[str] = []
+    real_reset = rig.turns.reset
+    real_replace = rig.coordinator.replace_idle
+
+    async def reset():
+        order.append("reset")
+        if len(order) == 1:
+            # Only the first reset is held open: the cancellation lands inside
+            # the hand-off, after the boundary was already published.
+            entered.set()
+            await asyncio.Event().wait()
+        await real_reset()
+        return lambda: order.append("reset-callback")
+
+    def replace_idle(*args, **kwargs):
+        order.append("replace")
+        return real_replace(*args, **kwargs)
+
+    monkeypatch.setattr(rig.turns, "reset", reset)
+    monkeypatch.setattr(rig.coordinator, "replace_idle", replace_idle)
+    try:
+        call = asyncio.create_task(rig.handler._compact(rig.params))
+        await asyncio.wait_for(entered.wait(), 5)
+        call.cancel()
+        # The cancellation still reaches the caller as a cancellation...
+        with pytest.raises(asyncio.CancelledError):
+            await call
+        # ...while the settlement it interrupted is retried and published.
+        assert order == ["reset", "reset", "reset-callback", "replace"]
+        assert [entry.kind for entry in rig.checkpoints()] == ["compaction"]
+        assert rig.checkpoints()[0].details == {"summaryLength": len(SUMMARY)}
+        assert rig.execution.active is None
+    finally:
+        await rig.aclose()
+
+
+@pytest.mark.asyncio
 async def test_published_settlement_failure_reports_persistence_state(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

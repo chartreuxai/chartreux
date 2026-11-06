@@ -285,8 +285,6 @@ class PathAuthority:
     scratchpad_roots: frozenset[Path] = frozenset()
     instruction_read_files: frozenset[Path] = frozenset()
     parents: tuple[PathAuthority, ...] = ()
-    plan_file_write_scope: Path | None = None
-    inherited_plan_write_scopes: tuple[tuple[Path, Path | None], ...] = ()
 
     def resolve(self, path: str, access: PathAccess) -> PermissionContext | None:
         decision = resolve_file_tool_permission(
@@ -300,8 +298,6 @@ class PathAuthority:
             scratchpad_dir=self.scratchpad,
             scratchpad_roots=self.scratchpad_roots,
             instruction_read_files=self.instruction_read_files,
-            plan_file_write_scope=self.plan_file_write_scope,
-            inherited_plan_write_scopes=self.inherited_plan_write_scopes,
             access=access,
         )
         for parent in self.parents:
@@ -319,7 +315,7 @@ class PathAuthority:
         return decision is not None and decision.permission == ToolPermission.ALWAYS
 
 
-def resolve_file_tool_permission(  # noqa: PLR0911, PLR0912, PLR0913 - independent runtime denial ceilings
+def resolve_file_tool_permission(  # noqa: PLR0911, PLR0913 - independent runtime denial ceilings
     path_str: str,
     *,
     tool_name: str,
@@ -330,15 +326,12 @@ def resolve_file_tool_permission(  # noqa: PLR0911, PLR0912, PLR0913 - independe
     workspace: Workspace | None = None,
     scratchpad_dir: Path | None = None,
     scratchpad_roots: frozenset[Path] = frozenset(),
-    plan_file_write_scope: Path | None = None,
-    inherited_plan_write_scopes: tuple[tuple[Path, Path | None], ...] = (),
     instruction_read_files: frozenset[Path] = frozenset(),
     access: PathAccess | None = None,
 ) -> PermissionContext | None:
     """Resolve permission for a file-based tool invocation.
 
-    Checks unconditional, path and sensitive denies before scoped Plan writes or
-    scratchpad. Plan scope is runtime-owned, not an ordinary config permission.
+    Checks unconditional, path and sensitive denies before scratchpad.
     Exact injected instruction files additionally permit read_file/grep and
     explicitly modeled shell reads, never writes or opaque mutators.
     Other reads and writes require workspace authority; allowlists never expand
@@ -369,47 +362,12 @@ def resolve_file_tool_permission(  # noqa: PLR0911, PLR0912, PLR0913 - independe
             denial_kind="sensitive",
         )
 
-    # Every parent scope is a ceiling, never a union of descendant allowances.
-    # Session/runtime persistence is not routed through this agent tool grant.
-    for parent_plan, parent_scratch in inherited_plan_write_scopes:
-        # Ancestor scratch roots are canonicalized when authority is captured.
-        # Re-resolution may validate that identity, never redefine its boundary.
-        # Targets still resolve normally, allowing safe links into/within scratch.
-        # This is a permission check, not a hostile-filesystem race sandbox.
-        try:
-            in_parent_scratch = (
-                parent_scratch is not None
-                and parent_scratch.resolve() == parent_scratch
-                and file_path.is_relative_to(parent_scratch)
-            )
-        except (ValueError, OSError):
-            in_parent_scratch = False
-        if file_path != parent_plan.absolute() and not in_parent_scratch:
-            return PermissionContext(
-                permission=ToolPermission.NEVER,
-                reason="Parent Plan scope permits writes only to its designated plan file or session scratchpad",
-                denial_kind="plan_scope",
-            )
-
     roots = scratchpad_roots
     if scratchpad_dir is not None:
         roots |= {scratchpad_dir.absolute()}
     if (request_roots := _scratchpad_ceiling.get()) is not None:
         roots = request_roots
     in_scratchpad = any(is_canonical_scratch_path(file_path, root) for root in roots)
-    if plan_file_write_scope is not None:
-        # A request grant cannot expand this ancestor's own Plan ceiling.
-        allowed = is_canonical_scratch_path(file_path, scratchpad_dir) or (
-            file_path == plan_file_write_scope.absolute()
-        )
-        return PermissionContext(
-            permission=ToolPermission.ALWAYS if allowed else ToolPermission.NEVER,
-            reason=None
-            if allowed
-            else "Plan mode permits file writes only to the designated plan file or session scratchpad",
-            denial_kind=None if allowed else "plan_scope",
-        )
-
     if (
         tool_name in {"bash", "bash_start"}
         and is_canonical_scratch_path(file_path, scratchpad_dir)
@@ -419,14 +377,9 @@ def resolve_file_tool_permission(  # noqa: PLR0911, PLR0912, PLR0913 - independe
         return PermissionContext(
             permission=ToolPermission.NEVER,
             reason="File access outside authorized project and session scratch roots; only an explicit user scope change can authorize it",
-            denial_kind="plan_scope",
+            denial_kind="parent_ceiling",
         )
     if in_scratchpad:
-        return PermissionContext(permission=ToolPermission.ALWAYS)
-
-    # The target passed every inherited ceiling and any local Plan scope above.
-    # Preserve that exact runtime grant, including a parent's out-of-workspace plan.
-    if inherited_plan_write_scopes:
         return PermissionContext(permission=ToolPermission.ALWAYS)
 
     # Exact-file read capability, never an effect-kind or directory grant.

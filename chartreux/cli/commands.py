@@ -123,6 +123,15 @@ class CommandRegistry:
                 description="Compact conversation history by summarizing. Optionally pass instructions to guide the summary",
                 handler="_compact_history",
             ),
+            "plan": Command(
+                aliases=frozenset(["/plan"]),
+                description=(
+                    "Plan with the configured planner, then /plan accept to start "
+                    "execution or /plan cancel to exit"
+                ),
+                handler="_plan_command",
+                side_channel=True,
+            ),
             "exit": Command(
                 aliases=frozenset(["/exit", "exit", "quit", ":q", ":quit"]),
                 description="Exit the application",

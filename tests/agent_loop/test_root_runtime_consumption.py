@@ -11,7 +11,6 @@ from chartreux.core.agent_loop import AgentLoop
 from chartreux.core.events import ToolResultEvent
 from chartreux.core.tools.base import ToolPermission
 from chartreux.core.tools.manager import NoSuchToolError
-from chartreux.core.tools.utils import resolve_file_tool_permission
 from chartreux.core.workspace import Workspace
 from tests.agent_loop.test_accepted_source_snapshot import make_orchestrator
 from tests.agent_loop.test_chartreux_policy_denials import _call, _collect
@@ -127,28 +126,6 @@ async def test_direct_child_requires_actual_narrowed_parent_ceiling(
         if child is not None:
             await child.aclose()
         await parent.aclose()
-
-
-@pytest.mark.parametrize("local_scope", [False, True])
-async def test_inherited_plan_allowances_are_not_unioned(
-    tmp_path: Path, local_scope: bool
-) -> None:
-    first, second = tmp_path / "first.md", tmp_path / "second.md"
-    for target in (first, second):
-        result = resolve_file_tool_permission(
-            str(target),
-            tool_name="write_file",
-            allowlist=["*"],
-            denylist=[],
-            config_permission=ToolPermission.ALWAYS,
-            sensitive_patterns=[],
-            workspace=Workspace.for_session(tmp_path / "project"),
-            inherited_plan_write_scopes=(
-                ((first, None),) if local_scope else ((first, None), (second, None))
-            ),
-            plan_file_write_scope=second if local_scope else None,
-        )
-        assert result is not None and result.permission == ToolPermission.NEVER
 
 
 async def test_cached_tool_observes_accepted_root_removal(tmp_path: Path) -> None:

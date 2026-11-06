@@ -5,7 +5,9 @@ from collections.abc import AsyncGenerator
 import json
 from unittest.mock import Mock
 
+import httpx
 import pytest
+import respx
 
 from chartreux.core.agent_loop.llm_gateway import (
     CallResources,
@@ -15,7 +17,12 @@ from chartreux.core.agent_loop.llm_gateway import (
     messages_for_backend,
 )
 from chartreux.core.config import ModelConfig, ProviderConfig
-from chartreux.core.llm.backend.anthropic import AnthropicAdapter, AnthropicMapper
+from chartreux.core.llm.backend.anthropic import (
+    REASONING_BLOCK_TYPES,
+    AnthropicAdapter,
+    AnthropicMapper,
+)
+from chartreux.core.llm.backend.generic import GenericBackend
 from chartreux.core.llm.types import BackendLike
 from chartreux.core.llm_models import (
     AvailableFunction,
@@ -27,6 +34,7 @@ from chartreux.core.llm_models import (
     ToolCall,
 )
 from chartreux.core.session_types import AgentStats
+from chartreux.core.subagents import InvalidLaunchThinkingError
 from tests.constants import ANTHROPIC_BASE_URL, ANTHROPIC_MESSAGES_PATH
 
 
@@ -673,6 +681,108 @@ class TestAdapterPrepareRequest:
         assert payload["output_config"] == {"effort": "medium"}
         assert "temperature" not in payload
         assert payload["max_tokens"] == 32_768
+
+    def test_history_forced_thinking_respects_declared_levels(self, adapter, provider):
+        messages = [
+            LLMMessage(role=Role.user, content="Hello"),
+            LLMMessage(
+                role=Role.assistant,
+                content="Answer",
+                reasoning_content="thinking...",
+                reasoning_payloads=[
+                    {"type": "thinking", "thinking": "thinking...", "signature": "sig"}
+                ],
+            ),
+        ]
+        req = adapter.prepare_request(
+            model_name="claude-sonnet-4-20250514",
+            messages=messages,
+            temperature=0.5,
+            tools=None,
+            max_tokens=None,
+            tool_choice=None,
+            enable_streaming=False,
+            provider=provider,
+            thinking="off",
+            thinking_levels={"off": None, "max": "max"},
+        )
+        payload = json.loads(req.body)
+        assert payload["output_config"] == {"effort": "max"}
+
+    def test_history_forced_thinking_with_only_off_declared_raises(
+        self, adapter, provider
+    ):
+        messages = [
+            LLMMessage(role=Role.user, content="Hello"),
+            LLMMessage(
+                role=Role.assistant,
+                content="Answer",
+                reasoning_content="thinking...",
+                reasoning_payloads=[
+                    {"type": "thinking", "thinking": "thinking...", "signature": "sig"}
+                ],
+            ),
+        ]
+        with pytest.raises(InvalidLaunchThinkingError):
+            adapter.prepare_request(
+                model_name="claude-sonnet-4-20250514",
+                messages=messages,
+                temperature=0.5,
+                tools=None,
+                max_tokens=None,
+                tool_choice=None,
+                enable_streaming=False,
+                provider=provider,
+                thinking="off",
+                thinking_levels={"off": None},
+            )
+
+
+class TestDeclaredThinkingTransport:
+    @pytest.mark.asyncio
+    async def test_backend_sends_a_declared_effort_for_forced_thinking(self) -> None:
+        assert "thinking" in REASONING_BLOCK_TYPES
+        provider = ProviderConfig(
+            name="anthropic",
+            api_base=ANTHROPIC_BASE_URL,
+            api_key_env_var="",
+            api_style="anthropic",
+        )
+        model = ModelConfig(
+            name="claude-sonnet-4-20250514",
+            provider="anthropic",
+            alias="claude",
+            thinking="off",
+            supported_thinking_levels=["off", "max"],
+        )
+        messages = [
+            LLMMessage(role=Role.user, content="Hello"),
+            LLMMessage(
+                role=Role.assistant,
+                content="Answer",
+                reasoning_content="thinking...",
+                reasoning_payloads=[
+                    {"type": "thinking", "thinking": "thinking...", "signature": "sig"}
+                ],
+            ),
+        ]
+
+        with respx.mock(base_url=ANTHROPIC_BASE_URL) as api:
+            route = api.post(ANTHROPIC_MESSAGES_PATH).mock(
+                return_value=httpx.Response(
+                    200,
+                    json={
+                        "content": [{"type": "text", "text": "hi"}],
+                        "usage": {"input_tokens": 1, "output_tokens": 1},
+                    },
+                )
+            )
+            async with GenericBackend(provider=provider) as backend:
+                await backend.complete(model=model, messages=messages)
+
+        payload = json.loads(route.calls.last.request.content)
+        assert payload["output_config"] == {"effort": "max"}
+        assert payload["output_config"]["effort"] != "medium"
 
 
 class TestAdapterParseResponse:

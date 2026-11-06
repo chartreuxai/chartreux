@@ -3,7 +3,7 @@ from __future__ import annotations
 # ruff: noqa: F401
 from enum import StrEnum
 
-from chartreux.core.callbacks import ClearContextCallback, SwitchAgentCallback
+from chartreux.core.callbacks import SwitchAgentCallback
 from chartreux.core.errors import (
     ContextTooLongError,
     RateLimitError,

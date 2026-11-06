@@ -716,8 +716,72 @@ def _anthropic_config():
     )
 
 
+def test_effective_thinking_respects_deployment_subset() -> None:
+    from chartreux.core.config import ModelConfig
+
+    config = build_test_vibe_config(
+        active_model="active",
+        models=[
+            ModelConfig(
+                name="mistral-large-4",
+                provider="mistral",
+                alias="active",
+                thinking="medium",
+                supported_thinking_levels=["low", "high"],
+            )
+        ],
+    )
+    effective = project_config(build_test_agent_loop(config=config)).effective_thinking
+    assert effective is not None
+    assert effective.effective == "high"
+    assert effective.api_effort == "high"
+    assert effective.matches_requested is False
+
+
+def test_effective_thinking_forced_anthropic_history_uses_declared_level() -> None:
+    from chartreux.core.config import ModelConfig, ProviderConfig
+    from chartreux.core.llm_models import Backend
+
+    provider = ProviderConfig(
+        name="claude",
+        api_base="https://claude.test/v1",
+        api_key_env_var="ANTHROPIC_API_KEY",
+        backend=Backend.GENERIC,
+        api_style="anthropic",
+    )
+    config = build_test_vibe_config(
+        active_model="claude",
+        providers=[provider],
+        models=[
+            ModelConfig(
+                name="claude-wire",
+                provider="claude",
+                alias="claude",
+                thinking="off",
+                supported_thinking_levels=["off", "max"],
+            )
+        ],
+    )
+    agent_loop = build_test_agent_loop(config=config)
+    agent_loop.messages.append(
+        LLMMessage(
+            role=Role.assistant,
+            content="Answered",
+            reasoning_payloads=[{"type": "thinking", "thinking": "considering"}],
+        )
+    )
+
+    effective = project_config(agent_loop).effective_thinking
+
+    assert effective is not None
+    assert effective.semantic == "medium"
+    assert effective.effective == "max"
+    assert effective.api_effort == "max"
+    assert effective.matches_requested is False
+
+
 def test_effective_thinking_glm_medium_is_api_effort_high() -> None:
-    """GLM-5.3 encodes the semantic ``medium`` level as API effort ``high``."""
+    """GLM-5.3 does not declare ``medium``; it resolves to the nearest ``high``."""
     agent_loop = build_test_agent_loop(config=_mistral_config("zai-glm-5-3", "medium"))
 
     effective = project_config(agent_loop).effective_thinking
@@ -725,19 +789,33 @@ def test_effective_thinking_glm_medium_is_api_effort_high() -> None:
     assert effective is not None
     assert effective.requested == "medium"
     assert effective.semantic == "medium"
+    assert effective.effective == "high"
     assert effective.api_effort == "high"
     assert effective.known is True
     assert effective.matches_requested is False
 
 
-def test_effective_thinking_mistral_low_is_api_effort_none() -> None:
-    """Mistral encodes its lowest level as the wire value ``none``."""
+def test_effective_thinking_mistral_large_4_low_is_api_effort_low() -> None:
+    """Mistral Large 4 declares low/medium/high reasoning efforts."""
     agent_loop = build_test_agent_loop(config=_mistral_config("mistral-large-4", "low"))
 
     effective = project_config(agent_loop).effective_thinking
 
     assert effective is not None
     assert effective.requested == "low"
+    assert effective.effective == "low"
+    assert effective.api_effort == "low"
+    assert effective.known is True
+    assert effective.matches_requested is True
+
+
+def test_effective_thinking_unlisted_mistral_model_uses_the_provider_table() -> None:
+    """A model without its own entry keeps the provider's legacy wire mapping."""
+    agent_loop = build_test_agent_loop(config=_mistral_config("zai-glm-future", "low"))
+
+    effective = project_config(agent_loop).effective_thinking
+
+    assert effective is not None
     assert effective.api_effort == "none"
     assert effective.known is True
     assert effective.matches_requested is False
@@ -830,6 +908,31 @@ def test_config_view_without_conversation_context_has_no_estimate() -> None:
     view = project_config_view(build_test_vibe_config())
 
     assert view.effective_thinking is None
+
+
+def test_config_view_reports_each_deployment_declared_thinking_levels() -> None:
+    """Clients offer exactly the declared levels, in vocabulary order."""
+    from chartreux.core.config import ModelConfig
+
+    config = build_test_vibe_config(
+        active_model="glm",
+        models=[
+            ModelConfig(name="zai-glm-5-3", provider="mistral", alias="glm"),
+            ModelConfig(name="mistral-large-4", provider="mistral", alias="large"),
+        ],
+    )
+
+    view = project_config_view(config)
+
+    declared = {
+        model.alias: model.thinking_levels
+        for model in view.models
+        if model.alias in {"glm", "large"}
+    }
+    assert declared == {
+        "glm": ["low", "high", "max"],
+        "large": ["low", "medium", "high"],
+    }
 
 
 def _sealed_transcript(

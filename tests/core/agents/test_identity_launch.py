@@ -524,17 +524,18 @@ def test_effective_thinking_precedence() -> None:
     )
 
 
-def test_unknown_model_and_unsupported_thinking_are_typed() -> None:
+def test_unknown_model_is_typed_and_undeclared_thinking_resolves() -> None:
     config = _config()
     with pytest.raises(InvalidLaunchModelSelectionError) as model_error:
         _resolve({"task": "x", "model": "no-such-model"}, config)
     assert model_error.value.field == "model"
-    with pytest.raises(InvalidLaunchModelSelectionError) as thinking_error:
-        _resolve(
-            {"task": "x", "model": "limited-model", "config": {"thinking": "high"}},
-            config,
-        )
-    assert thinking_error.value.field == "config.thinking"
+
+    # `limited-model` declares only "off". A requested "high" is served at the
+    # nearest declared level, so the selection resolves and keeps the request.
+    resolved = _resolve(
+        {"task": "x", "model": "limited-model", "config": {"thinking": "high"}}, config
+    )
+    assert resolved.effective_thinking == "high"
 
 
 def test_resolution_without_an_attached_catalog_is_typed() -> None:

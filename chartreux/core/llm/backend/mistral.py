@@ -57,6 +57,7 @@ from chartreux.core.llm.exceptions import BackendError, BackendErrorBuilder
 from chartreux.core.llm.thinking_levels import (
     MISTRAL_THINKING_LEVELS,
     get_thinking_levels,
+    narrow_thinking_levels,
 )
 from chartreux.core.llm_models import (
     AvailableTool,
@@ -586,7 +587,11 @@ class MistralBackend:
             reasoning_effort = cast(
                 Any,
                 get_thinking_wire_value(
-                    self._thinking_levels(model.name), model.thinking
+                    narrow_thinking_levels(
+                        self._thinking_levels(model.name),
+                        model.supported_thinking_levels,
+                    ),
+                    model.thinking,
                 ),
             )
             projected_messages = (
@@ -692,7 +697,11 @@ class MistralBackend:
             reasoning_effort = cast(
                 Any,
                 get_thinking_wire_value(
-                    self._thinking_levels(model.name), model.thinking
+                    narrow_thinking_levels(
+                        self._thinking_levels(model.name),
+                        model.supported_thinking_levels,
+                    ),
+                    model.thinking,
                 ),
             )
             projected_messages = (

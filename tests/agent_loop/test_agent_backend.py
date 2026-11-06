@@ -266,22 +266,6 @@ def _generic_provider_vibe_config(build_config: ConfigBuilder) -> ChartreuxConfi
 
 
 @pytest.mark.asyncio
-async def test_mistral_metadata_includes_user_plan(build_config: ConfigBuilder) -> None:
-    backend = FakeBackend([mock_llm_chunk(content="Response")])
-    agent = build_test_agent_loop(
-        config=_two_model_vibe_config("devstral-latest", build_config), backend=backend
-    )
-    agent.set_user_plan("Team")
-
-    [_ async for _ in agent.act("Hello")]
-
-    assert len(backend.requests_metadata) == 1
-    metadata = backend.requests_metadata[0]
-    assert metadata is not None
-    assert metadata["user_plan"] == "Team"
-
-
-@pytest.mark.asyncio
 async def test_mistral_metadata_header_call_type_per_turn(
     build_config: ConfigBuilder,
 ) -> None:

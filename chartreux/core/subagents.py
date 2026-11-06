@@ -5,6 +5,7 @@ from dataclasses import dataclass, field
 import enum
 from pathlib import Path
 import re
+import time
 from typing import TYPE_CHECKING, Any, Literal, Protocol
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -34,10 +35,13 @@ from chartreux.core.recovery_models import (
 )
 from chartreux.core.recovery_policy import ReplacementDecision
 from chartreux.core.subagent_submission import (
+    PRUNED_NAMES,
     UNKNOWN_WRITE_FOOTPRINT,
     bash_write_paths_from_result_event,
     blocked_submission_response,
+    classify_scan_path,
     touched_path_from_result_event,
+    transient_skip_notice,
 )
 from chartreux.core.tools.secret_scan import incomplete_finding, scan_paths
 from chartreux.core.tools.ui import ToolUIDataAdapter
@@ -928,6 +932,17 @@ def _capture_artifact_snapshot(path: str) -> ContentSnapshot | None:
         return None
 
 
+def _string_root_tuple(value: Any) -> tuple[str, ...]:
+    """The well-formed root paths in *value* (a frozen contract's root list).
+
+    A value that is not a root collection contributes no root; a contract
+    that reports no roots leaves the caller's path classification fail-closed.
+    """
+    if not isinstance(value, (list, tuple)):
+        return ()
+    return tuple(root for root in value if isinstance(root, str) and root)
+
+
 def mutation_roots_from_result_event(event: ToolResultEvent) -> tuple[list[str], bool]:
     """The mutation-roots footprint a shell result reports, and its unknown flag.
 
@@ -972,6 +987,17 @@ class SubagentRunAccumulator:
     # commands produced — collected from observed tool results and scanned
     # at the submission boundary (build_result). Insertion-ordered.
     _touched_paths: dict[str, None] = field(default_factory=dict)
+    # The per-RUN scan cutoff, captured at construction: the instant from
+    # which a DIRECTORY touched path (an extraction or patch root, a
+    # directory-destination copy, resolved to the working directory) is the
+    # session's own work. The submission scan still enumerates such a tree in
+    # full, but inspects only the files modified at or after this point, so
+    # pre-session content — including over-cap binaries — no longer blocks a
+    # run that merely wrote into an existing tree. Per RUN, never per
+    # retained identity: every run admission (fresh, reused, replacement, and
+    # resume successor) constructs its own accumulator. Content backdated to
+    # before the run is the accepted blind spot.
+    _scan_cutoff_ns: int = field(default_factory=time.time_ns)
     # A1: the session's mutation-roots footprint — the resolved work-tree
     # roots of the shell commands' checkout/switch invocations, collected
     # from observed tool results alongside the touched paths. A
@@ -1124,13 +1150,7 @@ class SubagentRunAccumulator:
         # one composes UNVERIFIED, never CONTRADICTED), and the claim's
         # bounded claimed-value surface (claimed commit hashes, claimed
         # artifact paths) reaches the artifact audit through the receipt.
-        contract_shared_roots = getattr(contract, "shared_roots", ())
-        if isinstance(contract_shared_roots, (list, tuple)):
-            shared_roots = tuple(
-                root for root in contract_shared_roots if isinstance(root, str) and root
-            )
-        else:
-            shared_roots = ()
+        shared_roots = _string_root_tuple(getattr(contract, "shared_roots", ()))
         # The composition reads the once-only finalization (P6a) from the
         # run-keyed cache and runs no checks; in stamp mode the composed
         # classification rides on the result, in enforce mode a
@@ -1164,7 +1184,51 @@ class SubagentRunAccumulator:
         # footprint never joins it (a work-tree root would scan the whole
         # repository and burn the bounded walk's budget, blocking
         # publication); the completion audit consumes _mutation_roots.
-        findings = scan_paths(self._touched_paths)
+        # The per-run cutoff qualifies directory paths — a tree the run wrote
+        # into is enumerated in full but only its in-run files are inspected;
+        # an explicitly named file path stays unconditional.
+        # S4: the scan's scope is partitioned by path class first. Repository
+        # content stays in the scan, fail-closed and unchanged. Runtime-owned
+        # transient content — the parent-shared scratchpad roots, and tempdir
+        # paths outside the session's authorized roots — is skipped with ONE
+        # bounded harness log notice: never a finding, never a block, never
+        # model-visible. The classifier resolves each path first, so a
+        # scratchpad symlink into the repository classifies repo and stays
+        # scanned, and an unestablished classification fails closed to repo.
+        # The walk prunes vendored and cache directories (they carry no
+        # session-authored content) and counts only entries it can inspect,
+        # with the scanner's absolute enumeration cap still bounding the walk.
+        scan_authorized_roots = _string_root_tuple(getattr(contract, "roots", ()))
+        contract_cwd = getattr(contract, "cwd", None)
+        scan_cwd = (
+            contract_cwd if isinstance(contract_cwd, str) and contract_cwd else None
+        )
+        if scan_cwd is not None:
+            scan_authorized_roots += (scan_cwd,)
+        repo_paths: list[str] = []
+        transient_paths: list[str] = []
+        for touched in self._touched_paths:
+            if (
+                classify_scan_path(
+                    touched, shared_roots, scan_authorized_roots, cwd=scan_cwd
+                )
+                == "transient"
+            ):
+                transient_paths.append(touched)
+            else:
+                repo_paths.append(touched)
+        findings = scan_paths(
+            repo_paths,
+            modified_since_ns=self._scan_cutoff_ns,
+            exclude_roots=shared_roots,
+            prune_names=PRUNED_NAMES,
+            count_qualifying_only=True,
+        )
+        if transient_paths:
+            logger.info(
+                "Subagent submission scan: %s",
+                transient_skip_notice(transient_paths, len(self._touched_paths)),
+            )
         if UNKNOWN_WRITE_FOOTPRINT in self._touched_paths:
             # Fail-closed: a shell command whose write surface could not be
             # established leaves an unscannable footprint — scan_paths skips

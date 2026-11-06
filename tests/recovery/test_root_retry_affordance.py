@@ -1,13 +1,18 @@
 """R1 — terminal root-failure retry affordance (plan v0.5.6-recovery, package R1).
 
 R1 (the manual fallback that must exist before R2's automation): on an
-authoritative TERMINAL RETRYABLE root failure, the TUI displays a
-keyboard-accessible "Retry — new turn" affordance that invokes the EXISTING
+authoritative TERMINAL RETRYABLE root failure, the TUI offers the EXISTING
 retry operation (one injected new turn, ``user_initiated_retry=True``,
 ``build_retry_prompt("")``) — never ``resume_agent``, never automatic.
 
-Retryable-set decision (pinned here): the affordance's retryable set is the
-existing ``_RETRYABLE_TURN_ERROR_CODES`` PLUS exhaustion-after-cooldown
+E1 (v0.7.3) changed the PRESENTATION only: the failure mounts a plain
+``ErrorMessage(retryable=False)`` with a one-line text hint ("/retry or Ctrl+R
+to retry this turn") and the retry presentation is armed WITHOUT a widget.
+The retry operation and its gates are unchanged; the retryable widget itself
+is never mounted, so a cancelled presentation cannot strand one.
+
+Retryable-set decision (pinned here): the retryable set is the existing
+``_RETRYABLE_TURN_ERROR_CODES`` PLUS exhaustion-after-cooldown
 (``ALL_DEPLOYMENTS_UNAVAILABLE``). The user pressing Retry is a genuine user
 action, and the existing manual retry operation's intentional cooldown reset
 (the only path allowed to reset it) is exactly what makes a retry meaningful
@@ -17,12 +22,12 @@ cooldowns.
 
 Coverage map (R1 behavior bullet -> tests):
 
-- Affordance display conditions -> ``test_affordance_offered_for_each_retryable_code``,
+- Retry offered for the retryable set -> ``test_affordance_offered_for_each_retryable_code``,
   ``test_no_affordance_for_non_retryable_codes``,
   ``test_affordance_retryable_set_is_pinned``.
-- Keyboard access + existing-operation invocation + warning preservation +
-  cooldown-reset retention + double activation -> the TUI-level pins in
-  ``tests/cli/textual_ui/test_app_server_requests.py`` (the R1 block), plus
+- Existing-operation invocation + warning preservation + cooldown-reset
+  retention + double activation -> the TUI-level pins in
+  ``tests/cli/textual_ui/test_app_server_requests.py`` (the R0/R1 block), plus
   ``test_retry_invokes_existing_operation``,
   ``test_double_activation_starts_at_most_one_turn``,
   ``test_begin_retry_refuses_second_activation``,
@@ -115,19 +120,19 @@ def test_affordance_retryable_set_is_pinned() -> None:
 
 @pytest.mark.parametrize("code", _AFFORDANCE_CODES)
 def test_affordance_offered_for_each_retryable_code(code: TurnErrorCode) -> None:
-    """An authoritative terminal retryable root failure displays the affordance:
-    the error widget carries the retry button and the retry presentation is
-    offered (so the affordance invokes the EXISTING retry operation).
+    """An authoritative terminal retryable root failure mounts ONE plain error
+    message and arms the retry presentation WITHOUT a widget (E1), so /retry
+    and Ctrl+R stay available and no retryable widget can be stranded.
     """
     app = _mock_app()
     supervisor = cast(Any, SimpleNamespace(_app=app))
 
     asyncio.run(TurnSupervisor._mount_turn_error(supervisor, _turn_error(code), "boom"))
 
-    app.event_handler.offer_retry.assert_called_once()
-    widget = app.event_handler.offer_retry.call_args.args[0]
+    app.event_handler.offer_retry.assert_called_once_with()
+    widget = app._mount_and_scroll.call_args.args[0]
     assert isinstance(widget, ErrorMessage)
-    assert widget._retryable is True
+    assert widget._retryable is False
     app._refresh_command_registry.assert_called_once()
 
 
@@ -153,7 +158,8 @@ def test_no_affordance_for_non_retryable_codes(code: TurnErrorCode) -> None:
 def test_exhaustion_error_text_is_honest() -> None:
     """The exhaustion (all-deployments-unavailable) error text is honest: the
     deployments really were unavailable, a manual retry resets the model's
-    cooldowns, and the completed-actions-may-repeat warning is preserved.
+    cooldowns, the completed-actions-may-repeat warning is preserved, and the
+    retry is offered as text (/retry or Ctrl+R) — there is no button to name.
     """
     app = MagicMock()
     app._retry_hint = TurnSupervisor._retry_hint
@@ -169,22 +175,23 @@ def test_exhaustion_error_text_is_honest() -> None:
 
     assert "All deployments for model 'base' are unavailable" in message
     assert "test-first" in message
-    assert "Retry — new turn" in message
-    assert "/retry [additional instructions]" in message
+    assert "/retry or Ctrl+R to retry this turn" in message
     assert "resets the model's cooldowns" in message
     assert "Completed tool results are kept; recent actions may repeat." in message
+    assert "button" not in message
+    assert "Retry — new turn" not in message
 
 
 def test_retry_hint_preserves_completed_actions_warning() -> None:
-    """The retry hint names the affordance (button + Ctrl+R + /retry) and
-    keeps the completed-actions warning verbatim; the injected retry turn
-    carries the same warning (the affordance must not weaken it).
+    """The retry hint states the manual retry paths as one line of text
+    (/retry or Ctrl+R), keeps the completed-actions warning verbatim, and
+    names no button; the injected retry turn carries the same warning (the
+    retry offer must not weaken it).
     """
     hint = TurnSupervisor._retry_hint()
-    assert "Retry — new turn" in hint
-    assert "Ctrl+R" in hint
-    assert "/retry [additional instructions]" in hint
+    assert "/retry or Ctrl+R to retry this turn" in hint
     assert "Completed tool results are kept; recent actions may repeat." in hint
+    assert "button" not in hint
     assert "recent actions may repeat" in build_retry_prompt("")
 
 

@@ -363,41 +363,52 @@ async def test_collapsible_result_preserves_suffix_in_header() -> None:
 
 
 @pytest.mark.parametrize(
-    "detail",
+    ("detail", "collapsible_result"),
     [
-        FileWriteEffectDetail(
-            tool_name="write_file",
-            display=EffectCallDisplay(
-                summary="Writing dummy.txt",
-                verb="Creating",
-                message="dummy.txt",
-                status_text="Writing file",
+        pytest.param(
+            FileWriteEffectDetail(
+                tool_name="write_file",
+                display=EffectCallDisplay(
+                    summary="Writing dummy.txt",
+                    verb="Creating",
+                    message="dummy.txt",
+                    status_text="Writing file",
+                ),
             ),
+            True,
+            id="write_file",
         ),
-        FileEditEffectDetail(
-            tool_name="edit",
-            display=EffectCallDisplay(
-                summary="Editing dummy.txt",
-                verb="Editing",
-                message="dummy.txt",
-                status_text="Editing file",
+        pytest.param(
+            FileEditEffectDetail(
+                tool_name="edit",
+                display=EffectCallDisplay(
+                    summary="Editing dummy.txt",
+                    verb="Editing",
+                    message="dummy.txt",
+                    status_text="Editing file",
+                ),
             ),
+            True,
+            id="edit",
         ),
-        UserQuestionEffectDetail(
-            tool_name="ask_user_question",
-            display=EffectCallDisplay(
-                summary="Asking a question",
-                verb="Asking",
-                message="Continue?",
-                status_text="Waiting for user input",
+        pytest.param(
+            UserQuestionEffectDetail(
+                tool_name="ask_user_question",
+                display=EffectCallDisplay(
+                    summary="Asking a question",
+                    verb="Asking",
+                    message="Continue?",
+                    status_text="Waiting for user input",
+                ),
             ),
+            False,
+            id="ask_user_question",
         ),
     ],
-    ids=["write_file", "edit", "ask_user_question"],
 )
 @pytest.mark.asyncio
 async def test_running_always_expanded_result_stays_full_contrast(
-    detail: EffectDetail,
+    detail: EffectDetail, collapsible_result: bool
 ) -> None:
     app = _ToolStreamApp()
 
@@ -410,6 +421,9 @@ async def test_running_always_expanded_result_stays_full_contrast(
         assert call._verb_widget is not None
         assert call._text_widget is not None
         assert call._header_row.has_class("running")
-        assert not call._header_row.has_class("collapsible-result")
+        # A collapsible result kind marks its row from the detail alone, so a
+        # running edit/write_file already advertises the fold; the running rule
+        # keeps that row at full contrast either way.
+        assert call._header_row.has_class("collapsible-result") == collapsible_result
         assert call._verb_widget.styles.text_opacity == 1.0
         assert call._text_widget.styles.text_opacity == 1.0

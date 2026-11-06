@@ -146,8 +146,8 @@ async def test_status_shows_requested_semantic_and_api_effort() -> None:
 
         assert "- **Requested**: low" in text
         assert "- **Semantic**: low" in text
-        # Mistral encodes its lowest level as the wire value ``none``.
-        assert "- **API effort**: none" in text
+        # Mistral Large 4 declares low/medium/high reasoning efforts.
+        assert "- **API effort**: low" in text
         assert "next request" in text
 
 

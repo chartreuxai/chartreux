@@ -17,6 +17,9 @@ class ModelConfigView(ProtocolModel):
     thinking: ThinkingLevel
     supports_images: bool
     display_name: str
+    # The levels this deployment declares, in vocabulary order. Empty when the
+    # projection could not resolve them; clients then offer the full vocabulary.
+    thinking_levels: list[ThinkingLevel] = Field(default_factory=list)
 
 
 class ProxySettingsView(ProtocolModel):
@@ -75,16 +78,19 @@ class EffectiveThinkingView(ProtocolModel):
 
     ``requested`` is the level the session selected, ``semantic`` the level
     after launch-time semantic coercion (retained Anthropic thinking keeps
-    thinking on), and ``api_effort`` the provider's wire value. ``known`` is
-    false when the estimate cannot be resolved, and clients must then show
-    ``unknown`` rather than imply the requested level is effective.
-    ``matches_requested`` is the same comparison made once server-side. The
-    estimate describes the next request only: an in-flight call keeps the
-    encoding it started with, and failover may pick another deployment.
+    thinking on), ``effective`` the declared level nearest the semantic one,
+    and ``api_effort`` the provider's wire value. ``known`` is false when the
+    estimate cannot be resolved, and clients must then show ``unknown`` rather
+    than imply the requested level is effective. ``matches_requested`` is the
+    same comparison made once server-side, including the nearest-level
+    fallback. The estimate describes the next request only: an in-flight call
+    keeps the encoding it started with, and failover may pick another
+    deployment.
     """
 
     requested: ThinkingLevel
     semantic: ThinkingLevel | None = None
+    effective: ThinkingLevel | None = None
     api_effort: str | None = None
     known: bool = False
     matches_requested: bool | None = None

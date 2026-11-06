@@ -10,7 +10,6 @@ from unittest.mock import AsyncMock, MagicMock
 
 import httpx
 import pytest
-from textual.widgets import Button
 
 from chartreux.app_server.events import AgentsUpdate, CallbackRequested
 from chartreux.app_server.models import (
@@ -234,20 +233,6 @@ async def _wait_for_retry_error(app: ChartreuxApp, pilot) -> None:
             and app.event_handler._retry_presentation is not None
         ),
     )
-
-
-async def _wait_for_retry_button(pilot, error_widget: ErrorMessage) -> Button:
-    """Wait for the "Retry — new turn" button to mount on the error widget.
-
-    Textual registers a mounted widget in the DOM before its compose()
-    children mount, so the button needs its own settling wait: under
-    full-suite load the widget's message pump can lag the turn-state
-    updates the text/job waits observe (R1).
-    """
-    await _wait_until(
-        pilot, lambda: len(error_widget.query(".error-retry-button")) == 1
-    )
-    return error_widget.query_one(".error-retry-button", Button)
 
 
 @pytest.mark.asyncio
@@ -914,7 +899,7 @@ def test_backend_error_message_hints_at_retry() -> None:
         app, _turn_error(TurnErrorCode.BACKEND_ERROR)
     )
 
-    assert "/retry [additional instructions]" in message
+    assert "/retry or Ctrl+R to retry this turn" in message
     assert "Network error" in message
 
 
@@ -1278,7 +1263,16 @@ async def test_retry_command_reuses_interrupted_assistant_message() -> None:
             for widget in app._messages_area.children
             if isinstance(widget, AssistantMessage | ErrorMessage | SlashCommandMessage)
         ]
-        assert [type(widget) for widget in visible_turn] == [AssistantMessage]
+        # E1: the failure record stays as a plain transcript message (there is
+        # no retryable widget to resolve away); only the retry's own command
+        # message is dropped once the retry streams.
+        assert sorted(type(widget).__name__ for widget in visible_turn) == [
+            "AssistantMessage",
+            "ErrorMessage",
+        ]
+        error_widget = app.query_one(ErrorMessage)
+        assert error_widget._retryable is False
+        assert len(error_widget.query(".error-retry-button")) == 0
         assert [
             message._content
             for message in app.query(UserMessage)
@@ -1331,7 +1325,12 @@ async def test_retry_command_keeps_separate_assistant_after_reasoning() -> None:
             "recovered",
         ]
         assert len(app.query(ReasoningMessage)) == 1
-        assert len(app.query(ErrorMessage)) == 0
+        # E1: the failure stays as ONE plain transcript message — no retryable
+        # widget and no button — and the retry's command message is dropped.
+        assert len(app.query(ErrorMessage)) == 1
+        error_widget = app.query_one(ErrorMessage)
+        assert error_widget._retryable is False
+        assert len(error_widget.query(".error-retry-button")) == 0
         assert len(app.query(SlashCommandMessage)) == 0
 
 
@@ -1551,7 +1550,7 @@ def test_retry_and_empty_mcp_copy_and_availability() -> None:
     registry.refresh(CommandContext(retry_available=True))
     assert registry.has_command("retry")
     assert "new turn" in registry.get_help_text()
-    assert "new turn" in TurnSupervisor._retry_hint()
+    assert "/retry or Ctrl+R to retry this turn" in TurnSupervisor._retry_hint()
     assert "may repeat" in build_retry_prompt("")
 
 
@@ -2116,12 +2115,12 @@ async def test_r0_all_deployments_unavailable_is_visible_terminal_state() -> Non
     turns.
 
     R1 (plan v0.5.6-recovery) layers the manual fallback ON TOP of R0's
-    characterization: the terminal exhaustion error now carries the
-    keyboard-accessible "Retry — new turn" affordance. R0 pinned its pre-R1
-    absence ("NO /retry affordance today — R1's design territory"); R1 makes
-    the exhaustion state retryable-for-the-affordance, with honest text that
-    the deployments were unavailable and a manual retry resets the model's
-    cooldowns.
+    characterization: the terminal exhaustion error offers the manual retry.
+    E1 (v0.7.3) presents it as a plain error message with a one-line text hint
+    (/retry or Ctrl+R) — no retryable widget, no button — while the retry
+    presentation is armed so the command and shortcut keep working. The text
+    stays honest that the deployments were unavailable and a manual retry
+    resets the model's cooldowns.
     """
     backend = ControlledTransport([_r0_connect_fault()])
     agent_loop = build_test_agent_loop(
@@ -2134,7 +2133,7 @@ async def test_r0_all_deployments_unavailable_is_visible_terminal_state() -> Non
         chat_input = app.query_one(ChatInputContainer)
         chat_input.post_message(ChatInputContainer.Submitted("hi"))
         # Turn 1: the only deployment faults — a retryable backend error
-        # whose widget offers /retry.
+        # whose message offers /retry.
         await _wait_until(
             pilot,
             lambda: any(
@@ -2163,13 +2162,11 @@ async def test_r0_all_deployments_unavailable_is_visible_terminal_state() -> Non
         terminal_text = str(terminal[0]._error)
         assert "test-first" in terminal_text
         assert "cooldown" in terminal_text
-        # R1: the terminal exhaustion error carries the retry affordance —
-        # the keyboard-accessible button on the widget, the retry hint, and
-        # the honest text that a manual retry resets the model's cooldowns.
-        assert terminal[0]._retryable is True
-        button = await _wait_for_retry_button(pilot, terminal[0])
-        assert str(button.label) == "Retry — new turn"
-        assert "Retry — new turn" in terminal_text
+        # E1: ONE plain mount — no retryable widget, no button — with the
+        # retry hint as text and the honest cooldown-reset note.
+        assert terminal[0]._retryable is False
+        assert len(terminal[0].query(".error-retry-button")) == 0
+        assert "/retry or Ctrl+R to retry this turn" in terminal_text
         assert "resets the model's cooldowns" in terminal_text
         assert "recent actions may repeat" in terminal_text
         assert await wait_until(pilot, lambda: app.commands.has_command("retry"))
@@ -2274,6 +2271,10 @@ async def test_r0_incomplete_stream_bound_is_per_episode() -> None:
         await _wait_until(pilot, lambda: not app._agent_job_active())
         await _wait_until(pilot, lambda: len(app.query(ErrorMessage)) == 1)
         assert "/retry" in str(app.query_one(ErrorMessage)._error)
+        # E1: the visible error is a plain transcript message — the transcript
+        # accumulates plain records, never retryable widgets.
+        assert not any(error._retryable for error in app.query(ErrorMessage))
+        assert len(app.query(".error-retry-button")) == 0
         # Each continuation is an injected new turn carrying the retry
         # prompt — never a user message.
         for attempt in (1, 2):
@@ -2286,21 +2287,24 @@ async def test_r0_incomplete_stream_bound_is_per_episode() -> None:
         await _wait_until(pilot, lambda: len(backend.requests_messages) == 6)
         await _wait_until(pilot, lambda: not app._agent_job_active())
         await _wait_until(pilot, lambda: len(app.query(ErrorMessage)) == 2)
+        # TWO plain mounts, ZERO retryable widgets: submitting a fresh prompt
+        # discards the retry presentation but strands nothing.
+        assert not any(error._retryable for error in app.query(ErrorMessage))
+        assert len(app.query(".error-retry-button")) == 0
 
     assert len(backend.requests_messages) == 6
 
 
 @pytest.mark.asyncio
-async def test_r1_retry_affordance_button_starts_exactly_one_new_turn() -> None:
-    """R1 (TUI): the "Retry — new turn" affordance invokes the EXISTING retry
-    operation.
+async def test_e1_terminal_error_is_plain_and_leaves_no_stranded_widget() -> None:
+    """E1 (v0.7.3): a terminal retryable failure mounts ONE plain error
+    message — no retryable widget, no button — and nothing is stranded.
 
-    One activation of the button on the terminal error widget starts exactly
-    one new turn: one additional transport attempt, an injected retry-prompt
-    message, and no new user message. The intentional user-requested cooldown
-    reset (the only path allowed to reset it) is what admits the retry past
-    the armed cooldown. The completed-actions-may-repeat warning stays on the
-    error text, and the button disables itself on activation.
+    The pre-E1 retryable widget's only removal handle lived on the retry
+    presentation; a new prompt discarded that handle and left the widget
+    mounted forever, accumulating one per failed retryable turn. A plain
+    transcript message has no such handle, so the stranding cannot happen
+    while the retry presentation stays armed for /retry and Ctrl+R.
     """
     backend = FakeInterruptedStreamingBackend([
         [mock_llm_chunk(content="Ran three dummy read-only")],
@@ -2310,9 +2314,6 @@ async def test_r1_retry_affordance_button_starts_exactly_one_new_turn() -> None:
         config=_disabled_root_recovery_config(), backend=backend, enable_streaming=True
     )
     app = build_test_chartreux_app(agent_loop=agent_loop)
-    registry = agent_loop.config_orchestrator.availability_registry
-    committed = agent_loop.committed_model
-    assert committed is not None
 
     async with app.run_test() as pilot:
         await pilot.pause(0.1)
@@ -2321,58 +2322,44 @@ async def test_r1_retry_affordance_button_starts_exactly_one_new_turn() -> None:
         await _wait_for_retry_error(app, pilot)
         await _wait_until(pilot, lambda: not app._agent_job_active())
 
+        # One plain mount per failure, with the retry hint as text.
+        assert len(app.query(ErrorMessage)) == 1
         error_widget = app.query_one(ErrorMessage)
-        # The affordance is displayed with the warning preserved.
-        assert error_widget._retryable is True
-        assert "recent actions may repeat" in str(error_widget._error)
-        button = await _wait_for_retry_button(pilot, error_widget)
-        assert str(button.label) == "Retry — new turn"
+        assert error_widget._retryable is False
+        assert len(error_widget.query(".error-retry-button")) == 0
+        error_text = str(error_widget._error)
+        assert "/retry or Ctrl+R to retry this turn" in error_text
+        assert "recent actions may repeat" in error_text
+        # The retry presentation is armed WITHOUT a widget (so /retry and
+        # Ctrl+R work) and holds nothing whose removal handle can be lost.
+        assert app.event_handler is not None
+        presentation = app.event_handler._retry_presentation
+        assert presentation is not None
+        assert presentation.transient_widgets == []
+        assert await wait_until(pilot, lambda: app.commands.has_command("retry"))
 
-        # The interrupted stream armed the shared deployment cooldown.
-        assert (
-            registry.cooldown_until(committed.base_model, committed.provider)
-            is not None
-        )
+        # Cancelling the presentation is the pre-E1 stranding path (a new user
+        # prompt does exactly this): the plain error stays a normal transcript
+        # record, and nothing retryable is left behind.
+        app.event_handler.cancel_retry_presentation()
+        app._refresh_command_registry()
+        await pilot.pause(0.1)
 
-        # Activate the affordance button.
-        button.press()
-        await _wait_until(pilot, lambda: backend.streaming_attempts == 2)
-        await _wait_until(pilot, lambda: not app._agent_job_active())
-
-        # The button disabled itself on activation.
-        assert button.disabled is True
-        # Exactly ONE new turn: one additional attempt, one assistant
-        # message — and no new user message (the retry turn is injected).
-        assert backend.streaming_attempts == 2
-        assert len(app.query(AssistantMessage)) == 1
-        assert [
-            message._content
-            for message in app.query(UserMessage)
-            if not isinstance(message, SlashCommandMessage)
-        ] == ["hi"]
-        # The manual retry retained its intentional cooldown reset: the
-        # retry was admitted past the armed cooldown, and the reset cleared
-        # it.
-        assert registry.cooldown_until(committed.base_model, committed.provider) is None
-        # The terminal error widget (affordance included) was resolved away
-        # once the retry turn produced output.
-        assert len(app.query(ErrorMessage)) == 0
-
-    retry_message = backend.requests_messages[-1][-1]
-    assert retry_message.injected is True
-    assert retry_message.content == build_retry_prompt("")
+        assert app.event_handler._retry_presentation is None
+        assert len(app.query(ErrorMessage)) == 1
+        assert not any(error._retryable for error in app.query(ErrorMessage))
+        assert len(app.query(".error-retry-button")) == 0
 
 
 @pytest.mark.asyncio
 async def test_r1_retry_affordance_keyboard_shortcut_starts_one_turn() -> None:
-    """R1 (TUI): the affordance is keyboard-accessible — Ctrl+R invokes the
+    """R1 (TUI): the retry offer is keyboard-accessible — Ctrl+R invokes the
     EXISTING retry operation, gated exactly like /retry.
 
-    The chat input's focus policy reclaims focus from transcript widgets, so
-    the displayed button is pointer-activated and Ctrl+R is the keyboard
-    path; the error text names both. With no retry offered the shortcut is a
-    no-op; with the affordance offered it starts exactly one new turn with
-    the intentional user-requested cooldown reset.
+    E1 presents the offer as text, so the error text names both manual paths
+    (/retry and Ctrl+R) and Ctrl+R is the keyboard path. With no retry offered
+    the shortcut is a no-op; with the offer armed it starts exactly one new
+    turn with the intentional user-requested cooldown reset.
     """
     backend = FakeInterruptedStreamingBackend([
         [mock_llm_chunk(content="partial")],
@@ -2403,9 +2390,9 @@ async def test_r1_retry_affordance_keyboard_shortcut_starts_one_turn() -> None:
             is not None
         )
         error_widget = app.query_one(ErrorMessage)
-        # The error text names the keyboard path and the button.
-        assert "Ctrl+R" in str(error_widget._error)
-        assert "Retry — new turn" in str(error_widget._error)
+        # The error text names both manual retry paths (no button to name).
+        assert "/retry or Ctrl+R to retry this turn" in str(error_widget._error)
+        assert error_widget._retryable is False
         assert await wait_until(pilot, lambda: app.commands.has_command("retry"))
 
         # Keyboard activation starts exactly one new turn.
@@ -2425,9 +2412,10 @@ async def test_r1_retry_affordance_keyboard_shortcut_starts_one_turn() -> None:
 async def test_r1_retry_affordance_double_activation_starts_one_turn() -> None:
     """R1 (TUI): double activation starts AT MOST one turn.
 
-    Two rapid activations of the affordance — the widget-level guard (the
-    button disables itself and posts once) and the operation-level guard (the
-    retry operation's turn-ownership claim refuses a second turn) both apply.
+    E1 removed the widget-level guard together with the button, so the
+    OPERATION-level guard carries this: the retry operation's turn-ownership
+    claim refuses a second turn when a second activation arrives — a Ctrl+R
+    press plus a directly posted affordance message.
     """
     backend = FakeInterruptedStreamingBackend([
         [mock_llm_chunk(content="partial")],
@@ -2446,11 +2434,11 @@ async def test_r1_retry_affordance_double_activation_starts_one_turn() -> None:
         await _wait_until(pilot, lambda: not app._agent_job_active())
 
         error_widget = app.query_one(ErrorMessage)
-        button = await _wait_for_retry_button(pilot, error_widget)
+        assert len(error_widget.query(".error-retry-button")) == 0
 
-        # Two rapid activations: a real button press plus a directly posted
+        # Two rapid activations: a keyboard activation plus a directly posted
         # affordance message (exercising the operation-level guard).
-        button.press()
+        await pilot.press("ctrl+r")
         error_widget.post_message(ErrorRetryRequested())
         await _wait_until(pilot, lambda: backend.streaming_attempts == 2)
         await _wait_until(pilot, lambda: not app._agent_job_active())
@@ -2458,7 +2446,6 @@ async def test_r1_retry_affordance_double_activation_starts_one_turn() -> None:
 
         # At most one new turn started.
         assert backend.streaming_attempts == 2
-        assert button.disabled is True
 
     retry_message = backend.requests_messages[-1][-1]
     assert retry_message.injected is True
@@ -2467,10 +2454,9 @@ async def test_r1_retry_affordance_double_activation_starts_one_turn() -> None:
 
 @pytest.mark.asyncio
 async def test_r1_exhaustion_affordance_retries_with_cooldown_reset() -> None:
-    """R1 (TUI): the affordance's retryable set INCLUDES
-    exhaustion-after-cooldown — the terminal all-deployments-unavailable
-    error offers "Retry — new turn", and activating it starts exactly one
-    new turn.
+    """R1 (TUI): the retryable set INCLUDES exhaustion-after-cooldown — the
+    terminal all-deployments-unavailable error offers the manual retry, and
+    activating it starts exactly one new turn.
 
     The retry is a genuine user action, so the EXISTING retry operation's
     intentional cooldown reset (the only path allowed to reset it) admits the
@@ -2510,7 +2496,7 @@ async def test_r1_exhaustion_affordance_retries_with_cooldown_reset() -> None:
         )
 
         # Turn 2: blocked at admission — the terminal exhaustion error,
-        # which (R1) carries the affordance with honest text.
+        # which (R1) offers the retry with honest text.
         chat_input.post_message(ChatInputContainer.Submitted("again"))
         await _wait_until(
             pilot,
@@ -2531,14 +2517,15 @@ async def test_r1_exhaustion_affordance_retries_with_cooldown_reset() -> None:
         terminal_text = str(terminal[0]._error)
         assert "test-first" in terminal_text
         assert "cooldown" in terminal_text
-        assert "Retry — new turn" in terminal_text
+        assert "/retry or Ctrl+R to retry this turn" in terminal_text
         assert "resets the model's cooldowns" in terminal_text
         assert "recent actions may repeat" in terminal_text
-        assert terminal[0]._retryable is True
-        await _wait_for_retry_button(pilot, terminal[0])
+        # E1: a plain mount — no retryable widget, no button.
+        assert terminal[0]._retryable is False
+        assert len(terminal[0].query(".error-retry-button")) == 0
         assert await wait_until(pilot, lambda: app.commands.has_command("retry"))
 
-        # Activate the affordance (keyboard path): the user-initiated retry
+        # Activate the retry (keyboard path): the user-initiated retry
         # resets the cooldown and is admitted — exactly one new turn.
         await pilot.press("ctrl+r")
         await _wait_until(pilot, lambda: len(backend.requests_messages) == 2)
@@ -2556,8 +2543,8 @@ async def test_r1_exhaustion_affordance_retries_with_cooldown_reset() -> None:
 @pytest.mark.asyncio
 async def test_r1_no_retry_action_with_unresolved_runtime_approval() -> None:
     """R1 (TUI): no retry action while an unresolved runtime approval is
-    present — activating the affordance under an open callback starts no
-    turn.
+    present — activating the retry (keyboard path) under an open callback
+    starts no turn.
     """
     backend = FakeInterruptedStreamingBackend([[mock_llm_chunk(content="partial")]])
     agent_loop = build_test_agent_loop(
@@ -2573,13 +2560,13 @@ async def test_r1_no_retry_action_with_unresolved_runtime_approval() -> None:
         await _wait_until(pilot, lambda: not app._agent_job_active())
 
         error_widget = app.query_one(ErrorMessage)
-        button = await _wait_for_retry_button(pilot, error_widget)
+        assert error_widget._retryable is False
 
-        # An unresolved runtime approval arrives while the affordance is shown.
+        # An unresolved runtime approval arrives while the retry is offered.
         await app._handle_turn_event(CallbackRequested(_question_callback("cb-1")))
         await _wait_until(pilot, lambda: app._active_callback is not None)
 
-        button.press()
+        await pilot.press("ctrl+r")
         await pilot.pause(0.2)
 
         # No retry turn started: still exactly one transport attempt, and
@@ -2632,11 +2619,10 @@ async def test_r1_disconnect_offers_inspection_guidance_not_retry(
         assert "Inspect the session and server state" in text
         assert "reconnects automatically" in text
         assert "Nothing is continued automatically" in text
-        # No retry affordance, no retry hint, no automatic continuation.
+        # No retry offer, no retry hint, no automatic continuation.
         assert error_widget._retryable is False
         assert len(error_widget.query(".error-retry-button")) == 0
         assert "/retry" not in text
-        assert "Retry — new turn" not in text
         assert "Ctrl+R" not in text
         assert app.event_handler is not None
         assert app.event_handler._retry_presentation is None

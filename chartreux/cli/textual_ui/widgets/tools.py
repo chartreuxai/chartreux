@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, ClassVar
 
+from pydantic import JsonValue
 from textual import events
 from textual.app import ComposeResult
 from textual.binding import Binding, BindingType
@@ -52,6 +53,7 @@ from chartreux.cli.textual_ui.widgets.tool_grouping import (
 from chartreux.cli.textual_ui.widgets.tool_widgets import (
     ToolResultWidget,
     clean_output,
+    edit_result_stats,
     effect_result_is_collapsible,
     get_result_widget,
     linkify_effect_result,
@@ -708,6 +710,9 @@ class ToolResultMessage(ClickWithoutDragMixin, Static):
         self._call_widget = call_widget
         self._tool_name = entry.detail.tool_name
         self._content_container: Vertical | None = None
+        # The expanded path composes its border up front; the collapsible path
+        # builds one inside the lazily-created body (see `build_result_body`).
+        self._border: ExpandingBorder | None = None
         self._result_widget: ToolResultWidget | None = None
         self._is_collapsible = self._determine_collapsible()
         self._is_error = False
@@ -917,6 +922,44 @@ class ToolResultMessage(ClickWithoutDragMixin, Static):
                 group.show_message_timestamps and group.is_collapsed
             )
 
+    def _header_suffix(self, suffix: str, output: JsonValue) -> str:
+        """The header's trailing metadata: the display suffix plus edit stats."""
+        # Edits carry their change size on the collapsed header, counted from the
+        # same occurrences (and normalization) the expanded diff renders.
+        stats = (
+            edit_result_stats(output)
+            if self._entry.detail.kind is ToolEffectKind.FILE_EDIT
+            else ""
+        )
+        return " ".join(part for part in (suffix, stats) if part)
+
+    def _build_result_body(
+        self, output: JsonValue, fallback_text: str, display: EffectResultDisplay
+    ) -> Widget:
+        """Build one result body inside the shared bordered container.
+
+        Kept as a separate method so the section can call it lazily: nothing here
+        (in particular the heavy diff/Markdown widget) exists while collapsed.
+        """
+        if output is None and fallback_text:
+            widget: Widget = NoMarkupStatic(fallback_text, classes="tool-result-detail")
+        else:
+            widget = get_result_widget(
+                self._entry.detail,
+                output,
+                success=display.success,
+                message=display.message,
+                warnings=display.warnings,
+            )
+            self._result_widget = widget
+        border = ExpandingBorder(classes="tool-result-border")
+        self._border = border
+        return Horizontal(
+            border,
+            Vertical(widget, classes="tool-result-content"),
+            classes="tool-result-container",
+        )
+
     async def _render_result_collapsible(self) -> None:
         # Bodies are built lazily (factory closures): a collapsed result keeps
         # only its header, and the heavy content widget (Markdown/Syntax/diff) is
@@ -1005,24 +1048,7 @@ class ToolResultMessage(ClickWithoutDragMixin, Static):
         )
 
         def build_result_body() -> Widget:
-            if output is None and fallback_text:
-                widget: Widget = NoMarkupStatic(
-                    fallback_text, classes="tool-result-detail"
-                )
-            else:
-                widget = get_result_widget(
-                    self._entry.detail,
-                    output,
-                    success=display.success,
-                    message=display.message,
-                    warnings=display.warnings,
-                )
-                self._result_widget = widget
-            return Horizontal(
-                ExpandingBorder(classes="tool-result-border"),
-                Vertical(widget, classes="tool-result-content"),
-                classes="tool-result-container",
-            )
+            return self._build_result_body(output, fallback_text, display)
 
         # The header is inert only when there is genuinely nothing to unfold: no
         # structured output, no fallback text, and no warnings.
@@ -1037,7 +1063,7 @@ class ToolResultMessage(ClickWithoutDragMixin, Static):
             build_result_body,
             header_text=header_text,
             header_verb=display.verb,
-            header_suffix=display.suffix,
+            header_suffix=self._header_suffix(display.suffix, output),
             header_success=display.success,
             header_muted=not display.success,
             collapsible=has_body,
@@ -1131,7 +1157,13 @@ class ToolResultMessage(ClickWithoutDragMixin, Static):
                 return None
 
     def _apply_border_colors(self) -> None:
-        if self._result_widget is None:
+        # A collapsed collapsible result has no border (its body is torn down), and
+        # a render notification can outlive the body it came from: ignore both.
+        if (
+            self._border is None
+            or self._result_widget is None
+            or not self._result_widget.is_attached
+        ):
             return
         self._border.set_row_colors(self._result_widget.border_row_colors)
 

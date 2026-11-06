@@ -46,6 +46,7 @@ from chartreux.app_server.protocol import (
 )
 from chartreux.cli.textual_ui.app import ChartreuxApp
 from chartreux.cli.textual_ui.turn_supervisor import (
+    _ANSWERED_ELSEWHERE_MESSAGE,
     _CLOSED_CALLBACK_MESSAGE,
     _DEAD_CALLBACK_MESSAGE,
 )
@@ -190,17 +191,22 @@ async def test_child_question_closure_dismisses_the_widget_without_user_action(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "terminal_state",
+    ("terminal_state", "expected_message"),
     [
-        CancelledCallbackState(reason="turn ended"),
-        AnsweredCallbackState(output=_answer("cb-1")),
+        (CancelledCallbackState(reason="turn ended"), _CLOSED_CALLBACK_MESSAGE),
+        (AnsweredCallbackState(output=_answer("cb-1")), _ANSWERED_ELSEWHERE_MESSAGE),
     ],
     ids=["cancelled", "answered"],
 )
 async def test_projected_terminal_state_dismisses_the_matching_widget(
-    terminal_state, monkeypatch: pytest.MonkeyPatch
+    terminal_state, expected_message: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Any non-open projection state unmounts the live widget (not just expired)."""
+    """Any non-open projection state unmounts the live widget (not just expired).
+
+    The copy is outcome-specific (plan U): a cancellation reads as closed and an
+    answer landed elsewhere reads as answered elsewhere — in both cases quietly,
+    as information rather than a warning.
+    """
     app = build_test_chartreux_app()
     callback = _question_callback("projected")
     notify = MagicMock()
@@ -217,9 +223,11 @@ async def test_projected_terminal_state_dismisses_the_matching_widget(
 
         await _wait_until(pilot, lambda: not app.query(QuestionApp))
         assert app._active_callback is None
-        assert _CLOSED_CALLBACK_MESSAGE in [
-            call.args[0] for call in notify.call_args_list
+        matched = [
+            call for call in notify.call_args_list if call.args[0] == expected_message
         ]
+        assert matched, notify.call_args_list
+        assert matched[0].kwargs["severity"] == "information"
 
 
 @pytest.mark.asyncio

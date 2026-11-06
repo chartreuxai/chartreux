@@ -37,7 +37,6 @@ from chartreux.app_server.protocol import (
     ServerErrorParams,
     ServerWarningParams,
     SessionCompactedParams,
-    SessionContextClearedParams,
     SessionSnapshotParams,
     SessionUpdatedParams,
     StatsUpdatedParams,
@@ -69,11 +68,6 @@ class SessionSnapshot:
 @dataclass(frozen=True, slots=True)
 class SessionCompacted:
     params: SessionCompactedParams
-
-
-@dataclass(frozen=True, slots=True)
-class SessionContextCleared:
-    params: SessionContextClearedParams
 
 
 @dataclass(frozen=True, slots=True)
@@ -151,7 +145,6 @@ type AppServerEvent = (
     | HistoryEntryUpdated
     | SessionSnapshot
     | SessionCompacted
-    | SessionContextCleared
     | SessionUpdated
     | TurnStarted
     | TurnUpdated
@@ -260,7 +253,6 @@ type _KnownEventParams = (
     | HistoryEntryUpdatedParams
     | SessionSnapshotParams
     | SessionCompactedParams
-    | SessionContextClearedParams
     | SessionUpdatedParams
     | StatsUpdatedParams
     | TurnCompletedParams
@@ -282,7 +274,6 @@ class UnknownNotificationError(RuntimeError):
 _PROJECTION_EVENT_PARAMS: dict[str, type[_KnownEventParams]] = {
     "session/snapshot": SessionSnapshotParams,
     "session/compacted": SessionCompactedParams,
-    "session/contextCleared": SessionContextClearedParams,
     "session/updated": SessionUpdatedParams,
     "history/entryAdded": HistoryEntryAddedParams,
     "history/entryUpdated": HistoryEntryUpdatedParams,
@@ -465,12 +456,10 @@ class ClientProjection:
         self, notification: Notification, *, dedupe_history_additions: bool = True
     ) -> AppServerEvent | None:
         params = _parse_event_params(notification)
-        if isinstance(params, SessionCompactedParams | SessionContextClearedParams):
+        if isinstance(params, SessionCompactedParams):
             self._validate_handoff(params)
             self._replace_state(params.state)
-            if isinstance(params, SessionCompactedParams):
-                return SessionCompacted(params)
-            return SessionContextCleared(params)
+            return SessionCompacted(params)
         if isinstance(params, SessionSnapshotParams):
             self._validate_snapshot(params)
         event_id = self._next_event_id(params.event_id, params.session_id)
@@ -522,7 +511,7 @@ class ClientProjection:
             case StatsUpdatedParams():
                 self.state.session.token_usage = params.stats.token_usage
                 event = StatsUpdated(params)
-            case SessionCompactedParams() | SessionContextClearedParams():
+            case SessionCompactedParams():
                 raise AssertionError("Session handoffs are reduced before events")
         return event
 
@@ -553,9 +542,7 @@ class ClientProjection:
                 "App-server snapshot watermark does not match its notification"
             )
 
-    def _validate_handoff(
-        self, params: SessionCompactedParams | SessionContextClearedParams
-    ) -> None:
+    def _validate_handoff(self, params: SessionCompactedParams) -> None:
         if params.old_session_id != self.state.session.id:
             raise EventSequenceError(
                 "App-server handoff does not replace the active session"

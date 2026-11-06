@@ -63,6 +63,8 @@ from chartreux.app_server.protocol import (
     SessionListResponse,
     SessionLogReadParams,
     SessionLogReadResponse,
+    SessionPlanHandoffParams,
+    SessionPlanHandoffResponse,
     SessionReadParams,
     SessionReadResponse,
     SessionRelocateParams,
@@ -409,6 +411,21 @@ class SessionResource:
         self._state.reset_usage_baseline()
         self._state.session_log = response.session_log
         self._connection.mark_session_attached()
+
+    async def plan_handoff(
+        self, params: SessionPlanHandoffParams
+    ) -> SessionPlanHandoffResponse:
+        """Start the consented executor session; publishes the replaced state."""
+        client = await self._connection.connect()
+        response = validate_wire(
+            SessionPlanHandoffResponse,
+            await client.request("session/plan/handoff", params),
+        )
+        self._state.projection.replace_state(response.state)
+        self._state.reset_usage_baseline()
+        self._state.session_log = response.session_log
+        self._connection.mark_session_attached()
+        return response
 
     async def compact(self, extra_instructions: str = "") -> str:
         client = await self._connection.connect()

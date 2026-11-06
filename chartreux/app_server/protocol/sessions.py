@@ -447,6 +447,28 @@ class SessionHistoryClearResponse(ProtocolModel):
     session_log: SessionLogSummary
 
 
+class SessionPlanHandoffParams(ProtocolModel):
+    """Consent snapshot for a /plan accept, resolved by the client at modal open.
+
+    The server applies exactly these values or fails without starting
+    execution. ``planner_thinking_alias``/``planner_thinking_value`` carry the
+    /plan-entry thinking-key restore: the pre-entry value to restore, or removal
+    of the key when it was absent pre-entry (``planner_thinking_value=None``).
+    """
+
+    session_id: str
+    executor_model: str
+    executor_thinking: str
+    executor_identity: str
+    plan_path: str = ""
+    planner_thinking_alias: str | None = None
+    planner_thinking_value: str | None = None
+
+
+class SessionPlanHandoffResponse(SessionHistoryClearResponse):
+    """A plan-accept handoff publishes the same replaced-session state as /clear."""
+
+
 class SessionCompactParams(ProtocolModel):
     session_id: str
     extra_instructions: str = ""
