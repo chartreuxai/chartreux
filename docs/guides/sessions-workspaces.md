@@ -39,6 +39,40 @@ restart only through scratch artifacts and the persisted transcript, not
 through an automatic resume. See
 [Failure recovery, suspension, and resume](subagents.md#failure-recovery-suspension-and-resume).
 
+## Plan mode across resume and branch
+
+Plan mode is persisted with the session rather than held as a process-local
+flag. Entry writes a record into the session metadata — plan document path,
+theme, planner selection, and the pre-entry model and thinking — and the record
+is what every later surface reads: resume restore, the compaction notice, and
+`/plan status`. With session logging disabled there is no metadata to carry it,
+so a logging-disabled planning session is neither restored nor re-injected on
+resume; the mode itself still works for that session.
+
+Resume restores the mode before the session is marked ready, so it is in place
+before any startup prompt dispatches: the prompt tint returns, and one short
+notice names the mode and the plan document, with the theme only when the mode
+has one. `-P`/`--plan` composes with resume as a "make sure the session is
+planning" instruction rather than a switch:
+
+| Last session | `-c` / `--resume` | `-c -P [THEME]` |
+| --- | --- | --- |
+| Was planning | Resume, then the record restores the mode | The same outcome: the restored record wins and the flag's theme is ignored |
+| Was not planning | The session resumes as saved | The session resumes and plan mode is entered on the resumed conversation — a new record, a snapshot of that session's model, and the flag's theme |
+
+Entering on a resumed conversation deliberately does not reset its context: the
+planner inherits the discussion so far. Start with `chartreux -P` when you want
+a clean session for planning.
+
+`/plan cancel` and `/clear` remove the record, which is why a resumed or
+restarted session no longer claims to be planning. `/plan accept` removes
+nothing: the executor is a fresh session, and the replaced planner session is
+checkpointed with its record, so resuming that checkpoint is the way to undo a
+handoff. `/branch` inherits the record, so a fork starts in plan mode and shares
+its parent's plan document — last writer wins, with no locking between the two
+sessions. Sharing the document is accepted behavior; it is the only artifact a
+handoff crosses on.
+
 ## Managed-job lifetime
 
 Managed shell jobs belong to one live root runtime, including jobs launched by

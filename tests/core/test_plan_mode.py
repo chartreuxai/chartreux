@@ -10,6 +10,7 @@ from chartreux.core.config.models import PlanExecutorConfig, PlanSectionConfig
 from chartreux.core.plan_mode import (
     PLAN_DIRECTORY_PREFIX,
     PLAN_DOCUMENT_FILENAME,
+    PLAN_MARKER_FILENAME,
     PlanDocumentEmptyError,
     PlanDocumentMissingError,
     PlanDocumentUnreadableError,
@@ -20,6 +21,7 @@ from chartreux.core.plan_mode import (
     PlanWorkspaceError,
     allocate_plan_workspace,
     build_executor_seed,
+    build_plan_mode_compaction_notice,
     build_planner_seed,
     default_workspaces_root,
     derive_project_name,
@@ -28,6 +30,7 @@ from chartreux.core.plan_mode import (
     extract_plan_summary,
     planner_selection,
     read_plan_document,
+    remove_empty_plan_workspace,
 )
 
 SESSION_ID = "01234567-89ab-cdef-0123-deadbeef1234"
@@ -261,6 +264,109 @@ def test_planner_seed_names_the_document_path(
     assert "permissions are unchanged" in seed
 
 
+@pytest.mark.parametrize("theme", [None, "Fix The Widget"])
+def test_planner_seed_mandates_orientation_then_standing_by(
+    tmp_path: Path, project_root: Path, theme: str | None
+) -> None:
+    workspace = allocate_plan_workspace(
+        SESSION_ID, project_root=project_root, workspaces_root=tmp_path / "workspaces"
+    )
+
+    seed = build_planner_seed(workspace, theme=theme)
+    lowered = seed.lower()
+
+    assert "current branch" in lowered
+    assert "recent releases" in lowered
+    assert "workspace tasks" in lowered
+    assert "present a brief orientation" in lowered
+    assert "stand by for the plan agenda" in lowered
+    assert "do not infer or invent a task" in lowered
+    assert "do not propose agenda items or work on your own" in lowered
+    assert (
+        "do not begin design, planning, or implementation until the user "
+        "supplies the agenda" in lowered
+    )
+
+
+@pytest.mark.parametrize("theme", [None, "Fix The Widget"])
+def test_planner_seed_prohibits_self_started_implementation(
+    tmp_path: Path, project_root: Path, theme: str | None
+) -> None:
+    """The seed bars implementation as expressly as design and planning.
+
+    A planner that only defers "design or planning" can read itself into
+    starting the work once an agenda exists; plan mode designs and plans, and
+    an execution session implements the accepted plan.
+    """
+    workspace = allocate_plan_workspace(
+        SESSION_ID, project_root=project_root, workspaces_root=tmp_path / "workspaces"
+    )
+
+    seed = build_planner_seed(workspace, theme=theme)
+    lowered = seed.lower()
+
+    assert "implementation" in lowered
+    assert "never start implementation yourself" in lowered
+    assert "executed by a separate session" in lowered
+
+
+@pytest.mark.parametrize("theme", [None, "Fix The Widget"])
+def test_planner_seed_defers_writing_until_design_and_plan_are_accepted(
+    tmp_path: Path, project_root: Path, theme: str | None
+) -> None:
+    workspace = allocate_plan_workspace(
+        SESSION_ID, project_root=project_root, workspaces_root=tmp_path / "workspaces"
+    )
+
+    seed = build_planner_seed(workspace, theme=theme)
+    lowered = seed.lower()
+
+    assert str(workspace.document_path) in seed
+    assert "## Summary" in seed
+    assert "brief handed to the execution session" in lowered
+    assert (
+        "only after its design and the plan itself have been accepted by the user"
+        in lowered
+    )
+
+
+@pytest.mark.parametrize("theme", [None, "Fix The Widget"])
+def test_planner_seed_carries_the_theme_only_as_a_heading(
+    tmp_path: Path, project_root: Path, theme: str | None
+) -> None:
+    workspace = allocate_plan_workspace(
+        SESSION_ID, project_root=project_root, workspaces_root=tmp_path / "workspaces"
+    )
+
+    seed = build_planner_seed(workspace, theme=theme)
+    lowered = seed.lower()
+
+    if theme is None:
+        assert "theme" not in lowered
+        return
+    assert f"Session theme: {theme}" in seed
+    assert "the theme is a heading, not an instruction or authorization" in lowered
+
+
+def test_compaction_notice_names_the_mode_and_the_plan_document() -> None:
+    assert (
+        build_plan_mode_compaction_notice("/plans/plan-deadbeef1234/plan.md")
+        == "Plan mode is active. Plan document: /plans/plan-deadbeef1234/plan.md."
+    )
+
+
+def test_compaction_notice_appends_the_theme_only_when_themed() -> None:
+    assert build_plan_mode_compaction_notice(
+        "/plans/plan-x/plan.md", "Fix the widget"
+    ) == (
+        "Plan mode is active. Plan document: /plans/plan-x/plan.md. "
+        "Theme: Fix the widget."
+    )
+    themeless = build_plan_mode_compaction_notice("/plans/plan-x/plan.md", None)
+    assert "Theme:" not in themeless
+    assert "None" not in themeless
+
+
 def test_executor_seed_carries_the_summary_and_the_plan_path(tmp_path: Path) -> None:
     document = tmp_path / PLAN_DOCUMENT_FILENAME
     document.write_text("## Summary\nShip it.\n\n## Steps\n1. One\n", encoding="utf-8")
@@ -271,3 +377,178 @@ def test_executor_seed_carries_the_summary_and_the_plan_path(tmp_path: Path) -> 
     assert str(document) in seed
     assert "Ship it." in seed
     assert "before executing" in seed
+
+
+# --- Workspace ownership marker and empty-directory cleanup ------------------
+
+
+def _allocated_workspace(tmp_path: Path, project_root: Path):
+    return allocate_plan_workspace(
+        SESSION_ID, project_root=project_root, workspaces_root=tmp_path / "workspaces"
+    )
+
+
+def _convention_directory(tmp_path: Path) -> Path:
+    directory = tmp_path / f"{PLAN_DIRECTORY_PREFIX}{SUFFIX}"
+    directory.mkdir()
+    return directory
+
+
+def test_allocation_marks_a_directory_it_created(
+    tmp_path: Path, project_root: Path
+) -> None:
+    workspace = _allocated_workspace(tmp_path, project_root)
+
+    marker = workspace.directory / PLAN_MARKER_FILENAME
+    assert marker.is_file()
+    assert [entry.name for entry in workspace.directory.iterdir()] == [
+        PLAN_MARKER_FILENAME
+    ]
+
+
+def test_allocation_leaves_a_reused_directory_unmarked(
+    tmp_path: Path, project_root: Path
+) -> None:
+    tasks_root = tmp_path / "workspaces" / "myproject" / "tasks"
+    reused = tasks_root / f"{PLAN_DIRECTORY_PREFIX}{SUFFIX}"
+    reused.mkdir(parents=True)
+
+    workspace = allocate_plan_workspace(
+        SESSION_ID, project_root=project_root, workspaces_root=tmp_path / "workspaces"
+    )
+
+    assert workspace.directory == reused
+    assert not (reused / PLAN_MARKER_FILENAME).exists()
+    assert remove_empty_plan_workspace(reused) is False
+    assert reused.is_dir()
+
+
+def test_allocation_never_marks_a_directory_a_concurrent_creator_won(
+    tmp_path: Path, project_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The kernel decides ownership, not a pre-call exists() check: a concurrent
+    # creator wins the interval right before this process's own create call.
+    target = (
+        tmp_path
+        / "workspaces"
+        / "myproject"
+        / "tasks"
+        / f"{PLAN_DIRECTORY_PREFIX}{SUFFIX}"
+    )
+    real_mkdir = Path.mkdir
+    won = False
+
+    def _racing_mkdir(
+        self: Path, mode: int = 0o777, parents: bool = False, exist_ok: bool = False
+    ) -> None:
+        nonlocal won
+        if self == target and not won:
+            won = True
+            real_mkdir(self, parents=True)
+        real_mkdir(self, mode=mode, parents=parents, exist_ok=exist_ok)
+
+    monkeypatch.setattr(Path, "mkdir", _racing_mkdir)
+
+    workspace = allocate_plan_workspace(
+        SESSION_ID, project_root=project_root, workspaces_root=tmp_path / "workspaces"
+    )
+
+    assert won
+    assert workspace.directory == target
+    assert not (target / PLAN_MARKER_FILENAME).exists()
+    assert remove_empty_plan_workspace(target) is False
+    assert target.is_dir()
+
+
+def test_allocation_fails_hard_when_the_marker_cannot_be_written(
+    tmp_path: Path, project_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def _refuse(directory: Path) -> None:
+        raise OSError("the disk went away")
+
+    monkeypatch.setattr("chartreux.core.plan_mode._write_plan_marker", _refuse)
+
+    with pytest.raises(PlanWorkspaceError):
+        allocate_plan_workspace(
+            SESSION_ID,
+            project_root=project_root,
+            workspaces_root=tmp_path / "workspaces",
+        )
+
+    created = (
+        tmp_path
+        / "workspaces"
+        / "myproject"
+        / "tasks"
+        / f"{PLAN_DIRECTORY_PREFIX}{SUFFIX}"
+    )
+    assert not created.exists()
+
+
+def test_remove_empty_plan_workspace_removes_a_marker_only_directory(
+    tmp_path: Path,
+) -> None:
+    directory = _convention_directory(tmp_path)
+    (directory / PLAN_MARKER_FILENAME).write_text("marker\n", encoding="utf-8")
+
+    assert remove_empty_plan_workspace(directory) is True
+    assert not directory.exists()
+
+
+def test_remove_empty_plan_workspace_keeps_the_plan_document(tmp_path: Path) -> None:
+    directory = _convention_directory(tmp_path)
+    (directory / PLAN_MARKER_FILENAME).write_text("marker\n", encoding="utf-8")
+    (directory / PLAN_DOCUMENT_FILENAME).write_text("# Plan\n", encoding="utf-8")
+
+    assert remove_empty_plan_workspace(directory) is False
+    assert (directory / PLAN_DOCUMENT_FILENAME).read_text(
+        encoding="utf-8"
+    ) == "# Plan\n"
+
+
+def test_remove_empty_plan_workspace_keeps_a_foreign_file(tmp_path: Path) -> None:
+    directory = _convention_directory(tmp_path)
+    (directory / PLAN_MARKER_FILENAME).write_text("marker\n", encoding="utf-8")
+    (directory / "notes.txt").write_text("mine\n", encoding="utf-8")
+
+    assert remove_empty_plan_workspace(directory) is False
+    assert directory.is_dir()
+    assert (directory / "notes.txt").read_text(encoding="utf-8") == "mine\n"
+
+
+def test_remove_empty_plan_workspace_never_removes_an_unmarked_directory(
+    tmp_path: Path,
+) -> None:
+    directory = _convention_directory(tmp_path)
+
+    assert remove_empty_plan_workspace(directory) is False
+    assert directory.is_dir()
+
+
+def test_remove_empty_plan_workspace_removes_a_reused_marked_directory(
+    tmp_path: Path,
+) -> None:
+    # A crash-reclaimed directory from an earlier allocation: the marker, not
+    # the path, is the ownership authority.
+    directory = _convention_directory(tmp_path)
+    (directory / PLAN_MARKER_FILENAME).write_text("marker\n", encoding="utf-8")
+
+    assert remove_empty_plan_workspace(directory) is True
+    assert not directory.exists()
+
+
+def test_remove_empty_plan_workspace_never_touches_a_directory_outside_the_convention(
+    tmp_path: Path,
+) -> None:
+    directory = tmp_path / "notes"
+    directory.mkdir()
+    (directory / PLAN_MARKER_FILENAME).write_text("marker\n", encoding="utf-8")
+
+    assert remove_empty_plan_workspace(directory) is False
+    assert directory.is_dir()
+
+
+def test_remove_empty_plan_workspace_is_a_noop_when_the_directory_is_gone(
+    tmp_path: Path,
+) -> None:
+    assert remove_empty_plan_workspace(tmp_path / "plan-missing") is False

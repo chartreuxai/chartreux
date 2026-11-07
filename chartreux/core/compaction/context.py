@@ -97,6 +97,7 @@ def render_compaction_context(
     previous_user_messages: Sequence[LLMMessage],
     summary: str,
     file_state_section: str | None = None,
+    mode_notice: str | None = None,
 ) -> str:
     lines = [
         "You are continuing a trajectory after a context compaction.",
@@ -128,6 +129,14 @@ def render_compaction_context(
         # so the model sees the working-set paths and their revisions right
         # after compaction, without re-reading the files.
         lines.extend(["", file_state_section])
+    if mode_notice:
+        # The mode notice is the same kind of carrier: it is read off the
+        # session's own metadata and rendered into the boundary content, so the
+        # model keeps the mode and the plan path through ANY compaction. Its
+        # theme is free user text, so it is escaped like every other preserved
+        # fragment — a theme quoting a boundary tag must not forge a
+        # previous-user-message block.
+        lines.extend(["", _escape_reserved_previous_user_message_tags(mode_notice)])
     return "\n".join(lines)
 
 

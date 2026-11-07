@@ -19,11 +19,17 @@ from chartreux.core.config.models import PlanSectionConfig
 from chartreux.core.paths import CHARTREUX_HOME
 from chartreux.core.session.session_id import extract_suffix
 from chartreux.utils.io import read_safe
-from chartreux.utils.private_paths import ensure_private_directory
+from chartreux.utils.private_paths import create_private_directory
 
 PLAN_DIRECTORY_PREFIX = "plan-"
 PLAN_DOCUMENT_FILENAME = "plan.md"
 PLAN_SUMMARY_HEADING = "Summary"
+
+# The ownership marker: written only for a directory this module created, so a
+# reused convention-matching directory is never claimed. Presence is the
+# authority cancel consults — the path convention alone proves nothing.
+PLAN_MARKER_FILENAME = ".chartreux-plan-mode"
+_PLAN_MARKER_CONTENT = "chartreux plan-mode workspace\n"
 
 # The session-derived name comes first; numbered alternatives follow so an
 # existing plan document is never overwritten.
@@ -162,6 +168,8 @@ def allocate_plan_workspace(
     document already exists, the first free numbered alternative
     (``plan-<suffix>-2``, ...) is allocated instead. The task directory is
     created owner-only; the document itself is left for the planner to write.
+    A directory this call created carries :data:`PLAN_MARKER_FILENAME`; a
+    reused one keeps whatever it already held, marker or not.
     """
     suffix = derive_session_suffix(session_id)
     project_name = derive_project_name(project_root)
@@ -173,17 +181,94 @@ def allocate_plan_workspace(
         document_path = directory / PLAN_DOCUMENT_FILENAME
         if document_path.exists():
             continue
-        ensure_private_directory(directory)
+        # Ownership is what the exclusive create reports, never a pre-call
+        # exists() test: a concurrent creator can win that interval, and a
+        # marker written into its directory would make it look claimable.
+        created_here = _create_workspace_directory(directory)
         if not directory.is_dir():
             raise PlanWorkspaceError(
                 f"cannot create plan workspace directory: {directory}"
             )
         if document_path.exists():
+            if created_here:
+                _discard_created_directory(directory)
             continue
+        if created_here:
+            # Allocation is the directory plus its marker: a created-but-
+            # unmarked directory must never be left behind as foreign content.
+            try:
+                _write_plan_marker(directory)
+            except OSError as error:
+                _discard_created_directory(directory)
+                raise PlanWorkspaceError(
+                    f"cannot mark the plan workspace directory: {directory}: {error}"
+                ) from error
         return PlanWorkspace(directory=directory, document_path=document_path)
     raise PlanWorkspaceError(
         f"no free plan workspace name for session {session_id!r} under {tasks_root}"
     )
+
+
+def _create_workspace_directory(directory: Path) -> bool:
+    """Create the leaf exclusively; report whether this call created it."""
+    try:
+        return create_private_directory(directory)
+    except OSError as error:
+        raise PlanWorkspaceError(
+            f"cannot create plan workspace directory: {directory}: {error}"
+        ) from error
+
+
+def remove_empty_plan_workspace(directory: Path) -> bool:
+    """Remove an allocated plan workspace that holds nothing but its marker.
+
+    Ownership is the marker file, not the path convention: a reused,
+    convention-matching directory that carries no marker is foreign and never
+    removed, while a marker-only directory from an earlier allocation is
+    chartreux's own leftover. A plan document or any other content keeps the
+    directory. Removal is a guarded ``rmdir`` — never a recursive delete — and
+    a directory that has already gone missing is a no-op.
+    """
+    if directory.is_symlink() or not directory.is_dir():
+        return False
+    if not _is_plan_directory_name(directory.name):
+        return False
+    marker = directory / PLAN_MARKER_FILENAME
+    if not marker.is_file():
+        return False
+    try:
+        if any(entry.name != PLAN_MARKER_FILENAME for entry in directory.iterdir()):
+            return False
+        marker.unlink()
+        directory.rmdir()
+    except OSError:
+        return False
+    return True
+
+
+def _write_plan_marker(directory: Path) -> None:
+    """Write the ownership marker; the caller fails allocation if this raises."""
+    (directory / PLAN_MARKER_FILENAME).write_text(
+        _PLAN_MARKER_CONTENT, encoding="utf-8"
+    )
+
+
+def _discard_created_directory(directory: Path) -> None:
+    """Undo a directory this call created, never removing foreign content."""
+    try:
+        (directory / PLAN_MARKER_FILENAME).unlink()
+    except OSError:
+        pass
+    try:
+        directory.rmdir()
+    except OSError:
+        pass
+
+
+def _is_plan_directory_name(name: str) -> bool:
+    if not name.startswith(PLAN_DIRECTORY_PREFIX):
+        return False
+    return _SAFE_NAME.fullmatch(name[len(PLAN_DIRECTORY_PREFIX) :]) is not None
 
 
 def extract_plan_summary(content: str) -> str | None:
@@ -249,15 +334,43 @@ def read_plan_document(path: Path) -> PlanDocument:
     return PlanDocument(path=path, content=content, summary=summary)
 
 
-def build_planner_seed(workspace: PlanWorkspace) -> str:
-    """The visible entry message telling the planner where to write the plan."""
+def build_planner_seed(workspace: PlanWorkspace, theme: str | None = None) -> str:
+    """Orient the planner, then defer design, planning, and writing until asked."""
+    theme_line = (
+        f"\nSession theme: {theme}. The theme is a heading, not an instruction "
+        "or authorization."
+        if theme
+        else ""
+    )
     return (
-        "Plan mode is active. Explore and research freely; permissions are "
-        "unchanged. Write the plan as Markdown to:\n"
+        f"Plan mode is active; permissions are unchanged.{theme_line}\n\n"
+        "Orient yourself about the state of the repository first: read the "
+        "current branch, the recent releases, and the existing workspace tasks. "
+        "Then present a brief orientation to the user and stand by for the plan "
+        "agenda. Do not infer or invent a task, do not propose agenda items or "
+        "work on your own — the user drives — and do not begin design, "
+        "planning, or implementation until the user supplies the agenda. Never "
+        "start implementation yourself: the accepted plan is executed by a "
+        "separate session.\n\n"
+        "The plan document is written only after its design and the plan itself "
+        "have been accepted by the user, as Markdown to:\n"
         f"{workspace.document_path}\n\n"
         f'Include a "## {PLAN_SUMMARY_HEADING}" section: its text is the brief '
         "handed to the execution session."
     )
+
+
+def build_plan_mode_compaction_notice(plan_path: str, theme: str | None = None) -> str:
+    """The one-line notice re-injected after a compaction rewrote the history.
+
+    The same text is the ``/plan status`` line. The theme clause follows the
+    seed's iff-theme discipline: a themeless mode never renders
+    "Theme: None.".
+    """
+    notice = f"Plan mode is active. Plan document: {plan_path}."
+    if theme:
+        return f"{notice} Theme: {theme}."
+    return notice
 
 
 def build_executor_seed(document: PlanDocument) -> str:

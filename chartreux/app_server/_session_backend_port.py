@@ -46,6 +46,9 @@ from chartreux.app_server.protocol import (
     SessionForkResponse,
     SessionListParams,
     SessionListResponse,
+    SessionPlanRecord,
+    SessionPlanRecordWriteParams,
+    SessionPlanRecordWriteResponse,
     SessionReadParams,
     SessionReadResponse,
     SessionResumeParams,
@@ -334,6 +337,12 @@ class SessionBackend(Protocol):  # noqa: PLR0904 - unified backend contract
     async def compact(
         self, params: SessionCompactParams
     ) -> SessionBackendResult[SessionCompactResponse]: ...
+
+    async def read_plan_record(self) -> SessionPlanRecord | None: ...
+
+    async def write_plan_record(
+        self, params: SessionPlanRecordWriteParams
+    ) -> SessionBackendResult[SessionPlanRecordWriteResponse]: ...
 
     async def dispatch_extension(
         self, method: str, raw_params: dict[str, Any]

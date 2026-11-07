@@ -97,3 +97,24 @@ def ensure_private_directory(path: Path) -> None:
         logger.debug("Private directory setup skipped path=%s err=%s", path, error)
         return
     restrict_private_path(path)
+
+
+def create_private_directory(path: Path) -> bool:
+    """Create the leaf directory exclusively, reporting whether this call made it.
+
+    ``ensure_private_directory`` cannot answer that question: it creates with
+    ``exist_ok=True`` and swallows ``OSError``, so a caller that must claim only
+    what it created has to test existence first and then races a concurrent
+    creator in the interval. The exclusive leaf ``mkdir`` lets the kernel
+    arbitrate — a ``FileExistsError`` means the leaf already belonged to someone
+    else, and the caller must treat it as foreign.
+    """
+    path.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
+    try:
+        path.mkdir(mode=0o700)
+    except FileExistsError:
+        created_here = False
+    else:
+        created_here = True
+    restrict_private_path(path)
+    return created_here

@@ -1053,6 +1053,11 @@ class PublicReasoningEntry(_PublicHistoryEntryBase):
     type: Literal["reasoning"] = "reasoning"
     text: str
     summary: list[str] = Field(default_factory=list)
+    # The persisted real wall-clock instant (epoch ms) of the event this entry
+    # restores. ``created_at`` stays the synthetic restore ordinal and is never
+    # a header source; a record written before v0.7.4 has no real clock and
+    # restores without one, never backfilled.
+    event_at: int | None = Field(default=None, exclude_if=lambda value: value is None)
 
 
 class PublicEffectEntry(_PublicHistoryEntryBase):
@@ -1060,6 +1065,9 @@ class PublicEffectEntry(_PublicHistoryEntryBase):
     title: str
     detail: EffectDetail
     state: EffectState
+    # The persisted real wall-clock start of the effect (epoch ms); see
+    # ``PublicReasoningEntry.event_at``.
+    event_at: int | None = Field(default=None, exclude_if=lambda value: value is None)
 
 
 class PublicCallbackEntry(_PublicHistoryEntryBase):

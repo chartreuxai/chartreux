@@ -73,6 +73,7 @@ from chartreux.app_server.protocol import (
     SessionForkParams,
     SessionHandoffParams,
     SessionListParams,
+    SessionPlanRecordWriteParams,
     SessionReadParams,
     SessionReadResponse,
     SessionResumeParams,
@@ -156,6 +157,7 @@ _SESSION_BACKEND_METHODS = frozenset({
     "config/write",
     "session/compact",
     "session/context/inject",
+    "session/plan/record/write",
     "session/settings/update",
     "app_server/session/turn/enqueue",
     "app_server/session/turn/queue/read",
@@ -920,7 +922,9 @@ class AppServer:
             )
             return DispatchResult(
                 SessionResumeResponse(
-                    state=response.state, last_event_id=response.last_event_id
+                    state=response.state,
+                    last_event_id=response.last_event_id,
+                    plan_record=await lifecycle.backend.read_plan_record(),
                 ),
                 after_response=lifecycle.after_response,
                 session_attached=True,
@@ -983,6 +987,11 @@ class AppServer:
                 after_response=result.after_response,
                 on_response_abandoned=result.on_response_abandoned,
             )
+        if method == "session/plan/record/write":
+            result = await root.write_plan_record(
+                validate_wire(SessionPlanRecordWriteParams, raw_params)
+            )
+            return DispatchResult(result.response, after_response=result.after_response)
         return None
 
     @staticmethod

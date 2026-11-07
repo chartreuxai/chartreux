@@ -5,10 +5,11 @@ from __future__ import annotations
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
 import pytest
 from textual.app import App, ComposeResult
+from textual.color import Color
 from textual.widgets import Button
 
 from chartreux.app_server.protocol import (
@@ -20,8 +21,10 @@ from chartreux.app_server.protocol import (
     ProtocolErrorCode,
 )
 from chartreux.cli.commands import CommandRegistry
-from chartreux.cli.textual_ui.app import ChartreuxApp
+from chartreux.cli.textual_ui.app import ChartreuxApp, StartupOptions
 from chartreux.cli.textual_ui.plan_mode import (
+    PLAN_MODE_LABEL,
+    PLAN_MODE_TINT_CLASS,
     ExecutorSelection,
     PlanDocumentBrief,
     PlanModeState,
@@ -36,7 +39,10 @@ from chartreux.cli.textual_ui.plan_mode import (
     planner_seed,
     pre_entry_snapshot,
     read_document,
+    record_from_state,
     restore_ops,
+    resume_notice,
+    state_from_record,
     thinking_path,
 )
 from chartreux.cli.textual_ui.screens.plan_consent import (
@@ -44,12 +50,28 @@ from chartreux.cli.textual_ui.screens.plan_consent import (
     START_BUTTON_ID,
     PlanConsentScreen,
 )
-from chartreux.cli.textual_ui.widgets.messages import ErrorMessage, UserCommandMessage
+from chartreux.cli.textual_ui.widgets.messages import (
+    ErrorMessage,
+    UserCommandMessage,
+    WarningMessage,
+)
+from chartreux.cli.textual_ui.widgets.session_picker import SessionPickerApp
 from chartreux.config_values import ThinkingLevel
+from chartreux.core.config import SessionLoggingConfig
 from chartreux.core.config.models import PlanSectionConfig
-from chartreux.core.plan_mode import PlanWorkspaceError
+from chartreux.core.plan_mode import (
+    PLAN_MARKER_FILENAME,
+    PlanWorkspaceError,
+    allocate_plan_workspace,
+)
+from chartreux.core.session.session_loader import SessionLoader
+from chartreux.core.session_types import PlanModeRecord
 from chartreux.ui.widgets.no_markup_static import NoMarkupStatic
-from tests.conftest import build_test_chartreux_app
+from tests.conftest import (
+    build_test_agent_loop,
+    build_test_chartreux_app,
+    build_test_vibe_config,
+)
 
 _PLAN_TEXT = """# Plan
 
@@ -117,6 +139,15 @@ def _workspace(tmp_path: Path) -> PlanWorkspacePaths:
     return PlanWorkspacePaths(directory=directory, document_path=directory / "plan.md")
 
 
+def _marked_workspace(tmp_path: Path) -> PlanWorkspacePaths:
+    """A workspace as the allocator leaves it: the directory and its marker."""
+    workspace = _workspace(tmp_path)
+    (workspace.directory / PLAN_MARKER_FILENAME).write_text(
+        "chartreux plan-mode workspace\n", encoding="utf-8"
+    )
+    return workspace
+
+
 def _write_plan(workspace: PlanWorkspacePaths, text: str = _PLAN_TEXT) -> None:
     workspace.document_path.write_text(text, encoding="utf-8")
 
@@ -128,12 +159,14 @@ def _state(
     planner_thinking: ThinkingLevel = "high",
     pre_entry_active_model: str | None = None,
     pre_entry_planner_thinking: str | None = None,
+    theme: str | None = None,
 ) -> PlanModeState:
     return PlanModeState(
         workspace=workspace,
         planner=PlannerSelection(model=planner_model, thinking=planner_thinking),
         pre_entry_active_model=pre_entry_active_model,
         pre_entry_planner_thinking=pre_entry_planner_thinking,
+        theme=theme,
     )
 
 
@@ -150,8 +183,10 @@ class _Harness:
         *,
         fields: list[ConfigFieldWire],
         workspace: PlanWorkspacePaths,
+        real_reset: bool = False,
     ) -> None:
         self.app = app
+        self._real_reset = real_reset
         self.mounted: list[Any] = []
         self.writes: list[tuple[list[Any], str]] = []
         self._patchers: list[Any] = []
@@ -188,6 +223,12 @@ class _Harness:
             patch.object(self.app, "_refresh_banner", MagicMock()),
             patch.object(self.app._queue, "clear_server_queue", AsyncMock()),
         ]
+        if self._real_reset:
+            self._patchers = [
+                patcher
+                for patcher in self._patchers
+                if patcher.attribute != "_reset_message_widgets"
+            ]
         for patcher in self._patchers:
             patcher.start()
         return self
@@ -409,6 +450,133 @@ async def test_plan_entry_reports_a_workspace_failure(
         assert "no free plan workspace name" in str(error._error)
 
 
+# --- Status ------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_plan_status_reports_the_mode_theme_and_document(
+    app: ChartreuxApp, tmp_path: Path
+) -> None:
+    workspace = _workspace(tmp_path)
+    app._plan_mode = _state(workspace, theme="Fix the widget")
+    async with app.run_test():
+        with _Harness(app, fields=_fields(), workspace=workspace) as harness:
+            await app._plan_command("  Status  ")
+
+        # A status report is read-only: no pins, no seed, no record write.
+        assert harness.writes == []
+        harness.seed.assert_not_called()
+        [posted] = harness.messages(UserCommandMessage)
+        assert posted._content == (
+            "Plan mode is active. "
+            f"Plan document: {workspace.document_path}. Theme: Fix the widget."
+        )
+
+
+@pytest.mark.asyncio
+async def test_plan_status_omits_the_theme_clause_when_themeless(
+    app: ChartreuxApp, tmp_path: Path
+) -> None:
+    workspace = _workspace(tmp_path)
+    app._plan_mode = _state(workspace)
+    async with app.run_test():
+        with _Harness(app, fields=_fields(), workspace=workspace) as harness:
+            await app._plan_command("status")
+
+        [posted] = harness.messages(UserCommandMessage)
+        assert posted._content == (
+            f"Plan mode is active. Plan document: {workspace.document_path}."
+        )
+        assert "Theme:" not in posted._content
+        assert "None" not in posted._content
+
+
+@pytest.mark.asyncio
+async def test_plan_status_outside_plan_mode_reports_not_in_plan_mode(
+    app: ChartreuxApp, tmp_path: Path
+) -> None:
+    async with app.run_test():
+        with _Harness(app, fields=_fields(), workspace=_workspace(tmp_path)) as harness:
+            await app._plan_command("status")
+
+        assert harness.writes == []
+        assert not harness.messages(UserCommandMessage)
+        [error] = harness.messages(ErrorMessage)
+        assert "Not in plan mode" in str(error._error)
+        assert app._plan_mode is None
+
+
+# --- The standing indicator --------------------------------------------------
+
+
+def _input_box(app: ChartreuxApp) -> Any:
+    container = app._chat_input_container
+    assert container is not None
+    return container.get_widget_by_id("input-box")
+
+
+@pytest.mark.asyncio
+async def test_plan_entry_applies_the_amber_tint_and_the_label(
+    app: ChartreuxApp, tmp_path: Path
+) -> None:
+    workspace = _workspace(tmp_path)
+    async with app.run_test() as pilot:
+        with _Harness(app, fields=_fields(), workspace=workspace):
+            await app._plan_command("")
+        await pilot.pause()
+
+        assert PLAN_MODE_TINT_CLASS in _tint_classes(app)
+        input_box = _input_box(app)
+        assert input_box.border_title == f" {PLAN_MODE_LABEL} "
+        amber = Color.parse(app.theme_variables["warning"])
+        assert input_box.styles.border_top == ("solid", amber)
+        assert input_box.styles.border_bottom == ("solid", amber)
+
+
+@pytest.mark.asyncio
+async def test_plan_cancel_clears_the_tint_and_the_label(
+    app: ChartreuxApp, tmp_path: Path
+) -> None:
+    workspace = _workspace(tmp_path)
+    app._plan_mode = _state(workspace)
+    async with app.run_test() as pilot:
+        baseline = _input_box(app).styles.border_top
+        app._set_plan_tint(True)
+        await pilot.pause()
+        assert _input_box(app).border_title == f" {PLAN_MODE_LABEL} "
+        assert _input_box(app).styles.border_top != baseline
+
+        with _Harness(app, fields=_fields(), workspace=workspace):
+            await app._plan_command("cancel")
+        await pilot.pause()
+
+        assert PLAN_MODE_TINT_CLASS not in _tint_classes(app)
+        input_box = _input_box(app)
+        assert input_box.border_title == ""
+        assert input_box.styles.border_top == baseline
+
+
+@pytest.mark.asyncio
+async def test_resumed_plan_mode_shows_the_styled_tint_and_the_label(
+    tmp_path: Path,
+) -> None:
+    # The resume-restored session carries the same standing indicator as an
+    # entered one: 01D restores the state, 01B-3 supplies the styling.
+    session_id, logging, plan_directory = await _planning_session(tmp_path)
+    app, _ = _resumed_app(logging, tmp_path)
+    async with app.run_test() as pilot:
+        await app._resume_local_session(session_id)
+        await pilot.pause()
+
+        assert app._plan_mode is not None
+        assert PLAN_MODE_TINT_CLASS in _tint_classes(app)
+        input_box = _input_box(app)
+        assert input_box.border_title == f" {PLAN_MODE_LABEL} "
+        amber = Color.parse(app.theme_variables["warning"])
+        assert input_box.styles.border_top == ("solid", amber)
+        assert input_box.styles.border_bottom == ("solid", amber)
+
+
 # --- Accept ------------------------------------------------------------------
 
 
@@ -505,6 +673,32 @@ async def test_plan_accept_applies_the_displayed_snapshot_and_seeds_the_executor
 
 
 @pytest.mark.asyncio
+async def test_plan_accept_shows_the_theme_without_exporting_the_discussion(
+    app: ChartreuxApp, tmp_path: Path
+) -> None:
+    # The theme row is display-only: the executor seed is the plan summary and
+    # the document path, byte for byte, with no discussion-context export.
+    workspace = _workspace(tmp_path)
+    _write_plan(workspace)
+    app._plan_mode = _state(workspace, theme="Fix the widget")
+    async with app.run_test():
+        with _Harness(app, fields=_fields(), workspace=workspace) as harness:
+            await app._plan_accept()
+            consent_call = harness.consent.await_args
+            assert consent_call is not None
+            assert consent_call.args[2] == "Fix the widget"
+            seed_call = harness.seed.await_args
+            assert seed_call is not None
+            seed = seed_call.args[0]
+            assert seed == (
+                f"Execute the plan at {workspace.document_path}.\n\n"
+                "Planner summary:\nDo the thing carefully.\n\n"
+                "Read the plan document at that path before executing."
+            )
+            assert "Fix the widget" not in seed
+
+
+@pytest.mark.asyncio
 async def test_plan_accept_admission_conflict_keeps_planning(
     app: ChartreuxApp, tmp_path: Path
 ) -> None:
@@ -552,6 +746,30 @@ async def test_plan_accept_post_bind_failure_names_the_plan_path(
         [error] = harness.messages(ErrorMessage)
         assert str(workspace.document_path) in str(error._error)
         assert "may already be active" in str(error._error)
+
+
+@pytest.mark.asyncio
+async def test_plan_accept_clears_the_tint_and_the_label(
+    app: ChartreuxApp, tmp_path: Path
+) -> None:
+    # The handoff ends the mode, so the standing indicator ends with it: the
+    # replaced session must not keep the amber border /plan entry applied.
+    workspace = _workspace(tmp_path)
+    _write_plan(workspace)
+    app._plan_mode = _state(workspace)
+    async with app.run_test() as pilot:
+        app._set_plan_tint(True)
+        await pilot.pause()
+        assert PLAN_MODE_TINT_CLASS in _tint_classes(app)
+        assert _input_box(app).border_title == f" {PLAN_MODE_LABEL} "
+
+        with _Harness(app, fields=_fields(), workspace=workspace, real_reset=True):
+            await app._plan_accept()
+        await pilot.pause()
+
+        assert app._plan_mode is None
+        assert PLAN_MODE_TINT_CLASS not in _tint_classes(app)
+        assert _input_box(app).border_title == ""
 
 
 # --- Cancel ------------------------------------------------------------------
@@ -621,15 +839,135 @@ async def test_plan_cancel_reports_a_restore_failure(
 
 
 @pytest.mark.asyncio
-async def test_plan_command_rejects_an_unknown_action(
+async def test_plan_cancel_removes_the_marker_only_workspace(
     app: ChartreuxApp, tmp_path: Path
 ) -> None:
+    workspace = _marked_workspace(tmp_path)
+    app._plan_mode = _state(workspace)
     async with app.run_test():
-        with _Harness(app, fields=_fields(), workspace=_workspace(tmp_path)) as harness:
-            await app._plan_command("resume")
+        with _Harness(app, fields=_fields(), workspace=workspace) as harness:
+            await app._plan_command("cancel")
 
-        [error] = harness.messages(ErrorMessage)
-        assert "Unknown /plan action: resume" in str(error._error)
+        assert app._plan_mode is None
+        assert not workspace.directory.exists()
+        posted = harness.messages(UserCommandMessage)
+        assert "removed" in str(posted[0]._content)
+
+
+@pytest.mark.asyncio
+async def test_plan_cancel_removes_the_workspace_the_allocator_created(
+    app: ChartreuxApp, tmp_path: Path
+) -> None:
+    allocated = allocate_plan_workspace(
+        "01234567-89ab-cdef-0123-deadbeef1234",
+        project_root=tmp_path,
+        workspaces_root=tmp_path / "workspaces",
+    )
+    assert (allocated.directory / PLAN_MARKER_FILENAME).is_file()
+    workspace = PlanWorkspacePaths(
+        directory=allocated.directory, document_path=allocated.document_path
+    )
+    app._plan_mode = _state(workspace)
+    async with app.run_test():
+        with _Harness(app, fields=_fields(), workspace=workspace):
+            await app._plan_command("cancel")
+
+        assert not allocated.directory.exists()
+
+
+@pytest.mark.asyncio
+async def test_plan_cancel_keeps_the_workspace_holding_the_plan(
+    app: ChartreuxApp, tmp_path: Path
+) -> None:
+    workspace = _marked_workspace(tmp_path)
+    _write_plan(workspace)
+    app._plan_mode = _state(workspace)
+    async with app.run_test():
+        with _Harness(app, fields=_fields(), workspace=workspace) as harness:
+            await app._plan_command("cancel")
+
+        assert workspace.directory.is_dir()
+        assert workspace.document_path.is_file()
+        posted = harness.messages(UserCommandMessage)
+        assert str(workspace.document_path) in posted[0]._content
+
+
+@pytest.mark.asyncio
+async def test_plan_cancel_keeps_a_workspace_holding_a_foreign_file(
+    app: ChartreuxApp, tmp_path: Path
+) -> None:
+    workspace = _marked_workspace(tmp_path)
+    (workspace.directory / "notes.txt").write_text("mine\n", encoding="utf-8")
+    app._plan_mode = _state(workspace)
+    async with app.run_test():
+        with _Harness(app, fields=_fields(), workspace=workspace):
+            await app._plan_command("cancel")
+
+        assert workspace.directory.is_dir()
+        assert (workspace.directory / "notes.txt").read_text(encoding="utf-8") == (
+            "mine\n"
+        )
+
+
+@pytest.mark.asyncio
+async def test_plan_cancel_never_removes_an_unmarked_reused_workspace(
+    app: ChartreuxApp, tmp_path: Path
+) -> None:
+    # The path matches the convention, but no allocation ever claimed it.
+    workspace = _workspace(tmp_path)
+    app._plan_mode = _state(workspace)
+    async with app.run_test():
+        with _Harness(app, fields=_fields(), workspace=workspace):
+            await app._plan_command("cancel")
+
+        assert workspace.directory.is_dir()
+
+
+@pytest.mark.asyncio
+async def test_plan_cancel_is_a_noop_when_the_workspace_is_gone(
+    app: ChartreuxApp, tmp_path: Path
+) -> None:
+    workspace = _marked_workspace(tmp_path)
+    (workspace.directory / PLAN_MARKER_FILENAME).unlink()
+    workspace.directory.rmdir()
+    app._plan_mode = _state(workspace)
+    async with app.run_test():
+        with _Harness(app, fields=_fields(), workspace=workspace) as harness:
+            await app._plan_command("cancel")
+
+        assert app._plan_mode is None
+        assert not workspace.directory.exists()
+        assert not harness.messages(ErrorMessage)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("theme", ["Fix The Widget", "accept later", "resume"])
+async def test_plan_command_enters_with_theme(
+    app: ChartreuxApp, tmp_path: Path, theme: str
+) -> None:
+    workspace = _workspace(tmp_path)
+    async with app.run_test():
+        with _Harness(app, fields=_fields(), workspace=workspace) as harness:
+            await app._plan_command(f"  {theme}  ")
+        assert app._plan_mode is not None
+        assert app._plan_mode.theme == theme
+        harness.seed.assert_awaited_once_with(planner_seed(workspace, theme=theme))
+
+
+@pytest.mark.asyncio
+async def test_plan_command_theme_does_not_reenter_active_mode(
+    app: ChartreuxApp, tmp_path: Path
+) -> None:
+    workspace = _workspace(tmp_path)
+    state = _state(workspace)
+    app._plan_mode = state
+    async with app.run_test():
+        with _Harness(app, fields=_fields(), workspace=workspace) as harness:
+            await app._plan_command("new theme")
+        assert app._plan_mode is state
+        assert not harness.writes
+        harness.seed.assert_not_awaited()
+        assert "already active" in _contents(harness.messages(UserCommandMessage))
 
 
 # --- /clear while planning ---------------------------------------------------
@@ -656,6 +994,22 @@ async def test_clear_while_planning_removes_the_pins_and_ends_the_mode(
         posted = _contents(harness.messages(UserCommandMessage))
         assert "Plan mode ended" in posted
         assert str(workspace.document_path) in posted
+
+
+@pytest.mark.asyncio
+async def test_clear_while_planning_keeps_the_workspace(
+    app: ChartreuxApp, tmp_path: Path
+) -> None:
+    # /clear keeps everything: it ends the mode without touching the workspace.
+    workspace = _marked_workspace(tmp_path)
+    app._plan_mode = _state(workspace)
+    async with app.run_test():
+        app.app_server.clear_history = AsyncMock()
+        with _Harness(app, fields=_fields(), workspace=workspace):
+            await app._clear_history()
+
+        assert workspace.directory.is_dir()
+        assert (workspace.directory / PLAN_MARKER_FILENAME).is_file()
 
 
 # --- Module seams ------------------------------------------------------------
@@ -834,7 +1188,7 @@ class _ModalApp(App[None]):
         self.result = result
 
 
-def _screen() -> PlanConsentScreen:
+def _screen(theme: str | None = None) -> PlanConsentScreen:
     return PlanConsentScreen(
         plan_path=str(_DOCUMENT.path),
         summary=_DOCUMENT.summary,
@@ -842,11 +1196,20 @@ def _screen() -> PlanConsentScreen:
         executor_thinking=_EXECUTOR.thinking,
         executor_identity=_EXECUTOR.identity,
         executor_display_name="Mistral Large",
+        theme=theme,
     )
 
 
 def _text(screen: PlanConsentScreen, selector: str) -> str:
     return str(screen.query_one(selector, NoMarkupStatic).content)
+
+
+def _labels(screen: PlanConsentScreen) -> list[str]:
+    return [
+        str(widget.content)
+        for widget in screen.query(NoMarkupStatic)
+        if widget.has_class("plan-consent-label")
+    ]
 
 
 @pytest.mark.asyncio
@@ -866,6 +1229,27 @@ async def test_consent_modal_shows_path_summary_and_the_exact_executor() -> None
             "Start execution"
         )
         assert str(screen.query_one(f"#{CANCEL_BUTTON_ID}", Button).label) == "Cancel"
+
+
+@pytest.mark.asyncio
+async def test_consent_modal_shows_the_theme_row_when_themed() -> None:
+    app = _ModalApp(_screen("Fix the widget"))
+    async with app.run_test(size=(80, 24)) as pilot:
+        await pilot.pause()
+        screen = app.screen_under_test
+        assert _text(screen, "#plan-consent-theme") == "Fix the widget"
+        assert _labels(screen).count("Theme") == 1
+        assert screen.query_one("#plan-consent-dialog").size.height <= 24
+
+
+@pytest.mark.asyncio
+async def test_consent_modal_has_no_theme_row_when_themeless() -> None:
+    app = _ModalApp(_screen())
+    async with app.run_test(size=(80, 24)) as pilot:
+        await pilot.pause()
+        screen = app.screen_under_test
+        assert not screen.query("#plan-consent-theme")
+        assert "Theme" not in _labels(screen)
 
 
 @pytest.mark.asyncio
@@ -916,3 +1300,642 @@ async def test_plan_accept_worker_guard_schedules_one_accept(
             assert worker is not None
             await app.workers.wait_for_complete([worker])
         flow.assert_awaited_once()
+
+
+# --- The persisted record ---------------------------------------------------
+
+
+async def _planning_session(
+    tmp_path: Path,
+    *,
+    theme: str | None = "Fix the widget",
+    pre_entry_active_model: str | None = "mistral-large-4",
+    allocated_workspace: bool = False,
+) -> tuple[str, SessionLoggingConfig, Path]:
+    """A persisted session whose record marks it as planning.
+
+    ``allocated_workspace`` allocates the directory through the real allocator,
+    so it carries the ownership marker and no plan document.
+    """
+    logging = SessionLoggingConfig(enabled=True, save_dir=str(tmp_path / "sessions"))
+    loop = build_test_agent_loop(
+        config=build_test_vibe_config(session_logging=logging), cwd=tmp_path
+    )
+    await loop.persist_empty_session()
+    if allocated_workspace:
+        plan_directory = allocate_plan_workspace(
+            loop.session_id,
+            project_root=tmp_path,
+            workspaces_root=tmp_path / "workspaces",
+        ).directory
+    else:
+        plan_directory = tmp_path / "tasks" / "plan-initial"
+        plan_directory.mkdir(parents=True)
+    await loop.session_logger.persist_plan_mode(
+        PlanModeRecord(
+            plan_path=str(plan_directory / "plan.md"),
+            theme=theme,
+            planner_model="glm-5-3",
+            planner_thinking="high",
+            pre_entry_active_model=pre_entry_active_model,
+            pre_entry_planner_thinking="low",
+        )
+    )
+    session_id = loop.session_id
+    await loop.aclose()
+    return session_id, logging, plan_directory
+
+
+def _resumed_app(
+    logging: SessionLoggingConfig, tmp_path: Path, *, initial_prompt: str | None = None
+) -> tuple[ChartreuxApp, Any]:
+    loop = build_test_agent_loop(
+        config=build_test_vibe_config(session_logging=logging), cwd=tmp_path
+    )
+    app = build_test_chartreux_app(agent_loop=loop, initial_prompt=initial_prompt)
+    return app, loop
+
+
+def _notices(loop: Any) -> list[str]:
+    return [
+        message.content
+        for message in loop.messages
+        if message.content and "Plan mode resumed" in message.content
+    ]
+
+
+def _tint_classes(app: ChartreuxApp) -> set[str]:
+    container = app._chat_input_container
+    assert container is not None
+    return set(container.classes)
+
+
+def _persisted_record(loop: Any) -> PlanModeRecord | None:
+    session_dir = loop.session_logger.session_dir
+    assert session_dir is not None
+    return SessionLoader.load_metadata(session_dir).plan_mode
+
+
+@pytest.mark.asyncio
+async def test_plan_entry_persists_the_record(tmp_path: Path) -> None:
+    logging = SessionLoggingConfig(enabled=True, save_dir=str(tmp_path / "sessions"))
+    loop = build_test_agent_loop(
+        config=build_test_vibe_config(session_logging=logging), cwd=tmp_path
+    )
+    await loop.persist_empty_session()
+    app = build_test_chartreux_app(agent_loop=loop)
+    workspace = _workspace(tmp_path)
+    async with app.run_test():
+        with _Harness(app, fields=_fields(), workspace=workspace):
+            await app._plan_command("  Fix the widget  ")
+
+    record = _persisted_record(loop)
+    assert record is not None
+    assert record.plan_path == str(workspace.document_path)
+    assert record.theme == "Fix the widget"
+    assert record.planner_model == "glm-5-3"
+    assert record.planner_thinking == "high"
+    assert record.pre_entry_active_model is None
+    assert app._plan_mode is not None
+
+
+@pytest.mark.asyncio
+async def test_plan_entry_reports_a_record_write_failure(tmp_path: Path) -> None:
+    # The pins are written and the mode works in memory; only the restart
+    # restore is lost, so entry stands and says so.
+    workspace = _workspace(tmp_path)
+    app = build_test_chartreux_app()
+    async with app.run_test():
+        with _Harness(app, fields=_fields(), workspace=workspace) as harness:
+            with patch.object(
+                app.app_server.resources.sessions,
+                "write_plan_record",
+                AsyncMock(side_effect=RuntimeError("the disk went away")),
+            ):
+                await app._plan_command("")
+
+        assert app._plan_mode is not None
+        harness.seed.assert_awaited_once()
+        warnings = "\n".join(
+            widget._message for widget in harness.messages(WarningMessage)
+        )
+        assert "will not be restored on resume" in warnings
+        assert "the disk went away" in warnings
+
+
+@pytest.mark.asyncio
+async def test_resumed_cancel_removes_the_record_and_restores_the_pins(
+    tmp_path: Path,
+) -> None:
+    session_id, logging, plan_directory = await _planning_session(tmp_path)
+    app, loop = _resumed_app(logging, tmp_path)
+    async with app.run_test():
+        await app._resume_local_session(session_id)
+        state = app._plan_mode
+        assert state is not None
+        with _Harness(app, fields=_fields(), workspace=state.workspace) as harness:
+            await app._plan_command("cancel")
+
+        [(ops, reason)] = harness.writes
+        assert reason == "plan mode cancel restore"
+        assert [(op.op, op.path, op.value) for op in ops] == [
+            ("set", "/active_model", "mistral-large-4"),
+            ("set", "/thinking_overrides/glm-5-3", "low"),
+        ]
+
+    assert app._plan_mode is None
+    assert _persisted_record(loop) is None
+    # This test built the directory itself, so it carries no ownership marker:
+    # an unmarked directory is foreign and stays.
+    assert plan_directory.is_dir()
+
+
+@pytest.mark.asyncio
+async def test_resumed_cancel_removes_the_record_the_allocated_workspace_and_the_pins(
+    tmp_path: Path,
+) -> None:
+    # The full restart -> resume -> cancel composite: the record and the empty
+    # allocated workspace go, and the pre-entry pins come back.
+    session_id, logging, plan_directory = await _planning_session(
+        tmp_path, allocated_workspace=True
+    )
+    assert (plan_directory / PLAN_MARKER_FILENAME).is_file()
+    assert not (plan_directory / "plan.md").exists()
+    app, loop = _resumed_app(logging, tmp_path)
+    async with app.run_test():
+        await app._resume_local_session(session_id)
+        state = app._plan_mode
+        assert state is not None
+        assert state.workspace.directory == plan_directory
+        with _Harness(app, fields=_fields(), workspace=state.workspace) as harness:
+            await app._plan_command("cancel")
+
+        [(ops, reason)] = harness.writes
+        assert reason == "plan mode cancel restore"
+        assert [(op.op, op.path, op.value) for op in ops] == [
+            ("set", "/active_model", "mistral-large-4"),
+            ("set", "/thinking_overrides/glm-5-3", "low"),
+        ]
+
+    assert app._plan_mode is None
+    assert _persisted_record(loop) is None
+    assert not plan_directory.exists()
+
+
+@pytest.mark.asyncio
+async def test_clear_while_planning_removes_the_record(tmp_path: Path) -> None:
+    session_id, logging, _ = await _planning_session(tmp_path)
+    app, loop = _resumed_app(logging, tmp_path)
+    async with app.run_test():
+        await app._resume_local_session(session_id)
+        app.app_server.clear_history = AsyncMock()
+        state = app._plan_mode
+        assert state is not None
+        with _Harness(app, fields=_fields(), workspace=state.workspace):
+            await app._clear_history()
+
+    assert app._plan_mode is None
+    assert _persisted_record(loop) is None
+
+
+@pytest.mark.asyncio
+async def test_continue_resume_restores_plan_mode_before_the_startup_prompt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    session_id, logging, plan_directory = await _planning_session(tmp_path)
+    app, loop = _resumed_app(logging, tmp_path, initial_prompt="continue the work")
+    dispatched: list[bool] = []
+
+    def _dispatch() -> None:
+        dispatched.append(app._plan_mode is not None)
+
+    monkeypatch.setattr(app, "_process_initial_prompt", _dispatch)
+
+    async with app.run_test():
+        app._continue_latest = True
+        app._startup_command_availability_ready.set()
+        with patch.object(
+            app.app_server.resources.sessions,
+            "resolve_continue_session",
+            AsyncMock(return_value=session_id),
+        ):
+            await app._auto_resume_on_startup()
+
+        # The startup prompt dispatch sees the restored mode: resume restore
+        # completes before any prompt dispatch, on this path.
+        assert dispatched == [True]
+        state = app._plan_mode
+        assert state is not None
+        assert state.plan_path == str(plan_directory / "plan.md")
+        assert state.theme == "Fix the widget"
+        assert state.planner == PlannerSelection(model="glm-5-3", thinking="high")
+        assert state.pre_entry_active_model == "mistral-large-4"
+        assert state.pre_entry_planner_thinking == "low"
+        assert PLAN_MODE_TINT_CLASS in _tint_classes(app)
+        assert _notices(loop) == [
+            f"Plan mode resumed. Plan document: {plan_directory / 'plan.md'}. "
+            "Theme: Fix the widget."
+        ]
+        # The notice is server-side history, not only a UI mount.
+        assert [
+            message.injected
+            for message in loop.messages
+            if message.content and "Plan mode resumed" in message.content
+        ] == [True]
+
+        # `-c -P` composition (design §8): the restored record makes the entry
+        # an already-active guard, so the extra theme is ignored.
+        with _Harness(app, fields=_fields(), workspace=state.workspace) as harness:
+            await app._plan_command("some other theme")
+
+        assert harness.writes == []
+        assert app._plan_mode is state
+        assert "already active" in _contents(harness.messages(UserCommandMessage))
+
+
+@pytest.mark.asyncio
+async def test_picker_resume_restores_plan_mode_before_the_startup_prompt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    session_id, logging, plan_directory = await _planning_session(tmp_path)
+    app, loop = _resumed_app(logging, tmp_path, initial_prompt="continue the work")
+    dispatched: list[bool] = []
+
+    def _dispatch() -> None:
+        dispatched.append(app._plan_mode is not None)
+
+    monkeypatch.setattr(app, "_process_initial_prompt", _dispatch)
+
+    async with app.run_test():
+        app._show_resume_picker = True
+        app._startup_command_availability_ready.set()
+        await app.on_session_picker_app_session_selected(
+            SessionPickerApp.SessionSelected(f"local:{session_id}", session_id)
+        )
+
+    # This path dispatches the startup prompt before marking the session ready;
+    # the invariant is only that the restore came first.
+    assert dispatched == [True]
+    assert app._session_ready.is_set()
+    state = app._plan_mode
+    assert state is not None
+    assert state.plan_path == str(plan_directory / "plan.md")
+    assert PLAN_MODE_TINT_CLASS in _tint_classes(app)
+    assert _notices(loop) == [
+        f"Plan mode resumed. Plan document: {plan_directory / 'plan.md'}. "
+        "Theme: Fix the widget."
+    ]
+
+
+@pytest.mark.asyncio
+async def test_resumed_themeless_plan_mode_posts_the_notice_without_a_theme(
+    tmp_path: Path,
+) -> None:
+    session_id, logging, plan_directory = await _planning_session(tmp_path, theme=None)
+    app, loop = _resumed_app(logging, tmp_path)
+    async with app.run_test():
+        await app._resume_local_session(session_id)
+
+    state = app._plan_mode
+    assert state is not None
+    assert state.theme is None
+    assert _notices(loop) == [
+        f"Plan mode resumed. Plan document: {plan_directory / 'plan.md'}."
+    ]
+
+
+@pytest.mark.asyncio
+async def test_resume_without_a_record_leaves_plan_mode_off(tmp_path: Path) -> None:
+    logging = SessionLoggingConfig(enabled=True, save_dir=str(tmp_path / "sessions"))
+    saved = build_test_agent_loop(
+        config=build_test_vibe_config(session_logging=logging), cwd=tmp_path
+    )
+    await saved.persist_empty_session()
+    session_id = saved.session_id
+    await saved.aclose()
+
+    app, loop = _resumed_app(logging, tmp_path)
+    async with app.run_test():
+        await app._resume_local_session(session_id)
+
+    assert app._plan_mode is None
+    assert PLAN_MODE_TINT_CLASS not in _tint_classes(app)
+    assert _notices(loop) == []
+
+
+@pytest.mark.asyncio
+async def test_a_resumed_restore_failure_does_not_abort_the_resume(
+    tmp_path: Path,
+) -> None:
+    session_id, logging, _ = await _planning_session(tmp_path)
+    app, _ = _resumed_app(logging, tmp_path)
+    async with app.run_test():
+        with patch(
+            "chartreux.cli.textual_ui.app.state_from_record",
+            side_effect=RuntimeError("unusable record"),
+        ):
+            await app._resume_local_session(session_id)
+
+        assert app.app_server.session_id == session_id
+        assert app._resume_ui_ready.is_set()
+        assert app._plan_mode is None
+
+
+# --- Startup entry (CLI -P/--plan, design §6/§8) -----------------------------
+
+
+@pytest.mark.asyncio
+async def test_post_ready_startup_ensures_the_startup_plan_mode(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app = build_test_chartreux_app(startup=StartupOptions(plan=True))
+    await app.prepare()
+    ensured = AsyncMock()
+    monkeypatch.setattr(app, "_ensure_startup_plan_mode", ensured)
+    monkeypatch.setattr(
+        app, "_show_custom_tools_deprecation_warning_after_initial_history", AsyncMock()
+    )
+    monkeypatch.setattr(app, "_refresh_banner", Mock())
+
+    await app._complete_post_ready_startup()
+
+    ensured.assert_awaited_once_with()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("plan", "theme"), [(True, None), ("  Fix the widget  ", "Fix the widget")]
+)
+async def test_startup_plan_entry_passes_the_requested_theme(
+    plan: bool | str, theme: str | None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    app = build_test_chartreux_app()
+    async with app.run_test():
+        entry = AsyncMock()
+        monkeypatch.setattr(app, "_plan_enter", entry)
+        app._startup_plan = plan
+        app._startup_plan_started = False
+
+        await app._ensure_startup_plan_mode()
+
+        entry.assert_awaited_once_with(theme=theme)
+
+
+@pytest.mark.asyncio
+async def test_startup_plan_entry_stays_off_without_the_flag(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app = build_test_chartreux_app()
+    async with app.run_test():
+        entry = AsyncMock()
+        monkeypatch.setattr(app, "_plan_enter", entry)
+
+        await app._ensure_startup_plan_mode()
+
+        entry.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_startup_plan_entry_runs_once(monkeypatch: pytest.MonkeyPatch) -> None:
+    app = build_test_chartreux_app()
+    async with app.run_test():
+        entry = AsyncMock()
+        monkeypatch.setattr(app, "_plan_enter", entry)
+        app._startup_plan = True
+        app._startup_plan_started = False
+
+        await app._ensure_startup_plan_mode()
+        await app._ensure_startup_plan_mode()
+
+        entry.assert_awaited_once_with(theme=None)
+
+
+@pytest.mark.asyncio
+async def test_startup_plan_entry_applies_the_theme_and_the_pins(
+    tmp_path: Path,
+) -> None:
+    workspace = _workspace(tmp_path)
+    app = build_test_chartreux_app()
+    async with app.run_test():
+        with _Harness(app, fields=_fields(), workspace=workspace) as harness:
+            app._startup_plan = "Fix the widget"
+            app._startup_plan_started = False
+
+            await app._ensure_startup_plan_mode()
+
+            assert app._plan_mode is not None
+            assert app._plan_mode.theme == "Fix the widget"
+            assert [reason for _, reason in harness.writes] == ["plan mode entry"]
+            harness.seed.assert_awaited_once_with(
+                planner_seed(workspace, theme="Fix the widget")
+            )
+            assert PLAN_MODE_TINT_CLASS in _tint_classes(app)
+
+
+@pytest.mark.asyncio
+async def test_continue_resume_restores_plan_mode_before_the_startup_plan_entry(
+    tmp_path: Path,
+) -> None:
+    session_id, logging, _ = await _planning_session(tmp_path)
+    app, _ = _resumed_app(logging, tmp_path)
+    entries: list[bool] = []
+
+    async def _entry(theme: str | None = None) -> None:
+        entries.append(app._plan_mode is not None)
+
+    async with app.run_test():
+        app._continue_latest = True
+        app._startup_plan = "another theme"
+        app._startup_plan_started = False
+        app._startup_command_availability_ready.set()
+        with (
+            patch.object(app, "_plan_enter", _entry),
+            patch.object(
+                app.app_server.resources.sessions,
+                "resolve_continue_session",
+                AsyncMock(return_value=session_id),
+            ),
+        ):
+            await app._auto_resume_on_startup()
+
+    # Resume restore lands first; the entry then sees the restored mode.
+    assert entries == [True]
+
+
+@pytest.mark.asyncio
+async def test_continue_with_plan_keeps_the_resumed_mode_and_ignores_the_theme(
+    tmp_path: Path,
+) -> None:
+    session_id, logging, plan_directory = await _planning_session(tmp_path)
+    app, _ = _resumed_app(logging, tmp_path)
+    async with app.run_test():
+        app._continue_latest = True
+        app._startup_command_availability_ready.set()
+        with _Harness(app, fields=_fields(), workspace=_workspace(tmp_path)) as harness:
+            app._startup_plan = "another theme"
+            app._startup_plan_started = False
+            with patch.object(
+                app.app_server.resources.sessions,
+                "resolve_continue_session",
+                AsyncMock(return_value=session_id),
+            ):
+                await app._auto_resume_on_startup()
+
+            assert harness.writes == []
+            assert "already active" in _contents(harness.messages(UserCommandMessage))
+    state = app._plan_mode
+    assert state is not None
+    assert state.plan_path == str(plan_directory / "plan.md")
+    assert state.theme == "Fix the widget"
+
+
+@pytest.mark.asyncio
+async def test_named_resume_with_plan_enters_plan_mode_on_the_landed_session(
+    tmp_path: Path,
+) -> None:
+    logging = SessionLoggingConfig(enabled=True, save_dir=str(tmp_path / "sessions"))
+    saved = build_test_agent_loop(
+        config=build_test_vibe_config(session_logging=logging), cwd=tmp_path
+    )
+    await saved.persist_empty_session()
+    session_id = saved.session_id
+    await saved.aclose()
+
+    app, _ = _resumed_app(logging, tmp_path)
+    workspace = _workspace(tmp_path)
+    async with app.run_test():
+        with _Harness(app, fields=_fields(), workspace=workspace) as harness:
+            app._resume_session_id = session_id
+            app._startup_plan = "Fix the widget"
+            app._startup_plan_started = False
+            app._startup_command_availability_ready.set()
+
+            await app._auto_resume_on_startup()
+
+            assert app.app_server.session_id == session_id
+            assert app._plan_mode is not None
+            assert app._plan_mode.theme == "Fix the widget"
+            harness.seed.assert_awaited_once_with(
+                planner_seed(workspace, theme="Fix the widget")
+            )
+
+
+@pytest.mark.asyncio
+async def test_continue_with_plan_and_no_sessions_still_enters_plan_mode(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app = build_test_chartreux_app()
+    async with app.run_test():
+        themes: list[str | None] = []
+
+        async def _entry(theme: str | None = None) -> None:
+            themes.append(theme)
+
+        monkeypatch.setattr(app, "_plan_enter", _entry)
+        monkeypatch.setattr(
+            app,
+            "_show_custom_tools_deprecation_warning_after_initial_history",
+            AsyncMock(),
+        )
+        app._continue_latest = True
+        app._startup_plan = True
+        app._startup_plan_started = False
+        app._startup_command_availability_ready.set()
+        with patch.object(
+            app.app_server.resources.sessions,
+            "resolve_continue_session",
+            AsyncMock(return_value=None),
+        ):
+            await app._auto_resume_on_startup()
+
+    assert themes == [None]
+
+
+@pytest.mark.asyncio
+async def test_picker_selection_with_plan_enters_plan_mode_after_the_resume(
+    tmp_path: Path,
+) -> None:
+    session_id, logging, _ = await _planning_session(tmp_path)
+    app, _ = _resumed_app(logging, tmp_path)
+    entries: list[bool] = []
+
+    async def _entry(theme: str | None = None) -> None:
+        entries.append(app._plan_mode is not None)
+
+    async with app.run_test():
+        app._show_resume_picker = True
+        app._startup_plan = "another theme"
+        app._startup_plan_started = False
+        app._startup_command_availability_ready.set()
+        with patch.object(app, "_plan_enter", _entry):
+            await app.on_session_picker_app_session_selected(
+                SessionPickerApp.SessionSelected(f"local:{session_id}", session_id)
+            )
+
+    assert entries == [True]
+    assert app._session_ready.is_set()
+
+
+@pytest.mark.asyncio
+async def test_picker_cancel_with_plan_enters_plan_mode_on_the_current_session(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app = build_test_chartreux_app()
+    async with app.run_test():
+        entry = AsyncMock()
+        monkeypatch.setattr(app, "_plan_enter", entry)
+        monkeypatch.setattr(app, "_switch_to_input_app", AsyncMock())
+        monkeypatch.setattr(
+            app,
+            "_show_custom_tools_deprecation_warning_after_initial_history",
+            AsyncMock(),
+        )
+        app._show_resume_picker = True
+        app._startup_plan = True
+        app._startup_plan_started = False
+        app._startup_command_availability_ready.set()
+
+        await app._exit_picker_to_input()
+
+        entry.assert_awaited_once_with(theme=None)
+
+
+def test_record_and_state_round_trip(tmp_path: Path) -> None:
+    workspace = _workspace(tmp_path)
+    state = _state(
+        workspace, pre_entry_active_model="some-model", pre_entry_planner_thinking="low"
+    )
+    record = record_from_state(state)
+    assert record.plan_path == str(workspace.document_path)
+    assert state_from_record(record) == state
+
+
+def test_record_from_state_carries_the_theme(tmp_path: Path) -> None:
+    state = PlanModeState(
+        workspace=_workspace(tmp_path),
+        planner=PlannerSelection(model="glm-5-3", thinking="high"),
+        pre_entry_active_model=None,
+        pre_entry_planner_thinking=None,
+        theme="Fix the widget",
+    )
+    assert record_from_state(state).theme == "Fix the widget"
+
+
+def test_resume_notice_appends_the_theme_only_when_one_exists(tmp_path: Path) -> None:
+    workspace = _workspace(tmp_path)
+    record = record_from_state(_state(workspace))
+    assert resume_notice(record) == (
+        f"Plan mode resumed. Plan document: {record.plan_path}."
+    )
+    themed = record_from_state(
+        PlanModeState(
+            workspace=workspace,
+            planner=PlannerSelection(model="glm-5-3", thinking="high"),
+            pre_entry_active_model=None,
+            pre_entry_planner_thinking=None,
+            theme="Fix the widget",
+        )
+    )
+    assert resume_notice(themed) == (
+        f"Plan mode resumed. Plan document: {themed.plan_path}. Theme: Fix the widget."
+    )

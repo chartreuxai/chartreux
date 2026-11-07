@@ -225,6 +225,8 @@ class SimpleListStreamEngine:
         self._style_generation = 0
         self._last_theme: str | None = None
         self._cache_key: tuple[int, int] | None = None
+        self._writing = False
+        self._invalidate_pending = False
         self.parse_bytes_log: list[int] = []
         self.layout_cache: dict[tuple[int, int], list[_CompletedListItem]] = {}
         self.cache_invalidations = 0
@@ -250,6 +252,7 @@ class SimpleListStreamEngine:
         self._render_options = None
         self._bullet_style = None
         self._cache_key = None
+        self._invalidate_pending = False
         self.parse_bytes_log.clear()
         self.layout_cache.clear()
         self.cache_invalidations = 0
@@ -257,21 +260,27 @@ class SimpleListStreamEngine:
 
     async def write(self, chunk: str, full: str) -> bool:
         """Handle one buffered write; True when consumed here."""
-        if self.mode == "undecided":
-            window = full[max(0, self._scanned - 2) :]
-            self._scanned = len(full)
-            if _LIST_START_RE.search(window):
-                if self._is_simple_document(full):
-                    await self._engage(full)
+        self._writing = True
+        try:
+            if self.mode == "undecided":
+                window = full[max(0, self._scanned - 2) :]
+                self._scanned = len(full)
+                if _LIST_START_RE.search(window):
+                    if self._is_simple_document(full):
+                        await self._engage(full)
+                        return True
+                    await self._fallback(full)
                     return True
-                await self._fallback(full)
+                return False
+            if self.mode == "fast":
+                await self._fast_write(full)
                 return True
-            return False
-        if self.mode == "fast":
-            await self._fast_write(full)
+            await self._fallback(full)
             return True
-        await self._fallback(full)
-        return True
+        finally:
+            self._writing = False
+            if self._invalidate_pending:
+                self.invalidate_width_caches()
 
     # -- shape confirmation (parser-confirmed, via the widget's own parser) --
 
@@ -616,6 +625,7 @@ class SimpleListStreamEngine:
         self._render_options = None
         self._active_offset = None
         self._cache_key = None
+        self._invalidate_pending = False
         self.layout_cache.clear()
 
     async def _stop_owner_stream(self) -> None:
@@ -638,6 +648,33 @@ class SimpleListStreamEngine:
             self._last_theme = theme
             self._style_generation += 1
         return (md.content_region.width, self._style_generation)
+
+    def invalidate_width_caches(self) -> None:
+        """Re-wrap the completed items after a resize.
+
+        The canvas strips and the layout cache are keyed by width, and only a
+        write rebuilds them — so a pure resize (no new bytes) would keep
+        serving strips wrapped at the old width. Nothing is reparsed here: the
+        items re-wrap from their cached parsed content.
+
+        A resize can be delivered while a write is suspended on an await, and
+        re-wrapping then re-keys the cache before the write tail has borrowed
+        its render context from the live widgets; the tail's own sync would
+        then early-return on the already-current key, leaving every completed
+        item with empty strips. The write owns the cache until its tail, so
+        the invalidation defers to it.
+        """
+        if self.mode != "fast" or self._list_block is None:
+            return
+        if self._writing:
+            self._invalidate_pending = True
+            return
+        self._invalidate_pending = False
+        if self._cache_key is not None and self._cache_key == self.current_layout_key():
+            return
+        self.layout_cache.clear()
+        self._cache_key = None
+        self._sync_layout_cache()
 
     def _sync_layout_cache(self) -> None:
         """Key the completed-item layout cache by width and style generation.
@@ -1089,6 +1126,13 @@ class StreamingMessageBase(Static):
             stream, self._stream = self._stream, None
             if stream._task is not None:
                 stream._task.cancel()
+
+    def _on_resize(self) -> None:
+        # Width-keyed stream state is only valid for the width it was built at;
+        # a resize redraws at a new width without any new bytes to trigger it.
+        engine = self._list_engine
+        if engine is not None:
+            engine.invalidate_width_caches()
 
     def _should_write_content(self) -> bool:
         return True

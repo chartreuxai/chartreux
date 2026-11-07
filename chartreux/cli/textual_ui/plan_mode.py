@@ -30,11 +30,18 @@ from chartreux.app_server.protocol import (
     ConfigWriteOpWire,
     ProtocolError,
     ProtocolErrorCode,
+    SessionPlanRecord,
 )
 
 OVERRIDES_LAYER = "overrides"
 ACTIVE_MODEL_PATH = "/active_model"
 THINKING_OVERRIDES_PATH = "/thinking_overrides"
+
+# The standing indicator: this class tints the prompt area (the amber borders
+# and label color live in app.tcss), and the label rides the prompt's border
+# title. Entry, resume restore, and the exit paths only apply or drop them.
+PLAN_MODE_TINT_CLASS = "plan-mode"
+PLAN_MODE_LABEL = "plan"
 
 
 def _core_plan_mode() -> ModuleType:
@@ -104,6 +111,7 @@ class PlanModeState:
     planner: PlannerSelection
     pre_entry_active_model: str | None
     pre_entry_planner_thinking: str | None
+    theme: str | None = None
 
     @property
     def plan_path(self) -> str:
@@ -185,6 +193,57 @@ def clear_ops(state: PlanModeState) -> list[ConfigWriteOpWire]:
     return [_remove(ACTIVE_MODEL_PATH), _remove(thinking_path(state.planner.model))]
 
 
+def record_from_state(state: PlanModeState) -> SessionPlanRecord:
+    """The persisted record for an entered mode (design §7)."""
+    return SessionPlanRecord(
+        plan_path=state.plan_path,
+        theme=state.theme,
+        planner_model=state.planner.model,
+        planner_thinking=state.planner.thinking,
+        pre_entry_active_model=state.pre_entry_active_model,
+        pre_entry_planner_thinking=state.pre_entry_planner_thinking,
+    )
+
+
+def state_from_record(record: SessionPlanRecord) -> PlanModeState:
+    """Restore the in-memory mode from a persisted record.
+
+    The workspace directory is derived from the document path: allocation put
+    the document inside the task directory, and the record only ever names
+    the document.
+    """
+    document_path = Path(record.plan_path)
+    return PlanModeState(
+        workspace=PlanWorkspacePaths(
+            directory=document_path.parent, document_path=document_path
+        ),
+        planner=PlannerSelection(
+            model=record.planner_model, thinking=record.planner_thinking
+        ),
+        pre_entry_active_model=record.pre_entry_active_model,
+        pre_entry_planner_thinking=record.pre_entry_planner_thinking,
+        theme=record.theme,
+    )
+
+
+def resume_notice(record: SessionPlanRecord) -> str:
+    """The one-line resume notice, with the theme clause only when themed."""
+    notice = f"Plan mode resumed. Plan document: {record.plan_path}."
+    if record.theme:
+        return f"{notice} Theme: {record.theme}."
+    return notice
+
+
+def plan_status(plan_path: str, theme: str | None) -> str:
+    """The ``/plan status`` line: mode, theme, and plan document.
+
+    The wording belongs to the core builder the compaction boundary's
+    re-injected notice uses, so the status line and what the model is told
+    after a compaction cannot drift apart.
+    """
+    return _core_plan_mode().build_plan_mode_compaction_notice(plan_path, theme)
+
+
 def thinking_path(alias: str) -> str:
     escape = _core_config_patch().escape_json_pointer_token
     return f"{THINKING_OVERRIDES_PATH}/{escape(alias)}"
@@ -220,6 +279,12 @@ def allocate_workspace(
     )
 
 
+def release_workspace(workspace: PlanWorkspacePaths) -> bool:
+    """Remove the workspace when cancel leaves it empty; True when it went away."""
+    plan_mode = _core_plan_mode()
+    return plan_mode.remove_empty_plan_workspace(workspace.directory)
+
+
 def read_document(path: Path) -> tuple[PlanDocumentBrief | None, str | None]:
     """Read the plan document for acceptance; the brief or the failure detail."""
     plan_mode = _core_plan_mode()
@@ -235,13 +300,14 @@ def read_document(path: Path) -> tuple[PlanDocumentBrief | None, str | None]:
     )
 
 
-def planner_seed(workspace: PlanWorkspacePaths) -> str:
+def planner_seed(workspace: PlanWorkspacePaths, theme: str | None = None) -> str:
     """The visible entry message telling the planner where to write the plan."""
     plan_mode = _core_plan_mode()
     return plan_mode.build_planner_seed(
         plan_mode.PlanWorkspace(
             directory=workspace.directory, document_path=workspace.document_path
-        )
+        ),
+        theme=theme,
     )
 
 

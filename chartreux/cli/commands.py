@@ -126,8 +126,8 @@ class CommandRegistry:
             "plan": Command(
                 aliases=frozenset(["/plan"]),
                 description=(
-                    "Plan with the configured planner, then /plan accept to start "
-                    "execution or /plan cancel to exit"
+                    "Enter plan mode with an optional theme; /plan accept starts "
+                    "execution and /plan cancel exits"
                 ),
                 handler="_plan_command",
                 side_channel=True,

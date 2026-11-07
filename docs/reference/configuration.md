@@ -180,7 +180,7 @@ rejected. Both subsections keep deep-merge semantics across sparse layers.
 | `displayed_workdir` | `""` | UI label for the working directory. |
 | `context_warnings` | `false` | Boolean. |
 | `show_thinking_nodes` | `false` | Boolean. |
-| `show_message_timestamps` | `true` | Boolean. Show known message posting times, whole-turn totals, and settled tool durations (also in child transcripts). Capture and persistence continue when off; unstamped history stays unstamped. |
+| `show_message_timestamps` | `true` | Boolean. Show known message posting times, whole-turn totals, settled tool durations, and the per-minute group headers that stamp transcript events with no time of their own (also in child transcripts). Capture and persistence continue when off; unstamped history stays unstamped. |
 | `ascii_chrome` | `false` | Boolean. Use ASCII equivalents for application chrome glyphs. |
 | `raise_on_compaction_failure` | `false` | Boolean. |
 | `compaction_prompt_id` | `"compact"` | Compaction prompt ID; `compact` is the default built-in. |

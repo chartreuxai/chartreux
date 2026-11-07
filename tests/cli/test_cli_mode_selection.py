@@ -94,6 +94,54 @@ def test_initial_prompt_reports_programmatic_mode(
     assert args.is_programmatic
 
 
+def test_piped_prompt_with_plan_is_rejected_before_startup_work(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    calls: list[str] = []
+    monkeypatch.setattr("sys.stdin", _PipedStdin("hello from pipe\n"))
+    monkeypatch.setattr(cli_mod, "load_dotenv_values", lambda: calls.append("dotenv"))
+    monkeypatch.setattr(
+        cli_mod, "bootstrap_config_files", lambda: calls.append("bootstrap")
+    )
+
+    with pytest.raises(SystemExit) as exc_info:
+        cli_mod.run_cli(_make_args(plan=True))
+
+    assert exc_info.value.code == 2
+    assert "-P/--plan" in capsys.readouterr().err
+    # A piped prompt selects programmatic mode, which plan mode cannot land in;
+    # the refusal precedes every startup step.
+    assert calls == ["dotenv"]
+
+
+def test_empty_pipe_with_plan_stays_interactive_after_mode_selection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[object] = []
+    monkeypatch.setattr("sys.stdin", _PipedStdin(" \n"))
+    monkeypatch.setattr(cli_mod, "load_dotenv_values", lambda: None)
+    monkeypatch.setattr(cli_mod, "bootstrap_config_files", lambda: None)
+    monkeypatch.setattr(cli_mod, "load_config_orchestrator_or_exit", lambda: object())
+    monkeypatch.setattr(
+        cli_mod, "require_api_key_or_onboard", lambda *_args, **_kwargs: None
+    )
+    monkeypatch.setattr(
+        cli_mod,
+        "restore_interactive_stdin",
+        lambda *, stdin_isatty: calls.append(("restore", stdin_isatty)),
+    )
+    monkeypatch.setattr(
+        cli_mod,
+        "_run_interactive_mode",
+        lambda *, args, stdin_prompt: calls.append(("interactive", stdin_prompt)),
+    )
+
+    cli_mod.run_cli(_make_args(plan="Fix the widget"))
+
+    # An empty pipe carries no prompt, so the TUI launch stands.
+    assert calls == [("restore", False), ("interactive", None)]
+
+
 def test_empty_pipe_stays_interactive_after_mode_selection(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

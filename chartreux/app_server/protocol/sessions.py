@@ -95,8 +95,43 @@ class SessionResumeParams(SessionOpenParams):
     session_id: str
 
 
+class SessionPlanRecord(ProtocolModel):
+    """The persisted plan-mode record as it crosses the app-server boundary.
+
+    Mirrors the session-metadata model: the record is written once at entry
+    and removed by the exit paths, so the TUI never assembles a mode from
+    anything but this.
+    """
+
+    plan_path: str
+    theme: str | None = None
+    planner_model: str
+    planner_thinking: str
+    pre_entry_active_model: str | None = None
+    pre_entry_planner_thinking: str | None = None
+
+
+class SessionPlanRecordWriteParams(ProtocolModel):
+    session_id: str
+    # ``None`` clears the record: /plan cancel and /clear express removal with
+    # the same call that writes it, so there is one seam, not two.
+    record: SessionPlanRecord | None = None
+
+
+class SessionPlanRecordWriteResponse(ProtocolModel):
+    # The record as READ BACK after the write: ``None`` when nothing was
+    # stored (logging disabled), so a caller cannot mistake the request for a
+    # persisted mode.
+    record: SessionPlanRecord | None = None
+
+
 class SessionResumeResponse(EventWatermarkResponse):
     state: PublicSessionState
+    # Carried with the adopted state rather than fetched afterwards: the
+    # restore runs inside the resume, before the session is marked ready, and
+    # a separate read would land after the point the mode must already be in
+    # place.
+    plan_record: SessionPlanRecord | None = None
 
 
 class SessionContinueParams(SessionOpenParams):

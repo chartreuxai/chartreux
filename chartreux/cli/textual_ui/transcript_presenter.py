@@ -57,6 +57,12 @@ if TYPE_CHECKING:
 # tests/perf/test_transcript_windowing.py from app) is preserved.
 _TRANSCRIPT_HIGH_MARK = 1500
 
+# A resize that lands mid-reflow re-runs the anchor pass for the newer
+# geometry; the cap bounds one chain of passes for a terminal that never
+# stops resizing, and a chain that exhausts it on drifted geometry hands the
+# slot to one successor chain instead of abandoning the resize it saw.
+_RESIZE_REFLOW_ATTEMPTS = 4
+
 
 class _SessionTranscriptWindow(TranscriptWindow):
     """Apply current interface preferences even to rematerialized history units."""
@@ -669,35 +675,94 @@ class TranscriptPresenter:
                 anchor = replace(
                     anchor, scroll_revision=self._transcript._scroll_revision
                 )
-
-                async def restore_after_reflow() -> None:
-                    # App resize precedes the screen's resize message. Wait for
-                    # the chat viewport to adopt the new width before restoring
-                    # a wrapped-message anchor against its reflowed geometry.
-                    for _ in range(100):
-                        if (
-                            not self._app.is_running
-                            or not self._app._chat_widget.display
-                            or self._app._chat_widget.region.width
-                            == self._app.size.width
-                        ):
-                            break
-                        await asyncio.sleep(0.01)
-                    # Restore against the available geometry if reflow never settles.
-                    self._app._messages_area.refresh(layout=True)
-                    await self._transcript._layout_pass(self._app._messages_area)
-                    await self._transcript.restore_anchor(
-                        self._app._messages_area, anchor
-                    )
-                    self._app._request_transcript_reconcile()
-
-                self._resize_anchor_task = asyncio.create_task(restore_after_reflow())
-                self._resize_anchor_task.add_done_callback(
-                    lambda _: self._app.call_after_refresh(
-                        self._app._remember_transcript_anchor
-                    )
-                )
+                self._arm_reflow_chain(anchor)
         self._app._request_transcript_reconcile()
+        self._repaint_when_resize_settles()
+
+    def _arm_reflow_chain(self, anchor: TranscriptAnchor) -> None:
+        """Take the single-flight slot with a chain of settle passes."""
+        task = asyncio.create_task(self._restore_after_reflow(anchor))
+        self._resize_anchor_task = task
+        task.add_done_callback(
+            lambda _: self._app.call_after_refresh(
+                self._app._remember_transcript_anchor
+            )
+        )
+
+    def _can_rearm_reflow(self) -> bool:
+        # A successor armed during teardown would chase a terminal that is
+        # already gone; skip it and let the app exit.
+        return not self._app._shutdown_started and self._app.is_running
+
+    async def _restore_after_reflow(self, anchor: TranscriptAnchor) -> None:
+        """Restore the reading anchor once the transcript has reflowed.
+
+        A resize can arrive while a pass is still waiting for the viewport to
+        adopt the new width; the single-flight gate drops it, so the pass
+        re-checks the terminal size when it ends and runs again for the newer
+        geometry instead of leaving a half-applied reflow behind.
+
+        The attempt cap bounds one chain, not the repair: a storm that ends on
+        a drifting pass would otherwise leave the anchor restored against
+        geometry the terminal has left. A chain that exhausts its passes on
+        drift hands the slot to the next one, which preserves single-flight
+        because it is armed as the settle task before this chain returns; the
+        repair stops when a pass finally ends on stable geometry, or when
+        teardown makes the successor pointless.
+        """
+        for _ in range(_RESIZE_REFLOW_ATTEMPTS):
+            terminal_size = self._app.size
+            await self._restore_anchor_for_current_geometry(anchor)
+            if self._app.size == terminal_size:
+                return
+        if not self._can_rearm_reflow():
+            return
+        self._arm_reflow_chain(anchor)
+        self._repaint_when_resize_settles()
+
+    async def _restore_anchor_for_current_geometry(
+        self, anchor: TranscriptAnchor
+    ) -> None:
+        # App resize precedes the screen's resize message. Wait for the chat
+        # viewport to adopt the new width before restoring a wrapped-message
+        # anchor against its reflowed geometry.
+        for _ in range(100):
+            if (
+                not self._app.is_running
+                or not self._app._chat_widget.display
+                or self._app._chat_widget.region.width == self._app.size.width
+            ):
+                break
+            await asyncio.sleep(0.01)
+        # Restore against the available geometry if reflow never settles.
+        self._app._messages_area.refresh(layout=True)
+        await self._transcript._layout_pass(self._app._messages_area)
+        await self._transcript.restore_anchor(self._app._messages_area, anchor)
+        self._app._request_transcript_reconcile()
+
+    def _repaint_when_resize_settles(self) -> None:
+        """Repaint the screen once this resize has settled.
+
+        Nothing in the app owns the conversation background: Screen, #chat and
+        #messages all declare ``background: transparent`` (app.tcss:11-31,
+        112-119), so cells a resize vacates are left showing whatever the
+        terminal held before — the stale right strip and bottom band in the
+        evidence. The Screen's own layer resolves to the app background
+        (``App.render``), so a full repaint re-blanks every cell with the app
+        conversation background before the widgets paint over it.
+
+        Scheduled off the gated reflow task, never from inside it: an empty
+        transcript and a picker preview skip the reflow and need the repaint
+        just as much.
+        """
+        task = self._resize_anchor_task
+        if task is not None and not task.done():
+            task.add_done_callback(lambda _: self._request_screen_repaint())
+        else:
+            self._request_screen_repaint()
+
+    def _request_screen_repaint(self) -> None:
+        self._app.call_after_refresh(self._app.screen.refresh)
 
     async def toggle_tool(self) -> None:
         groups = list(self._app.query(ToolGroup))

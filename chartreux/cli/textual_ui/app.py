@@ -126,6 +126,8 @@ from chartreux.cli.textual_ui.message_queue import (
 )
 from chartreux.cli.textual_ui.notifications import TextualNotificationAdapter
 from chartreux.cli.textual_ui.plan_mode import (
+    PLAN_MODE_LABEL,
+    PLAN_MODE_TINT_CLASS,
     ExecutorSelection,
     PlanDocumentBrief,
     PlanModeState,
@@ -135,10 +137,15 @@ from chartreux.cli.textual_ui.plan_mode import (
     executor_seed,
     handoff_failed_before_replacement,
     plan_section,
+    plan_status,
     planner_seed,
     pre_entry_snapshot,
     read_document,
+    record_from_state,
+    release_workspace,
     restore_ops,
+    resume_notice,
+    state_from_record,
 )
 from chartreux.cli.textual_ui.program_status import ProgramStatusEmitter
 from chartreux.cli.textual_ui.provider_services import (
@@ -542,6 +549,8 @@ class StartupOptions:
     startup_prompt_for_workspace_trust: bool | None = None
     resume_session_id: str | None = None
     continue_latest: bool = False
+    # `-P`/`--plan`: True for a bare flag, the theme string when one was given.
+    plan: bool | str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -1020,6 +1029,8 @@ class ChartreuxApp(App):  # noqa: PLR0904
         self._is_resuming_session = opts.is_resuming_session
         self._resume_session_id = opts.resume_session_id
         self._continue_latest = opts.continue_latest
+        self._startup_plan = opts.plan
+        self._startup_plan_started = False
         self._startup_prompt_for_workspace_trust = (
             opts.startup_prompt_for_workspace_trust
             if opts.startup_prompt_for_workspace_trust is not None
@@ -1833,6 +1844,17 @@ class ChartreuxApp(App):  # noqa: PLR0904
             self._agent_transcript_viewer.set_show_message_timestamps(
                 config.show_message_timestamps
             )
+        # Minute headers live on two surfaces: the window owns the ones its units
+        # open, the handler owns notice-record and fold-interior stamps. Both
+        # follow the gate, so both reconcile on the preference change.
+        if self.event_handler is not None:
+            self.run_worker(
+                self.event_handler.set_show_message_timestamps(
+                    config.show_message_timestamps
+                )
+            )
+        if self._transcript.unit_ids:
+            self._request_transcript_reconcile()
 
     async def _complete_mount(self) -> None:
         self.event_handler = EventHandler(
@@ -1847,6 +1869,9 @@ class ChartreuxApp(App):  # noqa: PLR0904
             entry_expansion_state=self._entry_expansion_state,
             group_expansion_state=self._tool_group_expansion_state,
         )
+        # The live path shares the window's visible-minute walk, so a stamp
+        # opens only a minute restore has not already rendered.
+        self.event_handler.transcript_minutes = self._transcript
 
         self._chat_input_container = self.query_one(ChatInputContainer)
         self._chat_input_container.replace_command_registry(self.commands)
@@ -1906,7 +1931,23 @@ class ChartreuxApp(App):  # noqa: PLR0904
             return
         if self._resume_session_id is not None or self._continue_latest:
             return
+        await self._ensure_startup_plan_mode()
         self._process_startup_prompt()
+
+    async def _ensure_startup_plan_mode(self) -> None:
+        """Enter plan mode for a `-P`/`--plan` launch (design §6/§8).
+
+        Runs at every landing point — the post-ready startup and, on the resume
+        paths, after the resume restore — so the mode is ensured on the session
+        the launch actually landed in. A restored record makes the entry its
+        already-active guard, so a `-P` theme never overrides an existing mode;
+        without one the entry runs on the landed conversation.
+        """
+        if self._startup_plan is None or self._startup_plan_started:
+            return
+        self._startup_plan_started = True
+        theme = self._startup_plan if isinstance(self._startup_plan, str) else ""
+        await self._plan_enter(theme=theme.strip() or None)
 
     async def _process_startup_prompt_when_available(self) -> None:
         await self._startup_command_availability_ready.wait()
@@ -4380,11 +4421,16 @@ class ChartreuxApp(App):  # noqa: PLR0904
         # unconditionally (the saved restore snapshot is voided, not applied).
         plan_state = self._plan_mode
         plan_removal_failure: str | None = None
+        plan_record_failure: str | None = None
         if plan_state is not None:
             self._plan_mode = None
+            self._set_plan_tint(False)
             plan_removal_failure = await self._plan_write(
                 clear_ops(plan_state), reason="plan mode cleared"
             )
+            # /clear ends the mode, so the record ends with it: the resumed
+            # replacement session is not a planning session.
+            plan_record_failure = await self._plan_clear_record()
         try:
             await self.app_server.clear_history()
             await self._queue.clear_server_queue()
@@ -4421,6 +4467,11 @@ class ChartreuxApp(App):  # noqa: PLR0904
                         "The planner model and thinking selections may remain "
                         f"active for this session: {plan_removal_failure}"
                     )
+                if plan_record_failure is not None:
+                    await self._plan_error(
+                        "The plan-mode record could not be removed, so a "
+                        f"resume may restore the mode: {plan_record_failure}"
+                    )
             self._chat_widget.scroll_home(animate=False)
             self._sync_terminal_title()
 
@@ -4440,21 +4491,30 @@ class ChartreuxApp(App):  # noqa: PLR0904
         if prompt:
             await self._handle_user_message(prompt)
 
-    # --- Plan mode (/plan, /plan accept, /plan cancel) ---
+    # --- Plan mode (/plan, /plan status, /plan accept, /plan cancel) ---
 
     async def _plan_command(self, cmd_args: str = "", **kwargs: Any) -> None:
-        action = cmd_args.strip().lower()
-        if action == "":
-            await self._plan_enter()
-        elif action == "accept":
+        action = cmd_args.strip()
+        if action.lower() == "accept":
             await self._plan_start_accept()
-        elif action == "cancel":
+        elif action.lower() == "cancel":
             await self._plan_cancel()
+        elif action.lower() == "status":
+            await self._plan_status()
         else:
+            await self._plan_enter(theme=action or None)
+
+    async def _plan_status(self) -> None:
+        """Report the active mode, its theme, and its plan document."""
+        state = self._plan_mode
+        if state is None:
             await self._plan_error(
-                f"Unknown /plan action: {action}. "
-                "Use /plan, /plan accept, or /plan cancel."
+                "Not in plan mode. Use /plan to start planning first."
             )
+            return
+        await self._mount_and_scroll(
+            UserCommandMessage(plan_status(state.plan_path, state.theme))
+        )
 
     async def _plan_error(self, message: str) -> None:
         await self._mount_and_scroll(
@@ -4479,7 +4539,78 @@ class ChartreuxApp(App):  # noqa: PLR0904
             return f"not applied ({response.application})"
         return None
 
-    async def _plan_enter(self) -> None:
+    async def _plan_persist_record(self, state: PlanModeState) -> str | None:
+        """Persist the plan-mode record; the failure detail or None.
+
+        A response with no stored record means the session is not logged, so
+        there is nothing a resume could restore — the designed behavior, not a
+        failure to report.
+        """
+        try:
+            stored = await self.app_server.resources.sessions.write_plan_record(
+                record_from_state(state)
+            )
+        except Exception as exc:
+            return str(exc)
+        if stored is None:
+            logger.debug("Plan mode record not stored: session logging is disabled")
+        return None
+
+    async def _plan_clear_record(self) -> str | None:
+        """Remove the plan-mode record; the failure detail or None."""
+        try:
+            await self.app_server.resources.sessions.clear_plan_record()
+        except Exception as exc:
+            return str(exc)
+        return None
+
+    def _set_plan_tint(self, active: bool) -> None:
+        """Apply or drop the standing indicator: the tint class and its label."""
+        container = self._chat_input_container
+        if container is None:
+            return
+        if active:
+            container.add_class(PLAN_MODE_TINT_CLASS)
+        else:
+            container.remove_class(PLAN_MODE_TINT_CLASS)
+        try:
+            input_box = container.get_widget_by_id(ChatInputContainer.ID_INPUT_BOX)
+        except Exception:
+            return
+        input_box.border_title = f" {PLAN_MODE_LABEL} " if active else ""
+
+    async def _restore_resumed_plan_mode(self) -> None:
+        """Restore the persisted plan mode after a resume (design §7).
+
+        Runs inside the resume, before the session is marked ready, so the mode
+        is in place before any startup-prompt dispatch and before plan entry.
+        The record arrives with the adopted resume, so this reads it rather
+        than requesting it: a request would land after the point the mode must
+        already be in place. A failure here is logged and never aborts the
+        resume: the session is already usable and merely not in plan mode.
+        """
+        try:
+            record = self.app_server.resources.sessions.resumed_plan_record
+            plan_mode = None if record is None else state_from_record(record)
+        except Exception:
+            logger.exception("Failed to read the resumed session's plan record")
+            return
+        self._plan_mode = plan_mode
+        self._set_plan_tint(plan_mode is not None)
+        if record is None:
+            return
+        notice = resume_notice(record)
+        await self._mount_and_scroll(UserCommandMessage(notice))
+        # The resumed model cannot see a UI mount: the notice is part of the
+        # history the next turn is built from, as compaction's notice is part
+        # of the boundary it is built from. It races the startup prompt by
+        # design, so a refusal is logged and the restore stands.
+        try:
+            await self.app_server.inject_user_context(notice)
+        except Exception:
+            logger.exception("Failed to inject the plan-mode resume notice")
+
+    async def _plan_enter(self, theme: str | None = None) -> None:
         """Switch this conversation to the configured planner and allocate a plan."""
         if self._plan_mode is not None:
             await self._mount_and_scroll(
@@ -4518,6 +4649,7 @@ class ChartreuxApp(App):  # noqa: PLR0904
             planner=planner,
             pre_entry_active_model=pre_entry_active_model,
             pre_entry_planner_thinking=pre_entry_thinking,
+            theme=theme,
         )
         failure = await self._plan_write(entry_ops(planner), reason="plan mode entry")
         if failure is None:
@@ -4537,7 +4669,16 @@ class ChartreuxApp(App):  # noqa: PLR0904
             await self._plan_error(f"Failed to enter plan mode: {failure} ({detail})")
             return
         self._plan_mode = state
-        seed = planner_seed(workspace)
+        self._set_plan_tint(True)
+        record_failure = await self._plan_persist_record(state)
+        if record_failure is not None:
+            await self._mount_and_scroll(
+                WarningMessage(
+                    "Plan mode is active, but it will not be restored on "
+                    f"resume: {record_failure}."
+                )
+            )
+        seed = planner_seed(workspace, theme=theme)
         if self._is_busy() or self._queue.paused:
             await self._enqueue_prompt_with_resources(seed)
         else:
@@ -4575,7 +4716,7 @@ class ChartreuxApp(App):  # noqa: PLR0904
         except Exception as exc:
             await self._plan_error(f"Failed to read the plan configuration: {exc}")
             return
-        if not await self._plan_request_consent(document, executor):
+        if not await self._plan_request_consent(document, executor, state.theme):
             await self._mount_and_scroll(
                 UserCommandMessage(
                     "Plan execution cancelled. Plan mode is still active. "
@@ -4586,7 +4727,10 @@ class ChartreuxApp(App):  # noqa: PLR0904
         await self._plan_handoff(document, executor, state)
 
     async def _plan_request_consent(
-        self, document: PlanDocumentBrief, executor: ExecutorSelection
+        self,
+        document: PlanDocumentBrief,
+        executor: ExecutorSelection,
+        theme: str | None,
     ) -> bool:
         screen_class = _get_plan_consent_screen_class()
         confirmed = await self.push_screen_wait(
@@ -4597,6 +4741,7 @@ class ChartreuxApp(App):  # noqa: PLR0904
                 executor_thinking=executor.thinking,
                 executor_identity=executor.identity,
                 executor_display_name=self.config.model_display_name(executor.model),
+                theme=theme,
             )
         )
         return confirmed is True
@@ -4645,6 +4790,7 @@ class ChartreuxApp(App):  # noqa: PLR0904
             return
         # The handoff replaced the session: mirror /clear's post-reset UI.
         self._plan_mode = None
+        self._set_plan_tint(False)
         self._root_recovery.cancel_local(reason="session_changed")
         await self._queue.clear_server_queue()
         self._refresh_context_progress()
@@ -4671,6 +4817,14 @@ class ChartreuxApp(App):  # noqa: PLR0904
             )
             return
         self._plan_mode = None
+        self._set_plan_tint(False)
+        # The record goes with the pin restore: the session is not planning
+        # any more, so neither a restart nor a resume may say it is.
+        record_failure = await self._plan_clear_record()
+        # The workspace is released before the restore write: the mode is
+        # already off, and the pins' outcome must not leave an empty directory
+        # behind. Only a chartreux-allocated, marker-only directory goes.
+        workspace_removed = release_workspace(state.workspace)
         failure = await self._plan_write(
             restore_ops(state), reason="plan mode cancel restore"
         )
@@ -4681,13 +4835,23 @@ class ChartreuxApp(App):  # noqa: PLR0904
                 "with /model or /thinking."
             )
             return
-        await self._mount_and_scroll(
-            UserCommandMessage(
+        if record_failure is not None:
+            await self._plan_error(
+                "Plan mode cancelled, but its stored record could not be "
+                f"removed, so a resume may restore it: {record_failure}"
+            )
+        if workspace_removed:
+            summary = (
+                "Plan mode cancelled. The previous model and thinking selections "
+                "were restored; the empty plan workspace was removed."
+            )
+        else:
+            summary = (
                 "Plan mode cancelled. The previous model and thinking selections "
                 "were restored; the plan document was left in place at "
                 f"`{state.plan_path}`."
             )
-        )
+        await self._mount_and_scroll(UserCommandMessage(summary))
 
     async def _show_log_path(self, **kwargs: Any) -> None:
         session_log = await self.app_server.resources.sessions.read_log()

@@ -107,7 +107,10 @@ def _message(
 
 def _reasoning(index: int = 1) -> PublicReasoningEntry:
     return PublicReasoningEntry(
-        **_base(f"reasoning-{index}"), text="thinking", summary=["one", "two"]
+        **_base(f"reasoning-{index}"),
+        text="thinking",
+        summary=["one", "two"],
+        event_at=1700000000000,
     )
 
 
@@ -126,6 +129,7 @@ def _effect(
             output={"rows": [1, 2]} if output is None else output,
             duration_ms=8.0,
         ),
+        event_at=1700000000000,
     )
 
 

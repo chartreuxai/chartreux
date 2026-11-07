@@ -204,6 +204,7 @@ class CompactionManager:
         *,
         manual: bool = False,
         outcome: CompactionOutcome | None = None,
+        mode_notice: str | None = None,
     ) -> str:
         """Summarize the conversation and publish the compaction boundary.
 
@@ -211,6 +212,9 @@ class CompactionManager:
         request can be cancelled by the server's own deadline) and defaults
         off, so the automatic caller is unchanged; ``outcome`` is the carrier
         that path reads after a cancellation and is reset here at entry.
+        ``mode_notice`` rides the published boundary CONTENT: it is the
+        model-visible carrier, whereas ``extra_instructions`` reach only the
+        summarizer request.
         """
         if outcome is not None:
             outcome.published = False
@@ -264,7 +268,7 @@ class CompactionManager:
         envelope = LLMMessage(
             role=Role.user,
             content=render_compaction_context(
-                prior_user_messages, summary, file_state_section
+                prior_user_messages, summary, file_state_section, mode_notice
             ),
             injected=True,
             context_boundary="compaction",

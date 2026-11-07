@@ -123,3 +123,12 @@ def test_add_dir_is_forwarded_to_the_local_harness_workspace_roots(
 
     options = captured_startup["harness_options"]
     assert options.session_options.workspace_roots == ["/extra/one", "/extra/two"]
+
+
+@pytest.mark.parametrize("plan", [True, "Fix the widget"])
+def test_plan_request_is_forwarded_to_the_textual_ui(
+    captured_startup: dict[str, Any], plan: bool | str
+) -> None:
+    _run(_make_args(plan=plan))
+
+    assert captured_startup["startup"].plan == plan

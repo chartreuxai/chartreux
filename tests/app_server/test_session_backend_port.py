@@ -69,6 +69,7 @@ def test_session_backend_contract_covers_the_complete_session_lifecycle() -> Non
         "read",
         "read_dangerous_command_authority",
         "read_mcp",
+        "read_plan_record",
         "read_policy",
         "read_roots",
         "read_turn_queue",
@@ -93,6 +94,7 @@ def test_session_backend_contract_covers_the_complete_session_lifecycle() -> Non
         "suspend_mcp",
         "update_settings",
         "write_config",
+        "write_plan_record",
     }
     assert _SESSION_BACKEND_METHODS == {
         "callback/result",
@@ -107,6 +109,7 @@ def test_session_backend_contract_covers_the_complete_session_lifecycle() -> Non
         "policy/roots/save",
         "session/compact",
         "session/context/inject",
+        "session/plan/record/write",
         "session/settings/update",
         "app_server/session/turn/enqueue",
         "app_server/session/turn/queue/read",

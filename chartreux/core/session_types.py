@@ -313,6 +313,25 @@ class WorktreeContext(BaseModel):
     created_at: int
 
 
+class PlanModeRecord(BaseModel):
+    """The persisted plan-mode record (design §7).
+
+    Written once at entry and removed by the exit paths. It carries the whole
+    in-memory mode state, including the pre-entry override snapshot, so
+    ``/plan cancel`` after a restart restores the selections that were active
+    when the mode was entered. Optional in every direction: an absent record
+    is "not planning", and the fields are plain strings so a record written by
+    a build that knows more thinking levels still loads here.
+    """
+
+    plan_path: str
+    theme: str | None = None
+    planner_model: str
+    planner_thinking: str
+    pre_entry_active_model: str | None = None
+    pre_entry_planner_thinking: str | None = None
+
+
 class SessionMetadata(BaseModel):
     session_id: str
     parent_session_id: str | None = None
@@ -336,6 +355,9 @@ class SessionMetadata(BaseModel):
     config: dict[str, JsonValue] | None = None
     import_provenance: dict[str, JsonValue] | None = None
     created_worktree: WorktreeContext | None = None
+    # The active plan mode, if any (design §7). Absent means "not planning",
+    # which is what a session written before the field existed restores as.
+    plan_mode: PlanModeRecord | None = None
     launch_config: LaunchMetadata | None = None
     # The conversation's frozen policy record (design §6, §10; package 10):
     # the serialized package-7 policy bundle, carried inline so resume works

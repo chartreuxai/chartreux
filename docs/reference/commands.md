@@ -25,6 +25,7 @@ prompt, prints a response, and exits.
 | `--identity ID` | Select identity for a new conversation (for example `coder` or `user:name`); frozen for that conversation. |
 | `--workflow ID` | Select workflow for a new conversation (for example `minimal` or `ceremony`). |
 | `--orchestration-strategy ID` | Select orchestration strategy for a new conversation; `none` disables a strategy body. |
+| `-P [THEME]`, `--plan [THEME]` | Start in plan mode, optionally with a heading-only theme. Interactive only: rejected with `-p`/`--prompt`, a positional prompt, piped stdin, and `--setup`. Composes with `-c`/`--resume` as described under [Plan mode](#plan-mode). |
 | `-c`, `--continue` | Continue the most recent saved session. Mutually exclusive with `--resume`. |
 | `--resume [SESSION_ID]` | Resume a session; without an ID, open the picker. |
 
@@ -107,6 +108,7 @@ can add commands.
 | `/debug` | Toggle the debug console. |
 | `/agents` | Toggle the docked agent browser above the input: Main plus subagents grouped by lifecycle (Active, Retained Idle, Recent) with Resident/Active/Idle/Recent/All filter tabs, name-first rows with dimmed handles, and active-only status counts. |
 | `/compact [instructions]` | Summarize the conversation context. |
+| `/plan [THEME]` | Enter plan mode; `/plan status` reports the active mode and plan document, `/plan accept` hands the plan to an executor, `/plan cancel` exits and restores the previous selections. Any other text is the plan's theme. |
 | `/exit`, `exit`, `quit`, `:q`, `:quit` | Exit immediately while idle. During consequential active work, opens the exit confirmation dialog. |
 | `/status` | Display agent statistics plus the next request's thinking estimate: **Requested**, **Semantic**, and **API effort** (the provider's wire value, or `unknown` when it cannot be resolved). |
 | `/usage` | Browse recorded usage and USD cost estimates by calendar window and project; available while a turn runs. |
@@ -122,6 +124,67 @@ can add commands.
 | `/loop <interval> <prompt>` | Schedule a recurring prompt; `/loop list` and `/loop cancel <id\|all>` manage it. |
 | `/theme` | Select `auto`, `light`, or `dark`. |
 | `/web-search` | Configure the web-search provider, credential, and search settings. |
+
+## Plan mode
+
+`/plan` starts a planning session. Entry applies the configured planner's model
+and thinking from `[plan.planner]` as session overrides, reloads the runtime,
+allocates the plan workspace, and posts the planner seed, which queues behind an
+active turn.
+
+The seed has the planner orient itself about the repository first — current
+branch, recent releases, existing workspace tasks — present a brief orientation,
+and then stand by for the plan agenda. It forbids inferring or inventing a task,
+proposing agenda items, and beginning design, planning, or implementation on its
+own: the user drives. The plan document is written only after its design and the
+plan itself have been accepted, as Markdown in the allocated task directory with
+a `## Summary` section whose text is the brief handed to the execution session.
+
+`/plan THEME` sets the plan's theme, and any text after `/plan` that is not an
+action is a theme. A theme is a heading, never an instruction or an
+authorization. `accept`, `cancel`, and `status` are the exact-match actions:
+
+| Command | Action |
+| --- | --- |
+| `/plan [THEME]` | Enter plan mode, with an optional theme. Entry is refused while the mode is already active. |
+| `/plan status` | Report the active mode, its theme, and the plan document path, in the same wording the post-compaction notice uses. |
+| `/plan accept` | Read the plan document, snapshot the configured executor selection, and show a consent screen with the plan path, summary, executor, and theme before handing off to a fresh executor session. Nothing is launched if you decline. |
+| `/plan cancel` | Leave the mode and restore the pre-entry model and thinking selections. The allocated workspace is removed only when it holds nothing but chartreux's ownership marker; otherwise the plan document stays at its path. |
+
+While the mode is active the prompt area carries an amber tint and a `plan`
+border label. After any compaction — `/compact`, proactive auto-compaction, or
+the reactive context-too-long path — the compaction boundary opens with a
+notice naming the mode and the plan document path, with the theme only when the
+mode has one, so the model cannot lose the mode mid-session. `/clear` ends the
+mode and keeps every file.
+
+Plan mode is persisted with the session and restored on resume; see
+[Plan mode across resume and branch](../guides/sessions-workspaces.md#plan-mode-across-resume-and-branch).
+
+### Starting in plan mode
+
+`-P [THEME]` / `--plan [THEME]` enters plan mode when the interactive interface
+opens, with the same heading-only theme semantics as `/plan THEME`. With
+`-c`/`--resume` the mode is ensured after the session lands: a restored
+plan-mode record keeps its own theme and the flag's theme is ignored, while a
+session that was not planning enters plan mode on the resumed conversation —
+use a bare `chartreux -P` when you want a clean start.
+
+The flag is rejected for every launch that has no interactive session to land
+in: `-p`/`--prompt`, a positional prompt, input piped on stdin, and `--setup`
+each exit with an error instead of being silently ignored. A theme beginning
+with `-` is read as an unknown option, so keep themes plain text.
+
+Planner model and thinking come from `[plan.planner]`. There is no
+`--plan-model` flag; the environment bridge is the override:
+
+```bash
+CHARTREUX_PLAN__PLANNER__MODEL=mistral-large-4 chartreux --plan
+```
+
+`CHARTREUX_PLAN__PLANNER__THINKING` overrides the level the same way. See
+[environment variables](../reference/configuration.md#environment-variables-and-env)
+for the naming convention.
 
 ## Key shortcuts
 

@@ -2,6 +2,144 @@
 
 All notable changes to Chartreux are documented in this file.
 
+## 0.7.4 (2026-11-07)
+
+Plan mode becomes an orientation-then-standby workflow that survives a restart
+and can be entered at launch, every transcript event gains a real clock with
+per-minute group headers, the stale-margin repaint after a resize is fixed, and
+a delegated subagent's tool catalog is gated against its own committed model
+rather than its parent's.
+
+### Added
+
+- **Plan mode is an orientation-then-standby workflow.** The entry seed has the
+  planner read the state of the repository — current branch, recent releases,
+  existing workspace tasks — present a brief orientation, and then stand by for
+  the user's plan agenda. It forbids inferring or inventing a task, proposing
+  agenda items, and beginning design, planning, or implementation on its own,
+  and it defers writing the plan document until the document's design and the
+  plan itself have been accepted. `/plan <text>` treats any text that is not an
+  action as a theme instead of an error: `accept`, `cancel`, and the new
+  `status` remain exact-match actions, and a theme is a heading, never an
+  instruction or an authorization.
+- `/plan status` reports the active mode, its theme, and the plan document path
+  in the same wording as the post-compaction notice, so the status line and what
+  the model is told after a compaction cannot drift apart. While the mode is
+  active the prompt area carries an amber tint and a `plan` border label; both
+  are applied on entry and on resume restore, and dropped by `/plan cancel`,
+  `/clear`, and `/plan accept`. The accept consent screen gained a Theme row,
+  present only when the mode has a theme.
+- **Plan mode survives a restart.** Entry persists a record — plan document
+  path, theme, planner selection, and the pre-entry model and thinking — into
+  the session metadata, and `-c`/`--resume` restores the mode before the session
+  is marked ready, reapplying the tint and posting one resume notice. `/plan
+  cancel` and `/clear` remove the record; the planner session checkpointed by
+  `/plan accept` keeps its record, so resuming that checkpoint is the way to
+  undo a handoff.
+- **Compaction re-injects the mode.** After any compaction — `/compact`,
+  proactive auto-compaction, or the reactive context-too-long path — the
+  published boundary opens with "Plan mode is active. Plan document: …",
+  appending the theme clause only when a theme exists. The notice is read from
+  the persisted record at the single compaction funnel, and the boundary stays
+  byte-identical when there is no record.
+- `-P [THEME]` / `--plan [THEME]` starts the interactive client in plan mode,
+  with the same heading-only theme semantics as `/plan THEME`. With
+  `-c`/`--resume` the mode is ensured after the session lands: a restored
+  plan-mode record keeps its own theme and ignores the flag's, while a session
+  that was not planning enters plan mode on the resumed conversation. The flag
+  is interactive-only and is rejected with `-p`/`--prompt`, a positional prompt,
+  piped stdin, and `--setup`; a theme beginning with `-` is read as an unknown
+  option. Planner model and thinking come from `[plan.planner]`, and the
+  environment bridge (`CHARTREUX_PLAN__PLANNER__MODEL`,
+  `CHARTREUX_PLAN__PLANNER__THINKING`) is the only override — there is no
+  `--plan-model` flag.
+- `/plan cancel` removes the plan workspace when it holds nothing but
+  chartreux's ownership marker (`.chartreux-plan-mode`, written only into a
+  directory the allocation itself created). A reused directory that happens to
+  match the naming convention never receives the marker and is never removable,
+  and a directory holding a plan document or any other content is kept. `/clear`
+  keeps everything, as before.
+- **Every transcript event carries a real clock.** Reasoning blocks, tool and
+  effect calls and results, hook notices, compaction records, schedule, route and
+  root-recovery notices, interrupt markers, warnings, errors, and session
+  records now persist a per-event wall-clock time in the session log and surface
+  it in restored history. Headers render only where a real clock exists and are
+  never backfilled, so logs written before this release keep their unstamped
+  events.
+- **Minute group headers.** Stamped events are bucketed by wall-clock minute and
+  render a `14:20`-style header (dated off-today, matching the message-header
+  format) only when the minute's first stamped event would otherwise show no
+  time of its own. A user or assistant message header counts as its minute's
+  marker, so events continuing in the same minute add no redundant header; an
+  effect stamps its start clock and never re-stamps when its result lands in a
+  later minute. The headers are a pure function of entry clocks, regenerated
+  inside the windowing path, so they survive rewind, transcript rebuild, and
+  virtualization eviction, and they compose with tool-group folding without
+  touching its expansion stores. The whole surface stays under
+  `show_message_timestamps`.
+
+### Fixed
+
+- **The stale-margin repaint after a resize.** A resize that leaves cells
+  vacated — the wider layout's right strip and bottom band still holding old
+  lines, durations, and separators — no longer survives the settle. A settled
+  resize repaints the screen, which re-blanks every cell with the app
+  conversation background the transparent Screen, `#chat`, and `#messages`
+  layers never own; any resize also clears the width-keyed streaming strip
+  caches rather than letting a pure resize keep serving strips wrapped at the
+  old width; and a resize arriving while the single-flight reflow runs is
+  re-armed instead of dropped, so the pass re-checks the terminal size when it
+  ends and runs again for the newer geometry. A chain of passes that exhausts
+  its attempt cap on drifting geometry hands the slot to one successor chain
+  rather than abandoning the resize it saw.
+- **`read_image` for vision-capable subagents.** A subagent's catalog was
+  filtered through the parent's delegation ceiling, which re-evaluated
+  capability against the parent's model: a non-vision parent stripped
+  `read_image` from every child, including children whose own deployment
+  supports images. Capability gating now evaluates against the child's own
+  committed active model, so a vision-capable child sees the tool and a
+  non-vision child still does not. Authority is unchanged — granted
+  configuration, live policy, delegation posture, and every ancestor's ceiling
+  still filter, and a name the identity does not register stays denied — as are
+  the real enforcement points: the send boundary's `ImagesNotSupportedError`,
+  the launch-time rejection of image history for a non-vision model, and the
+  tool's own run-time re-check.
+
+### Changed
+
+- Delegation evaluates authority and capability on separate axes. The parent's
+  delegation ceiling decides what a child may reach, never what a child's model
+  can do, and a capability gate is the caller's axis: an ancestor whose own
+  model fails a capability gate no longer narrows a descendant's catalog. This
+  is the semantics the v0.8.0 unguarded-mode authority inventory has to assume
+  for the same filter chain — the ceiling walk and the launched-child checks
+  share it, so an unguarded inventory must not read a capability-gate rejection
+  as an authority decision, nor an authority grant as a capability guarantee.
+- `/plan cancel` wording follows the outcome: it reports that the empty
+  workspace was removed when it was, and otherwise that the plan document was
+  left in place at its path.
+- Review amendments across the four items: minute headers bucket per entry
+  inside folded tool groups, live notice records carry their own stamps and
+  re-derive their residency from the DOM instead of assuming it, and a
+  `show_message_timestamps` change reconciles both header surfaces with the gate
+  off. The resize settle repairs drift past its second attempt cap instead of
+  ending on a half-applied reflow, and the seed states the executor handoff
+  explicitly so a planner never starts the implementation itself.
+
+### Retained limitations
+
+- A plan-mode session with session logging disabled gets neither the resume
+  restore nor the compaction notice: the metadata that carries the record does
+  not exist without logging, and no live-record fallback was added. The mode
+  itself still works for the session.
+- `/branch` inherits the persisted plan-mode record, so a fork shares its
+  parent's plan document with last-writer-wins semantics and no locking. That is
+  accepted behavior, not a defect: the plan document is the only artifact the
+  handoff crosses on.
+- The suite retains `tests/tools/test_ui_bash_execution.py::test_ui_handles_non_utf8_stderr`
+  and eight snapshot mismatches, which reproduce at the v0.7.3 base and are not
+  v0.7.4 regressions.
+
 ## 0.7.3 (2026-11-05)
 
 Thinking levels gain a six-level vocabulary declared per deployment, `/plan`

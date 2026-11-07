@@ -232,6 +232,20 @@ OptionList, OptionList:focus {
     }
 }
 
+/* Plan mode standing indicator: an amber prompt with a "plan" label. The class
+   rides the input container (app.py `_set_plan_tint`); the label is the
+   input box's border title, set beside it. */
+#input-container.plan-mode #input-box {
+    border-top: solid $warning;
+    border-bottom: solid $warning;
+    border-title-color: $warning;
+
+    &:focus-within {
+        border-top: solid $warning;
+        border-bottom: solid $warning;
+    }
+}
+
 #queue-mode-footer {
     height: 1;
     color: $text-muted;

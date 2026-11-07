@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import os
 from pathlib import Path
 from typing import Any
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
@@ -18,10 +19,12 @@ from chartreux.app_server.protocol import AppServerResponseError, SessionOptions
 import chartreux.cli.entrypoint as entrypoint
 from chartreux.cli.entrypoint import parse_arguments
 from chartreux.core.config import SessionLoggingConfig
+from chartreux.core.config.chartreux_schema import ChartreuxConfigSchema
 from chartreux.core.config.harness_files import (
     get_harness_files_manager,
     reset_harness_files_manager,
 )
+from chartreux.core.config.layers.environment import EnvironmentLayer
 from chartreux.core.git.worktree import naming_model
 from chartreux.core.llm import utility_completion
 from chartreux.core.usage import AsyncUsageWriter, UsagePurpose, UsageReader
@@ -103,6 +106,112 @@ def test_double_dash_separates_the_prompt_from_worktree(
 
     assert args.worktree is True
     assert args.initial_prompt == "Fix the login bug"
+
+
+def test_plan_defaults_to_none(monkeypatch: pytest.MonkeyPatch) -> None:
+    assert _parse(monkeypatch, []).plan is None
+
+
+@pytest.mark.parametrize("flag", ["-P", "--plan"])
+def test_bare_plan_requests_plan_mode(
+    monkeypatch: pytest.MonkeyPatch, flag: str
+) -> None:
+    args = _parse(monkeypatch, [flag])
+
+    assert args.plan is True
+    assert args.initial_prompt is None
+
+
+@pytest.mark.parametrize("flag", ["-P", "--plan"])
+def test_plan_theme_is_the_flag_value(
+    monkeypatch: pytest.MonkeyPatch, flag: str
+) -> None:
+    args = _parse(monkeypatch, [flag, "Fix the widget"])
+
+    assert args.plan == "Fix the widget"
+    assert args.initial_prompt is None
+
+
+def test_plan_leaves_the_positional_prompt_precedence_unchanged(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    args = _parse(monkeypatch, ["do the thing"])
+
+    assert args.initial_prompt == "do the thing"
+    assert args.plan is None
+
+
+@pytest.mark.parametrize(
+    "argument",
+    [
+        ["-P", "-p"],
+        ["-p", "do the thing", "-P"],
+        ["do the thing", "-P"],
+        ["-P", "Fix the widget", "do the thing"],
+        ["--setup", "-P"],
+    ],
+)
+def test_plan_rejects_the_non_tui_launches(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    argument: list[str],
+) -> None:
+    monkeypatch.setattr("sys.argv", ["chartreux", *argument])
+    with pytest.raises(SystemExit) as exc_info:
+        parse_arguments()
+
+    assert exc_info.value.code == 2
+    assert "-P/--plan" in capsys.readouterr().err
+
+
+def test_plan_rejects_a_dash_leading_theme(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # An option-shaped theme is never treated as one: argparse reads it as an
+    # unknown option and exits before any session starts.
+    monkeypatch.setattr("sys.argv", ["chartreux", "-P", "-my-theme"])
+    with pytest.raises(SystemExit) as exc_info:
+        parse_arguments()
+
+    assert exc_info.value.code == 2
+    assert "-my-theme" in capsys.readouterr().err
+
+
+def test_plan_help_documents_the_env_bridge(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setattr("sys.argv", ["chartreux", "--help"])
+    with pytest.raises(SystemExit) as exc_info:
+        parse_arguments()
+
+    assert exc_info.value.code == 0
+    output = capsys.readouterr().out
+    assert "--plan" in output
+    assert "CHARTREUX_PLAN__PLANNER__MODEL" in output
+
+
+def test_plan_has_no_model_flag(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # The env-config bridge is the only override mechanism: a model flag of its
+    # own would be a second, divergent one.
+    monkeypatch.setattr("sys.argv", ["chartreux", "-P", "--plan-model", "glm-5-3"])
+    with pytest.raises(SystemExit) as exc_info:
+        parse_arguments()
+
+    assert exc_info.value.code == 2
+    assert "unrecognized arguments: --plan-model" in capsys.readouterr().err
+
+
+@pytest.mark.asyncio
+async def test_plan_env_bridge_maps_the_plan_section() -> None:
+    # The env-config bridge is the only planner-model override mechanism, so
+    # the [plan] section must be reachable through it.
+    environment = {"CHARTREUX_PLAN__PLANNER__MODEL": "glm-5-3"}
+    with patch.dict(os.environ, environment, clear=True):
+        data = await EnvironmentLayer(schema=ChartreuxConfigSchema).load()
+
+    assert data.model_dump() == {"plan": {"planner": {"model": "glm-5-3"}}}
 
 
 def test_suggest_worktree_name_reads_the_dotenv_before_asking(

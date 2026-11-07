@@ -37,6 +37,13 @@ def _pin_timezone(monkeypatch: pytest.MonkeyPatch) -> None:
 def _pin_clocks(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     """Pin canonical posting and renderer today before any app tasks are created."""
     monkeypatch.setattr(message_header, "local_now", lambda: SNAPSHOT_NOW)
+    # The live projector stamps its entries' real emission clock, and the
+    # transcript renders minute group headers from it: an unpinned projector
+    # clock would stamp the running minute into every snapshot.
+    monkeypatch.setattr(
+        "chartreux.app_server._projector.now_ms",
+        lambda: int(SNAPSHOT_NOW.timestamp()) * 1000,
+    )
     # A fixed elapsed helper makes backend-generated totals measured zero;
     # timing showcases supply explicit nonzero durations. Never pin perf_counter.
     with use_posting_clock(lambda: SNAPSHOT_NOW), use_elapsed_clock(lambda: 0.0):

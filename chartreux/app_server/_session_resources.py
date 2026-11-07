@@ -65,6 +65,9 @@ from chartreux.app_server.protocol import (
     SessionLogReadResponse,
     SessionPlanHandoffParams,
     SessionPlanHandoffResponse,
+    SessionPlanRecord,
+    SessionPlanRecordWriteParams,
+    SessionPlanRecordWriteResponse,
     SessionReadParams,
     SessionReadResponse,
     SessionRelocateParams,
@@ -167,7 +170,7 @@ class ShellResource:
         return True
 
 
-class SessionResource:
+class SessionResource:  # noqa: PLR0904 - resource facade over the session RPC surface
     def __init__(
         self, connection: AppServerResourceConnection, state: ClientSessionState
     ) -> None:
@@ -257,6 +260,34 @@ class SessionResource:
         self._state.session_log = response.log
         return response.log
 
+    @property
+    def resumed_plan_record(self) -> SessionPlanRecord | None:
+        """The plan mode the adopted session was resumed with, if any."""
+        return self._state.plan_record
+
+    async def write_plan_record(
+        self, record: SessionPlanRecord | None
+    ) -> SessionPlanRecord | None:
+        """Persist the plan mode; a null record removes it.
+
+        Returns the record as READ BACK by the server, which is None when
+        nothing was stored (session logging disabled).
+        """
+        client = await self._connection.connect()
+        response = validate_wire(
+            SessionPlanRecordWriteResponse,
+            await client.request(
+                "session/plan/record/write",
+                SessionPlanRecordWriteParams(
+                    session_id=self._state.session_id, record=record
+                ),
+            ),
+        )
+        return response.record
+
+    async def clear_plan_record(self) -> SessionPlanRecord | None:
+        return await self.write_plan_record(None)
+
     async def resume(
         self, session_id: str, *, on_adopt: Callable[[], None] | None = None
     ) -> None:
@@ -267,6 +298,7 @@ class SessionResource:
             nonlocal adopted
             response = validate_wire(SessionResumeResponse, raw_response)
             self._state.projection = ClientProjection(response.state)
+            self._state.plan_record = response.plan_record
             self._state.reset_usage_baseline()
             self._connection.mark_session_attached()
             if on_adopt is not None:

@@ -192,9 +192,14 @@ class SessionFlowController:
         if self._app._show_resume_picker:
             self._app._show_resume_picker = False
             self._app._startup_prompt_processed = True
-        if self.exit_picker_preview():
+        previewing = self.exit_picker_preview()
+        if previewing:
             await self._app._rebuild_transcript_from_current_session()
             await self.restore_picker_history_range()
+        # The launch has landed in the live session, so a `-P` start is ensured
+        # here too — after the preview teardown, so its seed is not rebuilt away.
+        await self._app._ensure_startup_plan_mode()
+        if previewing:
             return
         self._app.run_worker(
             self._app._show_custom_tools_deprecation_warning_after_initial_history(),
@@ -330,6 +335,7 @@ class SessionFlowController:
         else:
             if self._app._show_resume_picker:
                 self._app._show_resume_picker = False
+                await self._app._ensure_startup_plan_mode()
                 await self._app._process_startup_prompt_when_available()
         finally:
             self._app._mark_session_ready()
@@ -358,6 +364,11 @@ class SessionFlowController:
             await self._app._mount_and_scroll(
                 UserCommandMessage(f"Resumed session `{session_id[:8]}`")
             )
+            # The persisted plan mode is restored HERE, inside the resume and
+            # before the session is marked ready: on both startup resume paths
+            # the restore therefore completes before any startup-prompt
+            # dispatch and before a plan entry can run.
+            await self._app._restore_resumed_plan_mode()
             await self.surface_committed_model_recovery()
             self._app.run_worker(self._app._finish_resume_notices(), exclusive=False)
         except BaseException as exc:
@@ -519,6 +530,8 @@ class SessionFlowController:
                         UserCommandMessage("No previous sessions found.")
                     )
                     await self._app._show_custom_tools_deprecation_warning_after_initial_history()
+                    # No resume landed, so the startup session is the landing.
+                    await self._app._ensure_startup_plan_mode()
                     await self._app._process_startup_prompt_when_available()
                     return
             await self._app._resume_local_session(session_id)
@@ -551,6 +564,10 @@ class SessionFlowController:
             # Must run before _process_startup_prompt so an injected prompt can
             # dispatch.
             self._app._mark_session_ready()
+            # The resume restore has completed, so this is the landing point for
+            # `-c -P` / `--resume <id> -P`: the already-active guard decides when
+            # the resumed session was planning, and the entry runs otherwise.
+            await self._app._ensure_startup_plan_mode()
             # _resume_local_session spawns _finish_resume_notices as a worker,
             # but the startup prompt must fire regardless of whether notices
             # have settled — _process_startup_prompt_when_available guards on

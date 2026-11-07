@@ -61,6 +61,10 @@ class TranscriptRecorder:
         self._response_order: dict[str, int] | None = None
         self._staged_responses: dict[int, list[LLMMessage]] = {}
         self._next_index = 0
+        # Emission clocks for calls whose assistant record has not completed
+        # yet: a streamed call event arrives mid-stream, but its transcript
+        # copy only exists once the completion commits.
+        self._pending_call_clocks: dict[str, int] = {}
 
     @property
     def response_order(self) -> dict[str, int] | None:
@@ -246,6 +250,21 @@ class TranscriptRecorder:
                     tool_call.presentation = event.presentation
                     return
 
+    def record_call_clock(self, call_id: str, started_at: int) -> None:
+        """Record the tool call's emission clock on its transcript copy.
+
+        The transcript copy may not exist yet (a streamed call event arrives
+        before its assistant record commits), so an unmatched clock waits for
+        the next completion. A later reading for the same call replaces an
+        earlier one: the last emission of the call wins.
+        """
+        for message in reversed(self._messages):
+            for tool_call in message.tool_calls or []:
+                if tool_call.id == call_id:
+                    tool_call.started_at = started_at
+                    return
+        self._pending_call_clocks[call_id] = started_at
+
     def record_response(
         self,
         tool_call: ResolvedToolCall,
@@ -275,15 +294,23 @@ class TranscriptRecorder:
             message.model_copy(update=updates) if updates else message,
         )
 
-    def record_completion(self, outcome: TranscriptAppend) -> None:
+    def record_completion(
+        self, outcome: TranscriptAppend, *, reasoning_at: int | None = None
+    ) -> None:
         """Append a committed completion, retaining the raw execution copy.
 
         Only the active completion retains execution arguments: the raw
         message is supplied to the loop through the synchronous
         ``set_execution_message`` callback, then the sanitized copy is
         appended and transcript copies are never used for execution.
+
+        ``reasoning_at`` is the reasoning block's clock, captured by the loop at
+        its emission site; the committed record carries it so a restore shows
+        when the block was emitted rather than when the log was saved.
         """
         message = outcome.message
+        if reasoning_at is not None and message.reasoning_content:
+            message = message.model_copy(update={"reasoning_at": reasoning_at})
         if outcome.committed_model is not None:
             message = message.model_copy(
                 update={"deployment_identity": outcome.committed_model.model_dump()}
@@ -292,11 +319,26 @@ class TranscriptRecorder:
             self._set_execution_message(message)
             message = message.model_copy(
                 update={
-                    "tool_calls": [self.record_call(tc) for tc in message.tool_calls]
+                    "tool_calls": [
+                        self._recorded_call(tool_call)
+                        for tool_call in message.tool_calls
+                    ]
                 }
             )
+        # Every clock still waiting belongs to a call this record does not
+        # carry, so nothing can legitimately consume it later.
+        self._pending_call_clocks.clear()
         self._messages.append(message)
         self._note_prose(message)
+
+    def _recorded_call(self, tool_call: ToolCall) -> ToolCall:
+        """The sanitized transcript copy, carrying its captured emission clock."""
+        recorded = self.record_call(tool_call)
+        if recorded.id is not None:
+            started_at = self._pending_call_clocks.get(recorded.id)
+            if started_at is not None:
+                recorded.started_at = started_at
+        return recorded
 
     def repair_missing_responses(self) -> None:
         """Backfill responses for tool calls that never produced one.

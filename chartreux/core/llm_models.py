@@ -58,6 +58,10 @@ class ToolCall(BaseModel):
     function: FunctionCall = Field(default_factory=FunctionCall)
     type: Literal["function"] = "function"
     presentation: ToolCallPresentation | None = None
+    # The tool run's real wall-clock start (epoch ms), captured when its call
+    # event was emitted and persisted with the record. Absent on records
+    # written before v0.7.4 and never backfilled.
+    started_at: int | None = None
 
 
 def _content_before(v: Any) -> str:
@@ -145,6 +149,33 @@ def posting_time() -> datetime:
     return clock() if clock is not None else datetime.now(UTC)
 
 
+_event_clock: ContextVar[Callable[[], datetime] | None] = ContextVar(
+    "event_clock", default=None
+)
+
+
+def event_clock_ms() -> int:
+    """The real wall-clock instant (epoch ms) of a transcript event.
+
+    Read AT the emission site: a persisted record carries the moment its event
+    was emitted, so a restore never reconstructs a clock from the log save.
+    Its clock is separate from the posting clock, so an event capture never
+    consumes a message-posting stamp.
+    """
+    clock = _event_clock.get()
+    return int((clock() if clock is not None else datetime.now(UTC)).timestamp() * 1000)
+
+
+@contextmanager
+def use_event_clock(clock: Callable[[], datetime]) -> Iterator[None]:
+    """Inject a task-local transcript-event clock, inherited by new tasks."""
+    token = _event_clock.set(clock)
+    try:
+        yield
+    finally:
+        _event_clock.reset(token)
+
+
 @contextmanager
 def use_posting_clock(clock: Callable[[], datetime]) -> Iterator[None]:
     """Inject a task-local posting clock, inherited by newly spawned async tasks."""
@@ -178,6 +209,11 @@ class LLMMessage(BaseModel):
     reasoning_content: Content | None = None
     reasoning_payloads: list[dict[str, Any]] | None = None
     reasoning_message_id: str | None = None
+    # The reasoning block's real wall-clock clock (epoch ms), captured at its
+    # emission site. Reasoning rides inside the compounded assistant record, so
+    # its clock is a per-block field here rather than a record of its own.
+    # Absent on records written before v0.7.4 and never backfilled.
+    reasoning_at: int | None = None
     tool_calls: list[ToolCall] | None = None
     name: str | None = None
     tool_call_id: str | None = None
@@ -232,6 +268,7 @@ class LLMMessage(BaseModel):
             "reasoning_payloads": getattr(v, "reasoning_payloads", None),
             "reasoning_message_id": getattr(v, "reasoning_message_id", None)
             or (str(uuid4()) if reasoning_content else None),
+            "reasoning_at": getattr(v, "reasoning_at", None),
             "tool_calls": getattr(v, "tool_calls", None),
             "name": getattr(v, "name", None),
             "tool_call_id": getattr(v, "tool_call_id", None),
@@ -304,6 +341,10 @@ class LLMMessage(BaseModel):
             reasoning_payloads=reasoning_payloads,
             reasoning_message_id=self.reasoning_message_id
             or other.reasoning_message_id,
+            # The LAST emission of a compounded block wins: a retried provider
+            # call re-emits its chunks with later clocks, and the persisted
+            # record carries its final clock.
+            reasoning_at=other.reasoning_at or self.reasoning_at,
             tool_calls=list(tool_calls_map.values()) or None,
             name=self.name,
             tool_call_id=self.tool_call_id,
@@ -346,6 +387,7 @@ def archived_replacement(
                 "reasoning_content": None,
                 "reasoning_payloads": None,
                 "reasoning_message_id": None,
+                "reasoning_at": None,
                 "tool_calls": None,
                 "name": None,
                 "tool_call_id": None,

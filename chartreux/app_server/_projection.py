@@ -806,6 +806,7 @@ def _append_assistant_history(
                     created_at,
                 ),
                 text=message.reasoning_content,
+                event_at=message.reasoning_at,
             )
         )
     if message.content:
@@ -837,6 +838,7 @@ def _append_assistant_history(
                 tool_call.function.name or "unknown",
                 tool_call.function.arguments,
                 created_at,
+                event_at=tool_call.started_at,
                 presentation=tool_call.presentation,
                 child_session_id=child_sessions.get(tool_call_id),
             )
@@ -926,6 +928,7 @@ def _history_effect(
     raw_arguments: str | None,
     created_at: int,
     *,
+    event_at: int | None = None,
     result_message: LLMMessage | None = None,
     presentation: ToolCallPresentation | None = None,
     child_session_id: str | None = None,
@@ -957,6 +960,7 @@ def _history_effect(
             output_text="",
             display=EffectResultDisplay(success=True, message=f"{tool_name} completed"),
         ),
+        event_at=event_at,
     )
     return entry.model_copy(
         update={"state": _persisted_effect_state(entry, result_message)}

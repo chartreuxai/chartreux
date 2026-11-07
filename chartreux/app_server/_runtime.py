@@ -1075,6 +1075,7 @@ class AgentRuntimeFactory:
             )
             await forked.wait_until_ready()
             forked.messages.extend(_messages_for_fork(source, message_id))
+            _inherit_plan_mode(source, forked)
             await forked.session_logger.save_interaction(
                 forked.messages, forked.stats, forked.config, forked.tool_manager
             )
@@ -2194,6 +2195,22 @@ def _messages_for_fork(source: AgentLoop, message_id: str | None) -> list[LLMMes
         len(messages),
     )
     return [message.model_copy(deep=True) for message in messages[:end]]
+
+
+def _inherit_plan_mode(source: AgentLoop, forked: AgentLoop) -> None:
+    """Carry the plan-mode record into a fork (design §7, accepted behavior).
+
+    ``/branch`` shares the plan document with its source, so resuming the fork
+    is resuming a planning session. Only the record travels: a fork's metadata
+    is otherwise fresh, and copy-on-branch machinery for the mode itself was
+    explicitly rejected.
+    """
+    source_metadata = source.session_logger.session_metadata
+    forked_metadata = forked.session_logger.session_metadata
+    if source_metadata is None or forked_metadata is None:
+        return
+    if source_metadata.plan_mode is not None:
+        forked_metadata.plan_mode = source_metadata.plan_mode.model_copy(deep=True)
 
 
 _USAGE_SETTLEMENT_TIMEOUT = 5.0

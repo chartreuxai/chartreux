@@ -44,6 +44,7 @@ from chartreux.cli.textual_ui.widgets.loading import (
     DEFAULT_LOADING_STATUS,
     THINKING_LOADING_STATUS,
 )
+from chartreux.cli.textual_ui.widgets.message_header import MinuteKey
 from chartreux.cli.textual_ui.widgets.messages import (
     AssistantMessage,
     ErrorMessage,
@@ -53,6 +54,7 @@ from chartreux.cli.textual_ui.widgets.messages import (
     SlashCommandMessage,
     UserCommandMessage,
 )
+from chartreux.cli.textual_ui.widgets.minute_group_header import MinuteGroupHeader
 from chartreux.cli.textual_ui.widgets.tool_grouping import (
     ToolGroupExpansionState,
     ToolGroupKey,
@@ -64,9 +66,15 @@ from chartreux.cli.textual_ui.widgets.tools import (
     ToolGroup,
     ToolResultMessage,
 )
+from chartreux.cli.textual_ui.windowing.history import (
+    advance_rendered_minute,
+    entry_minute,
+    renders_minute_record,
+)
 
 if TYPE_CHECKING:
     from chartreux.cli.textual_ui.widgets.loading import LoadingWidget
+    from chartreux.cli.textual_ui.windowing.transcript import TranscriptWindow
 
 
 @dataclass(slots=True)
@@ -74,6 +82,22 @@ class _RetryPresentation:
     assistant: AssistantMessage | None
     transient_widgets: list[Widget] = field(default_factory=list)
     active: bool = False
+
+
+@dataclass(slots=True)
+class _LiveMinuteStamp:
+    """A minute header this handler mounted itself, and how to home it again.
+
+    The window reconciles the headers its units own; the live path stamps the
+    records that own no unit (notice records, fold interiors). Keeping the
+    placement lets a timestamp-gate change withdraw those stamps and put them
+    back where they were.
+    """
+
+    header: MinuteGroupHeader
+    anchor: Widget | None = None
+    previous: Widget | None = None
+    container: Widget | None = None
 
 
 class EventHandler:
@@ -120,6 +144,19 @@ class EventHandler:
             ToolResultMessage, tuple[ToolGroup, int]
         ] = {}
         self._retry_presentation: _RetryPresentation | None = None
+        # The window owning the transcript-spanning visible-minute walk. The
+        # session app binds it after construction, like the presenter's own
+        # late-bound host; a standalone handler leaves it unset and walks alone.
+        self.transcript_minutes: TranscriptWindow | None = None
+        # The live transcript is appended in arrival order, so the rendered-
+        # minute marker advances here exactly as the window's entry walk does:
+        # the last minute a record has already shown never stamps twice. The
+        # walk is seeded from the window when one is bound, so a record that
+        # lands in a minute restore already stamped opens nothing.
+        self._rendered_minute: MinuteKey | None = None
+        # Minute headers this handler mounted itself (they own no unit, so the
+        # window's reconcile cannot see them).
+        self._minute_stamps: list[_LiveMinuteStamp] = []
 
     def offer_retry(self, error: ErrorMessage | None = None) -> None:
         presentation = self._retry_presentation
@@ -176,6 +213,7 @@ class EventHandler:
     async def _handle_entry_added(  # noqa: PLR0912 - one case per entry kind
         self, entry: PublicHistoryEntry, loading_widget: LoadingWidget | None
     ) -> ToolCallMessage | None:
+        marker = self._note_minute_record(entry)
         if self.current_tool_group is not None and not entry_keeps_tool_group(entry):
             self._finalize_tool_group()
         if not entry_keeps_tool_group(entry):
@@ -197,13 +235,17 @@ class EventHandler:
                 await self._resolve_retry_presentation(continue_assistant=False)
             case PublicReasoningEntry():
                 await self._resolve_retry_presentation(continue_assistant=False)
-                await self._handle_reasoning_delta(entry.text, loading_widget, entry.id)
+                await self._handle_reasoning_delta(
+                    entry.text, loading_widget, entry.id, marker=marker
+                )
                 if entry.generation_status is PublicEntryGenerationStatus.COMPLETED:
                     await self.finalize_streaming()
             case PublicEffectEntry():
                 await self._resolve_retry_presentation(continue_assistant=False)
                 await self.finalize_streaming()
-                tool_call = await self._handle_effect_started(entry, loading_widget)
+                tool_call = await self._handle_effect_started(
+                    entry, loading_widget, marker=marker
+                )
                 if _effect_is_terminal(entry):
                     await self._handle_effect_completed(entry, loading_widget)
                 return tool_call
@@ -220,7 +262,7 @@ class EventHandler:
                 # still does.
                 if not isinstance(entry.detail, RootRecoveryNoticeDetail):
                     await self._resolve_retry_presentation(continue_assistant=False)
-                await self._handle_notice(entry, loading_widget)
+                await self._handle_notice(entry, loading_widget, marker=marker)
             case PublicCallbackEntry():
                 await self._resolve_retry_presentation(continue_assistant=False)
                 await self.finalize_streaming()
@@ -229,6 +271,51 @@ class EventHandler:
                     f"Unsupported public history entry: {type(entry).__name__}"
                 )
         return None
+
+    def _note_minute_record(self, entry: PublicHistoryEntry) -> MinuteKey | None:
+        """Advance the live rendered-minute marker; return the stamp *entry* opens.
+
+        The live transcript is appended in arrival order, so the rule reduces to
+        a step per arrival, seeded by the same walk the window runs over the
+        visible entry set. A record keeps moving the marker while the preference
+        hides stamps: the gate chooses whether a stamp renders, never whether
+        the next record is owed one.
+        """
+        if not renders_minute_record(entry):
+            return None
+        shown = self._shown_minute(entry)
+        if shown is not None and (
+            self._rendered_minute is None or shown > self._rendered_minute
+        ):
+            self._rendered_minute = shown
+        self._rendered_minute, marker = advance_rendered_minute(
+            self._rendered_minute, entry
+        )
+        return marker if self.get_show_message_timestamps() else None
+
+    def _shown_minute(self, entry: PublicHistoryEntry) -> MinuteKey | None:
+        """The minute the transcript already renders, read from the window.
+
+        Restore admits a whole batch before the live path delivers anything, so
+        the window -- not a handler-local marker that starts empty -- is the
+        authority on the minute the reader last saw.
+        """
+        if self.transcript_minutes is None:
+            return None
+        return self.transcript_minutes._visible_minute(excluding=entry.id)
+
+    def _adopt_record_minute(self, entry: PublicHistoryEntry) -> None:
+        """Take a late canonical clock as the minute the transcript now shows.
+
+        A streaming message can mount without its posting time and receive it on
+        a later patch. Its own header then renders that minute, so the marker
+        moves with it and the records after it spawn no redundant stamp.
+        """
+        minute = entry_minute(entry)
+        if minute is None:
+            return
+        if self._rendered_minute is None or minute > self._rendered_minute:
+            self._rendered_minute = minute
 
     def _reconcile_stream_timing(self, entry: PublicMessageEntry) -> None:
         if self.current_streaming_message is not None:
@@ -284,6 +371,7 @@ class EventHandler:
                     and self.current_streaming_message.header.posted_at is None
                 ):
                     self.current_streaming_message.reconcile_timestamp(entry.posted_at)
+                    self._adopt_record_minute(entry)
                 if entry.generation_status is PublicEntryGenerationStatus.COMPLETED:
                     await self.finalize_streaming()
             case PublicReasoningEntry():
@@ -310,7 +398,11 @@ class EventHandler:
                 pass
 
     async def _handle_effect_started(
-        self, entry: PublicEffectEntry, loading_widget: LoadingWidget | None
+        self,
+        entry: PublicEffectEntry,
+        loading_widget: LoadingWidget | None,
+        *,
+        marker: MinuteKey | None = None,
     ) -> ToolCallMessage:
         existing = self.tool_calls.get(entry.id)
         if existing is not None:
@@ -323,12 +415,17 @@ class EventHandler:
             self.tool_calls[entry.id] = tool_call
             self._tool_call_anchors[entry.id] = tool_call
             if not entry_keeps_tool_group(entry):
+                # A standalone call is its own unit, so the window stamps the
+                # minute above it; only a fold's interior needs a live stamp.
                 self._finalize_tool_group()
                 await self.mount_callback(tool_call)
             else:
+                continues_group = self._group_continues()
                 group = await self._ensure_tool_group(entry.id)
                 group.resume()
                 group.add_call_kind(entry.detail.kind)
+                if marker is not None and continues_group:
+                    await self._mount_group_marker(group, marker)
                 self._tool_group_call_positions[entry.id] = (
                     group,
                     self._current_tool_group_next_position,
@@ -432,7 +529,12 @@ class EventHandler:
         return assistant
 
     async def _handle_reasoning_delta(
-        self, content: str, loading_widget: LoadingWidget | None, entry_id: str
+        self,
+        content: str,
+        loading_widget: LoadingWidget | None,
+        entry_id: str,
+        *,
+        marker: MinuteKey | None = None,
     ) -> None:
         if loading_widget is not None:
             loading_widget.set_status(THINKING_LOADING_STATUS)
@@ -449,9 +551,12 @@ class EventHandler:
                 expansion_state=self.entry_expansion_state,
             )
             self.current_streaming_reasoning = message
+            continues_group = self._group_continues()
             group = await self._ensure_tool_group(entry_id)
             if self.get_show_thinking():
                 group.mark_reasoning()
+            if marker is not None and continues_group:
+                await self._mount_group_marker(group, marker)
             await self._mount_in_group(group, message)
             if not self.get_show_thinking():
                 message.display = False
@@ -460,7 +565,11 @@ class EventHandler:
         await self.current_streaming_reasoning.append_content(content)
 
     async def _handle_notice(
-        self, entry: PublicNoticeEntry, loading_widget: LoadingWidget | None
+        self,
+        entry: PublicNoticeEntry,
+        loading_widget: LoadingWidget | None,
+        *,
+        marker: MinuteKey | None = None,
     ) -> None:
         match entry.detail:
             case HookNoticeDetail() as detail:
@@ -469,7 +578,7 @@ class EventHandler:
                 await self.finalize_streaming()
             case ScheduledLoopFiredNoticeDetail():
                 await self.finalize_streaming()
-                await self.mount_callback(UserCommandMessage(entry.message))
+                await self._mount_notice_record(entry, marker)
             case SessionTitleUpdatedNoticeDetail(title=title):
                 if self.on_session_title_changed is not None:
                     self.on_session_title_changed(title)
@@ -479,13 +588,31 @@ class EventHandler:
                 # interval and across reconnect), never a fresh instruction
                 # that would trigger another turn.
                 await self.finalize_streaming()
-                await self.mount_callback(UserCommandMessage(entry.message))
+                await self._mount_notice_record(entry, marker)
             case RouteTableAppliedNoticeDetail():
                 # ADR 0022: the applied route notice is a history entry —
                 # readable after the reload — never a fresh instruction that
                 # would trigger another turn.
                 await self.finalize_streaming()
-                await self.mount_callback(UserCommandMessage(entry.message))
+                await self._mount_notice_record(entry, marker)
+
+    async def _mount_notice_record(
+        self, entry: PublicNoticeEntry, marker: MinuteKey | None
+    ) -> None:
+        """Mount a notice record under the stamp it opens, if it opens one."""
+        header: MinuteGroupHeader | None = None
+        if marker is not None:
+            header = MinuteGroupHeader(marker)
+            await self.mount_callback(header)
+        record = UserCommandMessage(entry.message)
+        await self.mount_callback(record)
+        # The record is resident from here on: the window's minute walk reads
+        # this widget's placement instead of assuming every admitted notice
+        # still renders.
+        if self.transcript_minutes is not None:
+            self.transcript_minutes._bind_stamped_record(entry.id, record)
+        if header is not None:
+            self._remember_minute_stamp(_LiveMinuteStamp(header, anchor=record))
 
     async def _handle_hook_notice(
         self, detail: HookNoticeDetail, loading_widget: LoadingWidget | None
@@ -563,6 +690,13 @@ class EventHandler:
         self._finalized_tool_group = None
         self._current_tool_group_next_position = 0
 
+    def _group_continues(self) -> bool:
+        """Whether the next grouped record joins a fold instead of opening one."""
+        return (
+            self.current_tool_group is not None
+            or self._finalized_tool_group is not None
+        )
+
     async def _ensure_tool_group(self, entry_id: str) -> ToolGroup:
         if self.current_tool_group is None:
             if self._finalized_tool_group is not None:
@@ -587,6 +721,66 @@ class EventHandler:
         else:
             await self.mount_callback(widget, container=group.content_container)
         group.sync_visibility()
+
+    async def _mount_group_marker(self, group: ToolGroup, marker: MinuteKey) -> None:
+        """Stamp a minute transition inside a fold, above the record it opens.
+
+        Collapsed, the stamp hides with the body it belongs to, exactly like the
+        record beneath it; the fold's own leading stamp stays above the fold.
+        """
+        children = list(group.content_container.children)
+        header = MinuteGroupHeader(marker)
+        if children:
+            await self.mount_callback(header, after=children[-1])
+            self._remember_minute_stamp(_LiveMinuteStamp(header, previous=children[-1]))
+        else:
+            await self.mount_callback(header, container=group.content_container)
+            self._remember_minute_stamp(
+                _LiveMinuteStamp(header, container=group.content_container)
+            )
+
+    def _remember_minute_stamp(self, stamp: _LiveMinuteStamp) -> None:
+        self._minute_stamps.append(stamp)
+
+    async def set_show_message_timestamps(self, show: bool) -> None:
+        """Withdraw or re-home the minute headers this handler mounted itself.
+
+        The window reconciles the headers its units own, but notice-record and
+        fold-interior stamps sit outside that registry. A preference change must
+        reconcile every timestamp surface, so these leave and return with it.
+        """
+        if show:
+            for stamp in list(self._minute_stamps):
+                if not await self._restore_minute_stamp(stamp):
+                    self._minute_stamps.remove(stamp)
+            return
+        for stamp in self._minute_stamps:
+            if stamp.header.parent is not None:
+                await stamp.header.remove()
+
+    async def _restore_minute_stamp(self, stamp: _LiveMinuteStamp) -> bool:
+        """Put a withdrawn stamp back where it was, if its neighbourhood survives."""
+        header = stamp.header
+        if header.parent is not None:
+            return True
+        target = self._stamp_mount_target(stamp)
+        if target is None:
+            return False
+        await self.mount_callback(header, **target)
+        return True
+
+    @staticmethod
+    def _stamp_mount_target(stamp: _LiveMinuteStamp) -> dict[str, Widget] | None:
+        """The mount arguments that return a stamp to its recorded slot."""
+        if stamp.anchor is not None:
+            return None if stamp.anchor.parent is None else {"before": stamp.anchor}
+        if stamp.previous is not None:
+            return None if stamp.previous.parent is None else {"after": stamp.previous}
+        container = stamp.container
+        if container is None or container.parent is None:
+            return None
+        children = list(container.children)
+        return {"before": children[0]} if children else {"container": container}
 
     async def _handle_compact_start(self) -> None:
         compact = CompactMessage()

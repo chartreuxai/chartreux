@@ -27,6 +27,7 @@ from chartreux.app_server._execution import (
     SessionExecutionKind,
 )
 from chartreux.app_server._model import ProtocolModel, validate_wire
+from chartreux.app_server._plan_record import session_plan_record
 from chartreux.app_server._projection import (
     history_user_message_index,
     project_history,
@@ -138,6 +139,7 @@ from chartreux.app_server.protocol import (
     SessionLogReadResponse,
     SessionPlanHandoffParams,
     SessionPlanHandoffResponse,
+    SessionPlanRecord,
     SessionReadParams,
     SessionReadResponse,
     SessionReadyReadParams,
@@ -1092,7 +1094,11 @@ class CoreRequestHandler:
                 self._spawn_resume_task(task)
 
             return DispatchResult(
-                SessionResumeResponse(state=state, last_event_id=state.event_id),
+                SessionResumeResponse(
+                    state=state,
+                    last_event_id=state.event_id,
+                    plan_record=self._plan_record(),
+                ),
                 after_response=_spawn,
                 session_attached=True,
                 runtime_updated=True,
@@ -1102,10 +1108,23 @@ class CoreRequestHandler:
             SessionResumeResponse(
                 state=(state := self._public_state(params.history_limit)),
                 last_event_id=state.event_id,
+                plan_record=self._plan_record(),
             ),
             session_attached=True,
             runtime_updated=True,
         )
+
+    def _plan_record(self) -> SessionPlanRecord | None:
+        """The resumed session's persisted plan mode, read from its metadata.
+
+        Sent with the resume response because the restore has to be in place
+        before the session is marked ready; a separate read would land after
+        that point.
+        """
+        metadata = self._agent_loop.session_logger.session_metadata
+        if metadata is None or metadata.plan_mode is None:
+            return None
+        return session_plan_record(metadata.plan_mode)
 
     async def _finish_resume(self, agent_loop: AgentLoop, session_id: str) -> None:
         session_id = agent_loop.session_id

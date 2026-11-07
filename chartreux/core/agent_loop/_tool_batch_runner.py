@@ -49,7 +49,7 @@ from chartreux.core.llm.format import (
     ResolvedMessage,
     ResolvedToolCall,
 )
-from chartreux.core.llm_models import ToolCall
+from chartreux.core.llm_models import ToolCall, event_clock_ms
 from chartreux.core.session_types import AgentStats
 from chartreux.core.subagents import TaskResult
 from chartreux.core.tools import secret_redaction
@@ -257,6 +257,8 @@ class ToolBatchRunner:
                 tool_name=tc.function.name,
                 tool_class=tool_class,
             )
+            # CAPTURE seam: the call's clock is read as its event is emitted.
+            self._transcript_recorder.record_call_clock(tc.id, event_clock_ms())
             yield self._record_tool_call_event(
                 event.model_copy(
                     update={
@@ -302,6 +304,9 @@ class ToolBatchRunner:
                 }
             )
             event = self._record_tool_call_event(event)
+            self._transcript_recorder.record_call_clock(
+                event.tool_call_id, event_clock_ms()
+            )
             self._transcript_recorder.record_presentation(event)
             yield event
 

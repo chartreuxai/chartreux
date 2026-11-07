@@ -203,6 +203,17 @@ the last assistant message shows the whole-turn total. These values do not tick
 while work runs. Turning the setting off hides the displays but does not stop
 capture or persistence; older messages without timestamps stay unstamped.
 
+The same gate covers every transcript event, not just messages. Reasoning
+blocks, tool calls and results, notices, warnings, errors, and session records
+carry a real per-event clock, and events with no time of their own are grouped
+under one `HH:MM` minute header, dated off-today and rendered only where the
+minute's first stamped event would otherwise show no time. A user or assistant
+message header counts as its minute's stamp, so events continuing in that minute
+add no second header; an effect is stamped at its start, and a result landing in
+a later minute does not re-stamp it. Turning the setting off hides the minute
+headers with the rest, and sessions logged before this release keep their
+unstamped events — headers are never backfilled.
+
 ## User questions and unattended expiry
 
 The `ask_user_question` tool can mark a question as safe to leave unanswered.

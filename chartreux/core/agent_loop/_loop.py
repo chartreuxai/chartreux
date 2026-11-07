@@ -161,6 +161,7 @@ from chartreux.core.llm_models import (
     Role,
     StrToolChoice,
     ToolCall,
+    event_clock_ms,
     posting_time,
 )
 from chartreux.core.message_list import MessageList
@@ -178,6 +179,7 @@ from chartreux.core.middleware import (
     TurnLimitMiddleware,
 )
 from chartreux.core.model_catalog.availability import EligibleDeployment
+from chartreux.core.plan_mode import build_plan_mode_compaction_notice
 from chartreux.core.policy.bundle import (
     ActivatedPolicy,
     BundleStore,
@@ -738,6 +740,10 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
         # Only the active completion retains execution arguments; transcript
         # copies are sanitized before insertion and never used for execution.
         self._execution_message: LLMMessage | None = None
+        # The reasoning block's emission clock for the completion being
+        # streamed: captured at the emission site, consumed by the transcript
+        # append so the persisted record carries the emission time.
+        self._reasoning_at: int | None = None
 
         self.stats = AgentStats()
         # Retains admission names and resolved values only until outward
@@ -2647,6 +2653,7 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
         message_id: str | None = None
         reasoning_message_id: str | None = None
         emitted_tool_call_ids = set[str]()
+        self._reasoning_at = None
 
         async for chunk in self._chat_streaming():
             if message_id is None:
@@ -2655,6 +2662,10 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
                 reasoning_message_id = chunk.message.reasoning_message_id
 
             if chunk.message.reasoning_content:
+                # CAPTURE seam: the block's clock is read here, at its emission.
+                # The last emission wins, so a retried call's later clock is the
+                # one the persisted record ends up carrying.
+                self._reasoning_at = event_clock_ms()
                 yield ReasoningEvent(
                     content=chunk.message.reasoning_content,
                     message_id=reasoning_message_id,
@@ -2900,7 +2911,27 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
         )
 
     def _append_transcript(self, outcome: TranscriptAppend) -> None:
-        self._transcript_recorder.record_completion(outcome)
+        self._transcript_recorder.record_completion(
+            outcome, reasoning_at=self._take_reasoning_at(outcome.message)
+        )
+
+    def _take_reasoning_at(self, message: LLMMessage) -> int | None:
+        """The reasoning block's clock, as captured during this call.
+
+        A streamed block's clock is the one the emission site stamped. A
+        non-streamed call emits its whole message at once, so the gateway's own
+        emission stamp on the message is the honest clock there. Either way the
+        value is read during the call, never reconstructed at transcript save.
+        """
+        reasoning_at = self._reasoning_at
+        self._reasoning_at = None
+        if not message.reasoning_content:
+            return None
+        if reasoning_at is not None:
+            return reasoning_at
+        if message.posted_at is None:
+            return None
+        return int(message.posted_at.timestamp() * 1000)
 
     def _set_execution_message(self, message: LLMMessage) -> None:
         """Retain the raw completion message for post-turn tool-call parsing."""
@@ -3388,6 +3419,7 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
                 extra_instructions,
                 manual=manual,
                 outcome=self._compaction_outcome if manual else None,
+                mode_notice=self._plan_mode_compaction_notice(),
             )
             self.middleware_pipeline.reset(reset_reason=ResetReason.COMPACT)
             # A compacted conversation reads very differently from its first
@@ -3402,6 +3434,24 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
                 # failed retry save must not mask it.
                 logger.debug("compaction settlement retry save failed: %s", save_error)
             raise
+
+    def _plan_mode_compaction_notice(self) -> str | None:
+        """The plan-mode re-injection notice, or None when this loop is not planning.
+
+        Read from this loop's own in-memory session metadata: the record is
+        written by entry and removed by the exit paths, so a planner loop
+        reports it, while an executor or subagent loop holds a different
+        ``SessionMetadata`` and reports nothing. Session logging disabled makes
+        the metadata ``None`` by construction, which is the accepted behavior
+        (no notice, symmetric with no resume restore).
+        """
+        metadata = self.session_logger.session_metadata
+        if metadata is None:
+            return None
+        record = metadata.plan_mode
+        if record is None:
+            return None
+        return build_plan_mode_compaction_notice(record.plan_path, record.theme)
 
     @requires_init
     async def relocate(self, cwd: Path) -> None:

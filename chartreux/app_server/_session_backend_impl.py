@@ -16,6 +16,7 @@ from chartreux.app_server._handler import CoreRequestHandler
 from chartreux.app_server._host import HostRequestHandler, project_session_list
 from chartreux.app_server._mcp_authorization_bridge import RegistryAuthorizationProvider
 from chartreux.app_server._model import ProtocolModel
+from chartreux.app_server._plan_record import plan_mode_record, session_plan_record
 from chartreux.app_server._resources import ResourceRequestHandler
 from chartreux.app_server._root_session import RootSessionCoordinator
 from chartreux.app_server._session_backend_port import (
@@ -82,6 +83,9 @@ from chartreux.app_server.protocol import (
     SessionHistoryClearResponse,
     SessionListParams,
     SessionListResponse,
+    SessionPlanRecord,
+    SessionPlanRecordWriteParams,
+    SessionPlanRecordWriteResponse,
     SessionReadParams,
     SessionReadResponse,
     SessionRelocateResponse,
@@ -856,6 +860,47 @@ class SessionBackendImpl:
             return False
         active_model = loop.config.get_active_model().alias
         return await logger.persist_active_model(active_model)
+
+    async def read_plan_record(self) -> SessionPlanRecord | None:
+        """The persisted plan mode, or None when this session is not planning.
+
+        Internal to the app server: a resume response carries this value, so
+        no client-facing read exists to ask for it separately.
+        """
+        metadata = self.session.agent_loop.session_logger.session_metadata
+        if metadata is None or metadata.plan_mode is None:
+            return None
+        return session_plan_record(metadata.plan_mode)
+
+    async def write_plan_record(
+        self, params: SessionPlanRecordWriteParams
+    ) -> SessionBackendResult[SessionPlanRecordWriteResponse]:
+        """Persist (or, with a null record, remove) the plan mode.
+
+        The response carries the record as READ BACK, so a session whose
+        logging is disabled answers None instead of echoing a mode no resume
+        could restore.
+        """
+        self._require_plan_record_session(params.session_id)
+        logger = self.session.agent_loop.session_logger
+        if params.record is None:
+            await logger.clear_plan_mode()
+        else:
+            await logger.persist_plan_mode(plan_mode_record(params.record))
+        metadata = logger.session_metadata
+        persisted = (
+            None
+            if metadata is None or metadata.plan_mode is None
+            else session_plan_record(metadata.plan_mode)
+        )
+        return SessionBackendResult(SessionPlanRecordWriteResponse(record=persisted))
+
+    def _require_plan_record_session(self, session_id: str) -> None:
+        if session_id != self.session_id:
+            raise SessionBackendError(
+                ProtocolErrorCode.INVALID_PARAMS,
+                "The plan record belongs to the root session",
+            )
 
     async def read_turn_queue(
         self, params: TurnQueueReadParams

@@ -974,6 +974,15 @@ class ToolManager:  # noqa: PLR0904 - reviewed authority lookup joins the full m
         pass. Cached decisions are keyed on the carried implementation as
         well (verified by identity through a weak reference), so a warm entry
         computed for one implementation is never served for another.
+
+        A CAPABILITY gate (``is_available``) is the CALLER's axis, not the
+        ceiling's: the caller already gated that class against its own
+        committed active model, so an ancestor whose own model fails the gate
+        still admits the carried implementation (v0.7.4: a non-vision parent
+        stripped ``read_image`` from vision-capable children). Authority —
+        granted configuration, live policy, delegation posture, and every
+        ancestor's ceiling — is unchanged; a name this identity does not
+        register stays denied.
         """
         if self._authority_retired:
             return None
@@ -1001,6 +1010,20 @@ class ToolManager:  # noqa: PLR0904 - reviewed authority lookup joins the full m
                 selected = self._select_available_variant_or_none(name, fallback)
         else:
             selected = self._select_available_variant_or_none(name, fallback)
+        if selected is None and selected_class is not None and fallback is not None:
+            # The caller already gated this exact class against ITS own
+            # committed active model, so capability is not this ceiling's
+            # axis: an ancestor's incompatible model never narrows a
+            # descendant's catalog (v0.7.4 read_image fix). Only a class that
+            # IS this name's implementation in this registry can stand in —
+            # the implementation a caller threads for ANOTHER name (the
+            # bash_start -> bash coupling) never resolves this one — and
+            # authority still decides below, so an unregistered name stays
+            # denied.
+            with self._lock:
+                registered = self._tool_variants_for_name(name, fallback)
+            if any(variant is selected_class for variant in registered):
+                selected = selected_class
         if selected is not None:
             if (
                 name == "bash_start"

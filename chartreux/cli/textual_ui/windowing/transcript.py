@@ -15,10 +15,13 @@ from chartreux.app_server.models import (
     PublicEffectEntry,
     PublicHistoryEntry,
     PublicMessageEntry,
+    PublicNoticeEntry,
     PublicReasoningEntry,
 )
 from chartreux.cli.textual_ui.widgets.entry_expansion import EntryExpansionState
+from chartreux.cli.textual_ui.widgets.message_header import MinuteKey
 from chartreux.cli.textual_ui.widgets.messages import StreamingMessageBase
+from chartreux.cli.textual_ui.widgets.minute_group_header import MinuteGroupHeader
 from chartreux.cli.textual_ui.widgets.tool_grouping import (
     ToolGroupExpansionState,
     ToolGroupKey,
@@ -35,7 +38,9 @@ from chartreux.cli.textual_ui.windowing.fingerprints import (
 )
 from chartreux.cli.textual_ui.windowing.history import (
     _build_history_widgets_raw,
+    advance_rendered_minute,
     history_entry_renders_widget,
+    notice_renders_record,
 )
 from chartreux.cli.textual_ui.windowing.placeholder import PlacementPlaceholder
 
@@ -71,6 +76,12 @@ class TranscriptUnit:
     pin_reasons: set[str] = field(default_factory=set)
     restoring: bool = False
     restore_generation: int = 0
+    # The minute bucket this unit opens with a group header, derived from the
+    # visible entry set (never captured at mount) beside its sibling units.
+    head_minute: MinuteKey | None = None
+    # The mounted header itself, kept beside ``mounted_roots``: entry roots
+    # stay the unit's identity for every consumer that resolves them.
+    minute_header: MinuteGroupHeader | None = None
 
 
 class _CompactingSet(set[str]):
@@ -316,6 +327,10 @@ class _ShadowIndexes:
 
 
 class TranscriptWindow:
+    # Late-bound timestamp preference, assigned by the session window; a preview
+    # or batch window leaves it unset and renders stamps unconditionally.
+    _get_show_timestamps: Callable[[], bool]
+
     def __init__(
         self,
         *,
@@ -373,6 +388,19 @@ class TranscriptWindow:
         self._entry_default = (
             entry_expansion_state.default_collapsed if entry_expansion_state else True
         )
+        # Minute group headers: the marker spans units, so its state lives on
+        # this window (the one that outlives them) and is re-derived from the
+        # visible entry set at every change -- never updated incrementally and
+        # never captured at mount.
+        self._minute_revision = 0
+        self._minute_markers: tuple[int, bool] | None = None
+        # Stamped notice records the live path mounts outside the unit registry:
+        # visible records that take part in the marker walk without owning a unit.
+        self._stamped_records: dict[str, PublicHistoryEntry] = {}
+        # The record widget each of those notices mounted. Residency is read
+        # from the DOM: a record whose widget left the transcript (a rebuild
+        # removes every child) renders nothing and must not move the marker.
+        self._stamped_record_widgets: dict[str, Widget] = {}
 
     @property
     def admitted_start_index(self) -> int:
@@ -601,7 +629,7 @@ class TranscriptWindow:
             if unit.pin_reasons:
                 continue
             roots = unit.mounted_roots
-            height = roots[-1].region.bottom - roots[0].region.y
+            height = roots[-1].region.bottom - self._unit_top_row(unit)
             if height > high_mark:
                 continue
             rows += height
@@ -893,6 +921,13 @@ class TranscriptWindow:
                     self._shadow.link_append(entry_id)
                 unit = current
             else:
+                if isinstance(entry, PublicNoticeEntry):
+                    # The live path mounts this record itself, so it owns no
+                    # unit; it is still a visible record, and its clock must
+                    # move the marker exactly as an admitted record does.
+                    if notice_renders_record(entry):
+                        self._stamped_records[entry_id] = entry
+                    continue
                 if not history_entry_renders_widget(entry):
                     continue
                 unit = TranscriptUnit(
@@ -911,6 +946,7 @@ class TranscriptWindow:
             self._shadow_admitted_entry(unit, entry)
             self._invalidate(unit)
         self._place_new_units(prior_units, prior_first)
+        self._minute_revision += 1
         return prefix_shift
 
     def sync_expansion(self) -> set[str]:
@@ -1008,6 +1044,10 @@ class TranscriptWindow:
             if self.entry_expansion_state
             else True
         )
+        self._minute_revision += 1
+        self._minute_markers = None
+        self._stamped_records.clear()
+        self._stamped_record_widgets.clear()
 
     def update_entry(self, entry: PublicHistoryEntry) -> None:
         """Refresh retained data even when its placement is currently evicted."""
@@ -1023,6 +1063,8 @@ class TranscriptWindow:
             self._shadow_replaced_entry(unit, previous, entry)
             unit.entry_fingerprints[offset] = fingerprint
             self._invalidate(unit)
+            if offset == 0:
+                self._minute_revision += 1
 
     def admit_reused_root(
         self, entry: PublicMessageEntry, root: Widget, *, index: int
@@ -1041,6 +1083,7 @@ class TranscriptWindow:
         self._entry_to_unit[entry.id] = unit.id
         self._shadow_admitted_entry(unit, entry)
         self._invalidate(unit)
+        self._minute_revision += 1
         return True
 
     def has_admitted_entry(self, entry_id: str) -> bool:
@@ -1156,7 +1199,7 @@ class TranscriptWindow:
             if unit.placeholders:
                 continue
             roots = unit.mounted_roots
-            top = roots[0].region.y
+            top = self._unit_top_row(unit)
             bottom = roots[-1].region.bottom
             height = bottom - top
             if height > high_mark or unit.pin_reasons:
@@ -1179,8 +1222,9 @@ class TranscriptWindow:
         evict: list[str] = []
         for _, unit_id in sorted(candidates, reverse=True):
             evict.append(unit_id)
-            roots = self.units[unit_id].mounted_roots
-            budgeted_rows -= roots[-1].region.bottom - roots[0].region.y
+            unit = self.units[unit_id]
+            roots = unit.mounted_roots
+            budgeted_rows -= roots[-1].region.bottom - self._unit_top_row(unit)
             if budgeted_rows <= low_mark:
                 break
         return evict
@@ -1201,21 +1245,28 @@ class TranscriptWindow:
         ):
             raise ValueError("unit roots must share a parent")
         placeholders = [PlacementPlaceholder.from_widget(root) for root in roots]
+        # The minute header leaves with the entries it stamps, and rejoins them
+        # when the unit is restored (it is re-derived from the entry clocks, so
+        # it is never a resumed capture).
+        header = unit.minute_header
+        leaving = ([header] if header is not None else []) + roots
         self._evicting.add(unit_id)
         try:
             with parent.app.batch_update():
                 try:
                     await parent.mount_all(placeholders, before=roots[0])
-                    for root in roots:
+                    for root in leaving:
                         await root.remove()
                 except BaseException as original:
                     # Rollback owns its own task: repeated cancellation of the caller
                     # must not interrupt the re-mount/remove sequence halfway through.
                     async def restore() -> None:
-                        missing = [root for root in roots if root.parent is not parent]
+                        missing = [
+                            root for root in leaving if root.parent is not parent
+                        ]
                         if missing:
                             anchor = next(
-                                (root for root in roots if root.parent is parent),
+                                (root for root in leaving if root.parent is parent),
                                 next(
                                     (p for p in placeholders if p.parent is parent),
                                     None,
@@ -1243,9 +1294,13 @@ class TranscriptWindow:
                         raise failure from original
                     raise
             unit.mounted_roots = []
+            unit.minute_header = None
             unit.placeholders = placeholders
             self._shadow_unit(unit)
             self.geometry_version += 1
+            # The visible entry set shrank: the marker must re-derive before the
+            # next mount trusts it.
+            self._minute_revision += 1
             return placeholders
         finally:
             self._evicting.discard(unit_id)
@@ -1288,6 +1343,7 @@ class TranscriptWindow:
             self._index_end = max(self._occupied_indices)
         else:
             self._index_start, self._index_end = 0, -1
+        self._minute_revision += 1
 
     @staticmethod
     async def _layout_pass(parent: Widget) -> None:
@@ -1322,6 +1378,14 @@ class TranscriptWindow:
         if unit.placeholders:
             return unit.placeholders[0]
         return unit.mounted_roots[0] if unit.mounted_roots else None
+
+    @staticmethod
+    def _unit_top_row(unit: TranscriptUnit) -> int:
+        """The unit's first screen row, counting a mounted minute header."""
+        header = unit.minute_header
+        if header is not None and header.is_mounted:
+            return header.region.y
+        return unit.mounted_roots[0].region.y
 
     def _placement_rows(self, unit_id: str) -> tuple[int, int] | None:
         """The screen rows a unit's placement representative occupies.
@@ -1546,6 +1610,9 @@ class TranscriptWindow:
         # A stable height across a refresh is the settle signal. The floor
         # allows delayed content to get a layout opportunity; the cap handles
         # continuously changing widgets without wedging the reservation.
+        content_roots = [
+            root for root in roots if not isinstance(root, MinuteGroupHeader)
+        ]
         previous_height: int | None = None
         view = self._scroll_view(stream)
         superseded = scroll_superseded
@@ -1577,8 +1644,9 @@ class TranscriptWindow:
             anchor_id, row_offset, screen_row = anchor
             target = self.units.get(anchor_id)
             placement = self._placement(target) if target is not None else None
-            if anchor_id == unit.id:
-                placement = roots[0]
+            if anchor_id == unit.id and content_roots:
+                # Anchor rows are read off the unit's entry root, not its header.
+                placement = content_roots[0]
             if placement is not None:
                 delta = placement.region.y + row_offset - screen_row
                 self._set_scroll_flag(view, "_transcript_engine_scroll", True)
@@ -1592,8 +1660,9 @@ class TranscriptWindow:
                 if not valid():
                     return False
         # The live id: identity adoption may have renamed the unit while the
-        # placeholders were leaving the DOM.
-        self.register_restored(unit.id, roots)
+        # placeholders were leaving the DOM. Only the entry roots register: the
+        # header stays a window-owned stamp beside them.
+        self.register_restored(unit.id, content_roots)
         return True
 
     @staticmethod
@@ -1653,6 +1722,9 @@ class TranscriptWindow:
                 return False
             unit.restoring = True
             unit.restore_generation += 1
+            # The unit rejoins the visible set: the marker re-derives with it,
+            # so the header it mounts carries the stamp its position earns.
+            self._minute_revision += 1
             generation = unit.restore_generation
             session = self._session_generation
             # The unit, not its entry-time id: identity adoption renames the
@@ -1672,6 +1744,10 @@ class TranscriptWindow:
                 roots = self.build_unit(unit_id, history_widget_indices)
                 if not roots:
                     raise ValueError("restored unit has no roots")
+                # The header rejoins the unit it stamps, derived from the entry
+                # clocks exactly as the first mount derived it.
+                header = self._restored_header(unit)
+                mount_roots = ([header] if header is not None else []) + roots
                 scroll_revision = self._scroll_revision
                 for placeholder in placeholders:
                     placeholder.reserve()
@@ -1685,13 +1761,14 @@ class TranscriptWindow:
         view = self._scroll_view(stream)
         self._set_scroll_flag(view, "_transcript_layout_change", True)
         try:
-            await stream.mount_all(roots, before=placeholders[0])
+            await stream.mount_all(mount_roots, before=placeholders[0])
+            unit.minute_header = header
             self._restore_roots(unit, roots)
             await self._layout_pass(stream)
             if not valid():
                 return False
             scroll_start = view.scroll_offset.y
-            await (initialize or self._initialize_roots)(roots)
+            await (initialize or self._initialize_roots)(mount_roots)
             if not valid():
                 return False
             scroll_superseded = self._scroll_superseded(
@@ -1703,7 +1780,7 @@ class TranscriptWindow:
                 completed = await self._finish_restore(
                     unit,
                     stream,
-                    roots,
+                    mount_roots,
                     placeholders,
                     anchor,
                     valid,
@@ -1715,21 +1792,33 @@ class TranscriptWindow:
         finally:
             try:
                 if not completed:
-                    async with self._reconcile_lock:
-                        await self._rollback_restore(
-                            stream,
-                            roots,
-                            placeholders,
-                            registered=self.units.get(unit.id) is unit,
-                        )
+                    await self._release_failed_restore(
+                        unit, stream, mount_roots, placeholders
+                    )
             finally:
                 self._set_scroll_flag(view, "_transcript_layout_change", False)
                 unit.restoring = False
-                if not completed and self.units.get(unit.id) is unit:
-                    self._release_roots(unit)
-                    # The rollback re-mounts the placeholders it removed, so
-                    # the unit's slot has no rows until the next layout either.
-                    self._mark_unmeasured(unit)
+
+    async def _release_failed_restore(
+        self,
+        unit: TranscriptUnit,
+        stream: Widget,
+        roots: list[Widget],
+        placeholders: list[PlacementPlaceholder],
+    ) -> None:
+        """Roll a failed or superseded restore back and hand the slot its rows."""
+        async with self._reconcile_lock:
+            await self._rollback_restore(
+                stream, roots, placeholders, registered=self.units.get(unit.id) is unit
+            )
+        unit.minute_header = None
+        # The restore that counted this unit in the visible set was abandoned.
+        self._minute_revision += 1
+        if self.units.get(unit.id) is unit:
+            self._release_roots(unit)
+            # The rollback re-mounts the placeholders it removed, so the
+            # unit's slot has no rows until the next layout either.
+            self._mark_unmeasured(unit)
 
     def _window_low(self, index: list[str], edge: int) -> int | None:
         """Bisect the first placement whose bottom passes ``edge``.
@@ -1904,6 +1993,139 @@ class TranscriptWindow:
             async with self._reconcile_lock:
                 if unit_id in self.units and self.units[unit_id].mounted_roots:
                     await self.evict_unit(unit_id)
+        await self._sync_minute_headers(stream)
+
+    # -- Minute group headers ------------------------------------------------
+    #
+    # A minute bucket stamps its first record; the records that continue inside
+    # that minute carry no stamp of their own. The marker therefore spans units,
+    # and it lives here on the window that outlives them: re-derived from the
+    # visible entry set at every change, so a rewind, a rebuild and an
+    # eviction/restore all re-derive it instead of replaying a mount decision.
+
+    def _shows_timestamps(self) -> bool:
+        """The session window's live preference; a preview window has no gate."""
+        getter = getattr(self, "_get_show_timestamps", None)
+        return True if getter is None else bool(getter())
+
+    def _minute_markers_current(self) -> bool:
+        return self._minute_markers == (self._minute_revision, self._shows_timestamps())
+
+    def _bind_stamped_record(self, entry_id: str, record: Widget) -> None:
+        """Bind a mounted notice record to the visible-minute walk.
+
+        The live path mounts these records itself, outside the unit registry.
+        Registering the widget is what makes the record *resident*: the walk
+        reads residency from the DOM, so a record whose widget a rebuild
+        removed stops moving the marker even before the registry is cleared.
+        """
+        self._stamped_record_widgets[entry_id] = record
+        self._minute_revision += 1
+
+    def _stamped_record_resident(self, entry_id: str) -> bool:
+        record = self._stamped_record_widgets.get(entry_id)
+        return record is not None and record.parent is not None
+
+    def _visible_minute_records(
+        self,
+    ) -> list[tuple[int, PublicHistoryEntry, TranscriptUnit | None]]:
+        """The visible records the marker walk spans, in timeline order.
+
+        Every entry of every resident unit -- internal fold entries included,
+        so a fold that continues past a minute hands the marker on -- plus the
+        stamped notice records that are actually mounted. An evicted unit
+        renders nothing, so it takes no part: the minute it opened is re-opened
+        by the first unit the reader can still see.
+        """
+        records: list[tuple[int, PublicHistoryEntry, TranscriptUnit | None]] = []
+        for unit in self.units.values():
+            if not (unit.mounted_roots or unit.restoring):
+                continue
+            for entry in unit.entries:
+                index = self._admitted_indices.get(entry.id)
+                if index is not None:
+                    records.append((index, entry, unit))
+        for entry in self._stamped_records.values():
+            if not self._stamped_record_resident(entry.id):
+                continue
+            index = self._admitted_indices.get(entry.id)
+            if index is not None:
+                records.append((index, entry, None))
+        records.sort(key=lambda record: record[0])
+        return records
+
+    def _visible_minute(self, *, excluding: str | None = None) -> MinuteKey | None:
+        """The minute the visible transcript last rendered, as the walk sees it.
+
+        The live path reads this beside its own walk: restore admits a batch
+        before live delivery appends anything, so the two must agree on the
+        minute the reader has already been shown.
+        """
+        rendered: MinuteKey | None = None
+        for _, entry, _unit in self._visible_minute_records():
+            if excluding is not None and entry.id == excluding:
+                continue
+            rendered, _marker = advance_rendered_minute(rendered, entry)
+        return rendered
+
+    def _derive_minute_markers(self) -> None:
+        """Re-derive each visible unit's leading minute stamp from its entries."""
+        self._minute_markers = (self._minute_revision, self._shows_timestamps())
+        for unit in self.units.values():
+            unit.head_minute = None
+        rendered: MinuteKey | None = None
+        for _, entry, unit in self._visible_minute_records():
+            rendered, marker = advance_rendered_minute(rendered, entry)
+            if (
+                marker is not None
+                and unit is not None
+                and unit.entries
+                and unit.entries[0] is entry
+            ):
+                unit.head_minute = marker
+
+    def _restored_header(self, unit: TranscriptUnit) -> MinuteGroupHeader | None:
+        """The header a restoring unit re-opens with, re-derived from its entries."""
+        if not self._minute_markers_current():
+            self._derive_minute_markers()
+        if unit.head_minute is None or not self._shows_timestamps():
+            return None
+        return MinuteGroupHeader(unit.head_minute)
+
+    async def _sync_minute_headers(self, stream: Widget) -> None:
+        """Mount, relabel or drop the group header each mounted unit opens.
+
+        Every mount path ends in a reconcile, so this is where a header enters
+        and leaves the DOM: the presenter mounts the unit's own roots and owns
+        no header of its own. The header sits above ``mounted_roots[0]``, which
+        stays the unit's entry root for every consumer that resolves it.
+        """
+        if not self._minute_markers_current():
+            self._derive_minute_markers()
+        show = self._shows_timestamps()
+        for unit_id in self._shadow.mounted:
+            unit = self.units.get(unit_id)
+            if unit is None or not unit.mounted_roots or unit.placeholders:
+                continue
+            header = unit.minute_header
+            minute = unit.head_minute if show else None
+            if minute is None:
+                if header is not None:
+                    unit.minute_header = None
+                    await header.remove()
+                    self._invalidate(unit)
+                    self._mark_unmeasured(unit)
+                continue
+            if header is None:
+                header = MinuteGroupHeader(minute)
+                await stream.mount(header, before=unit.mounted_roots[0])
+                unit.minute_header = header
+                self._invalidate(unit)
+                self._mark_unmeasured(unit)
+            elif header.minute != minute:
+                header.set_minute(minute)
+            else:
+                header.refresh_label()
 
     def request_reconcile(
         self,
@@ -1997,6 +2219,7 @@ class TranscriptWindow:
             tools_collapsed=self.tools_collapsed,
             expansion_state=self.expansion_state,
             entry_expansion_state=self.entry_expansion_state,
+            show_message_timestamps=self._shows_timestamps(),
         )
 
     def flat_widgets(

@@ -17,6 +17,11 @@ def local_now() -> datetime:
     return datetime.now().astimezone()
 
 
+# A local wall-clock minute: the bucket key group headers compare, independent
+# of the label a given day asks for.
+type MinuteKey = tuple[int, int, int, int, int]
+
+
 def format_message_timestamp(
     posted_at: datetime | None, *, now: datetime | None = None
 ) -> str:
@@ -26,6 +31,15 @@ def format_message_timestamp(
     local = posted_at.astimezone()
     today = (now if now is not None else local_now()).astimezone().date()
     return local.strftime("%H:%M" if local.date() == today else "%Y-%m-%d %H:%M")
+
+
+def format_group_header_timestamp(
+    minute: MinuteKey, *, now: datetime | None = None
+) -> str:
+    """Format a minute bucket exactly like a message header stamps its time."""
+    moment = datetime(minute[0], minute[1], minute[2], minute[3], minute[4])
+    today = (now if now is not None else local_now()).astimezone().date()
+    return moment.strftime("%H:%M" if moment.date() == today else "%Y-%m-%d %H:%M")
 
 
 class MessageHeader(Horizontal):

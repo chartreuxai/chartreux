@@ -1,9 +1,10 @@
-"""The ``/plan accept`` consent modal: the plan, its path, and the executor.
+"""The ``/plan accept`` consent modal: the plan, its theme, path, and executor.
 
 One explicit decision before the handoff replaces the conversation: start
 execution with the snapshotted executor selection, or cancel and stay in plan
 mode. Nothing here resolves or re-reads a selection — the app snapshots it at
-modal open and the handoff applies exactly what this screen displays.
+modal open and the handoff applies exactly what this screen displays. The
+theme row appears only when the mode has a theme, and never rides the handoff.
 """
 
 from __future__ import annotations
@@ -44,6 +45,7 @@ class PlanConsentScreen(ModalScreen[bool]):
         executor_thinking: str,
         executor_identity: str,
         executor_display_name: str,
+        theme: str | None = None,
     ) -> None:
         super().__init__(id="plan-consent-screen")
         self._plan_path = plan_path
@@ -52,6 +54,7 @@ class PlanConsentScreen(ModalScreen[bool]):
         self._executor_thinking = executor_thinking
         self._executor_identity = executor_identity
         self._executor_display_name = executor_display_name
+        self._theme = theme
 
     def compose(self) -> ComposeResult:
         with Vertical(id="plan-consent-dialog"):
@@ -63,6 +66,13 @@ class PlanConsentScreen(ModalScreen[bool]):
                     classes="plan-consent-value",
                     id="plan-consent-path",
                 )
+                if self._theme:
+                    yield NoMarkupStatic("Theme", classes="plan-consent-label")
+                    yield NoMarkupStatic(
+                        self._theme,
+                        classes="plan-consent-value",
+                        id="plan-consent-theme",
+                    )
                 yield NoMarkupStatic("Summary", classes="plan-consent-label")
                 yield NoMarkupStatic(
                     self._summary,

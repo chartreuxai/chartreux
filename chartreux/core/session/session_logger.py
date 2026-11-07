@@ -56,6 +56,7 @@ from chartreux.core.session.transcript_archive import (
 from chartreux.core.session_types import (
     AgentStats,
     LaunchMetadata,
+    PlanModeRecord,
     SessionMetadata,
     WorktreeContext,
 )
@@ -3056,6 +3057,30 @@ class SessionLogger:  # noqa: PLR0904
                 await self._persist_metadata_locked(metadata, session_dir)
             session_metadata.config = config
             return True
+
+    async def persist_plan_mode(self, record: PlanModeRecord) -> None:
+        """Record the active plan mode (design §7); written once at entry.
+
+        The in-memory field is set as well as the file patched, for the same
+        reason ``created_worktree`` does both: entry can precede the session's
+        first message, so on a fresh session there is no metadata file to patch
+        yet and only the in-memory record can reach the first full save.
+        """
+        session_info = self._get_session_info()
+        if session_info is None:
+            return
+        _, session_metadata = session_info
+        session_metadata.plan_mode = record
+        await self._persist_metadata_field("plan_mode", record.model_dump(mode="json"))
+
+    async def clear_plan_mode(self) -> None:
+        """Remove the plan-mode record; the session is no longer planning."""
+        session_info = self._get_session_info()
+        if session_info is None:
+            return
+        _, session_metadata = session_info
+        session_metadata.plan_mode = None
+        await self._persist_metadata_field("plan_mode", None)
 
     async def persist_loops(self) -> None:
         session_info = self._get_session_info()
