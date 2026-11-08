@@ -1,0 +1,209 @@
+{
+  "attempt_count": 5,
+  "attempt_digest": "d488811af40023304ed4f6f0b07a6a69f49ab2242ad4417dd14afebc827a67ff",
+  "attempts": [
+    {
+      "failing_row": null,
+      "machine_fields_missing": [],
+      "machine_mismatch_fields": [],
+      "reasons": [],
+      "row_reasons": {},
+      "run_id": "x2_loaded_headless_8x200k-r01",
+      "run_reasons": [],
+      "run_start_utc": "2026-11-08T02:22:31Z",
+      "status": "eligible"
+    },
+    {
+      "failing_row": null,
+      "machine_fields_missing": [],
+      "machine_mismatch_fields": [],
+      "reasons": [],
+      "row_reasons": {},
+      "run_id": "x2_loaded_headless_8x200k-r02",
+      "run_reasons": [],
+      "run_start_utc": "2026-11-08T02:24:59Z",
+      "status": "eligible"
+    },
+    {
+      "failing_row": null,
+      "machine_fields_missing": [],
+      "machine_mismatch_fields": [],
+      "reasons": [],
+      "row_reasons": {},
+      "run_id": "x2_loaded_headless_8x200k-r03",
+      "run_reasons": [],
+      "run_start_utc": "2026-11-08T02:27:28Z",
+      "status": "eligible"
+    },
+    {
+      "failing_row": null,
+      "machine_fields_missing": [],
+      "machine_mismatch_fields": [],
+      "reasons": [],
+      "row_reasons": {},
+      "run_id": "x2_loaded_headless_8x200k-r04",
+      "run_reasons": [],
+      "run_start_utc": "2026-11-08T02:29:57Z",
+      "status": "eligible"
+    },
+    {
+      "failing_row": null,
+      "machine_fields_missing": [],
+      "machine_mismatch_fields": [],
+      "reasons": [],
+      "row_reasons": {},
+      "run_id": "x2_loaded_headless_8x200k-r05",
+      "run_reasons": [],
+      "run_start_utc": "2026-11-08T02:32:25Z",
+      "status": "eligible"
+    }
+  ],
+  "campaign_ids": [
+    "B1",
+    "B2",
+    "B3",
+    "B4"
+  ],
+  "campaigns": {
+    "B1": {
+      "campaign_id": "B1",
+      "cell": "x2_loaded_headless_8x200k",
+      "metric": "turn_application_overhead_p95_ms",
+      "null_reason": null,
+      "run_ids": [
+        "x2_loaded_headless_8x200k-r01",
+        "x2_loaded_headless_8x200k-r02",
+        "x2_loaded_headless_8x200k-r03",
+        "x2_loaded_headless_8x200k-r04",
+        "x2_loaded_headless_8x200k-r05"
+      ],
+      "run_p95s": [
+        19.4036,
+        19.9545,
+        20.1477,
+        20.1477,
+        19.7949
+      ],
+      "unit": "ms"
+    },
+    "B2": {
+      "campaign_id": "B2",
+      "cell": "x2_loaded_headless_8x200k",
+      "metric": "loop_heartbeat_excess_p95_ms",
+      "null_reason": null,
+      "run_ids": [
+        "x2_loaded_headless_8x200k-r01",
+        "x2_loaded_headless_8x200k-r02",
+        "x2_loaded_headless_8x200k-r03",
+        "x2_loaded_headless_8x200k-r04",
+        "x2_loaded_headless_8x200k-r05"
+      ],
+      "run_p95s": [
+        44.1837,
+        45.0482,
+        45.5554,
+        44.8221,
+        44.4161
+      ],
+      "unit": "ms"
+    },
+    "B3": {
+      "campaign_id": "B3",
+      "cell": "x2_loaded_headless_8x200k",
+      "metric": "notification_count_p95_per_root_turn",
+      "null_reason": null,
+      "run_ids": [
+        "x2_loaded_headless_8x200k-r01",
+        "x2_loaded_headless_8x200k-r02",
+        "x2_loaded_headless_8x200k-r03",
+        "x2_loaded_headless_8x200k-r04",
+        "x2_loaded_headless_8x200k-r05"
+      ],
+      "run_p95s": [
+        9.0,
+        9.0,
+        9.0,
+        9.0,
+        9.0
+      ],
+      "unit": "events"
+    },
+    "B4": {
+      "campaign_id": "B4",
+      "cell": "x2_loaded_headless_8x200k",
+      "metric": "notification_bytes_p95_per_root_turn",
+      "null_reason": null,
+      "run_ids": [
+        "x2_loaded_headless_8x200k-r01",
+        "x2_loaded_headless_8x200k-r02",
+        "x2_loaded_headless_8x200k-r03",
+        "x2_loaded_headless_8x200k-r04",
+        "x2_loaded_headless_8x200k-r05"
+      ],
+      "run_p95s": [
+        4972.0,
+        4972.0,
+        4972.0,
+        4972.0,
+        4972.0
+      ],
+      "unit": "bytes"
+    }
+  },
+  "cell": "x2_loaded_headless_8x200k",
+  "cell_identity": {
+    "cell": "x2_loaded_headless_8x200k",
+    "dimensions": {
+      "burst_agents": 7,
+      "burst_interval_turns": 10,
+      "child_agents": 7,
+      "history_messages": 2000,
+      "mode": "measure",
+      "root_turns": 400
+    },
+    "fixture_hash": "25d08b939a0329f8af0276686ccc468880b03d9ce5079832822391d80c9b9d7d",
+    "metric_version": "chartreux.runtime_perf.v1",
+    "workload_hash": null
+  },
+  "closure": {
+    "eligible_run_count": 5,
+    "eligible_run_ids": [
+      "x2_loaded_headless_8x200k-r01",
+      "x2_loaded_headless_8x200k-r02",
+      "x2_loaded_headless_8x200k-r03",
+      "x2_loaded_headless_8x200k-r04",
+      "x2_loaded_headless_8x200k-r05"
+    ],
+    "note": "5 eligible runs collected; the latest 5 are selected",
+    "reason": null,
+    "selected_run_count": 5,
+    "selected_run_ids": [
+      "x2_loaded_headless_8x200k-r01",
+      "x2_loaded_headless_8x200k-r02",
+      "x2_loaded_headless_8x200k-r03",
+      "x2_loaded_headless_8x200k-r04",
+      "x2_loaded_headless_8x200k-r05"
+    ],
+    "status": "eligible_complete"
+  },
+  "eligible_run_ids": [
+    "x2_loaded_headless_8x200k-r01",
+    "x2_loaded_headless_8x200k-r02",
+    "x2_loaded_headless_8x200k-r03",
+    "x2_loaded_headless_8x200k-r04",
+    "x2_loaded_headless_8x200k-r05"
+  ],
+  "machine": {
+    "commit": "33501f3d",
+    "core_count": 24,
+    "cpu_model": "AMD Ryzen 9 5900X 12-Core Processor",
+    "loadavg": [
+      0.771484375,
+      1.154296875,
+      1.33935546875
+    ],
+    "platform": "Linux-7.3.0-10-generic-x86_64-with-glibc2.44",
+    "python_version": "3.12.13"
+  },
+  "schema": "chartreux.runtime_baseline.v1"
+}

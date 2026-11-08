@@ -2076,14 +2076,12 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
         duration = turn.timing.finish()
         if duration is None:
             return
-        retained = {
-            message.message_id: message
-            for message in self.messages
-            if message.role is Role.assistant and message.content
-        }
+        # The stamp is a POST-RETENTION in-place write: the prose owner already
+        # sits in the retained list, so it goes through the list's bumping
+        # accessor — a request frozen before the stamp can never be reused
+        # after it.
         for message_id in reversed(turn.prose_ids):
-            if (message := retained.get(message_id)) is not None:
-                message.turn_duration = duration
+            if self.messages.stamp_turn_duration(message_id, duration):
                 self.completed_turn_timing = CompletedTurnTiming(message_id, duration)
                 # The owner can precede the logger's last saved boundary message.
                 try:

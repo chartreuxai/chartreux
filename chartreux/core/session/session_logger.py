@@ -47,10 +47,14 @@ from chartreux.core.session.transcript_archive import (
     ArchiveSealError,
     ArchiveSealReceipt,
     ReboundHydrationProof,
+    TrimAttemptKey,
     archived_prefix_chunks,
     eligible_archive_prefix,
+    eligible_pre_seal_prefix,
     iter_archived_records,
+    pre_seal_endpoint,
     prove_rebound_hydration,
+    trim_attempt_key,
     verify_archived_prefix_on_disk,
 )
 from chartreux.core.session_types import (
@@ -348,13 +352,17 @@ class SessionLogger:  # noqa: PLR0904
         # Serializes writes so concurrent saves cannot interleave appends to
         # messages.jsonl or race on the metadata read-modify-write.
         self._save_lock = asyncio.Lock()
-        # T1b post-turn trim completion: exclusivity per compaction boundary.
-        # A boundary is in ``_trim_in_flight_boundaries`` while its
+        # T1b post-turn trim completion: exclusivity per release-attempt key.
+        # A key is in ``_trim_in_flight_boundaries`` while its
         # drain/fence/seal/publication attempt runs and in
         # ``_trim_published_boundaries`` once published; a second attempt for
-        # the same boundary is excluded, never a concurrent seal/publication.
-        self._trim_in_flight_boundaries: set[str] = set()
-        self._trim_published_boundaries: set[str] = set()
+        # the same key is excluded, never a concurrent seal/publication. The
+        # key is the widened seam key (``trim_attempt_key``): a real compaction
+        # boundary keys as ("boundary", session, epoch, boundary id), a
+        # pre-seal release as ("pre-seal", session, epoch, endpoint) — never a
+        # bare None key.
+        self._trim_in_flight_boundaries: set[TrimAttemptKey] = set()
+        self._trim_published_boundaries: set[TrimAttemptKey] = set()
 
         # Repair every configured store independently, including when new logging
         # is disabled. The repair recognizes session directories and leaves other
@@ -507,8 +515,12 @@ class SessionLogger:  # noqa: PLR0904
         Minted (P4a4, M1 §4) only when a retained descriptor's epoch matches
         the saved list's epoch — the authoritative pairing. Without it the
         validators get no authority, so any archive marker in the snapshot
-        fails closed there. Function-level import: a top-level import of the
-        agent_loop validator would cycle (agent_loop -> _loop -> this module).
+        fails closed there. A PRE-SEAL descriptor (``boundary_message_id``
+        None, P3) is widened to the snapshot's current non-system count: the
+        whole live list is covered by the verified transcript, so the
+        authority carries no tail that would need a compaction boundary.
+        Function-level import: a top-level import of the agent_loop validator
+        would cycle (agent_loop -> _loop -> this module).
         """
         descriptor = self._archive_descriptor
         if descriptor is None:
@@ -518,6 +530,31 @@ class SessionLogger:  # noqa: PLR0904
         )
         if message_epoch is None or descriptor.message_epoch != message_epoch:
             return None
+        if descriptor.boundary_message_id is None:
+            from chartreux.core.agent_loop._transcript_integrity import (
+                ARCHIVE_REFERENCE_ATTRIBUTE,
+                ArchivedPrefixAuthority,
+            )
+
+            if any(
+                getattr(message, ARCHIVE_REFERENCE_ATTRIBUTE, None) is not None
+                for message in messages
+            ):
+                # A boundary-None descriptor over MARKED slots is not the
+                # cover-all pre-seal shape — the pre-seal publication replaces
+                # every slot with an UNMARKED copy — it is a partial seal
+                # (e.g. handed off across a fork/rewind). Mint the plain
+                # authority over the descriptor's own archived_count so the
+                # markers still match the sealed prefix exactly.
+                return self._mint_archive_authority(descriptor)
+            non_system_count = sum(
+                1 for message in messages if message.role is not Role.system
+            )
+            return ArchivedPrefixAuthority(
+                archived_count=non_system_count,
+                boundary_message_id=None,
+                message_epoch=descriptor.message_epoch,
+            )
         return self._mint_archive_authority(descriptor)
 
     @staticmethod
@@ -957,17 +994,6 @@ class SessionLogger:  # noqa: PLR0904
         if not non_system_messages and not allow_empty:
             return
 
-        # PI1/T (S1 save boundary): a transcript defect is never silently
-        # persisted. The append/insert boundary already refuses to create one;
-        # this backstop fails closed with the typed local diagnostic so no
-        # unknown path can re-poison the log the load-time repair just healed.
-        # P4a4: with an authoritative retained descriptor the save recognizes
-        # its authorized archived prefix (M1 §4); without one, any archive
-        # marker in the snapshot fails closed.
-        self._check_transcript_persistence(
-            non_system_messages, archived_prefix=self._archive_authority_for(messages)
-        )
-
         # Serialization and fsync are too slow for the UI thread, so snapshot
         # here and hand off to a worker thread.
         messages_snapshot = list(messages)
@@ -982,7 +1008,28 @@ class SessionLogger:  # noqa: PLR0904
             ),
         )
         config_snapshot = config.model_dump(mode="json")
+        # P5 (S1-C, protocol v2.3): the archived-prefix authority argument is
+        # captured on-loop pre-lock, exactly as the on-loop validation call
+        # captured it.
+        archived_prefix_authority = self._archive_authority_for(messages)
         async with self._save_lock:
+            # PI1/T (S1 save boundary): a transcript defect is never silently
+            # persisted. The append/insert boundary already refuses to create
+            # one; this backstop fails closed with the typed local diagnostic
+            # so no unknown path can re-poison the log the load-time repair
+            # just healed. P4a4: with an authoritative retained descriptor the
+            # save recognizes its authorized archived prefix (M1 §4); without
+            # one, any archive marker in the snapshot fails closed. The scan
+            # itself runs in a worker thread while the save lock is held, so
+            # the event loop stays free; the typed TranscriptIntegrityError
+            # still raises from inside the lock BEFORE the staleness fence
+            # below — exactly the on-loop call's observable failure, only on
+            # another thread.
+            await asyncio.to_thread(
+                self._check_transcript_persistence,
+                non_system_messages,
+                archived_prefix=archived_prefix_authority,
+            )
             # Fence the entire write (transcript and metadata), not only the
             # cursor update. Rewind/reset invalidates snapshots queued earlier.
             if self._transcript_cursor_generation != cursor_generation_snapshot:
@@ -1152,9 +1199,12 @@ class SessionLogger:  # noqa: PLR0904
             )
         eligible = eligible_archive_prefix(messages_snapshot)
         if eligible is None:
-            raise ArchiveSealError(
-                "no eligible archive prefix: no compaction boundary with a "
-                "complete settled round strictly before it"
+            # P3 (S1-B) pre-seal arm: no compaction boundary exists yet, so
+            # the post-seal prefix is not eligible. Release the settled
+            # pre-compaction prefix's reasoning payloads instead (disk
+            # unchanged) — or refuse when nothing is eligible pre-seal either.
+            return self._plan_pre_seal_release(
+                messages_snapshot, message_epoch, trim_mode, retained, messages_path
             )
         prefix_messages = list(eligible.messages)
         # M1 §4 required-contract item 1: strictly validate the closed prefix
@@ -1167,9 +1217,16 @@ class SessionLogger:  # noqa: PLR0904
         # marker). Without a retained descriptor this is None and any marker
         # fails closed here. The stale-retained check above has already
         # established the authoritative pairing, and ``messages_snapshot`` is a
-        # plain sequence (no list epoch to re-derive).
+        # plain sequence (no list epoch to re-derive). A retained PRE-SEAL
+        # descriptor (boundary None) is widened to the whole closed prefix:
+        # pre-seal slots carry no markers and the prefix has no compaction
+        # boundary in its tail.
         archived_prefix_authority = (
-            self._mint_archive_authority(retained) if retained is not None else None
+            self._widened_pre_seal_authority(retained, len(prefix_messages))
+            if retained is not None and retained.boundary_message_id is None
+            else self._mint_archive_authority(retained)
+            if retained is not None
+            else None
         )
         violations = validate_transcript(
             prefix_messages,
@@ -1214,6 +1271,105 @@ class SessionLogger:  # noqa: PLR0904
             prefix_end_byte=len(archived_bytes),
             prefix_sha256=hashlib.sha256(archived_bytes).hexdigest(),
             boundary_message_id=eligible.boundary_message_id,
+            trim_mode=trim_mode,
+        )
+
+    @staticmethod
+    def _widened_pre_seal_authority(
+        retained: ArchivedPrefixV1, covered_count: int
+    ) -> Any:
+        """The validation authority for a PRE-SEAL (boundary-None) archive.
+
+        A pre-seal descriptor covers the whole non-system snapshot it was
+        sealed over, and its released slots carry no archive markers, so the
+        authority is widened to ``covered_count`` records: the validators then
+        see no tail that would need a compaction boundary. Function-level
+        import: a top-level import of the agent_loop validator would cycle.
+        """
+        from chartreux.core.agent_loop._transcript_integrity import (
+            ArchivedPrefixAuthority,
+        )
+
+        return ArchivedPrefixAuthority(
+            archived_count=covered_count,
+            boundary_message_id=None,
+            message_epoch=retained.message_epoch,
+        )
+
+    def _plan_pre_seal_release(
+        self,
+        messages_snapshot: list[LLMMessage],
+        message_epoch: int,
+        trim_mode: Literal["payloads", "tombstones"],
+        retained: ArchivedPrefixV1 | None,
+        messages_path: Path,
+    ) -> ArchivedPrefixV1:
+        """Plan a PRE-SEAL payload release (P3, S1-B): descriptor with
+        ``boundary_message_id=None``.
+
+        The pre-seal descriptor covers the WHOLE non-system snapshot: the
+        released prefix and the retained rounds all live in the durably
+        verified transcript, so the cover-all descriptor leaves no live tail
+        that the admission validators would require to carry a compaction
+        boundary. The strict settled validation runs over the eligible
+        pre-seal prefix (settled by construction); the persistence check runs
+        over the whole snapshot. A re-release over a retained pre-seal
+        descriptor extends from the OLD PREFIX DISK BYTES plus the newly
+        appended records (the released slots' RAM copies no longer carry the
+        original payloads). Every refusal raises ``ArchiveSealError``.
+        """
+        pre = eligible_pre_seal_prefix(messages_snapshot)
+        if pre is None:
+            raise ArchiveSealError(
+                "no eligible archive prefix: no compaction boundary with a "
+                "complete settled round strictly before it, and no eligible "
+                "pre-seal prefix (settled rounds before the newest "
+                "retained user rounds carrying a reasoning payload)"
+            )
+        from chartreux.core.agent_loop._transcript_integrity import validate_transcript
+
+        non_system_messages = [
+            message for message in messages_snapshot if message.role != Role.system
+        ]
+        # The pre-seal descriptor covers the whole non-system snapshot; the
+        # authority is widened accordingly (pre-seal slots carry no markers).
+        archived_prefix_authority = (
+            self._widened_pre_seal_authority(retained, len(non_system_messages))
+            if retained is not None
+            else None
+        )
+        violations = validate_transcript(
+            list(pre.messages),
+            live_tail_exempt=False,
+            archived_prefix=archived_prefix_authority,
+        )
+        if violations:
+            raise ArchiveSealError(
+                "the pre-seal prefix failed the strict settled-transcript "
+                "validation; no receipt",
+                violations=tuple(violations),
+            )
+        self._check_transcript_persistence(
+            non_system_messages, archived_prefix=archived_prefix_authority
+        )
+        if retained is not None:
+            return self._extend_archive_descriptor(
+                retained,
+                non_system_messages,
+                message_epoch,
+                trim_mode,
+                boundary_message_id=None,
+                messages_path=messages_path,
+            )
+        prefix_records = [SessionLogger._message_record(m) for m in non_system_messages]
+        archived_bytes = SessionLogger._transcript_bytes(prefix_records)
+        return ArchivedPrefixV1(
+            session_id=self.session_id,
+            message_epoch=message_epoch,
+            archived_count=len(prefix_records),
+            prefix_end_byte=len(archived_bytes),
+            prefix_sha256=hashlib.sha256(archived_bytes).hexdigest(),
+            boundary_message_id=None,
             trim_mode=trim_mode,
         )
 
@@ -1548,7 +1704,7 @@ class SessionLogger:  # noqa: PLR0904
         self._archive_descriptor = descriptor_before
         self._last_save_archive_snapshot = snapshot_before
 
-    async def complete_post_turn_trim(  # noqa: PLR0911 - one explicit outcome per refusal/failure arm
+    async def complete_post_turn_trim(  # noqa: PLR0911, PLR0912, PLR0915 - one explicit outcome per refusal/failure arm
         self,
         messages: MessageList,
         stats: AgentStats,
@@ -1557,7 +1713,7 @@ class SessionLogger:  # noqa: PLR0904
         *,
         session_id: str,
         message_epoch: int,
-        boundary_message_id: str,
+        boundary_message_id: str | None,
         trim_mode: Literal["payloads", "tombstones"] = "payloads",
     ) -> PostTurnTrimResult:
         """Drain, fence, seal and publish a pending post-turn trim (T1b).
@@ -1566,12 +1722,13 @@ class SessionLogger:  # noqa: PLR0904
         the compaction manager records the pending trim at the exclusive idle
         seam and calls this with the recorded key. The path, in order:
 
-        1. validate the key (session, message epoch, boundary) against the
-           live list — a stale key is refused at this attempt boundary;
+        1. validate the key (session, message epoch, boundary or pre-seal
+           endpoint) against the live list — a stale key is refused at this
+           attempt boundary;
         2. DRAIN queued/in-flight saves and take the exclusivity + fence
            snapshot under ``_save_lock``: every save queued before this point
-           completes first, the boundary enters the in-flight set (no
-           concurrent seal/publication for the same boundary), and the save /
+           completes first, the attempt key enters the in-flight set (no
+           concurrent seal/publication for the same key), and the save /
            reset generations are snapshotted for the publication fence;
         3. SEAL via ``seal_archive`` (its own durable persist runs under the
            save lock, after the drained saves, and issues the receipt only
@@ -1579,6 +1736,15 @@ class SessionLogger:  # noqa: PLR0904
         4. FENCE + PUBLISH in one synchronous call to
            ``fence_and_publish_archive_trim`` — the fence and the publication
            never split as active behavior.
+
+        ``boundary_message_id=None`` selects the P3 pre-seal release: the
+        attempt key is the progressive pre-seal key (stable eligible-prefix
+        endpoint + session/epoch — never a bare None key), the seal plans a
+        boundary-None descriptor covering the whole non-system snapshot, and
+        the publication releases only the eligible pre-seal prefix's
+        reasoning payloads (the retained rounds keep theirs; disk is
+        unchanged). A real boundary coalesces: post-seal alone owns the
+        release once one exists.
 
         Failure semantics, each reported as an explicit outcome: a refused or
         failed seal issues no receipt and retains the originals; a seal that
@@ -1602,27 +1768,57 @@ class SessionLogger:  # noqa: PLR0904
                 f"pending message epoch {message_epoch} != list epoch "
                 f"{messages.message_epoch}: stale after a rebind, never sealed",
             )
-        eligible = eligible_archive_prefix(list(messages))
-        if eligible is None or eligible.boundary_message_id != boundary_message_id:
-            return PostTurnTrimResult(
-                "refused_boundary_mismatch",
-                f"pending boundary {boundary_message_id!r} is not the live "
-                "eligible boundary",
-            )
+        if boundary_message_id is not None:
+            eligible = eligible_archive_prefix(list(messages))
+            if eligible is None or eligible.boundary_message_id != boundary_message_id:
+                return PostTurnTrimResult(
+                    "refused_boundary_mismatch",
+                    f"pending boundary {boundary_message_id!r} is not the live "
+                    "eligible boundary",
+                )
+            endpoint: str | None = None
+        else:
+            pre = eligible_pre_seal_prefix(list(messages))
+            if pre is None:
+                return PostTurnTrimResult(
+                    "refused_boundary_mismatch",
+                    "no eligible pre-seal prefix: nothing settled before the "
+                    "retained user rounds carries a reasoning payload",
+                )
+            endpoint = pre_seal_endpoint(pre)
+        # The widened seam key — a real boundary keys as ("boundary", ...), a
+        # pre-seal release as ("pre-seal", ...) from the stable endpoint.
+        attempt_key = trim_attempt_key(
+            session_id, message_epoch, boundary_message_id, endpoint
+        )
         # Drain + exclusivity + fence snapshot under the save lock. Releasing
         # the lock before the seal is safe: seal_archive re-acquires it, so any
         # save queued in between still completes before the sealing persist,
         # and the publication fence discards anything snapshotted earlier.
         async with self._save_lock:
-            if boundary_message_id in self._trim_published_boundaries:
-                return PostTurnTrimResult(
-                    "excluded_already_published",
-                    f"boundary {boundary_message_id!r} was already sealed and published",
+            if attempt_key in self._trim_published_boundaries:
+                retained_now = self._archive_descriptor
+                non_system_now = sum(
+                    1 for message in messages if message.role is not Role.system
                 )
-            if boundary_message_id in self._trim_in_flight_boundaries:
+                if (
+                    retained_now is not None
+                    and retained_now.boundary_message_id is None
+                    and retained_now.archived_count < non_system_now
+                ):
+                    # A published pre-seal key with a coverage gap: the list
+                    # grew since the release — proceed to extend the cover-all
+                    # descriptor over the grown list (replacements idempotent).
+                    pass
+                else:
+                    return PostTurnTrimResult(
+                        "excluded_already_published",
+                        f"release key {attempt_key!r} was already sealed and published",
+                    )
+            if attempt_key in self._trim_in_flight_boundaries:
                 return PostTurnTrimResult(
                     "excluded_concurrent",
-                    f"a seal/publication for boundary {boundary_message_id!r} "
+                    f"a seal/publication for release key {attempt_key!r} "
                     "is already in flight",
                 )
             retained_before = self._archive_descriptor
@@ -1638,7 +1834,7 @@ class SessionLogger:  # noqa: PLR0904
                 )
             save_generation = self._transcript_cursor_generation
             reset_generation = self._archive_generation
-            self._trim_in_flight_boundaries.add(boundary_message_id)
+            self._trim_in_flight_boundaries.add(attempt_key)
         try:
             try:
                 receipt = await self.seal_archive(
@@ -1656,23 +1852,52 @@ class SessionLogger:  # noqa: PLR0904
             # The publish block is fully synchronous: no await can interleave
             # between the seal's receipt and the fence+publication.
             try:
-                eligible_now = eligible_archive_prefix(list(messages))
-                if (
-                    eligible_now is None
-                    or eligible_now.boundary_message_id != boundary_message_id
-                    or len(eligible_now.messages) != receipt.descriptor.archived_count
-                ):
-                    raise ArchiveSealError(
-                        "the list moved between sealing and publication; no publish"
-                    )
-                replacements = [
-                    archived_replacement(
-                        message,
-                        receipt.descriptor,
-                        trim_mode=receipt.descriptor.trim_mode,
-                    )
-                    for message in eligible_now.messages
-                ]
+                if boundary_message_id is not None:
+                    eligible_now = eligible_archive_prefix(list(messages))
+                    if (
+                        eligible_now is None
+                        or eligible_now.boundary_message_id != boundary_message_id
+                        or len(eligible_now.messages)
+                        != receipt.descriptor.archived_count
+                    ):
+                        raise ArchiveSealError(
+                            "the list moved between sealing and publication; no publish"
+                        )
+                    replacements = [
+                        archived_replacement(
+                            message,
+                            receipt.descriptor,
+                            trim_mode=receipt.descriptor.trim_mode,
+                        )
+                        for message in eligible_now.messages
+                    ]
+                else:
+                    pre_now = eligible_pre_seal_prefix(list(messages))
+                    non_system_now = [
+                        message
+                        for message in messages
+                        if message.role is not Role.system
+                    ]
+                    if (
+                        pre_now is None
+                        or pre_seal_endpoint(pre_now) != endpoint
+                        or len(non_system_now) != receipt.descriptor.archived_count
+                    ):
+                        raise ArchiveSealError(
+                            "the list moved between sealing and publication; no publish"
+                        )
+                    # Pre-seal publication through publish_archive_trim: the
+                    # cover-all descriptor replaces every non-system slot — the
+                    # eligible pre-seal prefix with payload-trimmed copies
+                    # (unmarked: the model context still carries them), the
+                    # retained rounds with their full selves.
+                    released = len(pre_now.messages)
+                    replacements = [
+                        message.model_copy(update={"reasoning_payloads": None})
+                        if index < released
+                        else message
+                        for index, message in enumerate(non_system_now)
+                    ]
                 self.fence_and_publish_archive_trim(
                     messages,
                     receipt.descriptor,
@@ -1692,10 +1917,10 @@ class SessionLogger:  # noqa: PLR0904
                 return PostTurnTrimResult(
                     "failed_publish", f"{type(exc).__name__}: {exc}", receipt=receipt
                 )
-            self._trim_published_boundaries.add(boundary_message_id)
+            self._trim_published_boundaries.add(attempt_key)
             return PostTurnTrimResult("published", receipt=receipt)
         finally:
-            self._trim_in_flight_boundaries.discard(boundary_message_id)
+            self._trim_in_flight_boundaries.discard(attempt_key)
 
     async def clear_and_reseal_warm_resume(
         self,

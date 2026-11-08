@@ -16,7 +16,7 @@ format).
 from __future__ import annotations
 
 from collections import deque
-from collections.abc import Iterable, Iterator, Sequence
+from collections.abc import Container, Iterable, Iterator, Sequence
 from dataclasses import dataclass
 import hashlib
 import json
@@ -292,6 +292,170 @@ def eligible_archive_prefix(
     return EligibleArchivePrefix(
         messages=region[:end], boundary_message_id=boundary_message_id
     )
+
+
+#: P3 (S1-B) pre-seal release policy: the newest
+#: ``PRE_SEAL_RETAIN_RECENT_USER_ROUNDS`` user-started rounds are retained in
+#: full (payloads included); only the longest settled prefix strictly before
+#: the older of those two rounds is eligible for payload release.
+PRE_SEAL_RETAIN_RECENT_USER_ROUNDS = 2
+
+
+@dataclass(frozen=True)
+class EligiblePreSealPrefix:
+    """The settled pre-compaction prefix eligible for payload release (S1-B).
+
+    ``messages`` holds the non-system messages of the closed prefix — the
+    longest settled round-ending prefix strictly before the older of the
+    newest ``PRE_SEAL_RETAIN_RECENT_USER_ROUNDS`` user-started rounds — and
+    ``endpoint_message_id`` is the message id of its last message (the stable
+    eligible-prefix endpoint the progressive release key is built from).
+    """
+
+    messages: tuple[LLMMessage, ...]
+    endpoint_message_id: str | None
+
+    def __post_init__(self) -> None:
+        if (
+            not isinstance(self.messages, tuple)
+            or not self.messages
+            or not all(isinstance(message, LLMMessage) for message in self.messages)
+        ):
+            raise ValueError(
+                "EligiblePreSealPrefix.messages must be a non-empty tuple of "
+                f"LLMMessage, got {self.messages!r}"
+            )
+        if any(message.role is Role.system for message in self.messages):
+            raise ValueError(
+                "an eligible pre-seal prefix never contains system messages"
+            )
+        if self.endpoint_message_id is not None and (
+            not isinstance(self.endpoint_message_id, str)
+            or not self.endpoint_message_id
+        ):
+            raise ValueError(
+                "EligiblePreSealPrefix.endpoint_message_id must be None or a "
+                f"non-empty str, got {self.endpoint_message_id!r}"
+            )
+
+
+def eligible_pre_seal_prefix(
+    messages: Sequence[LLMMessage],
+) -> EligiblePreSealPrefix | None:
+    """The settled pre-compaction prefix eligible for payload release, or None.
+
+    P3's (S1-B) pre-seal eligibility rule, operationalized:
+
+    - the newest ``PRE_SEAL_RETAIN_RECENT_USER_ROUNDS`` user-started rounds
+      are retained in full, so the candidate region is everything strictly
+      before the older of those two rounds;
+    - the region is trimmed back to the longest prefix ending at a complete
+      settled round (``_last_settled_round_end``);
+    - system messages never take part (the persisted transcript holds
+      non-system records only);
+    - at least one message of the prefix must carry a reasoning payload —
+      otherwise there is nothing to release and the caller does nothing.
+    """
+    non_system = tuple(
+        message for message in messages if message.role is not Role.system
+    )
+    user_starts = [
+        index for index, message in enumerate(non_system) if message.role is Role.user
+    ]
+    if len(user_starts) < PRE_SEAL_RETAIN_RECENT_USER_ROUNDS:
+        return None
+    # The older of the two newest user-started rounds: everything strictly
+    # before it is the candidate region.
+    region = non_system[: user_starts[-PRE_SEAL_RETAIN_RECENT_USER_ROUNDS]]
+    end = _last_settled_round_end(region)
+    if end == 0:
+        return None
+    prefix = region[:end]
+    if not any(message.reasoning_payloads for message in prefix):
+        return None
+    return EligiblePreSealPrefix(
+        messages=prefix, endpoint_message_id=prefix[-1].message_id
+    )
+
+
+#: The progressive release-attempt key: ``(kind, session_id, message_epoch,
+#: identifier)`` — ``kind`` is ``"pre-seal"`` (identifier = the eligible-prefix
+#: endpoint) or ``"boundary"`` (identifier = the compaction boundary id). A key
+#: is never a bare ``None``.
+TrimAttemptKey = tuple[str, str, int, str]
+
+
+def pre_seal_endpoint(prefix: EligiblePreSealPrefix) -> str:
+    """The stable eligible-prefix endpoint string of a pre-seal prefix.
+
+    Pure function of the descriptor: the prefix length plus its last
+    message's id, so an advancing prefix yields a new endpoint and a
+    duplicate release yields the same one.
+    """
+    last = prefix.messages[-1]
+    return f"{len(prefix.messages)}:{last.message_id or '-'}"
+
+
+def pre_seal_release_key(
+    session_id: str, message_epoch: int, endpoint: str
+) -> TrimAttemptKey:
+    """The progressive pre-seal release key — never a bare ``None`` key.
+
+    Pure function of its inputs: any empty session id, negative epoch, or
+    empty endpoint raises ``ValueError`` instead of producing a key that
+    could collide with (or suppress) other releases.
+    """
+    if not isinstance(session_id, str) or not session_id:
+        raise ValueError(f"session_id must be a non-empty str, got {session_id!r}")
+    if type(message_epoch) is not int or message_epoch < 0:
+        raise ValueError(
+            f"message_epoch must be a non-negative int, got {message_epoch!r}"
+        )
+    if not isinstance(endpoint, str) or not endpoint:
+        raise ValueError(f"endpoint must be a non-empty str, got {endpoint!r}")
+    return ("pre-seal", session_id, message_epoch, endpoint)
+
+
+def trim_attempt_key(
+    session_id: str,
+    message_epoch: int,
+    boundary_message_id: str | None,
+    endpoint: str | None,
+) -> TrimAttemptKey:
+    """The attempt key of one post-turn release attempt (seam-independent).
+
+    A real compaction boundary keys the attempt as ``"boundary"`` — once a
+    real boundary exists, post-seal alone owns the release (coalescing). A
+    ``None`` boundary keys the attempt as ``"pre-seal"`` from the stable
+    eligible-prefix endpoint. A ``None`` boundary with no endpoint is
+    refused: the key is never a bare ``None``.
+    """
+    if boundary_message_id is not None:
+        if not isinstance(boundary_message_id, str) or not boundary_message_id:
+            raise ValueError(
+                "boundary_message_id must be None or a non-empty str, got "
+                f"{boundary_message_id!r}"
+            )
+        if not isinstance(session_id, str) or not session_id:
+            raise ValueError(f"session_id must be a non-empty str, got {session_id!r}")
+        if type(message_epoch) is not int or message_epoch < 0:
+            raise ValueError(
+                f"message_epoch must be a non-negative int, got {message_epoch!r}"
+            )
+        return ("boundary", session_id, message_epoch, boundary_message_id)
+    return pre_seal_release_key(session_id, message_epoch, endpoint or "")
+
+
+def release_key_is_new(
+    published: Container[TrimAttemptKey], key: TrimAttemptKey
+) -> bool:
+    """Duplicate suppression for progressive release keys (pure).
+
+    True when ``key`` was never published: an advancing prefix yields a new
+    key, a duplicate attempt is suppressed, and a RETRY after a failed
+    attempt (which never published) is allowed again.
+    """
+    return key not in published
 
 
 def _parse_record_line(line: bytes) -> dict[str, Any]:

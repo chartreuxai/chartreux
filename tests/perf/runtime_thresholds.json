@@ -1,0 +1,1077 @@
+{
+  "activation_machine": {
+    "core_count": 24,
+    "cpu_model": "AMD Ryzen 9 5900X 12-Core Processor",
+    "platform": "Linux-7.3.0-10-generic-x86_64-with-glibc2.44",
+    "python_version": "3.12.13"
+  },
+  "active_count": 16,
+  "active_test": {
+    "evaluates_fresh_measured_value": false,
+    "indeterminate_context": "activation_machine_indeterminate",
+    "rule": "ACTIVATION (the activation event at stage-2 exit) is constructed from the COMMITTED BASELINE SET ALONE: a registry entry ACTIVATES as ACTIVE when its campaign is decision-ready (the shared run set carries exactly 5 eligible selected runs) and its threshold T built from that set is finite and positive. Activation never evaluates a fresh measured value; comparing a new measurement against the threshold is a COMPARISON (marked X5b outcome: ACTIVE-pass / ACTIVE-fail / COMPARISON-INELIGIBLE / DORMANT), never an activation state. ACTIVATION-MACHINE CONTEXT: if the activation machine's own context cannot be evaluated \u2014 a required machine-context field (cpu_model, core_count, python_version, platform) missing or unavailable at activation time \u2014 that is an INDETERMINATE activation input: the activation step halts and escalates (the plan's Activation-row rule); it is never a discretionary DORMANT or ACTIVE. A registry entry that is not ACTIVE at stage-2 exit is DORMANT with the first applicable reason in the reason order."
+  },
+  "dormancy_reasons": [
+    "machine_mismatch",
+    "insufficient_baseline_data",
+    "missing_determinants",
+    "degenerate_threshold"
+  ],
+  "dormancy_tiers": [
+    {
+      "recorded_reasons": [
+        "machine_mismatch"
+      ],
+      "rule": "machine_mismatch",
+      "tier": 1
+    },
+    {
+      "recorded_reasons": [
+        "insufficient_baseline_data"
+      ],
+      "rule": "campaign_not_decision_ready",
+      "tier": 2
+    },
+    {
+      "recorded_reasons": [
+        "missing_determinants"
+      ],
+      "rule": "missing_determinants",
+      "tier": 3
+    },
+    {
+      "recorded_reasons": [
+        "degenerate_threshold"
+      ],
+      "rule": "degenerate_threshold",
+      "tier": 4
+    }
+  ],
+  "dormant_count": 1,
+  "inputs": {
+    "baselines": {
+      "permission_fake_response": {
+        "attempt_digest": "38c74579582750ad08f06269ae4b2a08b5ceb8272f1fcaaa1210a29d51e4d342",
+        "closure_status": "eligible_complete"
+      },
+      "pilot_streaming_fresh": {
+        "attempt_digest": "fa0d34a477bc9a856785cd9b2de214842a1bdf7a5e0f803828774391ac262715",
+        "closure_status": "eligible_complete"
+      },
+      "save_loaded_200k": {
+        "attempt_digest": "800828da7e1e848201213472045d4ed73376669554a590510dcfaf16360acd06",
+        "closure_status": "eligible_complete"
+      },
+      "soak_loaded_latency_turns301_400": {
+        "attempt_digest": "82a3df6ff68b4e3e4cfb206ee14236602cd57293ff4383f616bbbac7d9ae41bc",
+        "closure_status": "eligible_complete"
+      },
+      "soak_loaded_memory_windows200_400": null,
+      "storm_8child": {
+        "attempt_digest": "b95704d4cb5299bde9dcb4eb41a9f70eaf9216d7833c47b87b8abdc2b16e3125",
+        "closure_status": "eligible_complete"
+      },
+      "x1_fresh_headless_fb10_c4": {
+        "attempt_digest": "52887b320a7a098b487519020818fdbc3229d8a7d4df06bcca982ab1c280323c",
+        "closure_status": "eligible_complete"
+      },
+      "x2_loaded_headless_8x200k": {
+        "attempt_digest": "d488811af40023304ed4f6f0b07a6a69f49ab2242ad4417dd14afebc827a67ff",
+        "closure_status": "eligible_complete"
+      }
+    },
+    "determinants_sha256": "a1847c336f05c83cd3f50cfe3cc756ce2a4b453f79eb9a4a0ddc02a60a7cf21f",
+    "digest_kind": "canonical_document",
+    "registry_sha256": "7b336621b946b5760fb13ad673c70d4b4c14bf90d6325543ca9e530a35086de5"
+  },
+  "reason_order": [
+    {
+      "recorded_reasons": [
+        "machine_mismatch"
+      ],
+      "rule": "machine_mismatch",
+      "tier": 1
+    },
+    {
+      "recorded_reasons": [
+        "insufficient_baseline_data"
+      ],
+      "rule": "campaign_not_decision_ready",
+      "tier": 2
+    },
+    {
+      "recorded_reasons": [
+        "missing_determinants"
+      ],
+      "rule": "missing_determinants",
+      "tier": 3
+    },
+    {
+      "recorded_reasons": [
+        "degenerate_threshold"
+      ],
+      "rule": "degenerate_threshold",
+      "tier": 4
+    },
+    {
+      "recorded_reasons": [
+        "run_ineligibility"
+      ],
+      "rule": "run_ineligibility",
+      "tier": 5
+    },
+    {
+      "recorded_reasons": [
+        "threshold_fail",
+        "threshold_pass"
+      ],
+      "rule": "threshold_fail / threshold_pass",
+      "tier": 6
+    }
+  ],
+  "row_count": 17,
+  "rows": [
+    {
+      "campaign_id": "A1",
+      "cell": "x1_fresh_headless_fb10_c4",
+      "closure_status": "eligible_complete",
+      "collected_run_p95s": [
+        22.3712,
+        22.0289,
+        21.5718,
+        21.8121,
+        21.4733
+      ],
+      "collected_run_p95s_signed": [
+        22.3712,
+        22.0289,
+        21.5718,
+        21.8121,
+        21.4733
+      ],
+      "decision_ready": true,
+      "machine_mismatch_fields": [],
+      "mad": 0.2403000000000013,
+      "measured_value": null,
+      "median": 21.8121,
+      "metric": "turn_application_overhead_p95_ms",
+      "null_reasons": {
+        "measured_value": "activation_never_evaluates_a_measured_value"
+      },
+      "reason": null,
+      "selected_runs": [
+        {
+          "run_id": "x1_fresh_headless_fb10_c4-r01",
+          "run_start_utc": "2026-11-08T02:19:12Z"
+        },
+        {
+          "run_id": "x1_fresh_headless_fb10_c4-r02",
+          "run_start_utc": "2026-11-08T02:19:33Z"
+        },
+        {
+          "run_id": "x1_fresh_headless_fb10_c4-r03",
+          "run_start_utc": "2026-11-08T02:19:55Z"
+        },
+        {
+          "run_id": "x1_fresh_headless_fb10_c4-r04",
+          "run_start_utc": "2026-11-08T02:20:16Z"
+        },
+        {
+          "run_id": "x1_fresh_headless_fb10_c4-r05",
+          "run_start_utc": "2026-11-08T02:20:38Z"
+        }
+      ],
+      "slope_clamp": null,
+      "slope_clamped": false,
+      "state": "ACTIVE",
+      "threshold": 26.17452,
+      "unit": "ms"
+    },
+    {
+      "campaign_id": "A2",
+      "cell": "x1_fresh_headless_fb10_c4",
+      "closure_status": "eligible_complete",
+      "collected_run_p95s": [
+        10.8917,
+        10.8869,
+        10.8879,
+        10.872,
+        10.8722
+      ],
+      "collected_run_p95s_signed": [
+        10.8917,
+        10.8869,
+        10.8879,
+        10.872,
+        10.8722
+      ],
+      "decision_ready": true,
+      "machine_mismatch_fields": [],
+      "mad": 0.004799999999999471,
+      "measured_value": null,
+      "median": 10.8869,
+      "metric": "transport_ttfb_p95_ms",
+      "null_reasons": {
+        "measured_value": "activation_never_evaluates_a_measured_value"
+      },
+      "reason": null,
+      "selected_runs": [
+        {
+          "run_id": "x1_fresh_headless_fb10_c4-r01",
+          "run_start_utc": "2026-11-08T02:19:12Z"
+        },
+        {
+          "run_id": "x1_fresh_headless_fb10_c4-r02",
+          "run_start_utc": "2026-11-08T02:19:33Z"
+        },
+        {
+          "run_id": "x1_fresh_headless_fb10_c4-r03",
+          "run_start_utc": "2026-11-08T02:19:55Z"
+        },
+        {
+          "run_id": "x1_fresh_headless_fb10_c4-r04",
+          "run_start_utc": "2026-11-08T02:20:16Z"
+        },
+        {
+          "run_id": "x1_fresh_headless_fb10_c4-r05",
+          "run_start_utc": "2026-11-08T02:20:38Z"
+        }
+      ],
+      "slope_clamp": null,
+      "slope_clamped": false,
+      "state": "ACTIVE",
+      "threshold": 13.06428,
+      "unit": "ms"
+    },
+    {
+      "campaign_id": "A3",
+      "cell": "x1_fresh_headless_fb10_c4",
+      "closure_status": "eligible_complete",
+      "collected_run_p95s": [
+        5.8336,
+        5.8349,
+        5.8285,
+        5.8187,
+        5.8216
+      ],
+      "collected_run_p95s_signed": [
+        5.8336,
+        5.8349,
+        5.8285,
+        5.8187,
+        5.8216
+      ],
+      "decision_ready": true,
+      "machine_mismatch_fields": [],
+      "mad": 0.006400000000000183,
+      "measured_value": null,
+      "median": 5.8285,
+      "metric": "transport_chunk_gap_p95_ms",
+      "null_reasons": {
+        "measured_value": "activation_never_evaluates_a_measured_value"
+      },
+      "reason": null,
+      "selected_runs": [
+        {
+          "run_id": "x1_fresh_headless_fb10_c4-r01",
+          "run_start_utc": "2026-11-08T02:19:12Z"
+        },
+        {
+          "run_id": "x1_fresh_headless_fb10_c4-r02",
+          "run_start_utc": "2026-11-08T02:19:33Z"
+        },
+        {
+          "run_id": "x1_fresh_headless_fb10_c4-r03",
+          "run_start_utc": "2026-11-08T02:19:55Z"
+        },
+        {
+          "run_id": "x1_fresh_headless_fb10_c4-r04",
+          "run_start_utc": "2026-11-08T02:20:16Z"
+        },
+        {
+          "run_id": "x1_fresh_headless_fb10_c4-r05",
+          "run_start_utc": "2026-11-08T02:20:38Z"
+        }
+      ],
+      "slope_clamp": null,
+      "slope_clamped": false,
+      "state": "ACTIVE",
+      "threshold": 6.9942,
+      "unit": "ms"
+    },
+    {
+      "campaign_id": "A4",
+      "cell": "x1_fresh_headless_fb10_c4",
+      "closure_status": "eligible_complete",
+      "collected_run_p95s": [
+        5.1084,
+        5.0148,
+        5.0196,
+        4.9397,
+        5.0414
+      ],
+      "collected_run_p95s_signed": [
+        5.1084,
+        5.0148,
+        5.0196,
+        4.9397,
+        5.0414
+      ],
+      "decision_ready": true,
+      "machine_mismatch_fields": [],
+      "mad": 0.021800000000000708,
+      "measured_value": null,
+      "median": 5.0196,
+      "metric": "loop_heartbeat_excess_p95_ms",
+      "null_reasons": {
+        "measured_value": "activation_never_evaluates_a_measured_value"
+      },
+      "reason": null,
+      "selected_runs": [
+        {
+          "run_id": "x1_fresh_headless_fb10_c4-r01",
+          "run_start_utc": "2026-11-08T02:19:12Z"
+        },
+        {
+          "run_id": "x1_fresh_headless_fb10_c4-r02",
+          "run_start_utc": "2026-11-08T02:19:33Z"
+        },
+        {
+          "run_id": "x1_fresh_headless_fb10_c4-r03",
+          "run_start_utc": "2026-11-08T02:19:55Z"
+        },
+        {
+          "run_id": "x1_fresh_headless_fb10_c4-r04",
+          "run_start_utc": "2026-11-08T02:20:16Z"
+        },
+        {
+          "run_id": "x1_fresh_headless_fb10_c4-r05",
+          "run_start_utc": "2026-11-08T02:20:38Z"
+        }
+      ],
+      "slope_clamp": null,
+      "slope_clamped": false,
+      "state": "ACTIVE",
+      "threshold": 6.0235199999999995,
+      "unit": "ms"
+    },
+    {
+      "campaign_id": "B1",
+      "cell": "x2_loaded_headless_8x200k",
+      "closure_status": "eligible_complete",
+      "collected_run_p95s": [
+        19.4036,
+        19.9545,
+        20.1477,
+        20.1477,
+        19.7949
+      ],
+      "collected_run_p95s_signed": [
+        19.4036,
+        19.9545,
+        20.1477,
+        20.1477,
+        19.7949
+      ],
+      "decision_ready": true,
+      "machine_mismatch_fields": [],
+      "mad": 0.19320000000000093,
+      "measured_value": null,
+      "median": 19.9545,
+      "metric": "turn_application_overhead_p95_ms",
+      "null_reasons": {
+        "measured_value": "activation_never_evaluates_a_measured_value"
+      },
+      "reason": null,
+      "selected_runs": [
+        {
+          "run_id": "x2_loaded_headless_8x200k-r01",
+          "run_start_utc": "2026-11-08T02:22:31Z"
+        },
+        {
+          "run_id": "x2_loaded_headless_8x200k-r02",
+          "run_start_utc": "2026-11-08T02:24:59Z"
+        },
+        {
+          "run_id": "x2_loaded_headless_8x200k-r03",
+          "run_start_utc": "2026-11-08T02:27:28Z"
+        },
+        {
+          "run_id": "x2_loaded_headless_8x200k-r04",
+          "run_start_utc": "2026-11-08T02:29:57Z"
+        },
+        {
+          "run_id": "x2_loaded_headless_8x200k-r05",
+          "run_start_utc": "2026-11-08T02:32:25Z"
+        }
+      ],
+      "slope_clamp": null,
+      "slope_clamped": false,
+      "state": "ACTIVE",
+      "threshold": 23.9454,
+      "unit": "ms"
+    },
+    {
+      "campaign_id": "B2",
+      "cell": "x2_loaded_headless_8x200k",
+      "closure_status": "eligible_complete",
+      "collected_run_p95s": [
+        44.1837,
+        45.0482,
+        45.5554,
+        44.8221,
+        44.4161
+      ],
+      "collected_run_p95s_signed": [
+        44.1837,
+        45.0482,
+        45.5554,
+        44.8221,
+        44.4161
+      ],
+      "decision_ready": true,
+      "machine_mismatch_fields": [],
+      "mad": 0.4059999999999988,
+      "measured_value": null,
+      "median": 44.8221,
+      "metric": "loop_heartbeat_excess_p95_ms",
+      "null_reasons": {
+        "measured_value": "activation_never_evaluates_a_measured_value"
+      },
+      "reason": null,
+      "selected_runs": [
+        {
+          "run_id": "x2_loaded_headless_8x200k-r01",
+          "run_start_utc": "2026-11-08T02:22:31Z"
+        },
+        {
+          "run_id": "x2_loaded_headless_8x200k-r02",
+          "run_start_utc": "2026-11-08T02:24:59Z"
+        },
+        {
+          "run_id": "x2_loaded_headless_8x200k-r03",
+          "run_start_utc": "2026-11-08T02:27:28Z"
+        },
+        {
+          "run_id": "x2_loaded_headless_8x200k-r04",
+          "run_start_utc": "2026-11-08T02:29:57Z"
+        },
+        {
+          "run_id": "x2_loaded_headless_8x200k-r05",
+          "run_start_utc": "2026-11-08T02:32:25Z"
+        }
+      ],
+      "slope_clamp": null,
+      "slope_clamped": false,
+      "state": "ACTIVE",
+      "threshold": 53.786519999999996,
+      "unit": "ms"
+    },
+    {
+      "campaign_id": "B3",
+      "cell": "x2_loaded_headless_8x200k",
+      "closure_status": "eligible_complete",
+      "collected_run_p95s": [
+        9.0,
+        9.0,
+        9.0,
+        9.0,
+        9.0
+      ],
+      "collected_run_p95s_signed": [
+        9.0,
+        9.0,
+        9.0,
+        9.0,
+        9.0
+      ],
+      "decision_ready": true,
+      "machine_mismatch_fields": [],
+      "mad": 0.0,
+      "measured_value": null,
+      "median": 9.0,
+      "metric": "notification_count_p95_per_root_turn",
+      "null_reasons": {
+        "measured_value": "activation_never_evaluates_a_measured_value"
+      },
+      "reason": null,
+      "selected_runs": [
+        {
+          "run_id": "x2_loaded_headless_8x200k-r01",
+          "run_start_utc": "2026-11-08T02:22:31Z"
+        },
+        {
+          "run_id": "x2_loaded_headless_8x200k-r02",
+          "run_start_utc": "2026-11-08T02:24:59Z"
+        },
+        {
+          "run_id": "x2_loaded_headless_8x200k-r03",
+          "run_start_utc": "2026-11-08T02:27:28Z"
+        },
+        {
+          "run_id": "x2_loaded_headless_8x200k-r04",
+          "run_start_utc": "2026-11-08T02:29:57Z"
+        },
+        {
+          "run_id": "x2_loaded_headless_8x200k-r05",
+          "run_start_utc": "2026-11-08T02:32:25Z"
+        }
+      ],
+      "slope_clamp": null,
+      "slope_clamped": false,
+      "state": "ACTIVE",
+      "threshold": 10.8,
+      "unit": "events"
+    },
+    {
+      "campaign_id": "B4",
+      "cell": "x2_loaded_headless_8x200k",
+      "closure_status": "eligible_complete",
+      "collected_run_p95s": [
+        4972.0,
+        4972.0,
+        4972.0,
+        4972.0,
+        4972.0
+      ],
+      "collected_run_p95s_signed": [
+        4972.0,
+        4972.0,
+        4972.0,
+        4972.0,
+        4972.0
+      ],
+      "decision_ready": true,
+      "machine_mismatch_fields": [],
+      "mad": 0.0,
+      "measured_value": null,
+      "median": 4972.0,
+      "metric": "notification_bytes_p95_per_root_turn",
+      "null_reasons": {
+        "measured_value": "activation_never_evaluates_a_measured_value"
+      },
+      "reason": null,
+      "selected_runs": [
+        {
+          "run_id": "x2_loaded_headless_8x200k-r01",
+          "run_start_utc": "2026-11-08T02:22:31Z"
+        },
+        {
+          "run_id": "x2_loaded_headless_8x200k-r02",
+          "run_start_utc": "2026-11-08T02:24:59Z"
+        },
+        {
+          "run_id": "x2_loaded_headless_8x200k-r03",
+          "run_start_utc": "2026-11-08T02:27:28Z"
+        },
+        {
+          "run_id": "x2_loaded_headless_8x200k-r04",
+          "run_start_utc": "2026-11-08T02:29:57Z"
+        },
+        {
+          "run_id": "x2_loaded_headless_8x200k-r05",
+          "run_start_utc": "2026-11-08T02:32:25Z"
+        }
+      ],
+      "slope_clamp": null,
+      "slope_clamped": false,
+      "state": "ACTIVE",
+      "threshold": 5966.4,
+      "unit": "bytes"
+    },
+    {
+      "campaign_id": "C1",
+      "cell": "save_loaded_200k",
+      "closure_status": "eligible_complete",
+      "collected_run_p95s": [
+        4.0869,
+        4.8312,
+        4.5322,
+        4.9038,
+        4.9094
+      ],
+      "collected_run_p95s_signed": [
+        4.0869,
+        4.8312,
+        4.5322,
+        4.9038,
+        4.9094
+      ],
+      "decision_ready": true,
+      "machine_mismatch_fields": [],
+      "mad": 0.07819999999999983,
+      "measured_value": null,
+      "median": 4.8312,
+      "metric": "save_worker_scan_p95_ms",
+      "null_reasons": {
+        "measured_value": "activation_never_evaluates_a_measured_value"
+      },
+      "reason": null,
+      "selected_runs": [
+        {
+          "run_id": "save_loaded_200k-r01",
+          "run_start_utc": "2026-11-08T02:34:54Z"
+        },
+        {
+          "run_id": "save_loaded_200k-r02",
+          "run_start_utc": "2026-11-08T02:35:00Z"
+        },
+        {
+          "run_id": "save_loaded_200k-r03",
+          "run_start_utc": "2026-11-08T02:35:05Z"
+        },
+        {
+          "run_id": "save_loaded_200k-r04",
+          "run_start_utc": "2026-11-08T02:35:11Z"
+        },
+        {
+          "run_id": "save_loaded_200k-r05",
+          "run_start_utc": "2026-11-08T02:35:17Z"
+        }
+      ],
+      "slope_clamp": null,
+      "slope_clamped": false,
+      "state": "ACTIVE",
+      "threshold": 5.79744,
+      "unit": "ms"
+    },
+    {
+      "campaign_id": "C2",
+      "cell": "save_loaded_200k",
+      "closure_status": "eligible_complete",
+      "collected_run_p95s": [
+        4.1546,
+        4.9027,
+        4.5989,
+        4.9723,
+        4.9807
+      ],
+      "collected_run_p95s_signed": [
+        4.1546,
+        4.9027,
+        4.5989,
+        4.9723,
+        4.9807
+      ],
+      "decision_ready": true,
+      "machine_mismatch_fields": [],
+      "mad": 0.0779999999999994,
+      "measured_value": null,
+      "median": 4.9027,
+      "metric": "save_lock_held_await_p95_ms",
+      "null_reasons": {
+        "measured_value": "activation_never_evaluates_a_measured_value"
+      },
+      "reason": null,
+      "selected_runs": [
+        {
+          "run_id": "save_loaded_200k-r01",
+          "run_start_utc": "2026-11-08T02:34:54Z"
+        },
+        {
+          "run_id": "save_loaded_200k-r02",
+          "run_start_utc": "2026-11-08T02:35:00Z"
+        },
+        {
+          "run_id": "save_loaded_200k-r03",
+          "run_start_utc": "2026-11-08T02:35:05Z"
+        },
+        {
+          "run_id": "save_loaded_200k-r04",
+          "run_start_utc": "2026-11-08T02:35:11Z"
+        },
+        {
+          "run_id": "save_loaded_200k-r05",
+          "run_start_utc": "2026-11-08T02:35:17Z"
+        }
+      ],
+      "slope_clamp": null,
+      "slope_clamped": false,
+      "state": "ACTIVE",
+      "threshold": 5.883240000000001,
+      "unit": "ms"
+    },
+    {
+      "campaign_id": "C3",
+      "cell": "save_loaded_200k",
+      "closure_status": "eligible_complete",
+      "collected_run_p95s": [
+        3.9301,
+        4.4041,
+        4.1795,
+        4.4945,
+        4.546
+      ],
+      "collected_run_p95s_signed": [
+        3.9301,
+        4.4041,
+        4.1795,
+        4.4945,
+        4.546
+      ],
+      "decision_ready": true,
+      "machine_mismatch_fields": [],
+      "mad": 0.14190000000000058,
+      "measured_value": null,
+      "median": 4.4041,
+      "metric": "loop_heartbeat_excess_p95_ms",
+      "null_reasons": {
+        "measured_value": "activation_never_evaluates_a_measured_value"
+      },
+      "reason": null,
+      "selected_runs": [
+        {
+          "run_id": "save_loaded_200k-r01",
+          "run_start_utc": "2026-11-08T02:34:54Z"
+        },
+        {
+          "run_id": "save_loaded_200k-r02",
+          "run_start_utc": "2026-11-08T02:35:00Z"
+        },
+        {
+          "run_id": "save_loaded_200k-r03",
+          "run_start_utc": "2026-11-08T02:35:05Z"
+        },
+        {
+          "run_id": "save_loaded_200k-r04",
+          "run_start_utc": "2026-11-08T02:35:11Z"
+        },
+        {
+          "run_id": "save_loaded_200k-r05",
+          "run_start_utc": "2026-11-08T02:35:17Z"
+        }
+      ],
+      "slope_clamp": null,
+      "slope_clamped": false,
+      "state": "ACTIVE",
+      "threshold": 5.28492,
+      "unit": "ms"
+    },
+    {
+      "campaign_id": "D1",
+      "cell": "pilot_streaming_fresh",
+      "closure_status": "eligible_complete",
+      "collected_run_p95s": [
+        3.8807,
+        3.9955,
+        4.1037,
+        3.9896,
+        3.8726
+      ],
+      "collected_run_p95s_signed": [
+        3.8807,
+        3.9955,
+        4.1037,
+        3.9896,
+        3.8726
+      ],
+      "decision_ready": true,
+      "machine_mismatch_fields": [],
+      "mad": 0.10889999999999977,
+      "measured_value": null,
+      "median": 3.9896,
+      "metric": "render_flush_p95_ms",
+      "null_reasons": {
+        "measured_value": "activation_never_evaluates_a_measured_value"
+      },
+      "reason": null,
+      "selected_runs": [
+        {
+          "run_id": "pilot_streaming_fresh-r01",
+          "run_start_utc": "2026-11-08T03:06:28Z"
+        },
+        {
+          "run_id": "pilot_streaming_fresh-r02",
+          "run_start_utc": "2026-11-08T03:13:26Z"
+        },
+        {
+          "run_id": "pilot_streaming_fresh-r03",
+          "run_start_utc": "2026-11-08T03:20:28Z"
+        },
+        {
+          "run_id": "pilot_streaming_fresh-r04",
+          "run_start_utc": "2026-11-08T03:27:27Z"
+        },
+        {
+          "run_id": "pilot_streaming_fresh-r05",
+          "run_start_utc": "2026-11-08T03:34:30Z"
+        }
+      ],
+      "slope_clamp": null,
+      "slope_clamped": false,
+      "state": "ACTIVE",
+      "threshold": 4.78752,
+      "unit": "ms"
+    },
+    {
+      "campaign_id": "E1",
+      "cell": "storm_8child",
+      "closure_status": "eligible_complete",
+      "collected_run_p95s": [
+        136.3842,
+        136.2807,
+        132.9642,
+        134.1589,
+        130.6008
+      ],
+      "collected_run_p95s_signed": [
+        136.3842,
+        136.2807,
+        132.9642,
+        134.1589,
+        130.6008
+      ],
+      "decision_ready": true,
+      "machine_mismatch_fields": [],
+      "mad": 2.1218000000000075,
+      "measured_value": null,
+      "median": 134.1589,
+      "metric": "completion_storm_drain_p95_ms",
+      "null_reasons": {
+        "measured_value": "activation_never_evaluates_a_measured_value"
+      },
+      "reason": null,
+      "selected_runs": [
+        {
+          "run_id": "storm_8child-r01",
+          "run_start_utc": "2026-11-08T02:45:03Z"
+        },
+        {
+          "run_id": "storm_8child-r02",
+          "run_start_utc": "2026-11-08T02:49:21Z"
+        },
+        {
+          "run_id": "storm_8child-r03",
+          "run_start_utc": "2026-11-08T02:53:38Z"
+        },
+        {
+          "run_id": "storm_8child-r04",
+          "run_start_utc": "2026-11-08T02:57:54Z"
+        },
+        {
+          "run_id": "storm_8child-r05",
+          "run_start_utc": "2026-11-08T03:02:11Z"
+        }
+      ],
+      "slope_clamp": null,
+      "slope_clamped": false,
+      "state": "ACTIVE",
+      "threshold": 160.99068,
+      "unit": "ms"
+    },
+    {
+      "campaign_id": "E2",
+      "cell": "permission_fake_response",
+      "closure_status": "eligible_complete",
+      "collected_run_p95s": [
+        11.3382,
+        11.0306,
+        11.232,
+        11.2685,
+        11.4568
+      ],
+      "collected_run_p95s_signed": [
+        11.3382,
+        11.0306,
+        11.232,
+        11.2685,
+        11.4568
+      ],
+      "decision_ready": true,
+      "machine_mismatch_fields": [],
+      "mad": 0.06970000000000098,
+      "measured_value": null,
+      "median": 11.2685,
+      "metric": "permission_round_trip_p95_ms",
+      "null_reasons": {
+        "measured_value": "activation_never_evaluates_a_measured_value"
+      },
+      "reason": null,
+      "selected_runs": [
+        {
+          "run_id": "permission_fake_response-r01",
+          "run_start_utc": "2026-11-08T02:35:23Z"
+        },
+        {
+          "run_id": "permission_fake_response-r02",
+          "run_start_utc": "2026-11-08T02:35:27Z"
+        },
+        {
+          "run_id": "permission_fake_response-r03",
+          "run_start_utc": "2026-11-08T02:35:32Z"
+        },
+        {
+          "run_id": "permission_fake_response-r04",
+          "run_start_utc": "2026-11-08T02:35:36Z"
+        },
+        {
+          "run_id": "permission_fake_response-r05",
+          "run_start_utc": "2026-11-08T02:35:40Z"
+        }
+      ],
+      "slope_clamp": null,
+      "slope_clamped": false,
+      "state": "ACTIVE",
+      "threshold": 13.5222,
+      "unit": "ms"
+    },
+    {
+      "campaign_id": "F1",
+      "cell": "soak_loaded_latency_turns301_400",
+      "closure_status": "eligible_complete",
+      "collected_run_p95s": [
+        98.6107,
+        102.459,
+        99.5105,
+        99.5585,
+        101.8243
+      ],
+      "collected_run_p95s_signed": [
+        98.6107,
+        102.459,
+        99.5105,
+        99.5585,
+        101.8243
+      ],
+      "decision_ready": true,
+      "machine_mismatch_fields": [],
+      "mad": 0.9478000000000009,
+      "measured_value": null,
+      "median": 99.5585,
+      "metric": "turn_application_overhead_p95_ms",
+      "null_reasons": {
+        "measured_value": "activation_never_evaluates_a_measured_value"
+      },
+      "reason": null,
+      "selected_runs": [
+        {
+          "run_id": "soak_loaded_latency_turns301_400-full-20261108T023547048094",
+          "run_start_utc": "2026-11-08T02:35:47.048094+00:00"
+        },
+        {
+          "run_id": "soak_loaded_latency_turns301_400-full-20261108T023738852346",
+          "run_start_utc": "2026-11-08T02:37:38.852346+00:00"
+        },
+        {
+          "run_id": "soak_loaded_latency_turns301_400-full-20261108T023930525800",
+          "run_start_utc": "2026-11-08T02:39:30.525800+00:00"
+        },
+        {
+          "run_id": "soak_loaded_latency_turns301_400-full-20261108T024122525851",
+          "run_start_utc": "2026-11-08T02:41:22.525851+00:00"
+        },
+        {
+          "run_id": "soak_loaded_latency_turns301_400-full-20261108T024313904626",
+          "run_start_utc": "2026-11-08T02:43:13.904626+00:00"
+        }
+      ],
+      "slope_clamp": null,
+      "slope_clamped": false,
+      "state": "ACTIVE",
+      "threshold": 119.47019999999999,
+      "unit": "ms"
+    },
+    {
+      "campaign_id": "F2",
+      "cell": "soak_loaded_latency_turns301_400",
+      "closure_status": "eligible_complete",
+      "collected_run_p95s": [
+        9.9099,
+        9.9429,
+        9.5292,
+        9.5743,
+        9.7314
+      ],
+      "collected_run_p95s_signed": [
+        9.9099,
+        9.9429,
+        9.5292,
+        9.5743,
+        9.7314
+      ],
+      "decision_ready": true,
+      "machine_mismatch_fields": [],
+      "mad": 0.17849999999999966,
+      "measured_value": null,
+      "median": 9.7314,
+      "metric": "loop_heartbeat_excess_p95_ms",
+      "null_reasons": {
+        "measured_value": "activation_never_evaluates_a_measured_value"
+      },
+      "reason": null,
+      "selected_runs": [
+        {
+          "run_id": "soak_loaded_latency_turns301_400-full-20261108T023547048094",
+          "run_start_utc": "2026-11-08T02:35:47.048094+00:00"
+        },
+        {
+          "run_id": "soak_loaded_latency_turns301_400-full-20261108T023738852346",
+          "run_start_utc": "2026-11-08T02:37:38.852346+00:00"
+        },
+        {
+          "run_id": "soak_loaded_latency_turns301_400-full-20261108T023930525800",
+          "run_start_utc": "2026-11-08T02:39:30.525800+00:00"
+        },
+        {
+          "run_id": "soak_loaded_latency_turns301_400-full-20261108T024122525851",
+          "run_start_utc": "2026-11-08T02:41:22.525851+00:00"
+        },
+        {
+          "run_id": "soak_loaded_latency_turns301_400-full-20261108T024313904626",
+          "run_start_utc": "2026-11-08T02:43:13.904626+00:00"
+        }
+      ],
+      "slope_clamp": null,
+      "slope_clamped": false,
+      "state": "ACTIVE",
+      "threshold": 11.67768,
+      "unit": "ms"
+    },
+    {
+      "campaign_id": "G1",
+      "cell": "soak_loaded_memory_windows200_400",
+      "closure_status": null,
+      "collected_run_p95s": [],
+      "collected_run_p95s_signed": [],
+      "decision_ready": false,
+      "machine_mismatch_fields": [],
+      "mad": null,
+      "measured_value": null,
+      "median": null,
+      "metric": "rss_slope_p95_bytes_per_turn",
+      "null_reasons": {
+        "collected_run_p95s": "insufficient_baseline_data",
+        "mad": "insufficient_baseline_data",
+        "measured_value": "activation_never_evaluates_a_measured_value",
+        "median": "insufficient_baseline_data",
+        "threshold": "insufficient_baseline_data"
+      },
+      "reason": "insufficient_baseline_data",
+      "selected_runs": [],
+      "slope_clamp": "clamp_negative_to_zero",
+      "slope_clamped": false,
+      "state": "DORMANT",
+      "threshold": null,
+      "unit": "bytes/turn"
+    }
+  ],
+  "run_record_tier": {
+    "recorded_reasons": [
+      "run_ineligibility"
+    ],
+    "rule": "run_ineligibility",
+    "tier": 5
+  },
+  "schema": "chartreux.runtime_thresholds.v1",
+  "slope_clamp": "clamp_negative_to_zero",
+  "table_digest": "b47c028c101d0545d9254818fa45bb66ffcda9ec44220c38003c85205dc35d5a",
+  "threshold_rule": "T = M + max(6*D, 0.20*M); measured <= T passes, equality included",
+  "threshold_tier": {
+    "recorded_reasons": [
+      "threshold_fail",
+      "threshold_pass"
+    ],
+    "rule": "threshold_fail / threshold_pass",
+    "tier": 6
+  }
+}

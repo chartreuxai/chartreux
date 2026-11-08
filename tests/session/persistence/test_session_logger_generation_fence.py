@@ -13,22 +13,30 @@ the current one.
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Callable, Sequence
 import hashlib
 import inspect
 import json
 import os
 from pathlib import Path
-from threading import Event
+from threading import Event, get_ident
 from typing import Any
 
 import pytest
 
 from chartreux.core.agent_loop._transcript_integrity import (
     ARCHIVE_REFERENCE_ATTRIBUTE,
+    ArchivedPrefixAuthority,
     TranscriptIntegrityError,
 )
 from chartreux.core.config import ChartreuxConfigSchema, SessionLoggingConfig
-from chartreux.core.llm_models import LLMMessage, Role
+from chartreux.core.llm_models import (
+    FunctionCall,
+    LLMMessage,
+    PersistedToolResult,
+    Role,
+    ToolCall,
+)
 from chartreux.core.message_list import MessageList
 from chartreux.core.session.session_loader import SessionLoader
 from chartreux.core.session.session_logger import SessionLogger
@@ -1164,3 +1172,356 @@ class TestT2aWarmResumeProofFence:
         assert logger._archive_generation == reset_generation
         assert logger.session_dir is not None
         assert not list(logger.session_dir.glob("messages.jsonl.recovered-*"))
+
+
+# ---------------------------------------------------------------------------
+# P5 (S1-C, PROTOCOL v2.3): the per-save persistence scan runs in a threaded
+# worker while the save lock is held. Parked-worker cases: the scan is off
+# the event loop (loop-occupancy proof), a generation bump mid-prep still
+# drops at the fence, cancellation during prep frees the lock with disk
+# untouched, an append during prep persists one consistent state, an injected
+# defect raises the typed TranscriptIntegrityError from the in-lock worker
+# BEFORE the fence (corrupt-but-fresh AND corrupt-but-stale), and overlapping
+# saves are serialized by construction (no overtaking).
+# ---------------------------------------------------------------------------
+
+
+def _worker_tool_result(call_id: str) -> LLMMessage:
+    return LLMMessage(
+        role=Role.tool,
+        tool_call_id=call_id,
+        name="read_file",
+        content="file contents",
+        tool_result=PersistedToolResult(output={"text": "file contents"}),
+    )
+
+
+def _worker_corrupt_transcript() -> list[LLMMessage]:
+    """A duplicate tool result: the save boundary's typed failure shape."""
+    return [
+        LLMMessage(role=Role.user, content="hi"),
+        LLMMessage(
+            role=Role.assistant,
+            content="Working",
+            tool_calls=[
+                ToolCall(
+                    id="c1",
+                    index=0,
+                    function=FunctionCall(name="read_file", arguments="{}"),
+                )
+            ],
+        ),
+        _worker_tool_result("c1"),
+        _worker_tool_result("c1"),
+    ]
+
+
+class _SavePrepScanGate:
+    """Test double for the lock-scoped validation scan.
+
+    Records the thread and the save-lock state of every scan. Optionally
+    blocks the first scan until released and runs ``mid_scan`` inside the
+    blocked scan (mid-prep), then always delegates to the real wrapper.
+    """
+
+    def __init__(
+        self,
+        logger: SessionLogger,
+        monkeypatch: pytest.MonkeyPatch,
+        *,
+        block_first: bool = True,
+        mid_scan: Callable[[], None] | None = None,
+    ) -> None:
+        self.started, self.release, self.finished = Event(), Event(), Event()
+        self.scans = 0
+        self.scan_threads: list[int] = []
+        self.lock_held_at_scan: list[bool] = []
+        original = logger._check_transcript_persistence
+
+        def gated(
+            messages: Sequence[LLMMessage],
+            *,
+            archived_prefix: ArchivedPrefixAuthority | None = None,
+        ) -> None:
+            self.scans += 1
+            self.scan_threads.append(get_ident())
+            self.lock_held_at_scan.append(logger._save_lock.locked())
+            if self.scans == 1:
+                self.started.set()
+                if mid_scan is not None:
+                    mid_scan()
+                if block_first:
+                    assert self.release.wait(5)
+            try:
+                original(messages, archived_prefix=archived_prefix)
+            finally:
+                self.finished.set()
+
+        monkeypatch.setattr(logger, "_check_transcript_persistence", gated)
+
+
+def _worker_transcript_contents(logger: SessionLogger) -> list[Any]:
+    raw = _fence_messages_path(logger).read_bytes()
+    return [json.loads(line).get("content") for line in raw.splitlines()]
+
+
+class TestSavePrepWorker:
+    @pytest.mark.asyncio
+    async def test_save_prep_worker_scan_runs_off_loop_with_the_save_lock_held(
+        self,
+        session_config: SessionLoggingConfig,
+        mock_vibe_config: ChartreuxConfigSchema,
+        mock_tool_manager: ToolManager,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The validation scan occupies a worker thread, not the event loop:
+        while the in-lock scan is gated, other tasks keep running on the loop
+        and the save lock stays held across the whole save.
+        """
+        logger = SessionLogger(session_config, "save-prep-worker-offloop")
+        gate = _SavePrepScanGate(logger, monkeypatch)
+        loop_thread = get_ident()
+
+        ticks = 0
+
+        async def ticker() -> None:
+            nonlocal ticks
+            while not gate.release.is_set():
+                ticks += 1
+                await asyncio.sleep(0)
+
+        task = asyncio.create_task(
+            _fence_save(
+                logger, [_fence_user("u1", "u1")], mock_vibe_config, mock_tool_manager
+            )
+        )
+        tick_task = asyncio.create_task(ticker())
+        assert await asyncio.to_thread(gate.started.wait, 5)
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        assert ticks > 0  # the event loop stayed free during the in-lock scan
+        assert logger._save_lock.locked()
+        gate.release.set()
+        await task
+        await tick_task
+        assert gate.scans == 1
+        assert gate.scan_threads[0] != loop_thread  # the scan ran off-loop
+        assert gate.lock_held_at_scan == [True]
+        assert _worker_transcript_contents(logger) == ["u1"]
+
+    @pytest.mark.asyncio
+    async def test_save_prep_worker_generation_bump_mid_prep_is_dropped_at_the_fence(
+        self,
+        session_config: SessionLoggingConfig,
+        mock_vibe_config: ChartreuxConfigSchema,
+        mock_tool_manager: ToolManager,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        logger = SessionLogger(session_config, "save-prep-worker-stale")
+        await _fence_save(
+            logger, [_fence_user("u1", "u1")], mock_vibe_config, mock_tool_manager
+        )
+        before = _fence_messages_path(logger).read_bytes()
+        generation = logger._transcript_cursor_generation
+
+        def bump_mid_prep() -> None:
+            # The lock-free generation bump, issued from the scan worker
+            # thread mid-prep.
+            logger.invalidate_transcript_cursor()
+
+        gate = _SavePrepScanGate(logger, monkeypatch, mid_scan=bump_mid_prep)
+        task = asyncio.create_task(
+            _fence_save(
+                logger,
+                [_fence_user("u2", "u2")],
+                mock_vibe_config,
+                mock_tool_manager,
+                steps=2,
+            )
+        )
+        assert await asyncio.to_thread(gate.started.wait, 5)
+        assert logger._transcript_cursor_generation == generation + 1
+        gate.release.set()
+        await task  # no raise: the fence drops the stale save
+        assert _fence_messages_path(logger).read_bytes() == before
+        assert gate.scans == 1
+
+    @pytest.mark.asyncio
+    async def test_save_prep_worker_cancel_during_prep_frees_the_lock_disk_untouched(
+        self,
+        session_config: SessionLoggingConfig,
+        mock_vibe_config: ChartreuxConfigSchema,
+        mock_tool_manager: ToolManager,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        logger = SessionLogger(session_config, "save-prep-worker-cancel")
+        await _fence_save(
+            logger, [_fence_user("u1", "u1")], mock_vibe_config, mock_tool_manager
+        )
+        before = _fence_messages_path(logger).read_bytes()
+        gate = _SavePrepScanGate(logger, monkeypatch)
+        task = asyncio.create_task(
+            _fence_save(
+                logger,
+                [_fence_user("u1", "u1"), _fence_user("u2", "u2")],
+                mock_vibe_config,
+                mock_tool_manager,
+                steps=2,
+            )
+        )
+        assert await asyncio.to_thread(gate.started.wait, 5)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert not logger._save_lock.locked()  # the lock freed on cancel
+        gate.release.set()
+        assert await asyncio.to_thread(gate.finished.wait, 5)  # pure worker drained
+        assert _fence_messages_path(logger).read_bytes() == before  # disk untouched
+        # A later save still acquires the lock and persists.
+        await _fence_save(
+            logger,
+            [_fence_user("u1", "u1"), _fence_user("u2", "u2")],
+            mock_vibe_config,
+            mock_tool_manager,
+            steps=3,
+        )
+        assert _worker_transcript_contents(logger) == ["u1", "u2"]
+
+    @pytest.mark.asyncio
+    async def test_save_prep_worker_append_during_prep_persists_one_consistent_state(
+        self,
+        session_config: SessionLoggingConfig,
+        mock_vibe_config: ChartreuxConfigSchema,
+        mock_tool_manager: ToolManager,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        logger = SessionLogger(session_config, "save-prep-worker-append")
+        messages = MessageList([_fence_user("u1", "u1")])
+        gate = _SavePrepScanGate(logger, monkeypatch)
+        task = asyncio.create_task(
+            _fence_save(logger, messages, mock_vibe_config, mock_tool_manager)
+        )
+        assert await asyncio.to_thread(gate.started.wait, 5)
+        # A concurrent append lands while the first save's scan is gated: the
+        # pre-lock snapshot already holds only u1.
+        messages.append(_fence_user("u2", "u2"))
+        gate.release.set()
+        await task
+        assert _worker_transcript_contents(logger) == ["u1"]
+        # The next save of the live list persists the appended message too:
+        # one consistent state per save, never a torn transcript.
+        await _fence_save(
+            logger, messages, mock_vibe_config, mock_tool_manager, steps=2
+        )
+        assert _worker_transcript_contents(logger) == ["u1", "u2"]
+
+    @pytest.mark.asyncio
+    async def test_save_prep_worker_corrupt_fresh_save_raises_typed_error_from_the_worker(
+        self,
+        session_config: SessionLoggingConfig,
+        mock_vibe_config: ChartreuxConfigSchema,
+        mock_tool_manager: ToolManager,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Corrupt-but-fresh: the typed TranscriptIntegrityError raises from
+        the in-lock worker BEFORE the fence — never silently persisted.
+        """
+        logger = SessionLogger(session_config, "save-prep-worker-corrupt-fresh")
+        await _fence_save(
+            logger, [_fence_user("u1", "u1")], mock_vibe_config, mock_tool_manager
+        )
+        before = _fence_messages_path(logger).read_bytes()
+        gate = _SavePrepScanGate(logger, monkeypatch, block_first=False)
+        loop_thread = get_ident()
+        corrupt = _worker_corrupt_transcript()
+        with pytest.raises(TranscriptIntegrityError) as exc_info:
+            await _fence_save(logger, corrupt, mock_vibe_config, mock_tool_manager)
+        assert gate.scans == 1
+        assert gate.scan_threads[0] != loop_thread  # raised from the worker
+        assert gate.lock_held_at_scan == [True]  # inside the lock, pre-fence
+        assert not logger._save_lock.locked()
+        assert _fence_messages_path(logger).read_bytes() == before  # not persisted
+        # Same exception type and message content as today's on-loop wrapper.
+        with pytest.raises(TranscriptIntegrityError) as direct:
+            SessionLogger._check_transcript_persistence(corrupt)
+        assert str(exc_info.value) == str(direct.value)
+        assert "session save boundary" in str(exc_info.value)
+
+    @pytest.mark.asyncio
+    async def test_save_prep_worker_corrupt_stale_save_raises_never_drops_at_the_fence(
+        self,
+        session_config: SessionLoggingConfig,
+        mock_vibe_config: ChartreuxConfigSchema,
+        mock_tool_manager: ToolManager,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Corrupt-but-stale: the generation bumps mid-prep, yet the save must
+        still RAISE from the validation worker — never silently drop at the
+        fence and never silently persist.
+        """
+        logger = SessionLogger(session_config, "save-prep-worker-corrupt-stale")
+        await _fence_save(
+            logger, [_fence_user("u1", "u1")], mock_vibe_config, mock_tool_manager
+        )
+        before = _fence_messages_path(logger).read_bytes()
+        generation = logger._transcript_cursor_generation
+
+        def bump_mid_prep() -> None:
+            logger.invalidate_transcript_cursor()
+
+        gate = _SavePrepScanGate(
+            logger, monkeypatch, block_first=False, mid_scan=bump_mid_prep
+        )
+        corrupt = _worker_corrupt_transcript()
+        with pytest.raises(TranscriptIntegrityError) as exc_info:
+            await _fence_save(logger, corrupt, mock_vibe_config, mock_tool_manager)
+        # The save was already stale when the worker raised: validation
+        # precedes the fence, so the typed error wins over the drop.
+        assert logger._transcript_cursor_generation == generation + 1
+        assert gate.scans == 1
+        assert gate.lock_held_at_scan == [True]
+        assert _fence_messages_path(logger).read_bytes() == before
+        with pytest.raises(TranscriptIntegrityError) as direct:
+            SessionLogger._check_transcript_persistence(corrupt)
+        assert str(exc_info.value) == str(direct.value)
+
+    @pytest.mark.asyncio
+    async def test_save_prep_worker_overlapping_saves_are_serialized_no_overtake(
+        self,
+        session_config: SessionLoggingConfig,
+        mock_vibe_config: ChartreuxConfigSchema,
+        mock_tool_manager: ToolManager,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Overlapping saves are serialized by the save lock held across prep
+        + write: the second save cannot even enter prep — let alone complete
+        — before the first.
+        """
+        logger = SessionLogger(session_config, "save-prep-worker-overlap")
+        gate = _SavePrepScanGate(logger, monkeypatch)
+        first = asyncio.create_task(
+            _fence_save(
+                logger, [_fence_user("u1", "u1")], mock_vibe_config, mock_tool_manager
+            )
+        )
+        assert await asyncio.to_thread(gate.started.wait, 5)
+        second = asyncio.create_task(
+            _fence_save(
+                logger,
+                [_fence_user("u1", "u1"), _fence_user("u2", "u2")],
+                mock_vibe_config,
+                mock_tool_manager,
+                steps=2,
+            )
+        )
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        assert gate.scans == 1  # the second save is queued behind the lock
+        assert not second.done()
+        gate.release.set()
+        await first
+        assert not second.done()  # no overtaking: second completes after first
+        await second
+        assert gate.scans == 2
+        assert gate.lock_held_at_scan == [True, True]
+        assert _worker_transcript_contents(logger) == ["u1", "u2"]

@@ -32,7 +32,10 @@ from chartreux.core.llm_models import (
     archived_replacement,
 )
 from chartreux.core.prompts import UtilityPrompt
-from chartreux.core.session.transcript_archive import eligible_archive_prefix
+from chartreux.core.session.transcript_archive import (
+    eligible_archive_prefix,
+    eligible_pre_seal_prefix,
+)
 from chartreux.core.tools.builtins.todo import TodoState
 from chartreux.core.usage import UsagePurpose
 from chartreux.observability.logging import log_model_call_success
@@ -135,14 +138,17 @@ class PendingPostTurnTrim:
     while the session, the ``MessageList`` epoch and the compaction boundary it
     was captured at all still hold. A list rebind (reset/resume bumps the
     epoch) or a new session makes it stale, and the next attempt discards it.
-    The capture is the single recording point; the same guarded entry makes the
+    ``boundary_message_id=None`` records a P3 PRE-SEAL release: no compaction
+    boundary exists yet, and the logger keys the attempt by the stable
+    eligible-prefix endpoint + session/epoch (never a bare None key). The
+    capture is the single recording point; the same guarded entry makes the
     recorded pending LIVE — drain/fence/seal/publish through
     ``SessionLogger.complete_post_turn_trim`` (T1b).
     """
 
     session_id: str
     message_epoch: int
-    boundary_message_id: str
+    boundary_message_id: str | None
 
 
 class CompactionManager:
@@ -417,13 +423,16 @@ class CompactionManager:
         captured at another session or message epoch is stale after a rebind
         and is discarded at this attempt boundary. The newest compaction
         boundary coalesces (an existing same-key pending is replaced, never
-        stacked). A boundary is never invented merely to trim, and an invalid
-        eligible prefix is skipped. The holder is consumed at the attempt
-        boundary. Any failure — including cancellation, which the logger
-        drains without publishing — is absorbed: a failed or cancelled
-        finalization never turns a completed turn into a failure, never
-        authorizes eviction, and never partially publishes; the originals are
-        retained.
+        stacked) — and once a real boundary exists, post-seal alone owns the
+        release (P3 coalescing rule). Without a real boundary, a P3 PRE-SEAL
+        release is triggered when a settled pre-compaction prefix is eligible;
+        a boundary is never invented merely to trim, and the entry refuses
+        when neither a real boundary nor an eligible pre-seal prefix exists.
+        The holder is consumed at the attempt boundary. Any failure — including
+        cancellation, which the logger drains without publishing — is
+        absorbed: a failed or cancelled finalization never turns a completed
+        turn into a failure, never authorizes eviction, and never partially
+        publishes; the originals are retained.
         """
         try:
             if self._pending_trim_getter is None or self._pending_trim_recorder is None:
@@ -446,15 +455,27 @@ class CompactionManager:
                 # Stale on rebind/new session: discard at the attempt boundary.
                 self._pending_trim_recorder(None)
             eligible = eligible_archive_prefix(list(self._messages))
-            if eligible is None or eligible.boundary_message_id is None:
-                # Never invent a boundary merely to trim; invalid prefixes skip.
-                return
-            # Coalesce to the newest boundary (the single recording point).
-            pending = PendingPostTurnTrim(
-                session_id=session_id,
-                message_epoch=message_epoch,
-                boundary_message_id=eligible.boundary_message_id,
-            )
+            if eligible is not None and eligible.boundary_message_id is not None:
+                # Coalesce to the newest boundary (the single recording point):
+                # post-seal alone owns the release once a real boundary exists.
+                pending = PendingPostTurnTrim(
+                    session_id=session_id,
+                    message_epoch=message_epoch,
+                    boundary_message_id=eligible.boundary_message_id,
+                )
+            else:
+                # P3 pre-seal trigger: no compaction boundary yet — release
+                # the settled pre-compaction prefix's payloads instead. The
+                # refusal site: neither a real boundary nor an eligible
+                # pre-seal prefix (a boundary is never invented merely to
+                # trim; an invalid prefix is skipped).
+                if eligible_pre_seal_prefix(list(self._messages)) is None:
+                    return
+                pending = PendingPostTurnTrim(
+                    session_id=session_id,
+                    message_epoch=message_epoch,
+                    boundary_message_id=None,
+                )
             self._pending_trim_recorder(pending)
             # T1b: make the recorded pending LIVE at the same exclusive seam —
             # drain/fence/seal/publish. The holder is consumed at this attempt

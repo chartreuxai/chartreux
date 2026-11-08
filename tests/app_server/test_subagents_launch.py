@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import replace
 import json
 from pathlib import Path
 from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock
 
+from pydantic import ValidationError
 import pytest
 
 from chartreux.app_server import _subagent_launch
@@ -33,8 +35,11 @@ from chartreux.core.agents.identity_launch import (
     InvalidChildIdentityError,
     InvalidLaunchPurposeError,
 )
-from chartreux.core.config import SessionLoggingConfig
+from chartreux.core.agents.manager import resolve_identity_candidate
+from chartreux.core.config import SessionLoggingConfig, build_default_orchestrator
+from chartreux.core.config.builder import ConfigBuilder
 from chartreux.core.config.chartreux_schema import OrchestrationConfig
+from chartreux.core.config.layers.overrides import OverridesLayer
 from chartreux.core.dispatch.route_models import (
     PackageTier as RoutePackageTier,
     PurposeRoute,
@@ -2587,4 +2592,209 @@ async def test_direct_runner_string_rejects_a_legacy_profile_name(
         ):
             await AgentRuntimeFactory().create_child(parent, "worker")
     finally:
+        await parent.aclose()
+
+
+def _layer_snapshot(orchestrator: Any) -> list[tuple[str, Any]]:
+    return [
+        (
+            layer.name,
+            layer.cached_data.model_dump() if layer.cached_data is not None else None,
+        )
+        for layer in orchestrator.layers
+    ]
+
+
+@pytest.mark.asyncio
+async def test_child_logging_rebuild_single_build_around_pre_resolved_candidate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """S1-D2 shape (b): the same-layer install performs exactly ONE candidate
+    build around a pre-resolved candidate; the retired set_field path built a
+    preview candidate and then rebuilt again.
+    """
+    parent = build_test_agent_loop(config=_config(), backend=FakeBackend())
+    candidate = resolve_identity_candidate(
+        TaskArgs(task="", identity="coder"),
+        parent_orchestrator=parent.config_orchestrator,
+        tool_inventory={
+            name: object() for name in parent.tool_manager.registered_tools
+        },
+        authorized_tool_names=frozenset(parent.tool_manager.delegable_tools),
+        session_model=parent.config.active_model,
+        user_prompts_dirs=parent.harness_files.user_prompts_dirs,
+    )
+    # Run the install on a builder-backed stack so the build count is exact.
+    candidate = replace(candidate, orchestrator=await build_default_orchestrator())
+    builds = 0
+    original = ConfigBuilder.build_candidate
+
+    async def counting_build(self: Any, *args: Any, **kwargs: Any) -> Any:
+        nonlocal builds
+        builds += 1
+        return await original(self, *args, **kwargs)
+
+    monkeypatch.setattr(ConfigBuilder, "build_candidate", counting_build)
+    child = None
+    try:
+        child = await AgentRuntimeFactory().create_child(parent, candidate)
+        assert builds == 1
+        assert child.config_orchestrator.config.session_logging.enabled is False
+    finally:
+        if child is not None:
+            await child.aclose()
+        await parent.aclose()
+
+
+@pytest.mark.asyncio
+async def test_child_logging_rebuild_save_dir_child_grandchild_sibling(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The child install derives save_dir from the live parent session dir:
+    child under <parent>/agents, grandchild under <child>/agents, sibling
+    sharing the child's save_dir with its own session folder.
+    """
+    logging = SessionLoggingConfig(
+        enabled=True, save_dir=str(tmp_path / "sessions"), session_prefix="session"
+    )
+    parent = build_test_agent_loop(config=_config(logging), backend=FakeBackend())
+    await parent.persist_empty_session()
+    parent_dir = parent.session_logger.session_dir
+    assert parent_dir is not None
+    monkeypatch.setattr(
+        "chartreux.core.agent_loop._loop.create_backend",
+        lambda **_: FakeBackend([mock_llm_chunk(content="done")]),
+    )
+    factory = AgentRuntimeFactory()
+    child = None
+    grandchild = None
+    sibling = None
+    try:
+        child = await factory.create_child(parent, "coder")
+        child_dir = child.session_logger.session_dir
+        assert child_dir is not None
+        assert child_dir.parent == parent_dir / "agents"
+        assert child_dir.name.startswith("coder_")
+        assert child.session_logger.save_dir == parent_dir / "agents"
+        assert child.session_logger.session_prefix == "coder"
+        child_logging = child.config_orchestrator.config.session_logging
+        assert child_logging.enabled is True
+        assert child_logging.save_dir == str(parent_dir / "agents")
+        assert child_logging.session_prefix == "coder"
+
+        grandchild = await factory.create_child(child, "coder")
+        grandchild_dir = grandchild.session_logger.session_dir
+        assert grandchild_dir is not None
+        assert grandchild_dir.parent == child_dir / "agents"
+        assert grandchild_dir.name.startswith("coder_")
+
+        sibling = await factory.create_child(parent, "coder")
+        sibling_dir = sibling.session_logger.session_dir
+        assert sibling_dir is not None
+        assert sibling_dir.parent == parent_dir / "agents"
+        assert sibling_dir != child_dir
+    finally:
+        for loop in (grandchild, sibling, child):
+            if loop is not None:
+                await loop.aclose()
+        await parent.aclose()
+
+
+@pytest.mark.asyncio
+async def test_child_logging_rebuild_disabled_arm_session_dir_none(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A parent without a session dir installs the disabled arm: the child
+    keeps session logging off and has no session dir.
+    """
+    parent = build_test_agent_loop(config=_config(), backend=FakeBackend())
+    assert parent.session_logger.session_dir is None
+    monkeypatch.setattr(
+        "chartreux.core.agent_loop._loop.create_backend",
+        lambda **_: FakeBackend([mock_llm_chunk(content="done")]),
+    )
+    child = None
+    try:
+        child = await AgentRuntimeFactory().create_child(parent, "coder")
+        assert child.session_logger.session_dir is None
+        assert child.session_logger.enabled is False
+        assert child.config_orchestrator.config.session_logging.enabled is False
+    finally:
+        if child is not None:
+            await child.aclose()
+        await parent.aclose()
+
+
+@pytest.mark.asyncio
+async def test_child_logging_rebuild_invalid_config_unwrapped_validation_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An invalid installed config surfaces as the unwrapped pydantic
+    ValidationError from the single rebuild (not a wrapped failure list).
+    """
+
+    class _InvalidLoggingDump(SessionLoggingConfig):
+        def model_dump(self, **kwargs: Any) -> dict[str, Any]:
+            return {"save_dir": 123, "session_prefix": "coder", "enabled": True}
+
+    monkeypatch.setattr(
+        "chartreux.app_server._runtime.SessionLoggingConfig", _InvalidLoggingDump
+    )
+    parent = build_test_agent_loop(config=_config(), backend=FakeBackend())
+    monkeypatch.setattr(
+        "chartreux.core.agent_loop._loop.create_backend",
+        lambda **_: FakeBackend([mock_llm_chunk(content="done")]),
+    )
+    try:
+        with pytest.raises(ValidationError):
+            await AgentRuntimeFactory().create_child(parent, "coder")
+    finally:
+        await parent.aclose()
+
+
+@pytest.mark.asyncio
+async def test_child_logging_rebuild_parent_orchestrator_not_mutated(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The install mutates only the child's copied orchestrator: the parent's
+    config and layer stack are byte-identical afterwards, while the child's
+    overrides layer carries the merged session_logging on top of its cache.
+    """
+    logging = SessionLoggingConfig(
+        enabled=True, save_dir=str(tmp_path / "sessions"), session_prefix="session"
+    )
+    parent = build_test_agent_loop(config=_config(logging), backend=FakeBackend())
+    await parent.persist_empty_session()
+    parent_dir = parent.session_logger.session_dir
+    assert parent_dir is not None
+    orchestrator = parent.config_orchestrator
+    orchestrator.insert_layer(OverridesLayer(data={"theme": "parent-theme"}), 0)
+    orchestrator.rebuild()
+    before_config = orchestrator.config.model_dump(mode="json")
+    before_layers = _layer_snapshot(orchestrator)
+    monkeypatch.setattr(
+        "chartreux.core.agent_loop._loop.create_backend",
+        lambda **_: FakeBackend([mock_llm_chunk(content="done")]),
+    )
+    child = None
+    try:
+        child = await AgentRuntimeFactory().create_child(parent, "coder")
+        assert orchestrator.config.model_dump(mode="json") == before_config
+        assert _layer_snapshot(orchestrator) == before_layers
+        child_overrides = next(
+            layer
+            for layer in child.config_orchestrator.layers
+            if layer.name == OverridesLayer.NAME
+        )
+        child_data = (
+            child_overrides.cached_data.model_dump()
+            if child_overrides.cached_data is not None
+            else {}
+        )
+        assert child_data["theme"] == "parent-theme"
+        assert child_data["session_logging"]["save_dir"] == str(parent_dir / "agents")
+        assert child_data["session_logging"]["session_prefix"] == "coder"
+    finally:
+        if child is not None:
+            await child.aclose()
         await parent.aclose()

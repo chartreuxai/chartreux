@@ -5,6 +5,7 @@ from typing import Any
 
 import pytest
 
+from chartreux.core.agents import launch as launch_module
 from chartreux.core.agents.launch import FrozenPersona, resolve_launch
 from chartreux.core.agents.manager import resolve_identity_candidate
 from chartreux.core.config.chartreux_schema import ChartreuxConfigSchema
@@ -741,3 +742,52 @@ def test_committed_model_launch_ignores_later_catalog_edits(
     )
     assert restored.committed_model == child.committed_model
     assert restored.orchestrator.config.get_active_model().thinking == "off"
+
+
+def _child_build_count(
+    monkeypatch: pytest.MonkeyPatch,
+    config: ChartreuxConfigSchema,
+    launch: LaunchConfig | None,
+) -> tuple[Any, int]:
+    # The count is measured around the resolution of a pre-resolved candidate,
+    # so an unrelated assembly in a caller cannot skew it.
+    builds: list[bool] = []
+    original = launch_module.build_child_orchestrator
+
+    def counting_build(
+        source: Any, inputs: Any, *, strip_runtime_thinking: bool = False
+    ) -> Any:
+        builds.append(strip_runtime_thinking)
+        return original(source, inputs, strip_runtime_thinking=strip_runtime_thinking)
+
+    monkeypatch.setattr(launch_module, "build_child_orchestrator", counting_build)
+    return resolve(config, launch), len(builds)
+
+
+def test_launch_build_count_single_build_for_pre_resolved_candidate(
+    config: ChartreuxConfigSchema, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """One child assembly per launch: the discarded duplicate is deleted (S1-D1).
+
+    The first build's orchestration result was thrown away and its staged
+    config overwritten before any use, so a second assembly added nothing the
+    resolved candidate could observe.
+    """
+    candidate, build_count = _child_build_count(monkeypatch, config, None)
+    assert candidate.effective_model.alias == "small"
+    assert build_count == 1
+
+
+def test_launch_build_count_explicit_thinking_rebuilds_once_more(
+    config: ChartreuxConfigSchema, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Explicit spawn thinking keeps its legitimate second build.
+
+    The thinking override is installed as a launch input after model
+    assignment, so that arm must rebuild the child exactly once more.
+    """
+    candidate, build_count = _child_build_count(
+        monkeypatch, config, LaunchConfig(thinking="low")
+    )
+    assert candidate.effective_thinking == "low"
+    assert build_count == 2

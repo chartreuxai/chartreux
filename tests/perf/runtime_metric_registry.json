@@ -1,0 +1,23 @@
+{
+  "schema": "chartreux.runtime_metric_registry.v1",
+  "scope": "Closed registry of gated metric-cell campaign IDs for the v0.7.5 stage-2 runtime gate. The stage-2 exit assertion enumerates exactly these entries: each must be ACTIVE-eligible or DORMANT-with-reason. A metric measured in any other cell is not gated. Activation inputs: the committed baselines (tests/perf/baselines/), this registry, and runtime_metric_determinants.json. Pre-existing frozen tests/perf ceilings are trip-safety only and are never superseded by this registry.",
+  "entries": [
+    {"campaign_id": "A1", "metric": "turn_application_overhead_p95_ms", "unit": "ms", "cell": "x1_fresh_headless_fb10_c4", "producer_wp": "X1"},
+    {"campaign_id": "A2", "metric": "transport_ttfb_p95_ms", "unit": "ms", "cell": "x1_fresh_headless_fb10_c4", "producer_wp": "X1"},
+    {"campaign_id": "A3", "metric": "transport_chunk_gap_p95_ms", "unit": "ms", "cell": "x1_fresh_headless_fb10_c4", "producer_wp": "X1"},
+    {"campaign_id": "A4", "metric": "loop_heartbeat_excess_p95_ms", "unit": "ms", "cell": "x1_fresh_headless_fb10_c4", "producer_wp": "X1"},
+    {"campaign_id": "B1", "metric": "turn_application_overhead_p95_ms", "unit": "ms", "cell": "x2_loaded_headless_8x200k", "producer_wp": "X1"},
+    {"campaign_id": "B2", "metric": "loop_heartbeat_excess_p95_ms", "unit": "ms", "cell": "x2_loaded_headless_8x200k", "producer_wp": "X1"},
+    {"campaign_id": "B3", "metric": "notification_count_p95_per_root_turn", "unit": "events", "cell": "x2_loaded_headless_8x200k", "producer_wp": "X2"},
+    {"campaign_id": "B4", "metric": "notification_bytes_p95_per_root_turn", "unit": "bytes", "cell": "x2_loaded_headless_8x200k", "producer_wp": "X2"},
+    {"campaign_id": "C1", "metric": "save_worker_scan_p95_ms", "unit": "ms", "cell": "save_loaded_200k", "producer_wp": "P5-Reanchor"},
+    {"campaign_id": "C2", "metric": "save_lock_held_await_p95_ms", "unit": "ms", "cell": "save_loaded_200k", "producer_wp": "P5-Reanchor"},
+    {"campaign_id": "C3", "metric": "loop_heartbeat_excess_p95_ms", "unit": "ms", "cell": "save_loaded_200k", "producer_wp": "P5-Reanchor"},
+    {"campaign_id": "D1", "metric": "render_flush_p95_ms", "unit": "ms", "cell": "pilot_streaming_fresh", "producer_wp": "WP2"},
+    {"campaign_id": "E1", "metric": "completion_storm_drain_p95_ms", "unit": "ms", "cell": "storm_8child", "producer_wp": "X8b"},
+    {"campaign_id": "E2", "metric": "permission_round_trip_p95_ms", "unit": "ms", "cell": "permission_fake_response", "producer_wp": "X8d"},
+    {"campaign_id": "F1", "metric": "turn_application_overhead_p95_ms", "unit": "ms", "cell": "soak_loaded_latency_turns301_400", "producer_wp": "X3a"},
+    {"campaign_id": "F2", "metric": "loop_heartbeat_excess_p95_ms", "unit": "ms", "cell": "soak_loaded_latency_turns301_400", "producer_wp": "X3a"},
+    {"campaign_id": "G1", "metric": "rss_slope_p95_bytes_per_turn", "unit": "bytes/turn", "cell": "soak_loaded_memory_windows200_400", "producer_wp": "X3b"}
+  ]
+}

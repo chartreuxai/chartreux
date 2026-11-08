@@ -43,6 +43,7 @@ from chartreux.core.agent_loop.errors import AgentLoopLLMResponseError
 from chartreux.core.agent_loop.llm_gateway import (
     CallResources,
     CompletionInputs,
+    LiveRequestSource,
     LLMGateway,
     TranscriptAppend,
 )
@@ -55,6 +56,11 @@ from chartreux.core.llm.failures import RequestRetryBudget, classify
 from chartreux.core.llm.format import APIToolFormatHandler
 from chartreux.core.llm.types import BackendLike
 from chartreux.core.llm_models import AvailableTool, LLMChunk, LLMMessage, StrToolChoice
+from chartreux.core.message_list import (
+    MessageList,
+    RequestEnvelope,
+    freeze_request_provenance,
+)
 from chartreux.core.model_catalog.availability import (
     EligibleDeployment,
     eligible_deployments,
@@ -222,6 +228,11 @@ class CompletionCoordinator:
         # resumed context); every other admission clears it, so ordinary
         # runs bind None into CallResources and are never watched.
         self._resume_progress_watch: ResumeProgressWatch | None = None
+        # S1-A1 request provenance: the envelope minted by the LAST
+        # build_completion_inputs call. attempt() runs one attempt at a time
+        # per loop, so the slot never interleaves; every later attempt mints
+        # its own envelope rather than refreshing this one.
+        self._last_request_envelope: RequestEnvelope | None = None
 
     def _extra_headers(self, provider: ProviderConfig | None = None) -> dict[str, str]:
         provider = (
@@ -246,11 +257,15 @@ class CompletionCoordinator:
         purpose: UsagePurpose = UsagePurpose.CONVERSATION,
     ) -> CompletionInputs:
         provider = self._config_getter().get_provider_for_model(model)
+        frozen_messages, envelope = freeze_request_provenance(
+            messages, model_alias=model.alias, supports_images=model.supports_images
+        )
+        self._last_request_envelope = envelope
         return CompletionInputs(
             model=model,
             provider_name=provider.name,
             emits_finish_reason=provider.emits_finish_reason,
-            messages=tuple(messages),
+            messages=frozen_messages,
             tools=tools,
             tool_choice=tool_choice,
             extra_headers=self._extra_headers(provider),
@@ -258,7 +273,24 @@ class CompletionCoordinator:
             max_tokens=self._max_tokens_getter(),
             account_conversation=account_conversation,
             purpose=purpose,
+            # S1-A2 carrier population: the live source list rides the
+            # envelope to the gateway, so the memo's service-time re-read
+            # reads the LIVE list, never a captured copy. Unprovenanced
+            # sequences (envelope None) keep the naive interface.
+            live_source=(
+                LiveRequestSource(source=messages, envelope=envelope)
+                if isinstance(messages, MessageList) and envelope is not None
+                else None
+            ),
         )
+
+    @property
+    def last_request_envelope(self) -> RequestEnvelope | None:
+        """The request envelope the last input build minted, if any.
+
+        ``None`` when the build ran over an unprovenanced sequence.
+        """
+        return self._last_request_envelope
 
     def build_call_resources(
         self, backend: BackendLike, budget: RequestRetryBudget | None = None

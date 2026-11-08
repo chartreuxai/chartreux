@@ -95,6 +95,7 @@ class EventProjector:
         self._session_preview = session_preview
         self.history: list[PublicHistoryEntry] = []
         self._entries: dict[str, PublicHistoryEntry] = {}
+        self._entry_positions: dict[str, int] = {}
         self._assistant_entries: dict[str, str] = {}
         self._reasoning_entries: dict[str, str] = {}
         self._effect_entries: dict[str, str] = {}
@@ -148,6 +149,9 @@ class EventProjector:
         self.session_id = session_id
         self.history = rebind_history(self.history, session_id)
         self._entries = {entry.id: entry for entry in self.history}
+        self._entry_positions = {
+            entry.id: position for position, entry in enumerate(self.history)
+        }
 
     def link_subagent(
         self, tool_call_id: str, child_session_id: str
@@ -636,6 +640,7 @@ class EventProjector:
             raise ValueError(f"Duplicate public history entry: {entry.id}")
         self.history.append(entry)
         self._entries[entry.id] = entry
+        self._entry_positions[entry.id] = len(self.history) - 1
         return ProjectedUpdate(
             method="history/entryAdded",
             params=HistoryEntryAddedParams(
@@ -647,11 +652,28 @@ class EventProjector:
             ),
         )
 
+    def _entry_position(self, entry_id: str) -> int:
+        """Locate an entry through the maintained id-to-position index."""
+        index = self._entry_positions.get(entry_id)
+        if index is not None and index < len(self.history):
+            if self.history[index].id == entry_id:
+                return index
+        # History is a public list; a foreign append invalidates positions.
+        self._entry_positions = {
+            entry.id: position for position, entry in enumerate(self.history)
+        }
+        return next(
+            index
+            for index, candidate in enumerate(self.history)
+            if candidate.id == entry_id
+        )
+
     def _patch(
         self, entry_id: str, operations: list[JsonPatchOperation]
     ) -> ProjectedUpdate:
         entry = self._entries[entry_id]
-        timing_only = is_timing_only_patch(entry, operations)
+        raw = entry.model_dump(mode="json", by_alias=True)
+        timing_only = is_timing_only_patch(entry, operations, raw=raw)
         if (
             entry.generation_status is PublicEntryGenerationStatus.COMPLETED
             and not timing_only
@@ -663,7 +685,6 @@ class EventProjector:
                 *operations,
                 JsonPatchOperation(op="replace", path="/updatedAt", value=timestamp),
             ]
-        raw = entry.model_dump(mode="json", by_alias=True)
         patched = apply_json_patch(raw, operations)
         updated = validate_history_entry(patched)
         if (
@@ -675,12 +696,7 @@ class EventProjector:
         ):
             raise ValueError(f"Public history entry identity is frozen: {entry_id}")
         self._entries[entry_id] = updated
-        index = next(
-            index
-            for index, candidate in enumerate(self.history)
-            if candidate.id == entry_id
-        )
-        self.history[index] = updated
+        self.history[self._entry_position(entry_id)] = updated
         return ProjectedUpdate(
             method="history/entryUpdated",
             params=HistoryEntryUpdatedParams(

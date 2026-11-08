@@ -1,0 +1,44 @@
+{
+  "attempt_count": 10,
+  "attempts_file": "attempts.jsonl",
+  "baseline_file": null,
+  "baseline_validation_error": null,
+  "campaign_ids": [
+    "G1"
+  ],
+  "campaign_wall_s": 4546.578,
+  "cell": "soak_loaded_memory_windows200_400",
+  "eligible_run_count": 0,
+  "halt": null,
+  "identity": null,
+  "machine": {
+    "commit": "33501f3d",
+    "core_count": 24,
+    "cpu_model": "AMD Ryzen 9 5900X 12-Core Processor",
+    "loadavg": [
+      1.79443359375,
+      1.71923828125,
+      1.78271484375
+    ],
+    "platform": "Linux-7.3.0-10-generic-x86_64-with-glibc2.44",
+    "python_version": "3.12.13"
+  },
+  "plan_price_s": 360.0,
+  "promotable": false,
+  "recipe": "soak-memory",
+  "selected_run_ids": [],
+  "status": "incomplete_attempts",
+  "unrepresentable_attempts": [
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10
+  ],
+  "x5a_closure": null
+}

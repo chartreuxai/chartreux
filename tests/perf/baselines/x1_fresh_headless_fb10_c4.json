@@ -1,0 +1,209 @@
+{
+  "attempt_count": 5,
+  "attempt_digest": "52887b320a7a098b487519020818fdbc3229d8a7d4df06bcca982ab1c280323c",
+  "attempts": [
+    {
+      "failing_row": null,
+      "machine_fields_missing": [],
+      "machine_mismatch_fields": [],
+      "reasons": [],
+      "row_reasons": {},
+      "run_id": "x1_fresh_headless_fb10_c4-r01",
+      "run_reasons": [],
+      "run_start_utc": "2026-11-08T02:19:12Z",
+      "status": "eligible"
+    },
+    {
+      "failing_row": null,
+      "machine_fields_missing": [],
+      "machine_mismatch_fields": [],
+      "reasons": [],
+      "row_reasons": {},
+      "run_id": "x1_fresh_headless_fb10_c4-r02",
+      "run_reasons": [],
+      "run_start_utc": "2026-11-08T02:19:33Z",
+      "status": "eligible"
+    },
+    {
+      "failing_row": null,
+      "machine_fields_missing": [],
+      "machine_mismatch_fields": [],
+      "reasons": [],
+      "row_reasons": {},
+      "run_id": "x1_fresh_headless_fb10_c4-r03",
+      "run_reasons": [],
+      "run_start_utc": "2026-11-08T02:19:55Z",
+      "status": "eligible"
+    },
+    {
+      "failing_row": null,
+      "machine_fields_missing": [],
+      "machine_mismatch_fields": [],
+      "reasons": [],
+      "row_reasons": {},
+      "run_id": "x1_fresh_headless_fb10_c4-r04",
+      "run_reasons": [],
+      "run_start_utc": "2026-11-08T02:20:16Z",
+      "status": "eligible"
+    },
+    {
+      "failing_row": null,
+      "machine_fields_missing": [],
+      "machine_mismatch_fields": [],
+      "reasons": [],
+      "row_reasons": {},
+      "run_id": "x1_fresh_headless_fb10_c4-r05",
+      "run_reasons": [],
+      "run_start_utc": "2026-11-08T02:20:38Z",
+      "status": "eligible"
+    }
+  ],
+  "campaign_ids": [
+    "A1",
+    "A2",
+    "A3",
+    "A4"
+  ],
+  "campaigns": {
+    "A1": {
+      "campaign_id": "A1",
+      "cell": "x1_fresh_headless_fb10_c4",
+      "metric": "turn_application_overhead_p95_ms",
+      "null_reason": null,
+      "run_ids": [
+        "x1_fresh_headless_fb10_c4-r01",
+        "x1_fresh_headless_fb10_c4-r02",
+        "x1_fresh_headless_fb10_c4-r03",
+        "x1_fresh_headless_fb10_c4-r04",
+        "x1_fresh_headless_fb10_c4-r05"
+      ],
+      "run_p95s": [
+        22.3712,
+        22.0289,
+        21.5718,
+        21.8121,
+        21.4733
+      ],
+      "unit": "ms"
+    },
+    "A2": {
+      "campaign_id": "A2",
+      "cell": "x1_fresh_headless_fb10_c4",
+      "metric": "transport_ttfb_p95_ms",
+      "null_reason": null,
+      "run_ids": [
+        "x1_fresh_headless_fb10_c4-r01",
+        "x1_fresh_headless_fb10_c4-r02",
+        "x1_fresh_headless_fb10_c4-r03",
+        "x1_fresh_headless_fb10_c4-r04",
+        "x1_fresh_headless_fb10_c4-r05"
+      ],
+      "run_p95s": [
+        10.8917,
+        10.8869,
+        10.8879,
+        10.872,
+        10.8722
+      ],
+      "unit": "ms"
+    },
+    "A3": {
+      "campaign_id": "A3",
+      "cell": "x1_fresh_headless_fb10_c4",
+      "metric": "transport_chunk_gap_p95_ms",
+      "null_reason": null,
+      "run_ids": [
+        "x1_fresh_headless_fb10_c4-r01",
+        "x1_fresh_headless_fb10_c4-r02",
+        "x1_fresh_headless_fb10_c4-r03",
+        "x1_fresh_headless_fb10_c4-r04",
+        "x1_fresh_headless_fb10_c4-r05"
+      ],
+      "run_p95s": [
+        5.8336,
+        5.8349,
+        5.8285,
+        5.8187,
+        5.8216
+      ],
+      "unit": "ms"
+    },
+    "A4": {
+      "campaign_id": "A4",
+      "cell": "x1_fresh_headless_fb10_c4",
+      "metric": "loop_heartbeat_excess_p95_ms",
+      "null_reason": null,
+      "run_ids": [
+        "x1_fresh_headless_fb10_c4-r01",
+        "x1_fresh_headless_fb10_c4-r02",
+        "x1_fresh_headless_fb10_c4-r03",
+        "x1_fresh_headless_fb10_c4-r04",
+        "x1_fresh_headless_fb10_c4-r05"
+      ],
+      "run_p95s": [
+        5.1084,
+        5.0148,
+        5.0196,
+        4.9397,
+        5.0414
+      ],
+      "unit": "ms"
+    }
+  },
+  "cell": "x1_fresh_headless_fb10_c4",
+  "cell_identity": {
+    "cell": "x1_fresh_headless_fb10_c4",
+    "dimensions": {
+      "burst_agents": 0,
+      "burst_interval_turns": 10,
+      "child_agents": 0,
+      "history_messages": 2000,
+      "mode": "measure",
+      "root_turns": 400
+    },
+    "fixture_hash": "25d08b939a0329f8af0276686ccc468880b03d9ce5079832822391d80c9b9d7d",
+    "metric_version": "chartreux.runtime_perf.v1",
+    "workload_hash": null
+  },
+  "closure": {
+    "eligible_run_count": 5,
+    "eligible_run_ids": [
+      "x1_fresh_headless_fb10_c4-r01",
+      "x1_fresh_headless_fb10_c4-r02",
+      "x1_fresh_headless_fb10_c4-r03",
+      "x1_fresh_headless_fb10_c4-r04",
+      "x1_fresh_headless_fb10_c4-r05"
+    ],
+    "note": "5 eligible runs collected; the latest 5 are selected",
+    "reason": null,
+    "selected_run_count": 5,
+    "selected_run_ids": [
+      "x1_fresh_headless_fb10_c4-r01",
+      "x1_fresh_headless_fb10_c4-r02",
+      "x1_fresh_headless_fb10_c4-r03",
+      "x1_fresh_headless_fb10_c4-r04",
+      "x1_fresh_headless_fb10_c4-r05"
+    ],
+    "status": "eligible_complete"
+  },
+  "eligible_run_ids": [
+    "x1_fresh_headless_fb10_c4-r01",
+    "x1_fresh_headless_fb10_c4-r02",
+    "x1_fresh_headless_fb10_c4-r03",
+    "x1_fresh_headless_fb10_c4-r04",
+    "x1_fresh_headless_fb10_c4-r05"
+  ],
+  "machine": {
+    "commit": "33501f3d",
+    "core_count": 24,
+    "cpu_model": "AMD Ryzen 9 5900X 12-Core Processor",
+    "loadavg": [
+      0.98095703125,
+      1.36328125,
+      1.43603515625
+    ],
+    "platform": "Linux-7.3.0-10-generic-x86_64-with-glibc2.44",
+    "python_version": "3.12.13"
+  },
+  "schema": "chartreux.runtime_baseline.v1"
+}

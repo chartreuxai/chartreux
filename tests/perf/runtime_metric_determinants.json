@@ -1,0 +1,205 @@
+{
+  "schema": "chartreux.runtime_metric_determinants.v1",
+  "registry_binding": "Entries A1..G1 refer to the campaign IDs of runtime_metric_registry.json (schema chartreux.runtime_metric_registry.v1). The registry and this file are pinned byte-exact in the plan document; a sha256 mismatch at P-Artifacts time is a stop-and-escalate condition and never authorizes silent re-emit.",
+  "common_determinants": {
+    "runs": "5 fresh-process runs per cell. Each run produces one p95 value; the five run-p95s produce M=median and D=MAD (median absolute deviation).",
+    "ops_floor": "Each run measures >= 100 operations of the metric's unit AFTER >= 10 warmup operations that are discarded and never counted.",
+    "heartbeat_floor": "Metrics whose unit is loop_heartbeat margin (loop_heartbeat_excess_p95_ms and any heartbeat-derived row) require >= 1000 logged heartbeat rows per run; a run with fewer heartbeat rows is invalid; a fresh run MAY be attempted within the campaign_closure attempt cap — never down-weighted, never waived.",
+    "p95_definition": "Nearest-rank p95 computed per run over that run's operation latencies (nearest-rank: the k-th smallest with k = ceil(0.95 * n)).",
+    "quiet_definition": "A run is quiet only if the 1-minute loadavg is <= 0.5 * core_count sampled immediately BEFORE the run and immediately AFTER the run. Both samples must satisfy the bound; a single noisy sample invalidates the run.",
+    "aggregation": "M = median of the five run-p95s; D = MAD of the five run-p95s (median of |x_i - M|).",
+    "threshold": "T = M + max(6*D, 0.20*M). Comparison: measured_value <= T passes (equality passes); measured_value > T fails.",
+    "active_test": "ACTIVATION (the activation event at stage-2 exit) is constructed from the COMMITTED BASELINE SET ALONE: a registry entry ACTIVATES as ACTIVE when its campaign is decision-ready (the shared run set carries exactly 5 eligible selected runs) and its threshold T built from that set is finite and positive. Activation never evaluates a fresh measured value; comparing a new measurement against the threshold is a COMPARISON (marked X5b outcome: ACTIVE-pass / ACTIVE-fail / COMPARISON-INELIGIBLE / DORMANT), never an activation state. ACTIVATION-MACHINE CONTEXT: if the activation machine's own context cannot be evaluated — a required machine-context field (cpu_model, core_count, python_version, platform) missing or unavailable at activation time — that is an INDETERMINATE activation input: the activation step halts and escalates (the plan's Activation-row rule); it is never a discretionary DORMANT or ACTIVE. A registry entry that is not ACTIVE at stage-2 exit is DORMANT with the first applicable reason in the reason order.",
+    "reason_order": "When more than one disposition reason applies, the recorded reason is the FIRST applicable in this order: (1) machine_mismatch; (2) campaign_not_decision_ready — fewer than 5 eligible runs (recorded reason insufficient_baseline_data); (3) missing_determinants; (4) degenerate_threshold — nonpositive or non-finite T; (5) run_ineligibility — including its recorded subtype invalid_sample_cap (>10% invalid samples); (6) threshold_fail / threshold_pass. TAXONOMY (pinned): tiers 1-4 are the DORMANCY rules — they determine the registry entry's ACTIVATION-STATE disposition; tier 5 is a RUN-RECORD reason, not a dormancy rule, applying wherever a run record is evaluated; tier 6 labels threshold comparisons. Dormancy tiers (1)-(4) dominate threshold comparison: a row dispositioned DORMANT is never simultaneously recorded as threshold_pass or threshold_fail, and the threshold comparison is evaluated only for non-dormant rows. SUBJECTS AND PHASES (pinned): dormancy tiers 1-4 are evaluated at ACTIVATION over the campaign's committed state and set the activation state; run_ineligibility (tier 5) applies wherever a run record is evaluated — at baseline SELECTION an ineligible run is excluded with its own ineligibility reason recorded (and never disqualifies a campaign that can still field 5 eligible runs: the campaign_closure attempt cap, not per-attempt disqualification, terminates a lean campaign; at activation, run-level ineligibility manifests solely through selection outcomes and the campaign tier); for a fresh COMPARISON run an ineligible run records COMPARISON-INELIGIBLE (no threshold outcome, activation state unchanged); tier 6 is evaluated only for eligible fresh COMPARISON runs recorded by the X5b comparison tool, never at activation.",
+    "baseline_inputs": "The committed baselines under tests/perf/baselines/ (fixture hashes, dimensions, committed M and D and T inputs), this registry, and this determinants file."
+  },
+  "common_rules": {
+    "run_eligibility": {
+      "fixture_hash": "The run's fixture hash must equal the committed baseline fixture hash for the cell.",
+      "dimensions": "The run's declared dimensions (agent count, payload size, turn count, window bounds, chunk schedule, injected-delay schedule as applicable) must equal the committed baseline dimensions for the cell.",
+      "observer_mode": "The run must execute in observer mode: instrumentation adds fields but does not change control flow; any run whose instrumentation changed gateway/protocol behavior is invalid.",
+      "metric_version": "The run record's metric_version field must equal 'chartreux.runtime_perf.v1' (the WP6 report schema — the METRIC VERSION of every run record). This is deliberately DISTINCT from this document's own schema field ('chartreux.runtime_metric_determinants.v1'), which identifies this determinants document and is never a run-record value.",
+      "machine_fields": "The run record must carry machine context with all four required fields non-null (cpu_model, core_count, python_version, platform — the helper's required fields, tests/perf/_metrics.py:95-108), plus the two quiet-stamp loadavg samples with their core_count-relative bound results. A missing required field invalidates the run."
+    },
+    "selection": "Selection is per CAMPAIGN. A baseline campaign's run set is SHARED by all campaign IDs measured in that cell (co-measured in the same runs — e.g. the x2_loaded_headless_8x200k cell's B1-B4 are collected together in one loaded-cell run set; likewise A1-A4 in the x1 cell, C1-C3 in the save cell, F1-F2 in the latency soak): select exactly the latest 5 eligible runs of that shared run set, ordered by run start time, with run id as the tie-breaker — the selected five are the same five runs for every campaign ID of the cell. SHARED-SET ELIGIBILITY (conjunction rule, deterministic): a run of a shared cell run set is eligible ONLY IF it satisfies the CONJUNCTION of every co-measured row's requirements for that cell — each row's op/sample floors, sample-validity rules, and the invalid-sample cap all hold for that single run. A run failing ANY one row's requirement is preserved as an attempted run with its ineligibility reason (the failing row's id recorded alongside) and is excluded from the shared selection for ALL campaign IDs of the cell: a run is never eligible for one row while ineligible for another. Campaign-closure attempt counting operates on this cell-wide eligibility. Selection NEVER uses a measured value. If fewer than 5 eligible runs exist, the campaign is not decision-ready: stage-2 exit cannot mark the cell's campaign IDs ACTIVE — after the campaign's bounded closure (campaign_closure) they record DORMANT with reason insufficient_baseline_data.",
+    "invalid_sample_cap": "If more than 10% of a run's samples are invalid (discarded by that row's validity rules), the run is ineligible — invalid_sample_cap is a RECORDED SUBTYPE REASON of run_ineligibility (reason-order tier 5), not a separate disposition tier. Note for B3/B4: counts are deterministic under the fixed loaded-cell protocol, so the expected D is 0; this property is recorded on every B3/B4 comparison, and the 20% band of the threshold formula is the protection against degenerate D=0 thresholds.",
+    "machine_mismatch": "If the stage-2 machine differs from the committed baseline machine — mismatch = inequality in ANY of the four required machine-context fields (cpu_model, core_count, python_version, platform), not core_count alone — the cell is recorded DORMANT with reason machine_mismatch and a PERF-BLOB machine-mismatch record is emitted; the cell is never marked ACTIVE on mismatched hardware and is never marked FAILED either.",
+    "campaign_closure": "A baseline campaign for a cell closes in exactly one of two ways: (a) ELIGIBLE_COMPLETE — exactly 5 eligible runs have been collected; or (b) INSUFFICIENT_DATA — 10 fresh-process runs have been ATTEMPTED for that cell without 5 eligible runs collecting. Every attempted run's status (eligible or its ineligibility reason) is preserved; there is no favorable selection and no re-attempt beyond the cap without a plan-level decision. A cell whose campaign closed insufficient_data is not decision-ready: threshold population from thin data is forbidden, and the cell records DORMANT with reason insufficient_baseline_data (reason-order tier 2). This closure makes the expected dormancy of F1/F2/G1(/E1) a REACHABLE terminal state rather than a stuck pipeline.",
+    "marked_comparison_outcomes": "Each comparison outcome record carries: campaign_id, the campaign closure status (eligible_complete / insufficient_data), direction (higher-is-better margin only if the row declares one; default lower-is-better), selected run ids with start timestamps, the COLLECTED run-p95s, the statistics M and D when computable, T when threshold population is authorized, the measured value when a threshold comparison occurred, the outcome label, and the reason_order-first applicable reason. NULLABLE-FIELDS RULE: a field that is not computable is recorded as NULL with its reason, NEVER fabricated or back-filled — an insufficient_data closure carries at most fewer-than-five collected run-p95s, no computable M/D beyond what those runs support, NO populated T (threshold population from thin data is forbidden), and no measured value. Outcome labels for a fresh COMPARISON run evaluated by the X5b comparison tool (never at activation): ACTIVE-pass / ACTIVE-fail (threshold comparison on a non-dormant row with an eligible comparison run), COMPARISON-INELIGIBLE (the comparison run failed its own eligibility — floors, quiet stamps, machine fields, or the invalid-sample cap; the run-level ineligibility reason recorded, NO threshold outcome, the activation state unchanged), and DORMANT (the row is dormant: the dormancy reason recorded, no threshold comparison). COMPARISON-LABEL PRECEDENCE (pinned, total order): for a fresh comparison run the recorded outcome label is determined ROW FIRST — a dormant row records DORMANT with its dormancy reason BEFORE any run-level evaluation (a comparison run's own ineligibility, if any, is recorded on the run record itself, never as the outcome label of a dormant row); on an eligible (non-dormant) row, an ineligible comparison run records COMPARISON-INELIGIBLE; only an eligible row with an eligible comparison run records ACTIVE-pass / ACTIVE-fail. Precedence: DORMANT > COMPARISON-INELIGIBLE > threshold labels."
+  },
+  "rows": {
+    "A1": {
+      "campaign_id": "A1",
+      "metric": "turn_application_overhead_p95_ms",
+      "cell": "x1_fresh_headless_fb10_c4",
+      "producer_wp": "X1",
+      "scenario": "Fresh-process headless session; X1 canonical injected-delay matrix cell: first-byte fb=10 ms plus 4 chunks of 5 ms each (c4); one canonical gate cell for A1-A4.",
+      "definition": "Per-turn end-to-end application overhead: wall time from the turn's user-message submission to the model-visible turn completion, minus the turn's TOTAL injected delays (10 ms first-byte + 4 x 5 ms chunks = 30 ms, known exactly).",
+      "floor_deviations": ["ops_floor: units are turns; >= 100 measured turns per fresh-process run after >= 10 warmup turns"],
+      "special_notes": "The injected delay is SUBTRACTED: overhead = raw_turn_latency - injected_delay. A negative residual after subtraction is an invalid sample for that turn. Both the raw latency and the injected delay are recorded alongside the residual; the run record must carry raw_p95 and residual_p95 separately, and the gate compares residual_p95 only."
+    },
+    "A2": {
+      "campaign_id": "A2",
+      "metric": "transport_ttfb_p95_ms",
+      "cell": "x1_fresh_headless_fb10_c4",
+      "producer_wp": "X1",
+      "scenario": "Same X1 canonical cell and run set as A1 (co-measured, one campaign sweep).",
+      "definition": "Transport time-to-first-byte: adapter-reported TTFB per turn as observed at the transport boundary.",
+      "floor_deviations": ["ops_floor: units are turns; >= 100 measured turns per run after >= 10 warmup turns"],
+      "special_notes": "Observed values INCLUDE the injected first-byte delay (fb=10 ms). The comparison keeps observed values gated against their own baseline; no subtraction is performed. The cell is delay-dominated by construction (10 ms is a large share of expected TTFB); this sensitivity is recorded as a property of the cell and is not a defect."
+    },
+    "A3": {
+      "campaign_id": "A3",
+      "metric": "transport_chunk_gap_p95_ms",
+      "cell": "x1_fresh_headless_fb10_c4",
+      "producer_wp": "X1",
+      "scenario": "Same X1 canonical cell and run set as A1 (co-measured).",
+      "definition": "Inter-chunk gap: wall time between consecutive chunk deliveries under the c4 schedule (3 gaps per turn), per gap.",
+      "floor_deviations": ["ops_floor: >= 100 measured turns per run after >= 10 warmup turns, AND >= 300 valid chunk gaps per run (3 gaps per turn x 100 turns)"],
+      "special_notes": "Observed values INCLUDE the injected 5 ms inter-chunk delays. Observed values stay gated; no subtraction. Like A2 the cell is delay-dominated by construction; recorded as a property. Metric minimum count note: metric-file gaps below ops floor make the run invalid, not relaxed."
+    },
+    "A4": {
+      "campaign_id": "A4",
+      "metric": "loop_heartbeat_excess_p95_ms",
+      "cell": "x1_fresh_headless_fb10_c4",
+      "producer_wp": "X1",
+      "scenario": "Same X1 canonical cell and run set as A1 (co-measured); heartbeat rows logged by the X4/X1 heartbeat observer throughout each run.",
+      "definition": "Heartbeat excess: per-heartbeat-row excess of the observed heartbeat interval over the scheduled interval (1 ms scheduled cadence in the X1 observer).",
+      "floor_deviations": ["heartbeat_floor applies: >= 1000 heartbeat rows per run; a short run is invalid — a fresh attempt MAY follow within the campaign_closure attempt cap (never relaxed)"],
+      "special_notes": "The heartbeat floor overrides the generic ops floor for this row. Warmup turns still precede measurement but do not exempt the 1000-row requirement."
+    },
+    "B1": {
+      "campaign_id": "B1",
+      "metric": "turn_application_overhead_p95_ms",
+      "cell": "x2_loaded_headless_8x200k",
+      "producer_wp": "X1",
+      "scenario": "Loaded headless cell: 8 total agents (root + 7 synchronized children), each holding a 200k-equivalent transcript footprint. Fixed seed, fixed barrier schedule, fixed load schedule (committed as baseline dimensions). The controlled load is part of the fixture; the quiet-machine rule applies to the bracketing background-noise samples only — a run whose post-run loadavg stamp is still elevated by the load tail is TENSION-RECORDED as follows: eligibility uses the bracketing stamps only, and no high-load exception exists in stage 2; campaign pricing is a budget, never an eligibility prediction.",
+      "definition": "Same metric as A1 measured in the loaded cell: per-turn wall from user-message submission to model-visible turn completion, with NO injected delay in this cell (the load itself is the fixture).",
+      "floor_deviations": ["ops_floor: >= 100 measured turns per run after >= 10 warmup turns"],
+      "special_notes": "loaded-cell definition is binding: agent_count=8, per-agent payload=200000-equivalent tokens/messages committed as fixture dimensions; the loaded cell's own fixture hash is used here, distinct from the x1 fresh cell. Quiet-machine rule unchanged (applies to whole runs)."
+    },
+    "B2": {
+      "campaign_id": "B2",
+      "metric": "loop_heartbeat_excess_p95_ms",
+      "cell": "x2_loaded_headless_8x200k",
+      "producer_wp": "X1",
+      "scenario": "Same loaded cell and run set as B1 (co-measured).",
+      "definition": "Same metric as A4, measured under load.",
+      "floor_deviations": ["heartbeat_floor applies: >= 1000 heartbeat rows per run under load; a short run is invalid — a fresh attempt MAY follow within the campaign_closure attempt cap"],
+      "special_notes": "The 1000-row floor applies under load; runs must be long enough. Quiet-machine rule applies to the whole run, not to load phases."
+    },
+    "B3": {
+      "campaign_id": "B3",
+      "metric": "notification_count_p95_per_root_turn",
+      "unit": "events",
+      "cell": "x2_loaded_headless_8x200k",
+      "producer_wp": "X2",
+      "scenario": "Loaded cell as B1. Window-closure rule (binding): the window opens at the root turn's user-message submission and closes at the projector's completed-state event for that turn's completion; every server-to-client notification serialized between open and close is counted, per root turn.",
+      "definition": "Notification count per root turn = number of server-to-client notifications serialized between window open and window close. Per-run p95 is nearest-rank p95 of the per-root-turn counts.",
+      "floor_deviations": ["ops_floor: units are root turns; >= 100 counted root turns per run after >= 10 warmup turns"],
+      "special_notes": "Counts are deterministic given the fixed seed/barrier/load schedule: the expected D over the five run-p95s is 0. This property is recorded on every B3 comparison outcome. The 20% band (max(6D, 0.20M)) is the protecting term against a degenerate all-zero-D threshold. Selection is never by measured value; B3 run selection uses start order and run id only."
+    },
+    "B4": {
+      "campaign_id": "B4",
+      "metric": "notification_bytes_p95_per_root_turn",
+      "unit": "bytes",
+      "cell": "x2_loaded_headless_8x200k",
+      "producer_wp": "X2",
+      "scenario": "Same window-closure rule as B3; same loaded-cell run set (co-measured with B3).",
+      "definition": "Sum of serialized notification payload bytes between window open and close, per root turn. Per-run p95 over >= 100 root turns.",
+      "floor_deviations": ["ops_floor: >= 100 counted root turns per run after >= 10 warmup turns"],
+      "special_notes": "Byte counts are deterministic given the fixed seed and payload provenance (fixed seed drives all notification payloads in the loaded-cell harness; no clock-derived or network-derived bytes enter the counted window). Expected D=0, recorded as for B3; 20% band is the protection. The per-notification payload provenance is committed with the fixture hash."
+    },
+    "C1": {
+      "campaign_id": "C1",
+      "metric": "save_worker_scan_p95_ms",
+      "cell": "save_loaded_200k",
+      "producer_wp": "P5-Reanchor",
+      "scenario": "Save cell with a 200k-equivalent transcript on the landed P5 code path: save_interaction runs _check_transcript_persistence in a lock-scoped asyncio.to_thread worker (chartreux/core/session/session_logger.py:1028-1032) before the staleness fence (:1035-1037). C1 times that worker's execution wall per successful save via a test-side wrapper; the worker thread identity is asserted.",
+      "definition": "Wall time of the worker's _check_transcript_persistence execution (the violation scan inside the wrapper, session_logger.py:1123-1149), per successful save.",
+      "floor_deviations": ["ops_floor: units are saves; >= 100 measured saves per run after >= 10 warmup saves"],
+      "special_notes": "200k-equivalent refers to the transcript-line/payload dimension committed in the baseline fixture hash, not 200k save operations. The timing boundary is the worker's own synchronous execution of the wrapper (entry to return inside the to_thread worker), not the lock-held await covered by C2, and not the full save call."
+    },
+    "C2": {
+      "campaign_id": "C2",
+      "metric": "save_lock_held_await_p95_ms",
+      "cell": "save_loaded_200k",
+      "producer_wp": "P5-Reanchor",
+      "scenario": "Same save cell and run set as C1 (co-measured).",
+      "definition": "Lock-held await: per successful save, the wall time from entry into the lock-held `await asyncio.to_thread(_check_transcript_persistence, ...)` (session_logger.py:1028-1032) until that await returns — LOCK-HELD ELAPSED TIME, not event-loop CPU, not full lock occupancy.",
+      "floor_deviations": ["ops_floor: units are saves; >= 100 measured saves per run after >= 10 warmup saves"],
+      "special_notes": "C2's phase INCLUDES the to_thread executor dispatch (submission overhead plus await), by design; this matches the P5 re-anchored code path where dispatch occurs inside the lock-scoped await."
+    },
+    "C3": {
+      "campaign_id": "C3",
+      "metric": "loop_heartbeat_excess_p95_ms",
+      "cell": "save_loaded_200k",
+      "producer_wp": "P5-Reanchor",
+      "scenario": "Heartbeat observer active during the save-cell runs (same run set as C1/C2).",
+      "definition": "Same metric as A4, measured while the save workload runs.",
+      "floor_deviations": ["heartbeat_floor applies: >= 1000 heartbeat rows per run"],
+      "special_notes": "C3 co-measures loop responsiveness during save activity; its run set is the C1/C2 campaign runs, provided the heartbeat floor is met (short runs are invalid; fresh attempts follow only within the campaign_closure attempt cap)."
+    },
+    "D1": {
+      "campaign_id": "D1",
+      "metric": "render_flush_p95_ms",
+      "cell": "pilot_streaming_fresh",
+      "producer_wp": "WP2",
+      "scenario": "Pilot adapter streaming cell: fresh process, WP4 Pilot adapter with streaming render path; per-render-flush timing at the D1 producer seam.",
+      "definition": "Per-flush render time at the producer seam, per completed render flush event.",
+      "floor_deviations": ["ops_floor: >= 100 completed turns AND >= 100 non-empty render flushes per run after >= 10 warmup flushes"],
+      "special_notes": "The D1 seam is the WP2 producer seam (the WP4 Pilot adapter's flush boundary). No human interaction, no real network: the Pilot adapter is exercised through its test harness with deterministic fixtures. This row depends on WP4 (Pilot adapter seam) and WP2 (producer); D1 cannot activate before both land. p50 flush duration is reported SEPARATELY alongside the gated p95."
+    },
+    "E1": {
+      "campaign_id": "E1",
+      "metric": "completion_storm_drain_p95_ms",
+      "cell": "storm_8child",
+      "producer_wp": "X8b",
+      "scenario": "Completion-history storm: 8 child agents behind a synchronized barrier. Each run exercises 100 storms, each against its OWN fresh cleaned child cohort (100 independent cleaned cohorts per run; in-memory completion history cleaned before each storm).",
+      "definition": "Time to drain one storm (from storm trigger to last completion drained), per storm; per-run p95 over >= 100 storms.",
+      "floor_deviations": ["ops_floor: units are storms; >= 100 storms per run after >= 10 warmup storms", "campaign pricing: each fresh-process run approximates 240 s; a 5-run E1 campaign is priced approximately 1200 s wall, not per-storm s"],
+      "special_notes": "Fresh cleaned cohorts are required per run: no cross-run contamination by residual completion-history entries. The cohort-cleaning step is part of the fixture, not the metric."
+    },
+    "E2": {
+      "campaign_id": "E2",
+      "metric": "permission_round_trip_p95_ms",
+      "cell": "permission_fake_response",
+      "producer_wp": "X8d",
+      "scenario": "Permission round-trip cell: the permission prompt/response exchange is exercised with a fake responder; no human in the loop and no network.",
+      "definition": "Per-round-trip latency from permission request issued to permission disposition applied, per round trip.",
+      "floor_deviations": ["ops_floor: units are permission round trips; >= 100 measured round trips per run after >= 10 warmup round trips"],
+      "special_notes": "The fake response is deterministic; fixtures carry the fake-responder fixture hash. E2 measures harness-side round-trip overhead only and its baseline dimensions exclude human/network time by construction."
+    },
+    "F1": {
+      "campaign_id": "F1",
+      "metric": "turn_application_overhead_p95_ms",
+      "cell": "soak_loaded_latency_turns301_400",
+      "producer_wp": "X3a",
+      "scenario": "Long-session soak cell: loaded (as B1); measured turns are exactly turns 301-400 of the session (100 late turns). No tracemalloc in latency runs.",
+      "definition": "Same metric as A1/B1 (no injected delay), measured only on turns 301-400.",
+      "floor_deviations": ["ops_floor: exactly 100 measured turns per run (turns 301-400) after the session has completed at least 300 turns, which serve as warmup", "no tracemalloc: the metric run MUST NOT have tracemalloc active; any latency run with tracemalloc enabled is invalid"],
+      "special_notes": "The 101-turn/100-turn boundary (turn 300 is warm boundary, turns 301-400 measured) is committed as a cell dimension. Runs must reach turn 400 to be eligible; a run that stops early is invalid — a fresh attempt MAY follow within the campaign_closure attempt cap. Per-run p95 is over the 100 late-turn latencies."
+    },
+    "F2": {
+      "campaign_id": "F2",
+      "metric": "loop_heartbeat_excess_p95_ms",
+      "cell": "soak_loaded_latency_turns301_400",
+      "producer_wp": "X3a",
+      "scenario": "Heartbeat observer during the F1 soak runs (same run set).",
+      "definition": "Same metric as A4, measured during the late-turn soak window; every heartbeat row logged while turns 301-400 are in flight is in scope.",
+      "floor_deviations": ["heartbeat_floor applies: >= 1000 heartbeat rows must be logged during turns 301-400 in-flight scope; a run with fewer late-window rows is invalid — a fresh attempt MAY follow within the campaign_closure attempt cap", "no tracemalloc rule applies as F1"],
+      "special_notes": "The heartbeat row floor binds to the feasible row count of the 100-turn late window; X3a's producer must ensure the run design (chunk schedules, load schedule) yields >= 1000 rows; a run with fewer late-window rows is invalid and a fresh attempt, if any, follows ONLY within the campaign_closure attempt cap."
+    },
+    "G1": {
+      "campaign_id": "G1",
+      "metric": "rss_slope_p95_bytes_per_turn",
+      "unit": "bytes/turn",
+      "cell": "soak_loaded_memory_windows200_400",
+      "producer_wp": "X3b",
+      "scenario": "Memory soak cell: loaded (as B1); RSS sampled per turn. The slope metric is computed over 101 rolling windows, each window 100 turns wide, spanning windows [200,300], [201,301], ..., [300,400]. Tracemalloc IS active in the G1 runs (memory runs) and the run design accounts for its cost; G1 runs are separate from F1/F2 latency runs (never co-measured).",
+      "definition": "Per-window RSS slope (bytes per turn) = slope of RSS over the window via least squares over the window's per-turn RSS samples; the run passes 101 windows; the per-run p95 is over the 101 window slopes.",
+      "floor_deviations": ["ops_floor override for G1: units are rolling windows; exactly 101 windows per run, spanning [200,300]..[300,400]", "G1 sampling: exactly 201 late RSS samples (turns 200..400), as required by the 101 windows' coverage", "G1 runs are memory runs with tracemalloc active and require completion of turn 400"],
+      "special_notes": "Clamp-negative-to-zero: a negative window slope is recorded as-is in the slope record but clamped to 0 for gate comparison. Nonpositive threshold rule: if the committed T for G1 is not positive (M + max(6D, 0.20M) <= 0), the row is recorded DORMANT with reason degenerate_threshold; G1 does NOT gate in that case. Signed slopes are recorded alongside the clamp so downstream analysis can see real negative slopes. Statistical shape: the p95 over 101 OVERLAPPING rolling slopes is a WITHIN-RUN summary — the five fresh-process runs are the independent replicates; M/D/T operate on the five per-run p95s, never on the 101 within-run slopes. Plateau self-disarm: a fully plateaued campaign (every rolling window's clamped slope exactly 0 across all five runs) yields M=D=0 and T=0, which triggers the degenerate_threshold dormancy rule (reason-order tier 4) — a plateaued baseline never gates. For a non-degenerate baseline (T>0), a compared p95 of 0 passes because 0 < T — the ordinary comparison relation, not the equality convention (equality passes applies only at p95 == T exactly). Re-baselining is out of stage-2 scope (recorded degeneracy, never re-emit from stage-2 runs)."
+    }
+  }
+}

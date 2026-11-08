@@ -2,6 +2,18 @@
 
 All notable changes to Chartreux are documented in this file.
 
+## 0.7.5 (2026-11-07)
+
+Stage 2 lands the runtime performance measurement machinery under `tests/perf/` — no production code changes.
+
+### Added
+
+- **Runtime measurement core**: observer primitives plus a fail-closed report/run-dir path guard (scratchpad-descendant `CHARTREUX_PERF_RUN_DIR`, guarded `CHARTREUX_PERF_REPORT`), the `chartreux.runtime_perf.v1` run-record/report schema with per-run chunks-coverage for all 17 gated campaign IDs, and a matrix runner with per-cell subprocess isolation, self-installed egress guards, and a py-spy readiness handshake.
+- **Scenario harnesses**: integrity-valid 200k-equivalent fixture, headless transport/projector harness, Pilot (Textual) adapter harness with cross-adapter fingerprint parity, and five test-side ablations (transport_object, integrity_stub, markdown_no_render, gc_disabled, source_coalesce with final-text/ordering equivalence).
+- **Producer cells**: end-to-end turn latency on both adapter paths with the injected-delay matrix (A1-A4, B1-B2), per-root-turn notification counts/bytes (B3-B4), save-loaded scan/lock-await/heartbeat cell on the P5 code path (C1-C3), Pilot render-flush cell (D1), completion storm with fresh cleaned cohorts (E1), deterministic permission round trips (E2), loaded latency and memory soaks (F1-F2, G1), plus observation-only startup, compaction, and process-tree cells.
+- **Gating machinery**: byte-exact pinned metric registry and determinants documents, per-metric baseline validation with shared-set conjunction eligibility and bounded campaign closure, a comparison tool that writes only to the run dir, deterministic threshold construction with the pinned reason order, and committed baselines for seven eligible cells. The release contract now asserts every registry metric is ACTIVE-eligible or DORMANT-with-reason: 16 ACTIVE, G1 DORMANT `insufficient_baseline_data` at first activation.
+- **Dev dependencies**: memray and pytest-memray (pyinstrument remains an external tool; declaring it is blocked by the retired-dev-root guard pending a plan-level decision).
+
 ## 0.7.4 (2026-11-07)
 
 Plan mode becomes an orientation-then-standby workflow that survives a restart

@@ -551,14 +551,17 @@ _P0D_COMBINED_LOOP_LAG_P50_CEILING_MS = 19.2
 # degradation, 183-184 ms awaited) is dominated by
 # find_persistence_violations — the REQUIRED per-save archived-marker
 # admission scan and per-record marker probe added by the P4a4
-# archive-integrity chain, run on the event-loop thread once per save (~40
-# times per combined phase) via _check_transcript_persistence, S1's save
-# boundary. That is fail-closed semantics, not waste: the 3x scan
-# duplication, per-call imports, and per-message function-call overhead were
-# removed first, and what remains is the guard itself. That work is OUTSIDE
-# the verify loop, so no yield cadence inside P6's pinned scope can remove
-# it. The deeper redesign — incremental marker bookkeeping in MessageList, or
-# moving the scan off the render loop — is deferred to the 0.8.0 backlog.
+# archive-integrity chain, which those figures measured running on the
+# event-loop thread once per save (~40 times per combined phase) via
+# _check_transcript_persistence, S1's save boundary. That is fail-closed
+# semantics, not waste: the 3x scan duplication, per-call imports, and
+# per-message function-call overhead were removed first, and what remains is
+# the guard itself. That work is OUTSIDE the verify loop, so no yield cadence
+# inside P6's pinned scope can remove it. The scan no longer runs on the
+# render loop: save_interaction now runs it in a lock-scoped asyncio.to_thread
+# worker inside _save_lock, before the staleness fence (P5), so only the
+# incremental-marker-bookkeeping half of that redesign is still deferred to
+# the 0.8.0 backlog — moving the scan off the render loop has since landed.
 # ENVIRONMENT CONTEXT ONLY: the historical 51.885% combined flush-p95 figure
 # was recorded under loadavg 7.9-9.0, and the P0d metadata records the
 # combined flush p95 as deliberately NOT ceiled (it was that package's

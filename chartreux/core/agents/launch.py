@@ -468,10 +468,6 @@ def resolve_launch(  # noqa: PLR0913, PLR0914, PLR0915
     # The child identity's personal posture is the second admission ceiling
     # for tool overrides, independent of the parent's delegation set.
     child_identity = _child_identity(identity)
-    orchestrator = build_child_orchestrator(
-        source, inputs, strip_runtime_thinking=explicit_model
-    )
-    staged_config = orchestrator.config
     if frozen_persona is not None:
         if (
             "instructions" in semantic.model_fields_set

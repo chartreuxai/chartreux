@@ -1,0 +1,143 @@
+{
+  "attempt_count": 5,
+  "attempt_digest": "b95704d4cb5299bde9dcb4eb41a9f70eaf9216d7833c47b87b8abdc2b16e3125",
+  "attempts": [
+    {
+      "failing_row": null,
+      "machine_fields_missing": [],
+      "machine_mismatch_fields": [],
+      "reasons": [],
+      "row_reasons": {},
+      "run_id": "storm_8child-r01",
+      "run_reasons": [],
+      "run_start_utc": "2026-11-08T02:45:03Z",
+      "status": "eligible"
+    },
+    {
+      "failing_row": null,
+      "machine_fields_missing": [],
+      "machine_mismatch_fields": [],
+      "reasons": [],
+      "row_reasons": {},
+      "run_id": "storm_8child-r02",
+      "run_reasons": [],
+      "run_start_utc": "2026-11-08T02:49:21Z",
+      "status": "eligible"
+    },
+    {
+      "failing_row": null,
+      "machine_fields_missing": [],
+      "machine_mismatch_fields": [],
+      "reasons": [],
+      "row_reasons": {},
+      "run_id": "storm_8child-r03",
+      "run_reasons": [],
+      "run_start_utc": "2026-11-08T02:53:38Z",
+      "status": "eligible"
+    },
+    {
+      "failing_row": null,
+      "machine_fields_missing": [],
+      "machine_mismatch_fields": [],
+      "reasons": [],
+      "row_reasons": {},
+      "run_id": "storm_8child-r04",
+      "run_reasons": [],
+      "run_start_utc": "2026-11-08T02:57:54Z",
+      "status": "eligible"
+    },
+    {
+      "failing_row": null,
+      "machine_fields_missing": [],
+      "machine_mismatch_fields": [],
+      "reasons": [],
+      "row_reasons": {},
+      "run_id": "storm_8child-r05",
+      "run_reasons": [],
+      "run_start_utc": "2026-11-08T03:02:11Z",
+      "status": "eligible"
+    }
+  ],
+  "campaign_ids": [
+    "E1"
+  ],
+  "campaigns": {
+    "E1": {
+      "campaign_id": "E1",
+      "cell": "storm_8child",
+      "metric": "completion_storm_drain_p95_ms",
+      "null_reason": null,
+      "run_ids": [
+        "storm_8child-r01",
+        "storm_8child-r02",
+        "storm_8child-r03",
+        "storm_8child-r04",
+        "storm_8child-r05"
+      ],
+      "run_p95s": [
+        136.3842,
+        136.2807,
+        132.9642,
+        134.1589,
+        130.6008
+      ],
+      "unit": "ms"
+    }
+  },
+  "cell": "storm_8child",
+  "cell_identity": {
+    "cell": "storm_8child",
+    "dimensions": {
+      "agents": 8,
+      "cell": "storm_8child",
+      "cohorts_per_storm": 1,
+      "measured_storms": 100,
+      "mode": "measure",
+      "warmup_storms": 10
+    },
+    "fixture_hash": "25d08b939a0329f8af0276686ccc468880b03d9ce5079832822391d80c9b9d7d",
+    "metric_version": "chartreux.runtime_perf.v1",
+    "workload_hash": null
+  },
+  "closure": {
+    "eligible_run_count": 5,
+    "eligible_run_ids": [
+      "storm_8child-r01",
+      "storm_8child-r02",
+      "storm_8child-r03",
+      "storm_8child-r04",
+      "storm_8child-r05"
+    ],
+    "note": "5 eligible runs collected; the latest 5 are selected",
+    "reason": null,
+    "selected_run_count": 5,
+    "selected_run_ids": [
+      "storm_8child-r01",
+      "storm_8child-r02",
+      "storm_8child-r03",
+      "storm_8child-r04",
+      "storm_8child-r05"
+    ],
+    "status": "eligible_complete"
+  },
+  "eligible_run_ids": [
+    "storm_8child-r01",
+    "storm_8child-r02",
+    "storm_8child-r03",
+    "storm_8child-r04",
+    "storm_8child-r05"
+  ],
+  "machine": {
+    "commit": "33501f3d",
+    "core_count": 24,
+    "cpu_model": "AMD Ryzen 9 5900X 12-Core Processor",
+    "loadavg": [
+      1.724609375,
+      1.755859375,
+      1.66162109375
+    ],
+    "platform": "Linux-7.3.0-10-generic-x86_64-with-glibc2.44",
+    "python_version": "3.12.13"
+  },
+  "schema": "chartreux.runtime_baseline.v1"
+}

@@ -1,0 +1,101 @@
+{
+  "attempt_count": 5,
+  "attempts_file": "attempts.jsonl",
+  "baseline_file": "baseline.json",
+  "baseline_validation_error": null,
+  "campaign_ids": [
+    "F1",
+    "F2"
+  ],
+  "campaign_wall_s": 558.017,
+  "cell": "soak_loaded_latency_turns301_400",
+  "eligible_run_count": 5,
+  "halt": null,
+  "identity": {
+    "cell": "soak_loaded_latency_turns301_400",
+    "dimensions": {
+      "budget_s": 360.0,
+      "burst_agents": 7,
+      "burst_interval_turns": 10,
+      "cell": "soak_loaded_latency_turns301_400",
+      "checkpoint_turns": [
+        0,
+        100,
+        200,
+        300,
+        400
+      ],
+      "child_agents": 7,
+      "fixture_hash": "25d08b939a0329f8af0276686ccc468880b03d9ce5079832822391d80c9b9d7d",
+      "heartbeat_interval_ms": 1.0,
+      "history_messages": 2000,
+      "kill_deadline_s": 720.0,
+      "late_window": {
+        "first_measured_turn": 301,
+        "last_measured_turn": 400,
+        "measured_turns": 100,
+        "warm_boundary_turn": 300
+      },
+      "mode": "measure",
+      "response_chars": 400,
+      "response_chunks": 4,
+      "root_turns": 400,
+      "root_user_chars": 400,
+      "schema": "chartreux.runtime_soak.v1",
+      "segment_turns": 100,
+      "shape": "full",
+      "total_agents": 8,
+      "tracemalloc": "disabled",
+      "workload_hash": "46ac0283ff4d52d119ad70ab1c5cb3d9240beda31658cff478f5569dcc250ac3",
+      "workload_seed": 20261108
+    },
+    "fixture_hash": "25d08b939a0329f8af0276686ccc468880b03d9ce5079832822391d80c9b9d7d",
+    "metric_version": "chartreux.runtime_perf.v1",
+    "workload_hash": null
+  },
+  "machine": {
+    "commit": "33501f3d",
+    "core_count": 24,
+    "cpu_model": "AMD Ryzen 9 5900X 12-Core Processor",
+    "loadavg": [
+      1.58544921875,
+      1.587890625,
+      1.53955078125
+    ],
+    "platform": "Linux-7.3.0-10-generic-x86_64-with-glibc2.44",
+    "python_version": "3.12.13"
+  },
+  "plan_price_s": 360.0,
+  "promotable": true,
+  "recipe": "soak-latency",
+  "selected_run_ids": [
+    "soak_loaded_latency_turns301_400-full-20261108T023547048094",
+    "soak_loaded_latency_turns301_400-full-20261108T023738852346",
+    "soak_loaded_latency_turns301_400-full-20261108T023930525800",
+    "soak_loaded_latency_turns301_400-full-20261108T024122525851",
+    "soak_loaded_latency_turns301_400-full-20261108T024313904626"
+  ],
+  "status": "eligible_complete",
+  "unrepresentable_attempts": [],
+  "x5a_closure": {
+    "eligible_run_count": 5,
+    "eligible_run_ids": [
+      "soak_loaded_latency_turns301_400-full-20261108T023547048094",
+      "soak_loaded_latency_turns301_400-full-20261108T023738852346",
+      "soak_loaded_latency_turns301_400-full-20261108T023930525800",
+      "soak_loaded_latency_turns301_400-full-20261108T024122525851",
+      "soak_loaded_latency_turns301_400-full-20261108T024313904626"
+    ],
+    "note": "5 eligible runs collected; the latest 5 are selected",
+    "reason": null,
+    "selected_run_count": 5,
+    "selected_run_ids": [
+      "soak_loaded_latency_turns301_400-full-20261108T023547048094",
+      "soak_loaded_latency_turns301_400-full-20261108T023738852346",
+      "soak_loaded_latency_turns301_400-full-20261108T023930525800",
+      "soak_loaded_latency_turns301_400-full-20261108T024122525851",
+      "soak_loaded_latency_turns301_400-full-20261108T024313904626"
+    ],
+    "status": "eligible_complete"
+  }
+}

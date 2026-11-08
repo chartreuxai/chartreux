@@ -36,9 +36,16 @@ def _json_equal(left: JsonValue, right: JsonValue) -> bool:
 
 
 def is_completed_effect_replay(
-    entry: PublicHistoryEntry, operations: list[JsonPatchOperation]
+    entry: PublicHistoryEntry,
+    operations: list[JsonPatchOperation],
+    *,
+    raw: dict[str, Any] | None = None,
 ) -> bool:
-    """Recognize an already-reflected completion, ignoring its delivery timestamp."""
+    """Recognize an already-reflected completion, ignoring its delivery timestamp.
+
+    ``raw`` is the entry's JSON snapshot when the caller has already serialized
+    it; the predicate never serializes a second time.
+    """
     if not (
         isinstance(entry, PublicEffectEntry)
         and isinstance(entry.state, CompletedEffectState)
@@ -46,7 +53,8 @@ def is_completed_effect_replay(
         and any(operation.path == "/state" for operation in operations)
     ):
         return False
-    raw = entry.model_dump(mode="json", by_alias=True)
+    if raw is None:
+        raw = entry.model_dump(mode="json", by_alias=True)
     for operation in operations:
         if operation.op != "replace" or operation.path not in {
             "/state",
@@ -62,10 +70,18 @@ def is_completed_effect_replay(
 
 
 def is_timing_only_patch(
-    entry: PublicHistoryEntry, operations: list[JsonPatchOperation]
+    entry: PublicHistoryEntry,
+    operations: list[JsonPatchOperation],
+    *,
+    raw: dict[str, Any] | None = None,
 ) -> bool:
-    """Allow duration settlement and content-preserving terminal recovery replays."""
-    raw = entry.model_dump(mode="json", by_alias=True)
+    """Allow duration settlement and content-preserving terminal recovery replays.
+
+    ``raw`` is the entry's JSON snapshot when the caller has already serialized
+    it; the predicate never serializes a second time.
+    """
+    if raw is None:
+        raw = entry.model_dump(mode="json", by_alias=True)
     if isinstance(entry, PublicMessageEntry) and entry.role == "assistant":
         path = "/turnDurationMs"
     elif isinstance(entry, PublicEffectEntry) and isinstance(

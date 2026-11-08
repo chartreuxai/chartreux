@@ -1,0 +1,75 @@
+{
+  "attempt_count": 5,
+  "attempts_file": "attempts.jsonl",
+  "baseline_file": "baseline.json",
+  "baseline_validation_error": null,
+  "campaign_ids": [
+    "A1",
+    "A2",
+    "A3",
+    "A4"
+  ],
+  "campaign_wall_s": 107.754,
+  "cell": "x1_fresh_headless_fb10_c4",
+  "eligible_run_count": 5,
+  "halt": null,
+  "identity": {
+    "cell": "x1_fresh_headless_fb10_c4",
+    "dimensions": {
+      "burst_agents": 0,
+      "burst_interval_turns": 10,
+      "child_agents": 0,
+      "history_messages": 2000,
+      "mode": "measure",
+      "root_turns": 400
+    },
+    "fixture_hash": "25d08b939a0329f8af0276686ccc468880b03d9ce5079832822391d80c9b9d7d",
+    "metric_version": "chartreux.runtime_perf.v1",
+    "workload_hash": null
+  },
+  "machine": {
+    "commit": "33501f3d",
+    "core_count": 24,
+    "cpu_model": "AMD Ryzen 9 5900X 12-Core Processor",
+    "loadavg": [
+      0.98095703125,
+      1.36328125,
+      1.43603515625
+    ],
+    "platform": "Linux-7.3.0-10-generic-x86_64-with-glibc2.44",
+    "python_version": "3.12.13"
+  },
+  "plan_price_s": 12.0,
+  "promotable": true,
+  "recipe": "latency-fresh",
+  "selected_run_ids": [
+    "x1_fresh_headless_fb10_c4-r01",
+    "x1_fresh_headless_fb10_c4-r02",
+    "x1_fresh_headless_fb10_c4-r03",
+    "x1_fresh_headless_fb10_c4-r04",
+    "x1_fresh_headless_fb10_c4-r05"
+  ],
+  "status": "eligible_complete",
+  "unrepresentable_attempts": [],
+  "x5a_closure": {
+    "eligible_run_count": 5,
+    "eligible_run_ids": [
+      "x1_fresh_headless_fb10_c4-r01",
+      "x1_fresh_headless_fb10_c4-r02",
+      "x1_fresh_headless_fb10_c4-r03",
+      "x1_fresh_headless_fb10_c4-r04",
+      "x1_fresh_headless_fb10_c4-r05"
+    ],
+    "note": "5 eligible runs collected; the latest 5 are selected",
+    "reason": null,
+    "selected_run_count": 5,
+    "selected_run_ids": [
+      "x1_fresh_headless_fb10_c4-r01",
+      "x1_fresh_headless_fb10_c4-r02",
+      "x1_fresh_headless_fb10_c4-r03",
+      "x1_fresh_headless_fb10_c4-r04",
+      "x1_fresh_headless_fb10_c4-r05"
+    ],
+    "status": "eligible_complete"
+  }
+}

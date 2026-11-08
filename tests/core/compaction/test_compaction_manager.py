@@ -37,7 +37,10 @@ from chartreux.core.session.session_logger import (
     SessionDiskFullError,
     SessionLogger,
 )
-from chartreux.core.session.transcript_archive import verify_archived_prefix_on_disk
+from chartreux.core.session.transcript_archive import (
+    trim_attempt_key,
+    verify_archived_prefix_on_disk,
+)
 from chartreux.core.session_types import AgentStats
 from chartreux.core.tools.manager import ToolManager
 from chartreux.core.usage import UsagePurpose
@@ -1205,8 +1208,10 @@ async def test_post_turn_entry_coalesces_to_the_newest_boundary() -> None:
 
 @pytest.mark.asyncio
 async def test_post_turn_entry_never_invents_a_boundary() -> None:
-    # No compaction boundary in the list: the entry records nothing and never
-    # reaches the completion — a boundary is never created merely to trim.
+    # No compaction boundary in the list and no eligible pre-seal prefix
+    # (only two user-started rounds: the retained ones cover everything
+    # before the older of them): the entry records nothing and never reaches
+    # the completion — a boundary is never created merely to trim.
     messages = _conversation()
     stats = AgentStats()
     box = _PendingTrimBox()
@@ -1222,6 +1227,86 @@ async def test_post_turn_entry_never_invents_a_boundary() -> None:
     fake_logger.complete_post_turn_trim.assert_not_called()
     fake_logger.seal_archive.assert_not_called()
     fake_logger.fence_and_publish_archive_trim.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_post_turn_entry_triggers_a_pre_seal_release_without_a_boundary() -> None:
+    # P3 pre-seal guardrails: with NO compaction boundary but an eligible
+    # settled pre-compaction prefix (three user-started rounds, a payload in
+    # the oldest one), the entry records a pending with boundary_message_id
+    # None — never an invented boundary string — and completes it through the
+    # logger with the None boundary.
+    messages = MessageList([
+        LLMMessage(role=Role.system, content="sys"),
+        LLMMessage(role=Role.user, content="oldest ask", message_id="u1"),
+        LLMMessage(
+            role=Role.assistant,
+            content="work",
+            message_id="a1",
+            reasoning_payloads=[{"opaque": "p1"}],
+        ),
+        LLMMessage(role=Role.user, content="middle ask", message_id="u2"),
+        LLMMessage(role=Role.assistant, content="work2", message_id="a2"),
+        LLMMessage(role=Role.user, content="newest ask", message_id="u3"),
+        LLMMessage(role=Role.assistant, content="work3", message_id="a3"),
+    ])
+    stats = AgentStats()
+    box = _PendingTrimBox()
+    manager, fake_logger = _build_post_turn_manager(
+        messages=messages, stats=stats, active_turn=True, box=box
+    )
+
+    await manager.capture_post_turn_pending_trim(
+        session_id="session-1", message_epoch=messages.message_epoch
+    )
+
+    # The completion ran once with the None boundary (the pre-seal key), and
+    # no boundary string was ever fabricated.
+    fake_logger.complete_post_turn_trim.assert_awaited_once()
+    call = fake_logger.complete_post_turn_trim.await_args
+    assert call.kwargs["session_id"] == "session-1"
+    assert call.kwargs["message_epoch"] == messages.message_epoch
+    assert call.kwargs["boundary_message_id"] is None
+    assert box.value is None
+    fake_logger.seal_archive.assert_not_called()
+    fake_logger.fence_and_publish_archive_trim.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_post_turn_entry_prefers_a_real_boundary_over_the_pre_seal_trigger() -> (
+    None
+):
+    # Coalescing rule: once a real compaction boundary exists, post-seal
+    # alone owns the release — the pending records the boundary id, not None,
+    # even when a pre-seal prefix is also eligible.
+    messages = MessageList([
+        LLMMessage(role=Role.system, content="sys"),
+        LLMMessage(role=Role.user, content="oldest ask", message_id="u1"),
+        LLMMessage(
+            role=Role.assistant,
+            content="work",
+            message_id="a1",
+            reasoning_payloads=[{"opaque": "p1"}],
+        ),
+        LLMMessage(role=Role.user, content="middle ask", message_id="u2"),
+        LLMMessage(role=Role.assistant, content="work2", message_id="a2"),
+        _boundary_message(),
+    ])
+    stats = AgentStats()
+    box = _PendingTrimBox()
+    manager, fake_logger = _build_post_turn_manager(
+        messages=messages, stats=stats, active_turn=True, box=box
+    )
+
+    await manager.capture_post_turn_pending_trim(
+        session_id="session-1", message_epoch=messages.message_epoch
+    )
+
+    fake_logger.complete_post_turn_trim.assert_awaited_once()
+    call = fake_logger.complete_post_turn_trim.await_args
+    boundary = _non_system(messages)[-1]
+    assert call.kwargs["boundary_message_id"] == boundary.message_id
+    assert call.kwargs["boundary_message_id"] is not None
 
 
 @pytest.mark.asyncio
@@ -1527,7 +1612,11 @@ async def test_post_turn_completion_is_exclusive_per_boundary(
     # Exactly one seal and one fenced publication for the boundary.
     assert seal_calls == 1
     assert fence_calls == 1
-    assert logger._trim_published_boundaries == {boundary.message_id}
+    assert logger._trim_published_boundaries == {
+        trim_attempt_key(
+            "t1b-exclusive", messages.message_epoch, boundary.message_id, None
+        )
+    }
     assert logger._trim_in_flight_boundaries == set()
     assert messages.archive_descriptor is not None
 

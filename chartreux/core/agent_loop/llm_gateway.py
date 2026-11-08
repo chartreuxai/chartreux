@@ -48,6 +48,7 @@ from chartreux.core.llm_models import (
     StrToolChoice,
     posting_time,
 )
+from chartreux.core.message_list import MessageList, RequestEnvelope
 from chartreux.core.recovery_models import CallEvidence, attach_call_evidence
 from chartreux.core.recovery_override import (
     CooldownOverrideLedger,
@@ -79,6 +80,20 @@ from chartreux.observability.logging import log_model_call_success, logger
 
 
 @dataclass(frozen=True)
+class LiveRequestSource:
+    """The live source list and the frozen envelope of one request (S1-A2).
+
+    Carried on ``CompletionInputs`` so the gateway can re-read the source's
+    LIVE version/epoch at service time — the envelope's captured triple alone
+    never authorizes a memo hit. The snapshot is shallow: the message objects
+    stay mutable, which is exactly why the live re-read is required.
+    """
+
+    source: MessageList
+    envelope: RequestEnvelope
+
+
+@dataclass(frozen=True)
 class CompletionInputs:
     model: ModelConfig
     provider_name: str
@@ -92,6 +107,11 @@ class CompletionInputs:
     # Sideband calls are priced, but do not measure the live conversation.
     account_conversation: bool = True
     purpose: UsagePurpose = UsagePurpose.CONVERSATION
+    # S1-A2 live-source carrier: the MessageList this request was frozen from,
+    # with the envelope minted at the coordinator. None (the default) keeps
+    # the naive preparation interface for unprovenanced inputs (a model
+    # context projection, a sideband list, utility completions).
+    live_source: LiveRequestSource | None = None
 
 
 @dataclass(frozen=True)
@@ -378,6 +398,58 @@ async def _budgeted_aclosing(
 class LLMGateway:
     """Own provider payload projection, response normalization, and call accounting."""
 
+    def __init__(self) -> None:
+        # S1-A2 exact-snapshot memo: ONE slot on this per-loop gateway holding
+        # the last successfully prepared request projection, keyed by
+        # (source identity, captured version, captured epoch, model alias,
+        # supports_images). The live source is re-read at service time before
+        # any hit is served; failures are never cached.
+        self._prepared_slot: (
+            tuple[tuple[int, int, int, str, bool], Sequence[LLMMessage]] | None
+        ) = None
+
+    def _prepare_backend_messages(
+        self, inputs: CompletionInputs
+    ) -> Sequence[LLMMessage]:
+        """Project the request for the backend, memoized on the exact snapshot.
+
+        Fully synchronous by contract: the key read, the LIVE version/epoch
+        re-read and the value publish occupy this one stretch with no await
+        between check and publish (``messages_for_backend`` itself is fully
+        synchronous), so no loop task can interleave a mutation in between.
+        On ANY doubt — missing provenance, live mismatch, or a miss — the
+        naive path runs; it always stays available. Only a full success is
+        published, and a failure is never cached.
+        """
+        live = inputs.live_source
+        if live is None:
+            return messages_for_backend(inputs.messages, inputs.model)
+        envelope = live.envelope
+        source = live.source
+        key = (
+            envelope.source_identity,
+            envelope.version,
+            envelope.epoch,
+            inputs.model.alias,
+            inputs.model.supports_images,
+        )
+        # Live re-read: envelope equality alone never authorizes a hit — the
+        # source must still carry the captured version AND the captured epoch
+        # (and the envelope's model key must match this attempt's model).
+        if (
+            source.source_identity == envelope.source_identity
+            and source.message_version == envelope.version
+            and source.message_epoch == envelope.epoch
+            and envelope.model_alias == inputs.model.alias
+            and envelope.supports_images == inputs.model.supports_images
+        ):
+            slot = self._prepared_slot
+            if slot is not None and slot[0] == key:
+                return slot[1]
+        prepared = messages_for_backend(inputs.messages, inputs.model)
+        self._prepared_slot = (key, prepared)
+        return prepared
+
     async def complete(
         self, inputs: CompletionInputs, resources: CallResources
     ) -> LLMChunk:
@@ -470,7 +542,7 @@ class LLMGateway:
         try:
             if watch is not None:
                 watch.enter_call()
-            backend_messages = messages_for_backend(inputs.messages, inputs.model)
+            backend_messages = self._prepare_backend_messages(inputs)
             logger.debug(
                 "Model call starting model=%s provider=%s messages=%d tools=%d thinking=%s",
                 inputs.model.alias,
@@ -727,7 +799,7 @@ class LLMGateway:
         try:
             if watch is not None:
                 watch.enter_call()
-            backend_messages = messages_for_backend(inputs.messages, inputs.model)
+            backend_messages = self._prepare_backend_messages(inputs)
             logger.debug(
                 "Model call starting model=%s provider=%s messages=%d tools=%d streaming=%s",
                 inputs.model.alias,

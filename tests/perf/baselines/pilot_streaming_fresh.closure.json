@@ -1,0 +1,72 @@
+{
+  "attempt_count": 5,
+  "attempts_file": "attempts.jsonl",
+  "baseline_file": "baseline.json",
+  "baseline_validation_error": null,
+  "campaign_ids": [
+    "D1"
+  ],
+  "campaign_wall_s": 2097.593,
+  "cell": "pilot_streaming_fresh",
+  "eligible_run_count": 5,
+  "halt": null,
+  "identity": {
+    "cell": "pilot_streaming_fresh",
+    "dimensions": {
+      "burst_agents": 0,
+      "burst_interval_turns": 10,
+      "child_agents": 0,
+      "history_messages": 2000,
+      "mode": "measure",
+      "root_turns": 400
+    },
+    "fixture_hash": "25d08b939a0329f8af0276686ccc468880b03d9ce5079832822391d80c9b9d7d",
+    "metric_version": "chartreux.runtime_perf.v1",
+    "workload_hash": null
+  },
+  "machine": {
+    "commit": "33501f3d",
+    "core_count": 24,
+    "cpu_model": "AMD Ryzen 9 5900X 12-Core Processor",
+    "loadavg": [
+      1.76953125,
+      1.6005859375,
+      1.62255859375
+    ],
+    "platform": "Linux-7.3.0-10-generic-x86_64-with-glibc2.44",
+    "python_version": "3.12.13"
+  },
+  "plan_price_s": 20.0,
+  "promotable": true,
+  "recipe": "pilot-render",
+  "selected_run_ids": [
+    "pilot_streaming_fresh-r01",
+    "pilot_streaming_fresh-r02",
+    "pilot_streaming_fresh-r03",
+    "pilot_streaming_fresh-r04",
+    "pilot_streaming_fresh-r05"
+  ],
+  "status": "eligible_complete",
+  "unrepresentable_attempts": [],
+  "x5a_closure": {
+    "eligible_run_count": 5,
+    "eligible_run_ids": [
+      "pilot_streaming_fresh-r01",
+      "pilot_streaming_fresh-r02",
+      "pilot_streaming_fresh-r03",
+      "pilot_streaming_fresh-r04",
+      "pilot_streaming_fresh-r05"
+    ],
+    "note": "5 eligible runs collected; the latest 5 are selected",
+    "reason": null,
+    "selected_run_count": 5,
+    "selected_run_ids": [
+      "pilot_streaming_fresh-r01",
+      "pilot_streaming_fresh-r02",
+      "pilot_streaming_fresh-r03",
+      "pilot_streaming_fresh-r04",
+      "pilot_streaming_fresh-r05"
+    ],
+    "status": "eligible_complete"
+  }
+}

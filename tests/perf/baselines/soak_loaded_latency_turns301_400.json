@@ -1,0 +1,193 @@
+{
+  "attempt_count": 5,
+  "attempt_digest": "82a3df6ff68b4e3e4cfb206ee14236602cd57293ff4383f616bbbac7d9ae41bc",
+  "attempts": [
+    {
+      "failing_row": null,
+      "machine_fields_missing": [],
+      "machine_mismatch_fields": [],
+      "reasons": [],
+      "row_reasons": {},
+      "run_id": "soak_loaded_latency_turns301_400-full-20261108T023547048094",
+      "run_reasons": [],
+      "run_start_utc": "2026-11-08T02:35:47.048094+00:00",
+      "status": "eligible"
+    },
+    {
+      "failing_row": null,
+      "machine_fields_missing": [],
+      "machine_mismatch_fields": [],
+      "reasons": [],
+      "row_reasons": {},
+      "run_id": "soak_loaded_latency_turns301_400-full-20261108T023738852346",
+      "run_reasons": [],
+      "run_start_utc": "2026-11-08T02:37:38.852346+00:00",
+      "status": "eligible"
+    },
+    {
+      "failing_row": null,
+      "machine_fields_missing": [],
+      "machine_mismatch_fields": [],
+      "reasons": [],
+      "row_reasons": {},
+      "run_id": "soak_loaded_latency_turns301_400-full-20261108T023930525800",
+      "run_reasons": [],
+      "run_start_utc": "2026-11-08T02:39:30.525800+00:00",
+      "status": "eligible"
+    },
+    {
+      "failing_row": null,
+      "machine_fields_missing": [],
+      "machine_mismatch_fields": [],
+      "reasons": [],
+      "row_reasons": {},
+      "run_id": "soak_loaded_latency_turns301_400-full-20261108T024122525851",
+      "run_reasons": [],
+      "run_start_utc": "2026-11-08T02:41:22.525851+00:00",
+      "status": "eligible"
+    },
+    {
+      "failing_row": null,
+      "machine_fields_missing": [],
+      "machine_mismatch_fields": [],
+      "reasons": [],
+      "row_reasons": {},
+      "run_id": "soak_loaded_latency_turns301_400-full-20261108T024313904626",
+      "run_reasons": [],
+      "run_start_utc": "2026-11-08T02:43:13.904626+00:00",
+      "status": "eligible"
+    }
+  ],
+  "campaign_ids": [
+    "F1",
+    "F2"
+  ],
+  "campaigns": {
+    "F1": {
+      "campaign_id": "F1",
+      "cell": "soak_loaded_latency_turns301_400",
+      "metric": "turn_application_overhead_p95_ms",
+      "null_reason": null,
+      "run_ids": [
+        "soak_loaded_latency_turns301_400-full-20261108T023547048094",
+        "soak_loaded_latency_turns301_400-full-20261108T023738852346",
+        "soak_loaded_latency_turns301_400-full-20261108T023930525800",
+        "soak_loaded_latency_turns301_400-full-20261108T024122525851",
+        "soak_loaded_latency_turns301_400-full-20261108T024313904626"
+      ],
+      "run_p95s": [
+        98.6107,
+        102.459,
+        99.5105,
+        99.5585,
+        101.8243
+      ],
+      "unit": "ms"
+    },
+    "F2": {
+      "campaign_id": "F2",
+      "cell": "soak_loaded_latency_turns301_400",
+      "metric": "loop_heartbeat_excess_p95_ms",
+      "null_reason": null,
+      "run_ids": [
+        "soak_loaded_latency_turns301_400-full-20261108T023547048094",
+        "soak_loaded_latency_turns301_400-full-20261108T023738852346",
+        "soak_loaded_latency_turns301_400-full-20261108T023930525800",
+        "soak_loaded_latency_turns301_400-full-20261108T024122525851",
+        "soak_loaded_latency_turns301_400-full-20261108T024313904626"
+      ],
+      "run_p95s": [
+        9.9099,
+        9.9429,
+        9.5292,
+        9.5743,
+        9.7314
+      ],
+      "unit": "ms"
+    }
+  },
+  "cell": "soak_loaded_latency_turns301_400",
+  "cell_identity": {
+    "cell": "soak_loaded_latency_turns301_400",
+    "dimensions": {
+      "budget_s": 360.0,
+      "burst_agents": 7,
+      "burst_interval_turns": 10,
+      "cell": "soak_loaded_latency_turns301_400",
+      "checkpoint_turns": [
+        0,
+        100,
+        200,
+        300,
+        400
+      ],
+      "child_agents": 7,
+      "fixture_hash": "25d08b939a0329f8af0276686ccc468880b03d9ce5079832822391d80c9b9d7d",
+      "heartbeat_interval_ms": 1.0,
+      "history_messages": 2000,
+      "kill_deadline_s": 720.0,
+      "late_window": {
+        "first_measured_turn": 301,
+        "last_measured_turn": 400,
+        "measured_turns": 100,
+        "warm_boundary_turn": 300
+      },
+      "mode": "measure",
+      "response_chars": 400,
+      "response_chunks": 4,
+      "root_turns": 400,
+      "root_user_chars": 400,
+      "schema": "chartreux.runtime_soak.v1",
+      "segment_turns": 100,
+      "shape": "full",
+      "total_agents": 8,
+      "tracemalloc": "disabled",
+      "workload_hash": "46ac0283ff4d52d119ad70ab1c5cb3d9240beda31658cff478f5569dcc250ac3",
+      "workload_seed": 20261108
+    },
+    "fixture_hash": "25d08b939a0329f8af0276686ccc468880b03d9ce5079832822391d80c9b9d7d",
+    "metric_version": "chartreux.runtime_perf.v1",
+    "workload_hash": null
+  },
+  "closure": {
+    "eligible_run_count": 5,
+    "eligible_run_ids": [
+      "soak_loaded_latency_turns301_400-full-20261108T023547048094",
+      "soak_loaded_latency_turns301_400-full-20261108T023738852346",
+      "soak_loaded_latency_turns301_400-full-20261108T023930525800",
+      "soak_loaded_latency_turns301_400-full-20261108T024122525851",
+      "soak_loaded_latency_turns301_400-full-20261108T024313904626"
+    ],
+    "note": "5 eligible runs collected; the latest 5 are selected",
+    "reason": null,
+    "selected_run_count": 5,
+    "selected_run_ids": [
+      "soak_loaded_latency_turns301_400-full-20261108T023547048094",
+      "soak_loaded_latency_turns301_400-full-20261108T023738852346",
+      "soak_loaded_latency_turns301_400-full-20261108T023930525800",
+      "soak_loaded_latency_turns301_400-full-20261108T024122525851",
+      "soak_loaded_latency_turns301_400-full-20261108T024313904626"
+    ],
+    "status": "eligible_complete"
+  },
+  "eligible_run_ids": [
+    "soak_loaded_latency_turns301_400-full-20261108T023547048094",
+    "soak_loaded_latency_turns301_400-full-20261108T023738852346",
+    "soak_loaded_latency_turns301_400-full-20261108T023930525800",
+    "soak_loaded_latency_turns301_400-full-20261108T024122525851",
+    "soak_loaded_latency_turns301_400-full-20261108T024313904626"
+  ],
+  "machine": {
+    "commit": "33501f3d",
+    "core_count": 24,
+    "cpu_model": "AMD Ryzen 9 5900X 12-Core Processor",
+    "loadavg": [
+      1.58544921875,
+      1.587890625,
+      1.53955078125
+    ],
+    "platform": "Linux-7.3.0-10-generic-x86_64-with-glibc2.44",
+    "python_version": "3.12.13"
+  },
+  "schema": "chartreux.runtime_baseline.v1"
+}

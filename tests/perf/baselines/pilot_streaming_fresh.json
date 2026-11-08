@@ -1,0 +1,143 @@
+{
+  "attempt_count": 5,
+  "attempt_digest": "fa0d34a477bc9a856785cd9b2de214842a1bdf7a5e0f803828774391ac262715",
+  "attempts": [
+    {
+      "failing_row": null,
+      "machine_fields_missing": [],
+      "machine_mismatch_fields": [],
+      "reasons": [],
+      "row_reasons": {},
+      "run_id": "pilot_streaming_fresh-r01",
+      "run_reasons": [],
+      "run_start_utc": "2026-11-08T03:06:28Z",
+      "status": "eligible"
+    },
+    {
+      "failing_row": null,
+      "machine_fields_missing": [],
+      "machine_mismatch_fields": [],
+      "reasons": [],
+      "row_reasons": {},
+      "run_id": "pilot_streaming_fresh-r02",
+      "run_reasons": [],
+      "run_start_utc": "2026-11-08T03:13:26Z",
+      "status": "eligible"
+    },
+    {
+      "failing_row": null,
+      "machine_fields_missing": [],
+      "machine_mismatch_fields": [],
+      "reasons": [],
+      "row_reasons": {},
+      "run_id": "pilot_streaming_fresh-r03",
+      "run_reasons": [],
+      "run_start_utc": "2026-11-08T03:20:28Z",
+      "status": "eligible"
+    },
+    {
+      "failing_row": null,
+      "machine_fields_missing": [],
+      "machine_mismatch_fields": [],
+      "reasons": [],
+      "row_reasons": {},
+      "run_id": "pilot_streaming_fresh-r04",
+      "run_reasons": [],
+      "run_start_utc": "2026-11-08T03:27:27Z",
+      "status": "eligible"
+    },
+    {
+      "failing_row": null,
+      "machine_fields_missing": [],
+      "machine_mismatch_fields": [],
+      "reasons": [],
+      "row_reasons": {},
+      "run_id": "pilot_streaming_fresh-r05",
+      "run_reasons": [],
+      "run_start_utc": "2026-11-08T03:34:30Z",
+      "status": "eligible"
+    }
+  ],
+  "campaign_ids": [
+    "D1"
+  ],
+  "campaigns": {
+    "D1": {
+      "campaign_id": "D1",
+      "cell": "pilot_streaming_fresh",
+      "metric": "render_flush_p95_ms",
+      "null_reason": null,
+      "run_ids": [
+        "pilot_streaming_fresh-r01",
+        "pilot_streaming_fresh-r02",
+        "pilot_streaming_fresh-r03",
+        "pilot_streaming_fresh-r04",
+        "pilot_streaming_fresh-r05"
+      ],
+      "run_p95s": [
+        3.8807,
+        3.9955,
+        4.1037,
+        3.9896,
+        3.8726
+      ],
+      "unit": "ms"
+    }
+  },
+  "cell": "pilot_streaming_fresh",
+  "cell_identity": {
+    "cell": "pilot_streaming_fresh",
+    "dimensions": {
+      "burst_agents": 0,
+      "burst_interval_turns": 10,
+      "child_agents": 0,
+      "history_messages": 2000,
+      "mode": "measure",
+      "root_turns": 400
+    },
+    "fixture_hash": "25d08b939a0329f8af0276686ccc468880b03d9ce5079832822391d80c9b9d7d",
+    "metric_version": "chartreux.runtime_perf.v1",
+    "workload_hash": null
+  },
+  "closure": {
+    "eligible_run_count": 5,
+    "eligible_run_ids": [
+      "pilot_streaming_fresh-r01",
+      "pilot_streaming_fresh-r02",
+      "pilot_streaming_fresh-r03",
+      "pilot_streaming_fresh-r04",
+      "pilot_streaming_fresh-r05"
+    ],
+    "note": "5 eligible runs collected; the latest 5 are selected",
+    "reason": null,
+    "selected_run_count": 5,
+    "selected_run_ids": [
+      "pilot_streaming_fresh-r01",
+      "pilot_streaming_fresh-r02",
+      "pilot_streaming_fresh-r03",
+      "pilot_streaming_fresh-r04",
+      "pilot_streaming_fresh-r05"
+    ],
+    "status": "eligible_complete"
+  },
+  "eligible_run_ids": [
+    "pilot_streaming_fresh-r01",
+    "pilot_streaming_fresh-r02",
+    "pilot_streaming_fresh-r03",
+    "pilot_streaming_fresh-r04",
+    "pilot_streaming_fresh-r05"
+  ],
+  "machine": {
+    "commit": "33501f3d",
+    "core_count": 24,
+    "cpu_model": "AMD Ryzen 9 5900X 12-Core Processor",
+    "loadavg": [
+      1.76953125,
+      1.6005859375,
+      1.62255859375
+    ],
+    "platform": "Linux-7.3.0-10-generic-x86_64-with-glibc2.44",
+    "python_version": "3.12.13"
+  },
+  "schema": "chartreux.runtime_baseline.v1"
+}

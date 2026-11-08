@@ -67,6 +67,7 @@ from chartreux.core.agent_loop import (
     AgentLoop,
     _transcript_integrity as _integrity_module,
 )
+from chartreux.core.agent_loop._completion_coordinator import CompletionCoordinator
 from chartreux.core.agent_loop._transcript_integrity import (
     ARCHIVE_REFERENCE_ATTRIBUTE,
     TRANSCRIPT_INTEGRITY_CATEGORY,
@@ -95,6 +96,7 @@ from chartreux.core.agent_loop._transcript_integrity import (
     validate_transcript,
 )
 from chartreux.core.agent_loop._transcript_recorder import TranscriptRecorder
+from chartreux.core.agent_loop.errors import ImagesNotSupportedError
 from chartreux.core.agent_loop.llm_gateway import (
     CallResources,
     CompletionInputs,
@@ -128,6 +130,8 @@ from chartreux.core.llm_models import (
     CONTEXT_INJECTION_ORIGIN_KEY,
     CONTEXT_INJECTION_TOOL_PAIR_V1,
     FunctionCall,
+    ImageAttachment,
+    InlineImageSource,
     LLMMessage,
     PersistedToolResult,
     Role,
@@ -4535,3 +4539,122 @@ class TestP4a4LoadTimeValidatesCompleteDiskHistory:
             Role.tool,
         ]
         assert validate_transcript(messages, live_tail_exempt=True) == []
+
+
+# ---------------------------------------------------------------------------
+# S1-A2 request-prep memo — typed-failure equivalence at the integrity seams
+# ---------------------------------------------------------------------------
+
+
+class TestRequestPrepMemoTypedFailures:
+    """The gateway's exact-snapshot memo (S1-A2) never caches a failure.
+
+    Across cache-hit vs naive, the typed request-build diagnostics are
+    identical: every service recomputes and re-raises the same typed error,
+    and the memo slot stays empty. The inputs are minted through the real
+    coordinator build so the carrier population is the production one.
+    """
+
+    def _coordinator(self) -> CompletionCoordinator:
+        config = build_test_vibe_config(
+            providers=[ProviderConfig(name="test", api_base="https://test.invalid")]
+        )
+        coordinator = CompletionCoordinator.__new__(CompletionCoordinator)
+        coordinator._config_getter = lambda: config
+        coordinator._session_id_getter = lambda: "session-1"
+        coordinator._backend_metadata = lambda call_type: {}
+        coordinator._max_tokens_getter = lambda: None
+        coordinator._last_request_envelope = None
+        return coordinator
+
+    def _spy_prep(self, monkeypatch: pytest.MonkeyPatch) -> list[int]:
+        calls: list[int] = []
+        real = messages_for_backend
+
+        def counting(messages, active_model):
+            calls.append(1)
+            return real(messages, active_model)
+
+        monkeypatch.setattr(
+            "chartreux.core.agent_loop.llm_gateway.messages_for_backend", counting
+        )
+        return calls
+
+    def test_request_prep_memo_transcript_integrity_failure_identical_and_never_cached(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # The stranded-call shape the request build fails closed on: both the
+        # first service and the replay raise the identical typed diagnostic,
+        # and nothing is ever published to the memo slot.
+        calls = self._spy_prep(monkeypatch)
+        stranded = MessageList([
+            _user("first"),
+            _assistant("c1"),
+            _user("second"),
+            _assistant("c1"),
+            _genuine_result("c1"),
+        ])
+        coordinator = self._coordinator()
+        model = _model()
+        inputs = coordinator.build_completion_inputs(
+            model=model, messages=stranded, tools=None, tool_choice=None
+        )
+        assert inputs.live_source is not None
+        gateway = LLMGateway()
+
+        with pytest.raises(TranscriptIntegrityError) as first:
+            gateway._prepare_backend_messages(inputs)
+        with pytest.raises(TranscriptIntegrityError) as second:
+            gateway._prepare_backend_messages(inputs)
+        assert type(first.value) is type(second.value)
+        assert str(first.value) == str(second.value)
+        assert calls == [1, 1]  # recomputed both times: failures never cached
+        assert gateway._prepared_slot is None
+
+    def test_request_prep_memo_images_not_supported_failure_identical_and_never_cached(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # The image-admission gate (llm_gateway.py:196-199): a model without
+        # supports_images over an image-carrying message raises the typed
+        # ImagesNotSupportedError identically on every service.
+        calls = self._spy_prep(monkeypatch)
+        image = ImageAttachment(
+            source=InlineImageSource(data="aGk="), alias="x.png", mime_type="image/png"
+        )
+        messages = MessageList([
+            LLMMessage(role=Role.user, content="look", images=[image])
+        ])
+        coordinator = self._coordinator()
+        model = ModelConfig(
+            name="test-model", provider="test", alias="test", supports_images=False
+        )
+        inputs = coordinator.build_completion_inputs(
+            model=model, messages=messages, tools=None, tool_choice=None
+        )
+        assert inputs.live_source is not None
+        gateway = LLMGateway()
+
+        with pytest.raises(ImagesNotSupportedError) as first:
+            gateway._prepare_backend_messages(inputs)
+        with pytest.raises(ImagesNotSupportedError) as second:
+            gateway._prepare_backend_messages(inputs)
+        assert type(first.value) is type(second.value)
+        assert (
+            str(first.value)
+            == str(second.value)
+            == str(ImagesNotSupportedError("test"))
+        )
+        assert calls == [1, 1]
+        assert gateway._prepared_slot is None
+
+        # Contrast: the same list under an image-capable model prepares
+        # successfully, and only then does the slot publish and replay-hit.
+        capable = ModelConfig(
+            name="test-model", provider="test", alias="test", supports_images=True
+        )
+        inputs_ok = coordinator.build_completion_inputs(
+            model=capable, messages=messages, tools=None, tool_choice=None
+        )
+        prep = gateway._prepare_backend_messages(inputs_ok)
+        assert gateway._prepare_backend_messages(inputs_ok) is prep
+        assert calls == [1, 1, 1]

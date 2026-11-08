@@ -63,7 +63,9 @@ from chartreux.core.agents.launch import FrozenPersona, LaunchCandidate, resolve
 from chartreux.core.agents.manager import AgentManager, resolve_identity_candidate
 from chartreux.core.background_jobs import BackgroundJobsPort
 from chartreux.core.config import (
+    AddOperationPatch,
     ChartreuxConfigSchema,
+    ConfigPatch,
     MCPHttp,
     MCPServer,
     MCPStaticAuth,
@@ -845,16 +847,49 @@ class AgentRuntimeFactory:
             session_prefix=agent_name,
             enabled=parent_session_dir is not None,
         )
-        failures = await orchestrator.set_field(
-            "/session_logging",
-            session_logging.model_dump(mode="json"),
-            reason="configure child session logging",
-            target_layer=OverridesLayer.NAME,
-        )
-        if failures:
+        logging_dump = session_logging.model_dump(mode="json")
+        try:
+            overrides = orchestrator.get_layer(OverridesLayer.NAME)
+        except KeyError as exc:
             raise RuntimeConfigurationError(
                 "Failed to configure child session logging"
-            ) from failures[0]
+            ) from exc
+        except AttributeError:
+            # A layer stack without a builder (the test double) resolves
+            # through the public layers view.
+            overrides = next(
+                (
+                    layer
+                    for layer in orchestrator.layers
+                    if layer.name == OverridesLayer.NAME
+                ),
+                None,
+            )
+        if overrides is None:
+            orchestrator.replace_or_append_layer(
+                OverridesLayer.NAME,
+                OverridesLayer(data={"session_logging": logging_dump}),
+            )
+        else:
+            if overrides.cached_data is None or overrides.fingerprint is None:
+                await overrides.load()
+            fingerprint = overrides.fingerprint
+            if fingerprint is None:
+                raise RuntimeConfigurationError(
+                    "Failed to configure child session logging"
+                ) from None
+            # Patch the installed layer in place: copy() binds the
+            # default-layer resolver to this exact object, so replacing the
+            # object would orphan the resolver and break later name-based
+            # default-layer resolution.
+            await overrides.apply(
+                ConfigPatch(
+                    AddOperationPatch(path="/session_logging", value=logging_dump),
+                    fingerprint=fingerprint,
+                    reason="configure child session logging",
+                )
+            )
+        orchestrator.rebuild()
         child_session_id = session_id or generate_session_id()
         lease = await asyncio.to_thread(
             _acquire_session_lease, parent.config, child_session_id

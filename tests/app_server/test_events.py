@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Iterator
 from types import SimpleNamespace
 from typing import Any, cast
 from unittest.mock import AsyncMock, Mock
@@ -34,6 +35,7 @@ from chartreux.app_server.models import (
     PublicEffectEntry,
     PublicEntryGenerationStatus,
     PublicError,
+    PublicHistoryEntry,
     PublicMessageEntry,
     PublicQueuedTurn,
     PublicReasoningEntry,
@@ -56,6 +58,7 @@ from chartreux.app_server.protocol import (
     AgentSummaryModel,
     AgentsUpdateParams,
     HistoryEntryAddedParams,
+    HistoryEntryUpdatedParams,
     JsonPatchOperation,
     MCPAuthRequiredParams,
     Notification,
@@ -993,6 +996,200 @@ def test_unknown_notifications_fail_strictly(method: str) -> None:
 
     with pytest.raises(UnknownNotificationError, match=method):
         projection.consume(Notification(method=method, params={"revision": 1}))
+
+
+# ---------------------------------------------------------------------------
+# v0.7.5 P7: one serialization per delta and a shared id-to-position index
+
+
+class _ScanCountingHistory(list[PublicHistoryEntry]):
+    """A history list that counts whole-list traversals (linear scans)."""
+
+    def __init__(self, entries: list[PublicHistoryEntry]) -> None:
+        super().__init__(entries)
+        self.traversals = 0
+
+    def __iter__(self) -> Iterator[PublicHistoryEntry]:
+        self.traversals += 1
+        return super().__iter__()
+
+
+def _count_entry_dumps(monkeypatch: pytest.MonkeyPatch) -> list[int]:
+    dumps: list[int] = []
+    original = PublicMessageEntry.model_dump
+
+    def counting_dump(self: PublicMessageEntry, *args: Any, **kwargs: Any) -> Any:
+        dumps.append(1)
+        return original(self, *args, **kwargs)
+
+    monkeypatch.setattr(PublicMessageEntry, "model_dump", counting_dump)
+    return dumps
+
+
+def test_projector_delta_dedup_server_dumps_entry_once_per_update(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    projector = EventProjector("session-1", "turn-1")
+    projector.project(AssistantEvent(content="done", message_id="message-1"))
+    projector.finalize()
+    dumps = _count_entry_dumps(monkeypatch)
+
+    update = projector._patch(
+        "message-1",
+        [JsonPatchOperation(op="replace", path="/turnDurationMs", value=250)],
+    )
+
+    assert update.method == "history/entryUpdated"
+    assert len(dumps) == 1
+    entry = projector.history[0]
+    assert isinstance(entry, PublicMessageEntry)
+    assert entry.turn_duration_ms == 250
+
+
+def test_projector_delta_dedup_client_dumps_entry_once_per_update(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    projector = EventProjector("session-1", "turn-1")
+    projection = _projection()
+    added = projector.project(AssistantEvent(content="done", message_id="message-1"))
+    projection.consume(_notification(1, added[0]))
+    projection.consume(_notification(2, projector.finalize()[0]))
+    update = projector._patch(
+        "message-1",
+        [JsonPatchOperation(op="replace", path="/turnDurationMs", value=250)],
+    )
+    dumps = _count_entry_dumps(monkeypatch)
+
+    event = projection.consume(_notification(3, update))
+
+    assert isinstance(event, HistoryEntryUpdated)
+    assert len(dumps) == 1
+    entry = projection.history[0]
+    assert isinstance(entry, PublicMessageEntry)
+    assert entry.turn_duration_ms == 250
+
+
+def test_projector_delta_dedup_server_index_replaces_without_scanning_history() -> None:
+    projector = EventProjector("session-1", "turn-1")
+    for index in range(200):
+        projector.project(
+            AssistantEvent(content=str(index), message_id=f"message-{index}")
+        )
+    history = _ScanCountingHistory(projector.history)
+    projector.history = history
+    history.traversals = 0
+
+    update = projector._patch(
+        "message-150",
+        [JsonPatchOperation(op="append", path="/content/0/text", value="+")],
+    )
+
+    assert history.traversals == 0
+    assert [entry.id for entry in history[148:152]] == [
+        "message-148",
+        "message-149",
+        "message-150",
+        "message-151",
+    ]
+    updated = history[150]
+    assert isinstance(updated, PublicMessageEntry)
+    assert updated.text == "150+"
+    assert isinstance(update.params, HistoryEntryUpdatedParams)
+    assert update.params.entry_id == "message-150"
+
+
+def test_projector_delta_dedup_client_index_replaces_without_scanning_history() -> None:
+    projector = EventProjector("session-1", "turn-1")
+    projection = _projection()
+    for sequence, index in enumerate(range(200), start=1):
+        addition = projector.project(
+            AssistantEvent(content=str(index), message_id=f"message-{index}")
+        )
+        projection.consume(_notification(sequence, addition[0]))
+    history = _ScanCountingHistory(projection.history)
+    projection.state.history = history
+    history.traversals = 0
+    streamed = projector.project(AssistantEvent(content="+", message_id="message-150"))
+
+    event = projection.consume(_notification(201, streamed[0]))
+
+    assert projection.state.history is history
+    assert isinstance(event, HistoryEntryUpdated)
+    assert history.traversals == 0
+    updated = history[150]
+    assert isinstance(updated, PublicMessageEntry)
+    assert updated.text == "150+"
+
+
+def test_projector_delta_dedup_preserves_client_noop_and_server_keyerror() -> None:
+    projector = EventProjector("session-1", "turn-1")
+    projector.project(AssistantEvent(content="done", message_id="message-1"))
+    projector.finalize()
+    update = projector._patch(
+        "message-1",
+        [JsonPatchOperation(op="replace", path="/turnDurationMs", value=250)],
+    )
+    projection = _projection()
+
+    assert projection.consume(_notification(1, update)) is None
+    assert projection.history == []
+    assert projection.last_event_id == 1
+
+    with pytest.raises(KeyError):
+        projector._patch(
+            "missing-entry",
+            [JsonPatchOperation(op="replace", path="/turnDurationMs", value=1)],
+        )
+
+
+def test_projector_delta_dedup_duplicate_ids_rejected_on_both_sides() -> None:
+    projector = EventProjector("session-1", "turn-1")
+    added = projector.project(AssistantEvent(content="hello", message_id="message-1"))
+    assert isinstance(added[0].params, HistoryEntryAddedParams)
+    duplicate = added[0].params.entry
+
+    with pytest.raises(ValueError, match="Duplicate public history entry"):
+        projector._add(duplicate)
+
+    projection = _projection()
+    assert isinstance(projection.consume(_notification(1, added[0])), HistoryEntryAdded)
+    assert projection.consume(_notification(2, added[0])) is None
+    assert [entry.id for entry in projection.history] == ["message-1"]
+
+    with pytest.raises(ValueError, match="Duplicate paged history entry"):
+        projection.prepend_history_page([duplicate, duplicate])
+
+
+def test_projector_delta_dedup_updated_event_shape_matches_both_sides() -> None:
+    projector = EventProjector("session-1", "turn-1")
+    added = projector.project(AssistantEvent(content="hell", message_id="message-1"))
+    previous = projector.history[0]
+    update = projector.project(AssistantEvent(content="o", message_id="message-1"))[0]
+
+    assert update.method == "history/entryUpdated"
+    assert isinstance(update.params, HistoryEntryUpdatedParams)
+    assert update.params.entry_id == "message-1"
+    assert any(operation.path == "/updatedAt" for operation in update.params.patch)
+    projected = projector.history[0]
+    assert isinstance(projected, PublicMessageEntry)
+    assert projected.text == "hello"
+    assert apply_json_patch(
+        previous.model_dump(mode="json", by_alias=True), update.params.patch
+    ) == projected.model_dump(mode="json", by_alias=True)
+
+    projection = _projection()
+    projection.consume(_notification(1, added[0]))
+    event = projection.consume(_notification(2, update))
+
+    assert isinstance(event, HistoryEntryUpdated)
+    assert event.previous.id == "message-1"
+    assert event.patch == update.params.patch
+    assert isinstance(event.entry, PublicMessageEntry)
+    assert event.entry.text == "hello"
+    assert projection.history[0] is event.entry
+    assert apply_json_patch(
+        event.previous.model_dump(mode="json", by_alias=True), event.patch
+    ) == event.entry.model_dump(mode="json", by_alias=True)
 
 
 # ---------------------------------------------------------------------------

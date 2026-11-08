@@ -359,6 +359,8 @@ class ClientProjection:
     def __init__(self, state: PublicSessionState) -> None:
         self.state = state
         self._entries = {entry.id: entry for entry in state.history or []}
+        self._entry_positions: dict[str, int] = {}
+        self._reindex_entries()
         self._last_event_id = state.event_id
         self._generation = 0
         self._retired_queue_item_ids: OrderedDict[str, None] = OrderedDict()
@@ -406,6 +408,7 @@ class ClientProjection:
         if self.state.history is None:
             self.state.history = []
         self.state.history[:0] = page_entries
+        self._reindex_entries()
 
     def ensure_callback(self, callback: PublicCallbackEntry) -> bool:
         if callback.id in self._entries:
@@ -567,6 +570,7 @@ class ClientProjection:
             self._retired_queue_item_ids.clear()
         self.state = state
         self._entries = {entry.id: entry for entry in state.history or []}
+        self._reindex_entries()
         self._last_event_id = state.event_id
         self._generation += 1
         self._remember_started_queue_items(state)
@@ -610,6 +614,7 @@ class ClientProjection:
         if self.state.history is None:
             self.state.history = []
         self.state.history.append(entry)
+        self._entry_positions[entry.id] = len(self.state.history) - 1
         if (
             isinstance(entry, PublicCallbackEntry)
             and entry.state.status == "open"
@@ -627,18 +632,18 @@ class ClientProjection:
         previous = self._entries.get(params.entry_id)
         if previous is None:
             return None
-        if is_completed_effect_replay(previous, params.patch):
+        raw = previous.model_dump(mode="json", by_alias=True)
+        if is_completed_effect_replay(previous, params.patch, raw=raw):
             # Ambiguous delivery and snapshot recovery can already contain this
             # completion. Drain the retry without changing the frozen entry.
             return None
         if (
             previous.generation_status is PublicEntryGenerationStatus.COMPLETED
-            and not is_timing_only_patch(previous, params.patch)
+            and not is_timing_only_patch(previous, params.patch, raw=raw)
         ):
             raise ValueError(
                 f"Completed public history entry is frozen: {params.entry_id}"
             )
-        raw = previous.model_dump(mode="json", by_alias=True)
         entry = validate_history_entry(apply_json_patch(raw, params.patch))
         self._replace_entry(entry)
         if isinstance(entry, PublicCallbackEntry):
@@ -651,15 +656,34 @@ class ClientProjection:
                 self.state.active_callbacks.append(entry)
         return HistoryEntryUpdated(previous=previous, entry=entry, patch=params.patch)
 
+    def _reindex_entries(self) -> None:
+        self._entry_positions = {
+            entry.id: position
+            for position, entry in enumerate(self.state.history or [])
+        }
+
+    def _entry_position(self, entry_id: str) -> int | None:
+        """Locate an entry through the maintained id-to-position index."""
+        history = self.state.history
+        if history is None:
+            return None
+        index = self._entry_positions.get(entry_id)
+        if index is not None and index < len(history):
+            if history[index].id == entry_id:
+                return index
+        # State is public; a foreign rewrite of its history invalidates positions.
+        self._reindex_entries()
+        return self._entry_positions.get(entry_id)
+
     def _replace_entry(self, entry: PublicHistoryEntry) -> None:
         self._entries[entry.id] = entry
         history = self.state.history
         if history is None:
             return
-        for index, existing in enumerate(history):
-            if existing.id == entry.id:
-                history[index] = entry
-                return
+        index = self._entry_position(entry.id)
+        if index is None:
+            return
+        history[index] = entry
 
     def _replace_turn(self, turn: PublicTurn) -> None:
         if turn.queue_item_id is not None:
