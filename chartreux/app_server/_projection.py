@@ -660,6 +660,10 @@ def project_message_history(
     timestamp = now_ms()
     entries: list[PublicHistoryEntry] = []
     effect_indices: dict[str, int] = {}
+    # Harness-injected notices — delivered completion notifications, the P2b
+    # sweep's synthesized backstop notifications, and recovery notices — all
+    # arrive as injected messages here and project uniformly: only shell
+    # effects gain a history entry, text-only injected notices project none.
     child_sessions = (
         {link.tool_call_id: link.session_id for link in metadata.child_sessions}
         if metadata is not None

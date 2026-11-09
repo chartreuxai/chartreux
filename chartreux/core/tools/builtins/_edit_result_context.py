@@ -13,7 +13,9 @@ derived from the file as it stands *after* the applied edit:
   With ``replace_all`` every site is named; the rendering is capped at
   ``EDIT_DIFF_MAX_SITES`` hunks, ``EDIT_DIFF_MAX_LINES_PER_SIDE`` lines and
   ``EDIT_DIFF_MAX_BYTES_PER_SIDE`` bytes per side, with an elision marker
-  stating what was cut.
+  stating what was cut. Sites past the hunk cap are still accounted for: a
+  trailing note states the count and total and enumerates their current line
+  numbers, itself bounded at ``EDIT_DIFF_NOTE_MAX_BYTES``.
 - ``context`` — a numbered window of the current content around the first
   applied site, rendered in the same ``N→line`` style as ``read_file`` so the
   model can correlate it with reads. Line numbers point at the current text
@@ -52,7 +54,7 @@ EDIT_WINDOW_CONTEXT_LINES = 2
 #: Hard cap on window lines (the replaced span counts toward it).
 EDIT_WINDOW_MAX_LINES = 16
 #: Soft cap on the rendered window text, in bytes.
-EDIT_WINDOW_MAX_BYTES = 8 * 1024
+EDIT_WINDOW_MAX_BYTES = 2 * 1024
 #: Per-line cap inside the window; longer lines are elided with a marker.
 EDIT_WINDOW_MAX_LINE_BYTES = 512
 #: Max site hunks rendered in the applied diff.
@@ -61,6 +63,8 @@ EDIT_DIFF_MAX_SITES = 8
 EDIT_DIFF_MAX_LINES_PER_SIDE = 12
 #: Max bytes rendered per side (old or new) of one site hunk.
 EDIT_DIFF_MAX_BYTES_PER_SIDE = 4 * 1024
+#: Max bytes for the trailing note that names the sites past the hunk cap.
+EDIT_DIFF_NOTE_MAX_BYTES = 512
 
 
 class AppliedSite(NamedTuple):
@@ -199,12 +203,48 @@ def _bounded_side(text: str) -> list[str]:
     return shown
 
 
+def _hidden_sites_note(hidden: list[AppliedSite], total: int) -> str:
+    """Render the bounded trailing note naming the sites past the hunk cap.
+
+    The count and exact total are always stated; the hidden sites' *current*
+    line numbers are enumerated while ``EDIT_DIFF_NOTE_MAX_BYTES`` allows, and
+    an explicit remainder marker reports how many anchors the budget cut, so
+    the note never grows with the number of hidden sites.
+    """
+    head = f"… {len(hidden)} more replaced site(s) not shown (total {total})."
+    lead = " Hidden lines: "
+    tail = ". Line-keyed read_file on the named file gives their content."
+    reserve = len(f", (+{len(hidden)} more)".encode())
+    budget = (
+        EDIT_DIFF_NOTE_MAX_BYTES
+        - len(head.encode("utf-8"))
+        - len(lead.encode("utf-8"))
+        - len(tail.encode("utf-8"))
+        - reserve
+    )
+    anchors: list[str] = []
+    used = 0
+    if budget > 0:
+        for site in hidden:
+            piece = str(site.line)
+            cost = len(piece.encode("utf-8")) + (2 if anchors else 0)
+            if used + cost > budget:
+                break
+            anchors.append(piece)
+            used += cost
+    omitted = len(hidden) - len(anchors)
+    if omitted:
+        anchors.append(f"(+{omitted} more)")
+    return head + lead + ", ".join(anchors) + tail
+
+
 def render_applied_diff(sites: list[AppliedSite]) -> str:
     """Render the applied change(s) as a bounded ``-``/``+`` hunk list.
 
     Every site is named (its current line number heads the hunk) up to
-    ``EDIT_DIFF_MAX_SITES``; further sites are summarized in a trailing note
-    so ``replace_all`` evidence always accounts for every applied site.
+    ``EDIT_DIFF_MAX_SITES``; further sites are named by their current line
+    number in a bounded trailing note, so ``replace_all`` evidence always
+    accounts for every applied site while the echo stays bounded.
     """
     blocks: list[str] = []
     for site in sites[:EDIT_DIFF_MAX_SITES]:
@@ -213,9 +253,9 @@ def render_applied_diff(sites: list[AppliedSite]) -> str:
         lines.extend(f"+ {line}" for line in _bounded_side(site.new_text))
         blocks.append("\n".join(lines))
     diff = "\n".join(blocks)
-    hidden = len(sites) - min(len(sites), EDIT_DIFF_MAX_SITES)
-    if hidden > 0:
-        diff += f"\n… {hidden} more replaced site(s) not shown (total {len(sites)})."
+    hidden = sites[EDIT_DIFF_MAX_SITES:]
+    if hidden:
+        diff += "\n" + _hidden_sites_note(hidden, len(sites))
     return diff
 
 

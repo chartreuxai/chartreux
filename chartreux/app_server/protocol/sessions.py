@@ -95,12 +95,32 @@ class SessionResumeParams(SessionOpenParams):
     session_id: str
 
 
+LEGACY_UNVERIFIED_STATE = "legacy-unverified"
+
+
+class SessionPlanScanDomain(ProtocolModel):
+    """The P1 ``{save_dir, session_prefix}`` scan domain, as carried on the wire.
+
+    A display mirror of the sidecar's recorded domain; the sidecar remains the
+    authority (DR-69). ProtocolModel keeps the wire exact: no extra fields.
+    """
+
+    save_dir: str
+    session_prefix: str
+
+
 class SessionPlanRecord(ProtocolModel):
     """The persisted plan-mode record as it crosses the app-server boundary.
 
     Mirrors the session-metadata model: the record is written once at entry
     and removed by the exit paths, so the TUI never assembles a mode from
     anything but this.
+
+    The episode extension (design §4.1) crosses the boundary whole. Unlike the
+    persisted model, this one is ``extra=forbid``: an OLD wire reader REJECTS an
+    extended record, which is the declared legacy surface — a rejection, never
+    a silently truncated mode. A record without an ``episode_id`` is
+    ``legacy_unverified``.
     """
 
     plan_path: str
@@ -109,6 +129,31 @@ class SessionPlanRecord(ProtocolModel):
     planner_thinking: str
     pre_entry_active_model: str | None = None
     pre_entry_planner_thinking: str | None = None
+    episode_id: str | None = None
+    sidecar_path: str | None = None
+    draft_path: str | None = None
+    snapshot_path: str | None = None
+    state: str | None = None
+    consent_sha256: str | None = None
+    attempt_generation: int | None = None
+    scan_domain: SessionPlanScanDomain | None = None
+
+    @property
+    def episode_bound(self) -> bool:
+        """True when the record carries an episode identity."""
+        return self.episode_id is not None
+
+    @property
+    def legacy_unverified(self) -> bool:
+        """The legacy marker: no episode identity means the record predates it."""
+        return not self.episode_bound
+
+    @property
+    def display_state(self) -> str | None:
+        """The state to display; a legacy record never claims a live lifecycle."""
+        if self.legacy_unverified:
+            return LEGACY_UNVERIFIED_STATE
+        return self.state
 
 
 class SessionPlanRecordWriteParams(ProtocolModel):
@@ -489,6 +534,22 @@ class SessionPlanHandoffParams(ProtocolModel):
     execution. ``planner_thinking_alias``/``planner_thinking_value`` carry the
     /plan-entry thinking-key restore: the pre-entry value to restore, or removal
     of the key when it was absent pre-entry (``planner_thinking_value=None``).
+
+    An episode-bound handoff carries the verifiable consent body: the episode
+    identity, the snapshot's path and SHA-256, and the snapshot BYTES themselves
+    base64-encoded. The bytes are the ONE authority — the digest is computed
+    over them and the path is only a locator for the plan workspace, never a
+    read path for the executor's content. A request carrying any one of these
+    fields must carry all of them; the fields are absent together on the legacy
+    (pre-episode) path.
+
+    ``snapshot_path`` names EITHER of the episode's snapshot names: the live
+    ``accepted-<episode_id>.md``, or the attempt's surviving
+    ``provenance-<episode_id>-<generation>.md``. The recovery re-offer therefore
+    passes the path it located plus that snapshot's bytes, and a request that
+    re-enters an ACCEPTING claim held by the same session continues its commit
+    from those bytes without reading the draft again (the draft is never
+    consulted after consent).
     """
 
     session_id: str
@@ -498,6 +559,10 @@ class SessionPlanHandoffParams(ProtocolModel):
     plan_path: str = ""
     planner_thinking_alias: str | None = None
     planner_thinking_value: str | None = None
+    episode_id: str | None = None
+    snapshot_path: str | None = None
+    snapshot_sha256: str | None = None
+    snapshot_bytes_b64: str | None = None
 
 
 class SessionPlanHandoffResponse(SessionHistoryClearResponse):

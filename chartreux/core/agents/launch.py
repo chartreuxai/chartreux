@@ -23,6 +23,7 @@ from chartreux.core.llm.thinking_levels import (
     resolve_thinking_level,
 )
 from chartreux.core.llm_models import LLMMessage
+from chartreux.core.model_catalog.defaults import child_auto_compact_threshold
 from chartreux.core.recovery_models import PackageTier, canonical_endpoint_identity
 from chartreux.core.recovery_override import CooldownOverrideLedger, OverridePermit
 from chartreux.core.session_types import CommittedModelIdentity
@@ -34,7 +35,10 @@ from chartreux.core.subagents import (
     LaunchConfig,
     LaunchToolOverride,
 )
-from chartreux.core.tools.manager import identity_allows_name
+from chartreux.core.tools.manager import (
+    CHILD_CONTEXT_UNAVAILABLE_TOOLS,
+    identity_allows_name,
+)
 from chartreux.core.tools.models import ToolPermission
 from chartreux.core.utils import name_matches
 
@@ -171,7 +175,9 @@ def _resolved_model(
                 or config.thinking_overrides.get(resolved.base_model)
             )
             model = resolved.materialize(
-                auto_compact_threshold=config.auto_compact_threshold,
+                auto_compact_threshold=child_auto_compact_threshold(
+                    resolved.deployment, config.auto_compact_threshold
+                ),
                 thinking=selected_thinking,
             )
         except ModelResolutionError as exc:
@@ -309,7 +315,7 @@ def _validate_tools(
     authorized_names: frozenset[str],
     child_identity: AgentIdentity | None = None,
 ) -> None:
-    """Validate launch tool overrides against two independent ceilings.
+    """Validate launch tool overrides against three independent ceilings.
 
     The first ceiling is the parent's delegated authority (``authorized_names``):
     granted authority never widens. The second ceiling is the CHILD identity's
@@ -319,8 +325,14 @@ def _validate_tools(
     and this guard rejects loosening attempts at admission). The identity's
     execution carve-out is part of that ceiling, not a loosening of it: a
     carved-out name is admitted exactly as the manager's runtime check admits
-    it. Narrowing overrides (``disabled_tools``, ``permission = "never"``
-    patches) stay allowed on both axes.
+    it. The third ceiling is the bounded-child execution restriction: a tool
+    the child context can never execute under ANY authority — it cannot spawn,
+    it holds no owner-side run inventory (recovery is owner-only), and it never
+    prompts the user — cannot be enabled or permission-granted here either,
+    because its definition is withheld from the child's catalog for the same
+    reason (P1); admitting it would create an "invocation permitted, definition
+    absent" state. Narrowing overrides (``disabled_tools``, ``permission =
+    "never"`` patches) stay allowed on every axis, including that one.
     """
     if "enabled_tools" in overrides.model_fields_set:
         patterns = overrides.enabled_tools or []
@@ -339,6 +351,11 @@ def _validate_tools(
                         raise InvalidLaunchToolError(
                             "config.enabled_tools",
                             f"Tool '{name}' exceeds the child identity posture",
+                        )
+                    if name in CHILD_CONTEXT_UNAVAILABLE_TOOLS:
+                        raise InvalidLaunchToolError(
+                            "config.enabled_tools",
+                            f"Tool '{name}' is unavailable to bounded children",
                         )
     if "disabled_tools" in overrides.model_fields_set:
         _validate_tool_patterns(
@@ -362,6 +379,15 @@ def _validate_tools(
             raise InvalidLaunchToolError(
                 f"config.tools.{name}",
                 f"Tool '{name}' exceeds the child identity posture",
+            )
+        if (
+            patch.permission is not None
+            and patch.permission != ToolPermission.NEVER
+            and name in CHILD_CONTEXT_UNAVAILABLE_TOOLS
+        ):
+            raise InvalidLaunchToolError(
+                f"config.tools.{name}",
+                f"Tool '{name}' is unavailable to bounded children",
             )
         # Re-validate the narrow public schema here so this boundary remains safe
         # when semantic state is reconstructed outside TaskArgs.
@@ -519,7 +545,9 @@ def resolve_launch(  # noqa: PLR0913, PLR0914, PLR0915
             or staged_config.thinking_overrides.get(candidate.base_model)
         )
         candidate_model = candidate.materialize(
-            auto_compact_threshold=staged_config.auto_compact_threshold,
+            auto_compact_threshold=child_auto_compact_threshold(
+                candidate.deployment, staged_config.auto_compact_threshold
+            ),
             thinking=candidate_thinking,
         )
         candidate_thinking = candidate_model.thinking

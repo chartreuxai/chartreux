@@ -57,6 +57,7 @@ from chartreux.core.launch_types import (
     ResolvedLaunchAuthority,
     validate_difficulty_for_purpose,
 )
+from chartreux.core.model_catalog.defaults import child_auto_compact_threshold
 from chartreux.core.model_catalog.resolver import (
     ModelResolutionError,
     ModelResolver,
@@ -717,7 +718,9 @@ def resolve_identity_launch(  # noqa: PLR0914, PLR0915
             thinking_override=explicit_thinking,
         )
         model = resolved_model.materialize(
-            auto_compact_threshold=config.auto_compact_threshold,
+            auto_compact_threshold=child_auto_compact_threshold(
+                resolved_model.deployment, config.auto_compact_threshold
+            ),
             thinking=(
                 explicit_thinking
                 or resolved_model.thinking

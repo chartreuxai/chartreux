@@ -14,6 +14,7 @@ from chartreux.core.file_outline import (
     outline_source,
 )
 from chartreux.core.file_revision import (
+    FileRevision,
     ReadTraversal,
     TraversalRegistry,
     new_traversal_id,
@@ -235,6 +236,20 @@ class ReadFileArgs(BaseModel):
             "normal read; pagination args are rejected with outline=true."
         ),
     )
+    expected_revision: str | None = Field(
+        default=None,
+        description=(
+            "A content revision previously returned by this tool for the same "
+            'file (for example "blake2b-128:..."). Makes the read '
+            "conditional: when the file's current content still has exactly "
+            "this revision, the result is a short unchanged confirmation that "
+            "states the checks performed (read authority and the current "
+            "content revision) instead of the file content. When the content "
+            "differs, the normal read is served and the result reports the "
+            "change. Cannot be combined with offset, limit, traversal_id, or "
+            "outline."
+        ),
+    )
 
     @model_validator(mode="after")
     def _outline_excludes_pagination_args(self) -> ReadFileArgs:
@@ -242,6 +257,17 @@ class ReadFileArgs(BaseModel):
             raise ValueError(
                 "outline=true cannot be combined with offset, limit, or "
                 "traversal_id: the outline is one bounded result."
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _expected_revision_is_a_whole_file_check(self) -> ReadFileArgs:
+        if self.expected_revision is not None and (
+            self.outline or self.model_fields_set & {"offset", "limit", "traversal_id"}
+        ):
+            raise ValueError(
+                "expected_revision describes the whole file state and cannot be "
+                "combined with offset, limit, traversal_id, or outline."
             )
         return self
 
@@ -263,6 +289,9 @@ class ReadFileResult(BaseModel):
     restarted: bool = False
     line_continues: bool = False
     outline: bool = False
+    unchanged: bool = False
+    expected_revision: str | None = None
+    checked: list[str] = Field(default_factory=list)
 
 
 class ReadFileConfig(BaseToolConfig):
@@ -492,6 +521,85 @@ class ReadFile(
                 first_chunk=True,
                 extra_note=None,
             ),
+        )
+
+    async def _conditional_request(
+        self, args: ReadFileArgs, file_path: Path, tool_io: ToolIOPort | None
+    ) -> ReadFileResult:
+        """Serve a conditional read keyed on an expected content revision.
+
+        "Unchanged" is declared only after two checks against live state: read
+        authority for the path, then the file's current content, read through
+        this tool's own read path and hashed to a full-scope revision. The
+        revision is content-derived, so a file reverted to its earlier bytes is
+        genuinely unchanged. A read path that cannot establish the current
+        revision (client-mediated reads) degrades to the normal read with a
+        note; it never declares unchanged.
+        """
+        expected = args.expected_revision or ""
+        context = self.resolve_permission(args)
+        if context is not None and context.permission == ToolPermission.NEVER:
+            raise ToolError(
+                context.reason or f"Reading {file_path} is denied by tool policy"
+            )
+        read = await self._read_window(
+            file_path, start_line=1, limit=args.limit, tool_io=tool_io, full_scan=True
+        )
+        if read.revision is None:
+            note = (
+                "Conditional read is unavailable for this read path (it cannot "
+                "establish a full-state content revision); serving the normal read."
+            )
+            result = await self._read_request(args, file_path, tool_io)
+            return result.model_copy(
+                update={
+                    "expected_revision": expected,
+                    "content": f"{_warning(note)}\n{result.content}",
+                }
+            )
+        current = FileRevision(
+            revision=read.revision,
+            size_bytes=read.raw_bytes or 0,
+            line_count=read.total_lines,
+        )
+        lines_word = "line" if current.line_count == 1 else "lines"
+        checks = [
+            "read authority for this path under tool policy",
+            f"current content through the tool read path (blake2b-128 over "
+            f"{current.size_bytes} bytes, {current.line_count} {lines_word})",
+        ]
+        if current.matches(expected):
+            content = (
+                f"Unchanged: {file_path} still has content revision "
+                f"{current.revision}.\n"
+                f"Checked before declaring unchanged: {checks[0]}; {checks[1]}."
+            )
+            return ReadFileResult(
+                file_path=str(file_path),
+                content=content,
+                num_lines=0,
+                start_line=1,
+                requested_offset=None,
+                requested_limit=None,
+                total_lines=read.total_lines,
+                was_truncated=False,
+                revision=current.revision,
+                expected_revision=expected,
+                unchanged=True,
+                checked=checks,
+            )
+        result = await self._read_request(args, file_path, tool_io)
+        observed = result.revision or current.revision
+        note = (
+            f"The file changed since revision {expected}: its current content "
+            f"revision is {observed}. Serving the current content."
+        )
+        return result.model_copy(
+            update={
+                "expected_revision": expected,
+                "checked": checks,
+                "content": f"{_warning(note)}\n{result.content}",
+            }
         )
 
     async def _outline_request(
@@ -888,6 +996,8 @@ class ReadFile(
             result = await self._continue_traversal(
                 args, file_path, tool_io, traversal_id=args.traversal_id
             )
+        elif args.expected_revision is not None:
+            result = await self._conditional_request(args, file_path, tool_io)
         else:
             result = await self._read_request(args, file_path, tool_io)
 
@@ -926,6 +1036,8 @@ class ReadFile(
             extras.append(f"from line {args.offset}")
         if args.outline:
             extras.append("outline")
+        if args.expected_revision is not None:
+            extras.append("conditional read")
         if args.limit != DEFAULT_LINE_LIMIT:
             extras.append(f"limit {args.limit} lines")
         if args.traversal_id:
@@ -954,6 +1066,13 @@ class ReadFile(
         suffix_parts: list[str] = []
         if is_scratchpad_display_path(event.result.file_path):
             suffix_parts.append("(scratchpad)")
+        if event.result.unchanged:
+            return ToolResultDisplay(
+                success=True,
+                verb="Checked",
+                message=f"{display_file_path(event.result.file_path)} unchanged",
+                suffix=" ".join(suffix_parts),
+            )
         if event.result.was_truncated or (
             event.result.total_lines is not None
             and event.result.start_line + event.result.num_lines - 1

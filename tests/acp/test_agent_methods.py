@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from pathlib import Path
+from typing import Any
 from unittest.mock import AsyncMock, Mock
 
 from acp.schema import (
@@ -28,11 +29,37 @@ from chartreux.app_server.protocol import (
 )
 from chartreux.app_server.session import AppServerSession
 from chartreux.core.config import ModelConfig
+from chartreux.core.model_catalog.loader import CatalogSnapshot
+from chartreux.core.model_catalog.schema import ModelCatalog
+from tests import conftest as tests_conftest
 from tests.conftest import build_test_agent_loop, build_test_vibe_config
 from tests.mock.utils import mock_llm_chunk
 from tests.stubs.app_server import start_test_app_server
 from tests.stubs.fake_backend import FakeBackend
 from tests.stubs.fake_client import FakeClient
+
+
+@pytest.fixture
+def documented_context_limit(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Declare a provider context limit on the catalogs the fixture builds.
+
+    The session-config fixture defines a throwaway deployment, which documents
+    no limit; the ACP usage update is skipped when the size is unknown, so the
+    update path would never be exercised. Declare the fact on the materialized
+    test catalog instead of changing what the fixture asks for.
+    """
+    original = tests_conftest._test_catalog_snapshot
+
+    def with_documented_limit(kwargs: dict[str, Any]) -> CatalogSnapshot:
+        snapshot = original(kwargs)
+        raw = snapshot.catalog.model_dump(mode="json")
+        for model in raw["models"].values():
+            for deployment in model["deployments"]:
+                if deployment["context_limit"] is None:
+                    deployment["context_limit"] = 1_000_000
+        return CatalogSnapshot(ModelCatalog.model_validate(raw), snapshot.revision)
+
+    monkeypatch.setattr(tests_conftest, "_test_catalog_snapshot", with_documented_limit)
 
 
 async def _new_session(agent: ChartreuxAcpAgent) -> str:
@@ -341,6 +368,7 @@ async def test_fork_returns_session_state_without_replaying_history(
 
 @pytest.mark.asyncio
 async def test_fork_session_sends_usage_update(
+    documented_context_limit: None,
     acp_agent_with_session_config: tuple[ChartreuxAcpAgent, FakeClient],
 ) -> None:
     agent, client = acp_agent_with_session_config
@@ -367,6 +395,7 @@ async def test_fork_session_sends_usage_update(
 
 @pytest.mark.asyncio
 async def test_resume_session_sends_usage_update(
+    documented_context_limit: None,
     acp_agent_with_session_config: tuple[ChartreuxAcpAgent, FakeClient],
     temp_session_dir: Path,
     create_test_session,

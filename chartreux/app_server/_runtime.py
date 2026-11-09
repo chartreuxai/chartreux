@@ -85,6 +85,7 @@ from chartreux.core.hooks.config import load_hooks_from_fs
 from chartreux.core.hooks.models import HookConfigResult
 from chartreux.core.llm_models import LLMMessage, Role
 from chartreux.core.paths import WORKTREES_DIR
+from chartreux.core.plan_episode import restored_plan_record
 from chartreux.core.recovery_models import PackageTier
 from chartreux.core.rewind import archived_history_for, complete_history
 from chartreux.core.scratchpad import cleanup_scratchpad
@@ -1886,7 +1887,7 @@ def build_unified_runtime_snapshot(
             output_price_per_million=active_model.output_price,
             cached_input_price_per_million=active_model.cached_input_price,
         ),
-        context_window=active_model.auto_compact_threshold,
+        context_window=active_model.context_limit,
         issues=list(issues),
         hooks_count=hooks_count,
         mcp=MCPState(),
@@ -2233,19 +2234,31 @@ def _messages_for_fork(source: AgentLoop, message_id: str | None) -> list[LLMMes
 
 
 def _inherit_plan_mode(source: AgentLoop, forked: AgentLoop) -> None:
-    """Carry the plan-mode record into a fork (design §7, accepted behavior).
+    """Carry the plan-mode record into a fork, REBOUND to the same sidecar.
 
     ``/branch`` shares the plan document with its source, so resuming the fork
-    is resuming a planning session. Only the record travels: a fork's metadata
-    is otherwise fresh, and copy-on-branch machinery for the mode itself was
-    explicitly rejected.
+    is resuming a planning session. Only the record travels, and it travels
+    rebuilt from the episode sidecar (design §4.5): the sidecar is the single
+    shared-disk arbiter, so no fork-local identity copy exists, an accepted or
+    cancelled source episode inherits its terminal state and never re-arms, and
+    a second fork's accept consults the same sidecar, sees accepting/accepted,
+    and refuses. ``source``'s own meta carries the P1 mirror of the episode, so
+    it is the session the bounded executor scan excludes.
+
+    An untrusted arbiter read leaves the copied record in place: the restore
+    surfaces observe the sidecar themselves and display the failure, and every
+    transition (accept above all) re-validates the sidecar before it acts.
     """
     source_metadata = source.session_logger.session_metadata
     forked_metadata = forked.session_logger.session_metadata
     if source_metadata is None or forked_metadata is None:
         return
-    if source_metadata.plan_mode is not None:
-        forked_metadata.plan_mode = source_metadata.plan_mode.model_copy(deep=True)
+    record = source_metadata.plan_mode
+    if record is None:
+        return
+    forked_metadata.plan_mode = restored_plan_record(
+        record, session_id=source.session_id
+    )
 
 
 _USAGE_SETTLEMENT_TIMEOUT = 5.0

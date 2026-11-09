@@ -136,6 +136,12 @@ class ResolvedModel:
             validate_thinking_selection(
                 self.provider, self.deployment, selected_thinking
             )
+        threshold = (
+            self.deployment.auto_compact_threshold
+            if self.deployment.auto_compact_threshold is not None
+            else auto_compact_threshold
+        )
+        self._validate_threshold(threshold)
         prices = self.deployment.prices
         return ModelConfig(
             name=self.deployment.name,
@@ -158,12 +164,35 @@ class ResolvedModel:
                 list[ThinkingLevel] | None, self.deployment.supported_thinking_levels
             ),
             supports_images=self.deployment.supports_images,
-            auto_compact_threshold=(
-                self.deployment.auto_compact_threshold
-                if self.deployment.auto_compact_threshold is not None
-                else auto_compact_threshold
-            ),
+            auto_compact_threshold=threshold,
+            context_limit=self.deployment.context_limit,
+            max_completion_tokens=self.deployment.max_completion_tokens,
         )
+
+    def _validate_threshold(self, threshold: int) -> None:
+        """Launch-side half of the config-load threshold invariant (design P4(c)).
+
+        The same inequality the configuration load enforces, re-validated at
+        every materialize call. Headroom is measured, never guaranteed: the
+        reactive ContextTooLongError -> compaction -> retry path stays
+        authoritative for what actually fits.
+        """
+        from chartreux.core.config.chartreux_schema import (
+            compaction_threshold_violation,
+            shipped_threshold_baseline,
+        )
+
+        violation = compaction_threshold_violation(
+            label=f"{self.deployment.provider}/{self.deployment.name}",
+            threshold=threshold,
+            baseline=shipped_threshold_baseline(
+                self.base_model, self.deployment.provider
+            ),
+            context_limit=self.deployment.context_limit,
+            max_completion_tokens=self.deployment.max_completion_tokens,
+        )
+        if violation is not None:
+            raise ModelResolutionError("compaction_threshold_invalid", violation)
 
 
 class ModelResolver:

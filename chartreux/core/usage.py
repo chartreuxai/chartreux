@@ -41,6 +41,14 @@ from chartreux.core.config import ModelConfig
 
 TokenCount = Annotated[int, Field(ge=0, strict=True)]
 UsdAmount = Annotated[float, Field(ge=0, allow_inf_nan=False)]
+# Request-shape telemetry measurements: serialized byte counts, elapsed
+# milliseconds, in-flight call counts, and declared token limits.
+MeasurementCount = Annotated[int, Field(ge=0, strict=True)]
+
+
+def _omit_unset(value: object) -> bool:
+    """Omit unset telemetry so rows keep their pre-telemetry serialized shape."""
+    return value is None
 
 
 class UsagePurpose(StrEnum):
@@ -48,6 +56,7 @@ class UsagePurpose(StrEnum):
     COMPACTION = "compaction"
     TITLE = "title"
     WORKTREE_NAMING = "worktree-naming"
+    KEEPALIVE = "keepalive"
 
 
 class UsageOutcome(StrEnum):
@@ -61,6 +70,20 @@ class UsageState(StrEnum):
     COMPLETE = "complete"
     PARTIAL = "partial"
     MISSING = "missing"
+
+
+class KeepaliveOutcome(StrEnum):
+    """P5 keep-alive attempt outcomes, carried on the ledger's keepalive entry.
+
+    These extend, never renumber, the call-accounting ``UsageOutcome`` values:
+    a keepalive attempt row maps onto the ordinary outcome axis (completed /
+    failed / interrupted) AND carries its precise keepalive outcome here.
+    """
+
+    COMPLETED = "completed"
+    UNKNOWN_USAGE = "unknown-usage"
+    CANCELLED = "cancelled"
+    SUPERSEDED = "superseded"
 
 
 class SnapshotState(StrEnum):
@@ -112,6 +135,12 @@ class UsageAttribution(_ImmutableModel):
     the subagent run this call belongs to (the join key to the app-side run
     record); None for root and utility calls. Like every attribution field,
     neither is ever request/response content or metadata.
+
+    The request-shape telemetry fields are content-free measurements of what
+    the attempt serialized: byte counts, digests, elapsed time, an in-flight
+    call count, and the declared output limit. None means unreported. Unset
+    telemetry is omitted from serialization so rows written before the fields
+    existed keep their exact shape.
     """
 
     root_session_id: str
@@ -126,6 +155,23 @@ class UsageAttribution(_ImmutableModel):
     project_key: str | None
     content_class: str | None = None
     run_id: str | None = None
+    system_prompt_bytes: MeasurementCount | None = Field(
+        default=None, exclude_if=_omit_unset
+    )
+    tool_def_bytes: MeasurementCount | None = Field(
+        default=None, exclude_if=_omit_unset
+    )
+    prefix_stability_hash: str | None = Field(default=None, exclude_if=_omit_unset)
+    gap_since_previous_call_ms: MeasurementCount | None = Field(
+        default=None, exclude_if=_omit_unset
+    )
+    concurrency_snapshot: MeasurementCount | None = Field(
+        default=None, exclude_if=_omit_unset
+    )
+    toolset_prompt_fingerprint: str | None = Field(default=None, exclude_if=_omit_unset)
+    declared_max_tokens: MeasurementCount | None = Field(
+        default=None, exclude_if=_omit_unset
+    )
 
 
 class CallAccountingOutcome(UsageTokens):
@@ -152,6 +198,26 @@ class CallAccountingOutcome(UsageTokens):
         return self
 
 
+class KeepaliveLedgerEntry(_ImmutableModel):
+    """Content-free P5 accounting for one keep-alive attempt.
+
+    The reserved_* fields carry the pre-send reservation the attempt was
+    charged against the absolute caps (billable input bound + declared max
+    completion tokens, priced at the ledger-recorded rates). retained_cost_usd
+    is what the attempt ultimately kept against the caps: the recorded actual
+    for completed, the full reservation for unknown-usage and cancelled, and
+    zero for superseded (released unspent pre-send). Summing retained_cost_usd
+    over purpose=keepalive rows reconstructs the spend-cap burn; counting
+    those rows reconstructs the attempts-counted count-cap burn.
+    """
+
+    outcome: KeepaliveOutcome
+    reserved_input_tokens: TokenCount
+    reserved_output_tokens: TokenCount
+    reserved_cost_usd: UsdAmount
+    retained_cost_usd: UsdAmount
+
+
 class UsageRecord(UsageAttribution, CallAccountingOutcome):
     schema_version: Literal[1, 2] = 2
     record_id: str
@@ -160,6 +226,9 @@ class UsageRecord(UsageAttribution, CallAccountingOutcome):
     known_cost_usd: UsdAmount
     has_unknown_cost: bool
     currency: Literal["USD"] = "USD"
+    # P5 keep-alive accounting, present on keepalive attempt rows only; unset
+    # rows keep their exact pre-keepalive serialized shape.
+    keepalive: KeepaliveLedgerEntry | None = Field(default=None, exclude_if=_omit_unset)
 
     @field_validator("occurred_at")
     @classmethod

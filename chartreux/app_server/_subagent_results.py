@@ -3,7 +3,10 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Protocol, cast
+import json
+import logging
+import math
+from typing import TYPE_CHECKING, Literal, Protocol, cast, overload
 
 from chartreux.app_server._subagent_records import (
     AgentRecord,
@@ -12,6 +15,7 @@ from chartreux.app_server._subagent_records import (
     _AgentState,
     _AgentTombstone,
 )
+from chartreux.core.session.session_logger import DeliveryStateScan
 from chartreux.core.subagents import (
     AgentResultExpiredError,
     CancelOutcome,
@@ -29,7 +33,49 @@ if TYPE_CHECKING:
     from chartreux.app_server._sessions import SessionRuntime
     from chartreux.app_server._subagent_execution import BackgroundExecutionContext
 
+logger = logging.getLogger(__name__)
+
 _MAX_STORED_RESULTS = 32
+
+#: P2d fetch routes named in the delivery telemetry (per-route reporting).
+_DELIVERY_ROUTE_GET = "get_agent_result"
+_DELIVERY_ROUTE_WAIT = "wait_for_agent"
+
+#: The fetch representations a mode-bearing delivery records.
+DeliveryMode = Literal["digest", "full"]
+
+
+@dataclass(frozen=True)
+class ResultDelivery:
+    """Delivery-state outcome of a mode-bearing fetch (P2d, design b).
+
+    ``status`` is one of:
+
+    - ``"delivered"``: the result was delivered; ``marking`` is the envelope
+      payload the fetch tool embeds in its result so the marking commits
+      atomically with the transcript write; ``post_lift`` marks a re-delivery
+      after a compaction boundary lifted the refusal (the fresh marking
+      re-arms it).
+    - ``"refused"``: mechanical refusal — the run was already delivered in
+      this representation with no compaction boundary since, and the fetch
+      was not forced; no payload is re-delivered. ``message`` carries the
+      force affordance.
+    - ``"nothing_left"``: COEXISTENCE — the retained result expired but a
+      persisted marking authorizes "nothing left to deliver"; a forced
+      refetch surfaces ``AgentResultExpiredError`` instead.
+    - ``"pending"``: the run is still running (get path); nothing was marked.
+    - ``"passthrough"``: a wait's ``still_running`` disposition passes through
+      unchanged; no delivery happened.
+    """
+
+    status: str
+    representation: str | None = None
+    result: TaskResult | None = None
+    disposition: WaitForAgentResult | None = None
+    marking: dict[str, str] | None = None
+    message: str = ""
+    forced: bool = False
+    post_lift: bool = False
 
 
 class ResultsStateView(Protocol):
@@ -46,6 +92,13 @@ class ResultsStateView(Protocol):
     _result_store: dict[tuple[str, str], StoredRunResult]
     _expired_results: set[tuple[str, str]]
     _collected_results: set[tuple[str, str]]
+    # P2d: in-memory delivery markings, (agent_id, run_id) -> {representation:
+    # position}. Installed lazily by RunResults on first use under the
+    # registry lock (the registry's __getattr__ raises for unknown names, so
+    # the store is created on demand). Like _collected_results the in-memory
+    # marker dies with eviction; the persisted envelope marking outlives it
+    # (COEXISTENCE).
+    _delivery_markings: dict[tuple[str, str], dict[str, float]]
     _latest_run_ids: dict[str, str]
     _wait_leases: dict[tuple[str, str], int]
     _pending_notifications: set[tuple[str, str]]
@@ -143,6 +196,11 @@ class RunResults:
                 # Marker lifetime never exceeds result lifetime: the run is
                 # no longer retrievable, so its collection marker dies here.
                 self._view._collected_results.discard(key)
+                # P2d COEXISTENCE: the in-memory delivery marker dies with the
+                # result exactly like the collection marker; the PERSISTED
+                # envelope marking outlives it and still authorizes "nothing
+                # left to deliver".
+                self._delivery_markings_locked().pop(key, None)
                 if listed:
                     self._view._note_uncollected_change_locked(stored.agent_id)
                 tombstone = self._view._evicted_agents.get(stored.agent_id)
@@ -361,6 +419,9 @@ class RunResults:
         keys.update(
             key for key in self._view._result_write_tokens if key[0] == agent_id
         )
+        keys.update(
+            key for key in self._delivery_markings_locked() if key[0] == agent_id
+        )
         for key in keys:
             self._view._result_store.pop(key, None)
             self._view._expired_results.discard(key)
@@ -368,12 +429,252 @@ class RunResults:
             self._view._pending_notifications.discard(key)
             self._view._wait_leases.pop(key, None)
             self._view._result_write_tokens.pop(key, None)
+            self._delivery_markings_locked().pop(key, None)
         self._view._latest_run_ids.pop(agent_id, None)
         return keys
 
+    # ------------------------------------------------------------------
+    # P2d delivery states: the marking, the refusal predicate, telemetry.
+    # ------------------------------------------------------------------
+
+    def _delivery_markings_locked(self) -> dict[tuple[str, str], dict[str, float]]:
+        """The registry-owned in-memory delivery marking store (locked).
+
+        Installed lazily on the view: the registry constructs RunResults before
+        any fetch, and its __getattr__ raises for unknown names, so the first
+        locked access creates the store.
+        """
+        markings = getattr(self._view, "_delivery_markings", None)
+        if markings is None:
+            markings = {}
+            self._view._delivery_markings = markings
+        return markings
+
+    def _conversation_id_locked(self) -> str | None:
+        """The persisted conversation id of the root session, when bound."""
+        root = getattr(self._view, "_root", None)
+        loop = getattr(root, "agent_loop", None) if root is not None else None
+        session_id = getattr(loop, "session_id", None) if loop is not None else None
+        return session_id if isinstance(session_id, str) else None
+
+    def _delivery_scan_locked(self) -> DeliveryStateScan | None:
+        """The transcript delivery-state scan via the bound root, if any.
+
+        Reads the persisted envelope markings and compaction boundaries
+        (surviving restart via transcript replay) plus the live tail. Returns
+        None when no real logger is bound — the refusal predicate then only
+        sees the in-memory markings.
+        """
+        root = getattr(self._view, "_root", None)
+        loop = getattr(root, "agent_loop", None) if root is not None else None
+        session_logger = (
+            getattr(loop, "session_logger", None) if loop is not None else None
+        )
+        scan_fn = getattr(session_logger, "delivery_state_scan", None)
+        if not callable(scan_fn):
+            return None
+        messages = getattr(loop, "messages", None)
+        try:
+            scan = scan_fn(messages)
+        except Exception:
+            return None
+        return scan if isinstance(scan, DeliveryStateScan) else None
+
+    def _refusal_state_locked(
+        self, key: tuple[str, str], mode: str, scan: DeliveryStateScan | None
+    ) -> tuple[float | None, bool]:
+        """The refusal predicate state for one (run, representation) fetch.
+
+        Returns ``(position, lifted)``: ``position`` is the latest marking
+        position for (conversation, agent, run, representation) — None when
+        the run was never delivered in this representation — and ``lifted``
+        is whether a compaction boundary landed AFTER that marking (the
+        mechanical refusal lift: "delivered AND no compaction boundary
+        between that delivery and this fetch" is false, so the fetch may
+        re-deliver). The in-memory marking carries the position the
+        delivery's tool message lands at (the scan's end), so a boundary
+        appended after it lifts even in the same live session.
+        """
+        conversation_id = self._conversation_id_locked()
+        persisted_position: float | None = None
+        if scan is not None:
+            for marking in scan.markings:
+                if (
+                    marking.agent_id == key[0]
+                    and marking.run_id == key[1]
+                    and marking.representation == mode
+                    and (
+                        conversation_id is None
+                        or marking.conversation_id == conversation_id
+                    )
+                ):
+                    if (
+                        persisted_position is None
+                        or marking.position > persisted_position
+                    ):
+                        persisted_position = marking.position
+        in_memory_position = self._delivery_markings_locked().get(key, {}).get(mode)
+        if persisted_position is None and in_memory_position is None:
+            return None, False
+        position = max(
+            persisted_position if persisted_position is not None else -math.inf,
+            in_memory_position if in_memory_position is not None else -math.inf,
+        )
+        lifted = scan is not None and any(
+            boundary > position for boundary in scan.compaction_boundaries
+        )
+        return position, lifted
+
+    def _persisted_marking_exists_locked(
+        self,
+        agent_id: str,
+        run_id: str | None,
+        mode: str,
+        conversation_id: str | None,
+        scan: DeliveryStateScan | None,
+    ) -> bool:
+        """Whether a persisted envelope marking authorizes "nothing left to
+        deliver" for the agent's run (COEXISTENCE; locked).
+        """
+        if scan is None:
+            return False
+        return any(
+            marking.agent_id == agent_id
+            and marking.representation == mode
+            and (run_id is None or marking.run_id == run_id)
+            and (conversation_id is None or marking.conversation_id == conversation_id)
+            for marking in scan.markings
+        )
+
+    def _note_delivery_locked(
+        self,
+        key: tuple[str, str],
+        mode: str,
+        status: str,
+        payload_bytes: int,
+        forced: bool,
+        post_lift: bool,
+        route: str,
+    ) -> None:
+        """Content-free delivery telemetry (P3 measurement conventions).
+
+        Digest deliveries, full deliveries, post-lift re-deliveries, and
+        refusals are reported per route with the delivered payload's
+        serialized bytes (the base P3's replay weighting multiplies).
+        """
+        logger.info(
+            "result_delivery event=result_delivery route=%s status=%s "
+            "representation=%s agent_id=%s run_id=%s payload_bytes=%d "
+            "forced=%s post_lift=%s",
+            route,
+            status,
+            mode,
+            key[0],
+            key[1],
+            payload_bytes,
+            forced,
+            post_lift,
+        )
+
+    def _settle_delivery_locked(
+        self,
+        key: tuple[str, str],
+        mode: DeliveryMode,
+        force: bool,
+        *,
+        route: str,
+        result: TaskResult | None = None,
+        disposition: WaitForAgentResult | None = None,
+    ) -> ResultDelivery:
+        """Evaluate the refusal and register the delivery marking (locked).
+
+        Pinned semantics: the marking PERSISTS; the refusal predicate is
+        "delivered AND no compaction boundary between that delivery and this
+        fetch". A delivered fetch registers a FRESH in-memory marking (and the
+        tool embeds the envelope payload so the persisted marking commits
+        with the transcript write), re-arming the refusal; a post-lift
+        re-delivery is exactly that fresh marking after a boundary.
+        """
+        scan = self._delivery_scan_locked()
+        prior, lifted = self._refusal_state_locked(key, mode, scan)
+        if prior is not None and not lifted and not force:
+            self._note_delivery_locked(key, mode, "refused", 0, force, False, route)
+            return ResultDelivery(
+                status="refused",
+                representation=mode,
+                message=(
+                    f"Run {key[1]} on agent {key[0]} was already delivered as "
+                    f"{mode} in this conversation and no compaction boundary "
+                    "has landed since that delivery, so the delivered payload "
+                    "is still in context. Pass force=True to re-deliver it "
+                    "anyway; refetching after a compaction boundary is normal "
+                    "and writes a fresh marking that re-arms this refusal."
+                ),
+            )
+        # The fresh in-memory marking sits where this delivery's tool message
+        # lands: the scan's end when a transcript is bound, else +inf (no
+        # boundaries are knowable without one).
+        delivery_position = float(scan.position_count) if scan is not None else math.inf
+        self._delivery_markings_locked().setdefault(key, {})[mode] = delivery_position
+        marking = {
+            "conversation_id": self._conversation_id_locked() or "",
+            "agent_id": key[0],
+            "run_id": key[1],
+            "representation": mode,
+        }
+        carried = (
+            result
+            if result is not None
+            else (disposition.result if disposition is not None else None)
+        )
+        payload_bytes = (
+            len(
+                json.dumps(carried.model_dump(mode="json"), default=str).encode("utf-8")
+            )
+            if carried is not None
+            else 0
+        )
+        self._note_delivery_locked(
+            key, mode, "delivered", payload_bytes, force, lifted, route
+        )
+        return ResultDelivery(
+            status="delivered",
+            representation=mode,
+            result=result,
+            disposition=disposition,
+            marking=marking,
+            forced=force,
+            post_lift=lifted,
+        )
+
+    @overload
     async def get_result(
-        self, agent_id: str, run_id: str | None = None
-    ) -> TaskResult | None:
+        self,
+        agent_id: str,
+        run_id: str | None = None,
+        *,
+        mode: None = None,
+        force: bool = False,
+    ) -> TaskResult | None: ...
+
+    @overload
+    async def get_result(
+        self,
+        agent_id: str,
+        run_id: str | None = None,
+        *,
+        mode: DeliveryMode,
+        force: bool = False,
+    ) -> ResultDelivery: ...
+
+    async def get_result(
+        self,
+        agent_id: str,
+        run_id: str | None = None,
+        *,
+        mode: DeliveryMode | None = None,
+        force: bool = False,
+    ) -> TaskResult | None | ResultDelivery:
         """Return the stored result for a run, expiring first (public read).
 
         A resolved ``TaskResult`` is marked collected inside the same locked
@@ -381,16 +682,60 @@ class RunResults:
         mark from the return, so a cancellation cannot mark a run whose
         result never reached the caller. The RUNNING -> ``None`` disposition
         and the typed expiry/unknown errors never mark.
+
+        With ``mode`` set (the fetch tools' delivery path; keyword-only, so
+        the registry's legacy delegate and the perf call sites keep the raw
+        ``TaskResult | None`` contract unchanged) the call evaluates the P2d
+        delivery states instead and returns a ``ResultDelivery``: delivered /
+        refused / nothing_left / pending. COEXISTENCE: a non-forced fetch of
+        an evicted result whose persisted marking covers (conversation,
+        agent, run, representation) answers "nothing left to deliver"; a
+        forced refetch surfaces ``AgentResultExpiredError``.
         """
         async with self._view._registry_lock:
             self.expire_locked()
-            resolved = self.resolve_locked(agent_id, run_id)
+            try:
+                resolved = self.resolve_locked(agent_id, run_id)
+            except AgentResultExpiredError:
+                if mode is not None and not force:
+                    conversation_id = self._conversation_id_locked()
+                    if self._persisted_marking_exists_locked(
+                        agent_id,
+                        run_id,
+                        mode,
+                        conversation_id,
+                        self._delivery_scan_locked(),
+                    ):
+                        key = (agent_id, run_id or "latest")
+                        self._note_delivery_locked(
+                            key,
+                            mode,
+                            "nothing_left",
+                            0,
+                            force,
+                            False,
+                            _DELIVERY_ROUTE_GET,
+                        )
+                        return ResultDelivery(
+                            status="nothing_left",
+                            representation=mode,
+                            message=(
+                                f"Nothing left to deliver for run {run_id or 'latest'} "
+                                f"on agent {agent_id}: it was already delivered as "
+                                f"{mode} in this conversation (persisted marking) "
+                                "and the retained result has since expired. A "
+                                "forced refetch surfaces AgentResultExpiredError."
+                            ),
+                        )
+                raise
             if resolved is None:
                 raise UnknownAgentError(f"Unknown run {run_id} for agent {agent_id}")
             key, target = resolved
             if isinstance(target, RunRecord):
                 if target.status is RunStatus.RUNNING:
-                    return None
+                    if mode is None:
+                        return None
+                    return ResultDelivery(status="pending", representation=mode)
                 if target.result is None:
                     raise AgentResultExpiredError(
                         f"Result expired for run {target.run_id} on agent {agent_id}"
@@ -403,11 +748,43 @@ class RunResults:
             if key not in self._view._collected_results:
                 self._view._collected_results.add(key)
                 self._view._note_uncollected_change_locked(agent_id)
-            return result
+            if mode is None:
+                return result
+            return self._settle_delivery_locked(
+                key, mode, force, route=_DELIVERY_ROUTE_GET, result=result
+            )
+
+    @overload
+    async def wait(
+        self,
+        agent_id: str,
+        run_id: str | None = None,
+        *,
+        timeout: float | None = None,
+        mode: None = None,
+        force: bool = False,
+    ) -> WaitForAgentResult: ...
+
+    @overload
+    async def wait(
+        self,
+        agent_id: str,
+        run_id: str | None = None,
+        *,
+        timeout: float | None = None,
+        mode: DeliveryMode,
+        force: bool = False,
+    ) -> ResultDelivery: ...
 
     async def wait(
-        self, agent_id: str, run_id: str | None = None, *, timeout: float | None = None
-    ) -> WaitForAgentResult:
+        self,
+        agent_id: str,
+        run_id: str | None = None,
+        *,
+        timeout: float | None = None,
+        mode: DeliveryMode | None = None,
+        force: bool = False,
+    ) -> WaitForAgentResult | ResultDelivery:
         """Wait for a run and return the typed disposition (design §6).
 
         ``completed`` carries the finished run's TaskResult; ``still_running``
@@ -421,6 +798,13 @@ class RunResults:
         (design B3): a wait cancelled while that cleanup would have been
         pending never marks, and no suspension point separates the
         collection marker from the registry's return.
+
+        With ``mode`` set (the wait tool's delivery path; keyword-only, so the
+        registry delegate and the perf call sites keep the raw
+        ``WaitForAgentResult`` contract unchanged — the marking is SHARED
+        with the get route) a ``completed`` disposition evaluates the P2d
+        delivery states in the same locked settle block and returns a
+        ``ResultDelivery``; ``still_running`` passes through unchanged.
         """
         if timeout is not None and timeout <= 0:
             raise ValueError("timeout must be positive or None")
@@ -459,13 +843,27 @@ class RunResults:
                         pinned.target,
                         run_id=pinned.run_id,
                         wait_started_at=pinned.started_at,
+                        mode=mode,
+                        force=force,
                     )
                     settled = True
                     return disposition
+            delivery: ResultDelivery | None = None
             async with self._view._registry_lock:
                 disposition = self.settle_wait_locked(agent_id, pinned)
+                if mode is not None and disposition.status is WaitStatus.COMPLETED:
+                    # P2d: the delivery marking settles in the SAME locked
+                    # block as the collection marker — no suspension point
+                    # between the refusal check, the marking, and the return.
+                    delivery = self._settle_delivery_locked(
+                        pinned.key,
+                        mode,
+                        force,
+                        route=_DELIVERY_ROUTE_WAIT,
+                        disposition=disposition,
+                    )
             settled = True
-            return disposition
+            return delivery if delivery is not None else disposition
         finally:
             if not settled:
                 async with self._view._registry_lock:
@@ -511,6 +909,7 @@ class RunResults:
         else:
             self._view._wait_leases.pop(key, None)
 
+    @overload
     async def still_running_disposition(
         self,
         agent_id: str,
@@ -519,7 +918,34 @@ class RunResults:
         *,
         run_id: str | None,
         wait_started_at: float,
-    ) -> WaitForAgentResult:
+        mode: None = None,
+        force: bool = False,
+    ) -> WaitForAgentResult: ...
+
+    @overload
+    async def still_running_disposition(
+        self,
+        agent_id: str,
+        key: tuple[str, str],
+        target: RunRecord,
+        *,
+        run_id: str | None,
+        wait_started_at: float,
+        mode: DeliveryMode,
+        force: bool = False,
+    ) -> ResultDelivery: ...
+
+    async def still_running_disposition(
+        self,
+        agent_id: str,
+        key: tuple[str, str],
+        target: RunRecord,
+        *,
+        run_id: str | None,
+        wait_started_at: float,
+        mode: DeliveryMode | None = None,
+        force: bool = False,
+    ) -> WaitForAgentResult | ResultDelivery:
         """Build the ``still_running`` disposition for an expired wait (§6).
 
         The pinned run identity is preserved across timeout/release/replacement
@@ -529,7 +955,9 @@ class RunResults:
         existing typed errors. The wait lease is released inside the same
         locked block that builds the disposition, so a completed boundary
         disposition is marked and returned with no suspension point between
-        (design B3).
+        (design B3). With ``mode`` set, a completed boundary disposition
+        additionally evaluates the P2d delivery states in that same locked
+        block and returns a ``ResultDelivery``.
         """
         async with self._view._registry_lock:
             if key not in self._view._wait_leases:
@@ -550,7 +978,18 @@ class RunResults:
                     self._view._collected_results.add(key)
                     self._view._note_uncollected_change_locked(agent_id)
                 self.expire_locked()
-                return WaitForAgentResult(status=WaitStatus.COMPLETED, result=result)
+                disposition = WaitForAgentResult(
+                    status=WaitStatus.COMPLETED, result=result
+                )
+                if mode is None:
+                    return disposition
+                return self._settle_delivery_locked(
+                    key,
+                    mode,
+                    force,
+                    route=_DELIVERY_ROUTE_WAIT,
+                    disposition=disposition,
+                )
             if target.status is not RunStatus.RUNNING:
                 raise RuntimeError(f"Run {key[1]} completed without a result")
             elapsed = max(0.0, self._view._clock() - wait_started_at)
@@ -578,7 +1017,12 @@ class RunResults:
             )
             self.release_wait_lease_locked(key)
             self.expire_locked()
-            return disposition
+            if mode is None:
+                return disposition
+            # P2d: a still_running wait delivered nothing — pass through.
+            return ResultDelivery(
+                status="passthrough", representation=mode, disposition=disposition
+            )
 
     async def cancel(  # noqa: PLR0911
         self,

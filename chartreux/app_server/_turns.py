@@ -2348,9 +2348,7 @@ class TurnController:  # noqa: PLR0904
 
     async def _emit_stats(self) -> None:
         try:
-            context_window = (
-                self._agent_loop.config.get_active_model().auto_compact_threshold
-            )
+            context_window = self._agent_loop.config.get_active_model().context_limit
         except ValueError:
             context_window = None
         await self._notify(

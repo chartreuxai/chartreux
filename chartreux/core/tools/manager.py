@@ -40,6 +40,7 @@ from chartreux.core.tools.base import (
     registry_provenance_classification,
 )
 from chartreux.core.tools.classification import (
+    TOOL_CLASSIFICATIONS,
     ToolClass,
     _stamp_location_trusted_user_tool,
     classification_revision,
@@ -152,14 +153,55 @@ def identity_allows_name(identity: AgentIdentity, tool_name: str) -> bool:
     return posture_allows_name(identity.personal_tools, tool_name)
 
 
-# Bounded children never prompt the user (question-widget fix design, Q1):
-# they return blockers to their parent instead, and a child-origin question is
-# excluded from unattended expiry. ``AskUserQuestion.run`` denies execution —
-# the load-bearing check — and this set keeps the tool out of a child's
-# advertised catalog. Withholding is advertisement-only on purpose: a forced
-# or stale call still resolves and hits the explicit blocker ToolError rather
-# than an opaque unknown-tool failure.
-_CHILD_WITHHELD_TOOLS = frozenset({"ask_user_question"})
+# Tools a bounded child can never execute, under ANY authority: the
+# restriction is loop-level, not a posture. Children never prompt the user
+# (question-widget fix design, Q1: ``AskUserQuestion.run`` denies a child and
+# the child returns a blocker instead), they cannot spawn (``Task.run``
+# refuses at the depth limit of 1), and the loop hands a child
+# ``subagent_manager=None``, so the owner-side run inventory — check, wait,
+# get, cancel, release, resume, reconcile — is owner-only (recovery never
+# descends to the child that owns no runs). Withholding is advertisement-only
+# on purpose: a forced or stale call still resolves and hits the tool's own
+# explicit blocker ToolError rather than an opaque unknown-tool failure.
+CHILD_CONTEXT_UNAVAILABLE_TOOLS = frozenset({
+    "ask_user_question",
+    "cancel_agent",
+    "check_agents",
+    "get_agent_result",
+    "reconcile_result",
+    "release_agent",
+    "resume_agent",
+    "task",
+    "wait_for_agent",
+})
+
+
+def child_withheld_tools(identity: AgentIdentity | None) -> frozenset[str]:
+    """The DEFAULT-authority definition-withholding set for a child identity.
+
+    ONE rule (v0.7.6 P1): a definition is withheld from a bounded child's
+    catalog IFF the child cannot invoke the tool under the default deployment
+    — either the loop-level child restriction above denies it structurally, or
+    the identity's personal posture (with its execution carve-out) excludes it.
+    Under the default authority configuration a child launch is the one the
+    shipped defaults produce: an unrestricted ``coder`` root delegates
+    everything its granted config admits, so the parent-delegation ceiling
+    withholds nothing here. That ceiling is not ignored — it is evaluated live
+    at every spec assembly, where a narrower parent removes the tool from
+    ``available_tools`` outright (see ``ToolManager.child_catalog_withholdings``)
+    and a broadened one restores an admitted tool.
+
+    ``identity`` is None for a custom identity, which carries no harness-known
+    posture (unrestricted on both axes): only the loop-level set applies.
+    """
+    withheld = set(CHILD_CONTEXT_UNAVAILABLE_TOOLS)
+    if identity is not None:
+        withheld.update(
+            name
+            for name in TOOL_CLASSIFICATIONS
+            if not identity_allows_name(identity, name)
+        )
+    return frozenset(withheld)
 
 
 class ToolManager:  # noqa: PLR0904 - reviewed authority lookup joins the full method budget
@@ -1399,18 +1441,65 @@ class ToolManager:  # noqa: PLR0904 - reviewed authority lookup joins the full m
             }
         return result
 
+    def _identity_posture_allows_tool_name(self, tool_name: str) -> bool:
+        """Name-keyed mirror of ``_personal_posture_allows`` for the catalog.
+
+        The definition filter judges the advertised NAME against the reviewed
+        classification table and the identity's execution carve-out, exactly
+        as ``identity_allows_name`` does at launch admission. It can only
+        narrow the advertised set: availability itself stays class-exact
+        (``_personal_posture_allows`` on the selected implementation), so a
+        foreign custom variant of a carved-out name is still denied — the
+        manager resolves nothing this check would admit.
+        """
+        personal, _, carve_out = self._identity_posture()
+        if personal is None:
+            return True
+        if tool_name in carve_out:
+            return True
+        return posture_allows_name(personal, tool_name)
+
     def _child_catalog_withholds(self, tool_name: str) -> bool:
         """Whether this manager's advertised catalog withholds ``tool_name``.
 
         ``parent_authority_getter`` is armed for every child manager by
         ``child_runtime_policy`` and stays None for roots, so no separate
-        subagent flag is needed. Withholding narrows only the model-facing
-        specs: execution is denied by the tool itself, which no catalog
-        selection can widen.
+        subagent flag is needed. The decision is made fresh at EVERY spec
+        assembly — nothing is cached — from the current loop-level restriction
+        and the current identity posture; the launching parent's delegation
+        ceiling is applied one step earlier, by ``available_tools``, which is
+        the catalog the specs are assembled from. A parent revocation therefore
+        drops a tool at the next assembly and a broadened delegation restores
+        an admitted one, so there is no "invocation permitted, definition
+        absent" (or its inverse) state. Withholding narrows only the
+        model-facing specs: execution is denied by the tool itself, which no
+        catalog selection can widen.
         """
-        return (
-            self._parent_authority_getter is not None
-            and tool_name in _CHILD_WITHHELD_TOOLS
+        if self._parent_authority_getter is None:
+            return False
+        if tool_name in CHILD_CONTEXT_UNAVAILABLE_TOOLS:
+            return True
+        return not self._identity_posture_allows_tool_name(tool_name)
+
+    def child_catalog_withholdings(self) -> frozenset[str]:
+        """Every registered name this manager's catalog withholds right now.
+
+        The complete P1 rule over the CURRENT authority, for enumeration and
+        reporting: a name is withheld from a bounded child IFF the child
+        cannot invoke it — the loop-level child restriction denies it, or it is
+        not on this identity's personal axis (``available_tools`` applies the
+        personal posture AND the launching parent's delegation ceiling, live).
+        Roots withhold nothing. Recomputed on every call.
+        """
+        if self._parent_authority_getter is None:
+            return frozenset()
+        with self._lock:
+            registered = frozenset(self._all_tools)
+        available = self.available_tools
+        return frozenset(
+            name
+            for name in registered
+            if name not in available or self._child_catalog_withholds(name)
         )
 
     @property
@@ -1762,9 +1851,11 @@ class ToolManager:  # noqa: PLR0904 - reviewed authority lookup joins the full m
         models, resolved descriptions, and (for MCP tools) live input schemas. The
         active set is recomputed first, so configuration filters, MCP changes, and
         parent authority changes remain visible. A child's advertised catalog
-        additionally withholds ``_CHILD_WITHHELD_TOOLS`` (Q1): the child never
-        sees the user-question tool, while a forced call still resolves and is
-        denied by ``AskUserQuestion.run`` with the blocker direction. Copy
+        additionally withholds every definition the child cannot invoke
+        (``_child_catalog_withholds``: the loop-level child restriction, and the
+        identity posture's own exclusions), so the child never sees the
+        user-question, spawn, or owner-only recovery definitions — while a forced
+        call still resolves and hits the tool's explicit blocker error. Copy
         schemas on return because
         consumers may mutate them. The key captures tool names, classes,
         argument-model classes, descriptions, and live remote parameter-schema

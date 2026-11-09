@@ -2,6 +2,120 @@
 
 All notable changes to Chartreux are documented in this file.
 
+## 0.7.6 (2026-11-08)
+
+Plan-mode handoff becomes a fenced, crash-recoverable episode transaction; a
+bounded child is offered only the tool definitions it can invoke, and subagent
+completion is synchronized rather than assumed; compaction thresholds are
+validated against a provider-documented context limit; the cache keep-alive
+pilot ships off; and the edit and read tools gain bounded echoes and
+revision-aware re-reads.
+
+### Added
+
+- **A bounded child's catalog carries only the definitions it can invoke.** A
+  child is no longer offered `ask_user_question`, `task`, or the owner-only run
+  inventory (`cancel_agent`, `check_agents`, `get_agent_result`,
+  `reconcile_result`, `release_agent`, `resume_agent`, `wait_for_agent`) — the
+  loop-level restriction is structural, not a posture — nor anything its
+  identity's personal posture excludes. Withholding is advertisement-only: a
+  forced or stale call still resolves to its definition and hits the tool's own
+  explicit blocker instead of failing as an unknown tool. Authority is
+  recomputed at every spec assembly, so a delegation grant restores the
+  definition and a parent revocation drops it. MCP servers are gated per server
+  on the same axis: a bounded child sees no configured server unless its parent
+  opts it in, and an opt-in never exceeds the parent's gate. The bounded-child
+  prompt fragment was compressed to pay for the catalog, and the pinned
+  task-definition saving gate was re-based to a 23,600-byte floor, accepting a
+  347-byte shortfall against the original 24,000.
+- **Subagent completion is synchronized.** Every finished run surfaces exactly
+  once through a reconciliation sweep with five triggers — continuation start,
+  drain completion, every run-state terminal transition, a bounded periodic
+  timer while the continuation is active, and the wall-clock cap boundary — so
+  a dropped or suppressed notification is surfaced without duplicating a
+  delivered one, and the sweep never writes a delivery marking. Results arrive
+  as a digest by default and in full on demand, completion and wait results
+  mark the transcript boundary they belong to, and the programmatic
+  continuation lifecycle was rebuilt on that run state. The shipped guidance
+  for `wait_for_agent`, `get_agent_result`, `check_agents`, `task`,
+  `cancel_agent`, and the design and plan skills follows it.
+- **A compaction threshold is validated against a documented context limit.**
+  A deployment may declare the provider-documented `context_limit` (a positive
+  whole integer token count, unknown unless the provider states it), and any
+  raise of `auto_compact_threshold` above its shipped value must satisfy the
+  headroom invariant at config load and at launch: the threshold plus a
+  217,000-token one-turn growth allowance may not exceed that limit less the
+  documented output reserve. Only raises are validated, so a deployment the
+  provider does not document still loads at its prior threshold, and a user
+  overlay raising one on an unknown-limit deployment must populate the limit or
+  fail validation, leaving the last accepted configuration active. Every
+  shipped deployment receiving the 500k threshold ships with a known limit and
+  reserve; `glm-5-3` moves to 500k and `mistral-large-4` keeps 400k.
+- **The cache keep-alive pilot, off by default.** A `[keepalive]` section
+  carries the pilot's surface — `enabled` (false unless set), the absolute
+  `max_attempts` count cap, the `max_spend_usd` spend cap, and the
+  `min_idle_gap_seconds` idle floor — validated like every other section, with
+  unknown keys rejected and an enabled pilot requiring spend room. While
+  disabled the pilot has no behavior at all: no snapshot, no timer, no ledger
+  row. When enabled, a strict accountant applies the caps to attempts rather
+  than completions, the snapshot is invalidated against the conversation it was
+  taken from, and keep-alive spend is isolated from the turn budget on its own
+  usage purpose.
+- **Request-shape telemetry on the usage row.** Every attempt of a logical call
+  records content-free measurements of its request build — the serialized
+  system-prompt and tool-definition byte counts, a prefix-stability hash, the
+  idle gap since the loop's previous build, the process-wide in-flight request
+  count, a toolset and prompt fingerprint, and the declared output limit — on
+  its ledger row. Unset telemetry is omitted from serialization, so rows
+  written before the fields existed keep their exact shape.
+- **Plan mode hands off through a fenced episode transaction.** A planning
+  episode is an identity with an on-disk arbiter: one directory holding one
+  sidecar, every state change serialized through a single kernel `flock`, and a
+  durable plan write whose temporary siblings carry the
+  `.chartreux-plan-tmp-*` prefix. Accept is a two-phase transaction — PREPARE
+  claims the episode, retains the draft's raw bytes, re-compares them against
+  the consented digest, and publishes the consent snapshot; COMMIT
+  dual-verifies the digest, durably marks the attempt, records the discovery
+  domain with a one-observation binding, then flips the state and renames the
+  snapshot to its provenance name. Crash recovery is keyed on the sidecar, the
+  accepted snapshot is retained as provenance, and a record written before this
+  release surfaces as `legacy_unverified` rather than being trusted. The
+  consent modal, the TUI episode flows, and the restore paths were rebuilt on
+  that arbiter, the shipped skill reference was synchronized with it, and the
+  release carries a 55-node crash-recovery suite.
+
+### Changed
+
+- `edit` gained `multi_anchor` — an ordered list of `old_string`/`new_string`
+  pairs, each matching exactly once, listed in file order, and non-overlapping,
+  with every anchor validated before one atomic write lands — and
+  `expected_site_count`, which pairs with `replace_all` and writes nothing when
+  the anchor's site count differs. The result no longer echoes unbounded
+  context: the window cap drops from 8 KiB to 2 KiB, and sites past the hunk
+  cap are named by line number in a trailing note bounded at 512 bytes that
+  always states the count and total.
+- `read_file` gained `expected_revision`: a read conditioned on a content
+  revision returns a short unchanged confirmation naming the checks it
+  performed instead of the file, and serves the normal read when the content
+  differs. It describes whole-file state and cannot be combined with `offset`,
+  `limit`, `traversal_id`, or `outline`.
+- The status line's context denominator is the deployment's documented context
+  limit, not the effective compaction threshold, and renders `—` when the
+  provider documents no limit.
+
+### Fixed
+
+- **Plan-handoff integrity, review rounds 1-3.** A terminal cancel writes the
+  cancelled state and keeps its record as display history; a continuation
+  commit is re-offered from the held claim together with the snapshot bytes
+  rather than re-reading a draft that may have moved; the consent modal and the
+  server both refuse an empty draft and a draft with no summary; the episode
+  directory is resolved from the sidecar after a rebind, and the rebind's reads
+  are anchored on a directory descriptor rather than a re-resolved path; the
+  server refuses the legacy handoff route; and the executor scan is narrowed to
+  the recorded `executor_session_id` and fails closed when that id cannot be
+  matched, instead of matching another run.
+
 ## 0.7.5 (2026-11-07)
 
 Stage 2 lands the runtime performance measurement machinery under `tests/perf/` — no production code changes.

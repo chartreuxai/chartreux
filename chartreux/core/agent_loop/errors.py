@@ -67,6 +67,26 @@ class OverrideStartDeniedError(AgentLoopError):
         )
 
 
+class KeepaliveSinkRequiredError(AgentLoopError):
+    """P5 strict sink: a keepalive ping requires an accounting sink and attribution.
+
+    The gateway's finalize silently tolerates a missing sink or attribution for
+    ordinary calls; the ping path bypasses that tolerance — a ping without a
+    sink is rejected before any transport and never silently unaccounted. A
+    LOCAL admission denial, never a provider failure: not retryable, never
+    fails over, and its UNKNOWN classification keeps it off the measured-
+    failure recording entirely.
+    """
+
+    non_retryable: ClassVar[bool] = True
+    failure_category: ClassVar[FailureCategory] = FailureCategory.UNKNOWN
+
+    def __init__(self) -> None:
+        super().__init__(
+            "A keepalive ping requires an accounting sink and usage attribution"
+        )
+
+
 class EmptyReplayBudgetStop(EmptyLLMResponseError):
     """Internal signal: an empty response whose in-call replay was denied.
 

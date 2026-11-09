@@ -278,7 +278,7 @@ def test_append_uses_shipped_stubs_without_losing_inherited_metadata(
         "glm-5-3"
     )
     assert resolved.materialize(auto_compact_threshold=200000).temperature == 1.0
-    assert model.deployments[0].auto_compact_threshold == 400000
+    assert model.deployments[0].auto_compact_threshold == 500000
 
 
 def test_roles_are_patched_per_key(tmp_path: Path) -> None:

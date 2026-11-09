@@ -17,7 +17,9 @@ from chartreux.cli.textual_ui.app import BottomApp
 from chartreux.cli.textual_ui.widgets.model_picker import ModelPickerApp
 from chartreux.cli.textual_ui.widgets.session_status_line import SessionStatusLine
 from chartreux.cli.textual_ui.widgets.thinking_picker import ThinkingPickerApp
-from chartreux.core.config import ModelConfig
+from chartreux.core.config import ChartreuxConfigSchema, ModelConfig
+from chartreux.core.model_catalog.loader import CatalogSnapshot
+from chartreux.core.model_catalog.schema import ModelCatalog
 from chartreux.ui.widgets.no_markup_static import NoMarkupStatic
 from tests.conftest import build_test_chartreux_app, build_test_vibe_config, wait_until
 
@@ -39,6 +41,24 @@ def _make_config_with_models(**kwargs):
 def _make_unpinned_config(**kwargs):
     # active_model="" is the unpinned sentinel.
     return build_test_vibe_config(models=_model_configs(), active_model="", **kwargs)
+
+
+def _with_documented_context_limits(
+    config: ChartreuxConfigSchema, limits: dict[str, int]
+) -> ChartreuxConfigSchema:
+    """Declare each listed deployment's provider context limit on the catalog.
+
+    The legacy model inputs carry only the schedule and price fields into the
+    catalog, so a provider fact is declared on the snapshot the app resolves its
+    active model from.
+    """
+    raw = config.catalog_snapshot.catalog.model_dump(mode="json")
+    for alias, limit in limits.items():
+        for deployment in raw["models"][alias]["deployments"]:
+            deployment["context_limit"] = limit
+    return config.attach_catalog_snapshot(
+        CatalogSnapshot(ModelCatalog.model_validate(raw), "test-fixture")
+    )
 
 
 async def _open_model_picker(pilot, app) -> ModelPickerApp:
@@ -467,8 +487,11 @@ async def test_model_picker_select_default_persists_empty_alias() -> None:
 async def test_model_switch_updates_context_window_status_bar() -> None:
     """Switching models refreshes the bottom-bar context window without a restart.
 
-    The context segment's denominator is the active model's auto_compact_threshold;
-    a switch to a different threshold must be reflected immediately.
+    The context segment's denominator is the active deployment's documented
+    context limit; the compaction threshold is not a denominator. A switch to a
+    deployment with a different limit must be reflected immediately, and the two
+    thresholds below are distinct from the limits so a regression to either one
+    is visible.
     """
     models = [
         ModelConfig(
@@ -484,11 +507,18 @@ async def test_model_switch_updates_context_window_status_bar() -> None:
             auto_compact_threshold=800_000,
         ),
     ]
-    config = build_test_vibe_config(models=models, active_model="alpha")
+    config = _with_documented_context_limits(
+        build_test_vibe_config(models=models, active_model="alpha"),
+        {"alpha": 1_000_000, "beta": 2_000_000},
+    )
     app = build_test_chartreux_app(config=config)
     async with app.run_test() as pilot:
         await pilot.pause(0.1)
-        assert app.query_one(SessionStatusLine).state.auto_compact_threshold == 200_000
+        status = app.query_one(SessionStatusLine)
+        # The status state carries the projected context window.
+        assert status.state.auto_compact_threshold == 1_000_000
+        assert "/1.0M" in status.render().plain
+        assert "200k" not in status.render().plain
 
         await _open_model_picker(pilot, app)
         # Highlight starts on Default; beta follows the two shipped models
@@ -497,7 +527,10 @@ async def test_model_switch_updates_context_window_status_bar() -> None:
         await pilot.press("enter")
         await wait_until(pilot, lambda: app.config.active_model.alias == "beta")
 
-        assert app.query_one(SessionStatusLine).state.auto_compact_threshold == 800_000
+        status = app.query_one(SessionStatusLine)
+        assert status.state.auto_compact_threshold == 2_000_000
+        assert "/2.0M" in status.render().plain
+        assert "800k" not in status.render().plain
 
 
 # --- /thinking command ---

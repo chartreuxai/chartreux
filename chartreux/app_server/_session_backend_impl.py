@@ -873,9 +873,17 @@ class SessionBackendImpl:
         return session_plan_record(metadata.plan_mode)
 
     async def write_plan_record(
-        self, params: SessionPlanRecordWriteParams
+        self, params: SessionPlanRecordWriteParams, *, force_durable: bool = False
     ) -> SessionBackendResult[SessionPlanRecordWriteResponse]:
         """Persist (or, with a null record, remove) the plan mode.
+
+        ``force_durable`` selects the FORCED durable write the plan handoff
+        needs — C2's retirement of the source record as accepted, and C3's
+        executor marker. It creates the metadata file when it does not exist yet
+        and raises unless the write is durable, which the ordinary entry/cancel
+        writes cannot afford to require: those land on a session that may have no
+        saved turn, where the first full save carries the in-memory record. The
+        root-session guard applies to both paths.
 
         The response carries the record as READ BACK, so a session whose
         logging is disabled answers None instead of echoing a mode no resume
@@ -883,10 +891,13 @@ class SessionBackendImpl:
         """
         self._require_plan_record_session(params.session_id)
         logger = self.session.agent_loop.session_logger
-        if params.record is None:
+        record = None if params.record is None else plan_mode_record(params.record)
+        if force_durable:
+            await logger.persist_plan_mode_durable(record)
+        elif record is None:
             await logger.clear_plan_mode()
         else:
-            await logger.persist_plan_mode(plan_mode_record(params.record))
+            await logger.persist_plan_mode(record)
         metadata = logger.session_metadata
         persisted = (
             None

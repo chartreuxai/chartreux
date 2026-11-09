@@ -260,14 +260,9 @@ def _get_available_skills_section(skill_manager: SkillManager) -> str:
     lines = [
         "# Available Skills",
         "",
-        "You have access to the following skills. When a task matches a skill's description,",
-        "use the `skill` tool to load the full skill instructions.",
+        "When a task matches a skill's description, use the `skill` tool to load the full skill instructions.",
         "",
-        "When a user message is exactly `/skill-name` (optionally followed by extra",
-        "instructions), the user has explicitly invoked that skill. Its instructions are",
-        "loaded for you automatically: you will see a `skill` tool call and result",
-        "immediately after that message. Treat the loaded content as the active",
-        "instructions and act on it — you do not need to call the `skill` tool yourself.",
+        "A user message that is exactly `/skill-name` (optionally with extra instructions) invokes that skill explicitly: its instructions load automatically, and the resulting `skill` tool call and result follow the message. Treat the loaded content as the active instructions — you do not need to call the `skill` tool yourself.",
         "",
         "<available_skills>",
     ]

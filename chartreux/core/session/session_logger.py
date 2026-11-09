@@ -17,7 +17,7 @@ from pathlib import Path
 import subprocess
 from threading import Lock
 import time
-from typing import TYPE_CHECKING, Any, Literal
+from typing import TYPE_CHECKING, Any, Final, Literal
 from uuid import uuid4
 import warnings
 
@@ -30,6 +30,7 @@ from chartreux.core.llm_models import (
     archived_replacement,
 )
 from chartreux.core.message_list import MessageList
+from chartreux.core.plan_episode import PlanEpisodeWriteError, durable_replace_plan
 from chartreux.core.session.session_loader import (
     MESSAGES_FILENAME,
     METADATA_FILENAME,
@@ -68,6 +69,7 @@ from chartreux.core.tools.secret_redaction import scrub_child_env
 from chartreux.core.utils import utc_now
 from chartreux.utils.durable_io import (
     durable_append,
+    durable_mkdir,
     durable_replace,
     durable_replace_stream,
     read_chunks,
@@ -107,6 +109,105 @@ _TOMBSTONE_RETAINED_KEYS: frozenset[str] = frozenset({"role", "message_id", "inj
 # ``_message_record`` call then probes ``getattr(message, name, None)``
 # directly instead of paying a function call per record on the save path.
 _archive_reference_attribute_name: str | None = None
+
+#: P2d delivery marking: the per-message ENVELOPE key under which a delivered
+#: subagent result travels atomically with its owning tool message in
+#: ``messages.jsonl``. The marking commits with the transcript write because
+#: it IS a key of the same record line — a crash can never leave a marking
+#: without its transcript record or vice versa. The payload-only trim at
+#: compaction/manager (:57-62, :297-304) releases ``reasoning_payloads``
+#: only, so this envelope key survives it.
+RESULT_DELIVERY_KEY: Final[str] = "result_delivery"
+#: The payload key inside ``tool_result.output`` that carries the marking to
+#: the persist path (the fetch tools embed it in their result models);
+#: ``_message_record`` hoists it to ``RESULT_DELIVERY_KEY`` and removes it
+#: from the persisted output, keeping the envelope key authoritative.
+RESULT_DELIVERY_OUTPUT_KEY: Final[str] = "delivery"
+#: The exact field set of a well-formed marking payload.
+RESULT_DELIVERY_FIELDS: Final[tuple[str, ...]] = (
+    "conversation_id",
+    "agent_id",
+    "run_id",
+    "representation",
+)
+#: The recognized representations (fetch modes) a marking records.
+RESULT_DELIVERY_REPRESENTATIONS: Final[frozenset[str]] = frozenset({"digest", "full"})
+
+
+def _wellformed_delivery_marking(value: Any) -> dict[str, str] | None:
+    """The normalized marking for a well-formed payload, else None.
+
+    Fail-closed shape check: exactly the four marking fields, all non-empty
+    strings, and a recognized representation. Anything else is ordinary
+    payload and is never hoisted to the envelope key.
+    """
+    if not isinstance(value, dict) or set(value) != set(RESULT_DELIVERY_FIELDS):
+        return None
+    if any(not isinstance(item, str) or not item for item in value.values()):
+        return None
+    if value["representation"] not in RESULT_DELIVERY_REPRESENTATIONS:
+        return None
+    return {field: value[field] for field in RESULT_DELIVERY_FIELDS}
+
+
+@dataclass(frozen=True)
+class ResultDeliveryMarking:
+    """One delivered (conversation, agent, run, representation) marking.
+
+    ``position`` is the record index in the scanned transcript stream — the
+    single ordering used to compare a marking against compaction boundaries
+    (a boundary at a later position lifts the mechanical refusal).
+    """
+
+    conversation_id: str
+    agent_id: str
+    run_id: str
+    representation: str
+    position: int
+
+
+@dataclass(frozen=True)
+class DeliveryStateScan:
+    """Markings and compaction boundaries over one ordered record stream."""
+
+    markings: tuple[ResultDeliveryMarking, ...]
+    compaction_boundaries: tuple[int, ...]
+    position_count: int
+
+
+_EMPTY_DELIVERY_SCAN = DeliveryStateScan((), (), 0)
+
+
+def scan_delivery_state(
+    records: Iterable[dict[str, Any]], *, start: int = 0
+) -> DeliveryStateScan:
+    """Scan raw transcript records for delivery markings and compaction boundaries.
+
+    Pure function over record dicts (persisted lines or live-message records):
+    a record carrying a well-formed ``RESULT_DELIVERY_KEY`` envelope is a
+    marking at its position; a record with ``context_boundary == "compaction"``
+    is a compaction boundary at its position. Positions start at ``start`` so
+    a live tail can continue a persisted file's index space.
+    """
+    markings: list[ResultDeliveryMarking] = []
+    boundaries: list[int] = []
+    position = start
+    for record in records:
+        marking = _wellformed_delivery_marking(record.get(RESULT_DELIVERY_KEY))
+        if marking is not None:
+            markings.append(
+                ResultDeliveryMarking(
+                    conversation_id=marking["conversation_id"],
+                    agent_id=marking["agent_id"],
+                    run_id=marking["run_id"],
+                    representation=marking["representation"],
+                    position=position,
+                )
+            )
+        if record.get("context_boundary") == "compaction":
+            boundaries.append(position)
+        position += 1
+    return DeliveryStateScan(tuple(markings), tuple(boundaries), position)
 
 
 class SessionDiskFullError(RuntimeError):
@@ -363,6 +464,12 @@ class SessionLogger:  # noqa: PLR0904
         # bare None key.
         self._trim_in_flight_boundaries: set[TrimAttemptKey] = set()
         self._trim_published_boundaries: set[TrimAttemptKey] = set()
+        # P2d: the persisted part of the delivery-state scan, cached by file
+        # (size, mtime_ns). Set before the disabled early-return so a disabled
+        # logger scans as empty.
+        self._delivery_scan_cache: tuple[tuple[int, int], DeliveryStateScan] | None = (
+            None
+        )
 
         # Repair every configured store independently, including when new logging
         # is disabled. The repair recognizes session directories and leaves other
@@ -825,10 +932,16 @@ class SessionLogger:  # noqa: PLR0904
         return end_time if isinstance(end_time, str) else None
 
     @staticmethod
-    def _persist_metadata_sync(metadata: Any, session_dir: Path) -> None:
+    def _persist_metadata_sync(
+        metadata: Any, session_dir: Path, *, plan_scope: bool = False
+    ) -> None:
         metadata_filepath = session_dir / METADATA_FILENAME
+        # A plan-scope write is published through the plan-mode wrapper, so its
+        # temporary sibling carries the recognizable plan temp prefix instead of
+        # an opaque random name.
+        publish = durable_replace_plan if plan_scope else durable_replace
         try:
-            durable_replace(
+            publish(
                 metadata_filepath,
                 json.dumps(metadata, indent=2, ensure_ascii=False).encode("utf-8"),
             )
@@ -842,14 +955,23 @@ class SessionLogger:  # noqa: PLR0904
             ) from e
 
     @staticmethod
-    async def persist_metadata(metadata: Any, session_dir: Path) -> None:
+    async def persist_metadata(
+        metadata: Any, session_dir: Path, *, plan_scope: bool = False
+    ) -> None:
         await asyncio.to_thread(
-            SessionLogger._persist_metadata_sync, metadata, session_dir
+            SessionLogger._persist_metadata_sync,
+            metadata,
+            session_dir,
+            plan_scope=plan_scope,
         )
 
-    async def _persist_metadata_locked(self, metadata: Any, session_dir: Path) -> None:
+    async def _persist_metadata_locked(
+        self, metadata: Any, session_dir: Path, *, plan_scope: bool = False
+    ) -> None:
         """Finish a metadata write before cancellation can release the save lock."""
-        persistence = asyncio.create_task(self.persist_metadata(metadata, session_dir))
+        persistence = asyncio.create_task(
+            self.persist_metadata(metadata, session_dir, plan_scope=plan_scope)
+        )
         try:
             await asyncio.shield(persistence)
         except asyncio.CancelledError as cancellation:
@@ -963,12 +1085,82 @@ class SessionLogger:  # noqa: PLR0904
             and message._context_injection_origin == CONTEXT_INJECTION_TOOL_PAIR_V1
         ):
             record[CONTEXT_INJECTION_ORIGIN_KEY] = CONTEXT_INJECTION_TOOL_PAIR_V1
+        # P2d: a tool message whose persisted output carries a well-formed
+        # delivery payload hoists it to the per-message ENVELOPE key, so the
+        # marking commits atomically with this very transcript write (same
+        # record line). The payload copy is removed — the envelope key stays
+        # the authoritative marking and survives the payload-only trim.
+        if message.role == Role.tool and isinstance(record.get("tool_result"), dict):
+            output = record["tool_result"].get("output")
+            if isinstance(output, dict):
+                marking = _wellformed_delivery_marking(
+                    output.get(RESULT_DELIVERY_OUTPUT_KEY)
+                )
+                if marking is not None:
+                    record[RESULT_DELIVERY_KEY] = marking
+                    output.pop(RESULT_DELIVERY_OUTPUT_KEY, None)
         return record
 
     @staticmethod
     def _message_fingerprint(message: LLMMessage) -> str:
         payload = json.dumps(SessionLogger._message_record(message), sort_keys=True)
         return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+    def _persisted_delivery_scan(self) -> DeliveryStateScan:
+        """The delivery-state scan of the persisted transcript, cached by file stat.
+
+        The cache key is (size, mtime_ns): saves append or rewrite the file, so
+        any committed change moves the key and forces a rescan. An unreadable
+        or missing transcript scans as empty — fail-open for the refusal
+        predicate, which only ever arms on a committed marking.
+        """
+        if not self.persisted:
+            return _EMPTY_DELIVERY_SCAN
+        messages_path = self.messages_filepath
+        try:
+            stat = messages_path.stat()
+            key = (stat.st_size, stat.st_mtime_ns)
+        except OSError:
+            return _EMPTY_DELIVERY_SCAN
+        cached = self._delivery_scan_cache
+        if cached is not None and cached[0] == key:
+            return cached[1]
+        try:
+            scan = scan_delivery_state(
+                SessionLogger._stream_persisted_records(messages_path)
+            )
+        except Exception:
+            scan = _EMPTY_DELIVERY_SCAN
+        self._delivery_scan_cache = (key, scan)
+        return scan
+
+    def delivery_state_scan(
+        self, live_messages: Iterable[LLMMessage] | None = None
+    ) -> DeliveryStateScan:
+        """One position space over the conversation's ordered records.
+
+        A supplied live list is the authoritative full conversation — the
+        persisted transcript is a saved prefix of it, so scanning both would
+        double-count every saved record. The live list is therefore scanned
+        alone, in its own index space, and an unsaved compaction boundary or
+        tool message counts immediately. With no live messages (restart
+        replay, before the loop binds) the persisted transcript is scanned
+        instead: it carries the same delivery-marking envelope keys and
+        compaction boundaries, so the marking state rebuilds from the
+        transcript alone. Positions order markings against boundaries; a
+        boundary at a later position than a marking is a compaction boundary
+        between that delivery and any later fetch.
+        """
+        live = [
+            message for message in (live_messages or []) if message.role != Role.system
+        ]
+        if not live:
+            return self._persisted_delivery_scan()
+        live_records = [
+            SessionLogger._message_record(message, allow_archived=True)
+            for message in live
+        ]
+        return scan_delivery_state(live_records)
 
     # Keep cancellation draining and error handling in one lock scope.
     async def save_interaction(  # noqa: PLR0915, PLR0912 - one serialized commit boundary
@@ -3306,6 +3498,66 @@ class SessionLogger:  # noqa: PLR0904
         _, session_metadata = session_info
         session_metadata.plan_mode = None
         await self._persist_metadata_field("plan_mode", None)
+
+    async def persist_plan_mode_durable(self, record: PlanModeRecord | None) -> None:
+        """Record (or, with ``None``, remove) the plan mode as a FORCED write.
+
+        This is the variant the handoff's two integrity writes use: C2's
+        retirement of the source record as accepted, and C3's executor marker
+        (episode identity, consent digest, snapshot reference) as the replacement
+        session's first durable act. ``_persist_metadata_field_locked`` returns
+        SILENTLY when the metadata file does not exist yet, and both writes land
+        exactly there — a fresh planning session with no saved turn, and a
+        session just rotated by the reset. A caller cannot tell that skip from a
+        durable write, so nothing here is silent: the metadata file is created
+        when absent, the bytes are published through the plan-scoped durable
+        wrapper (temporary sibling, content fsync, atomic replace, parent fsync),
+        and every failure raises.
+
+        The in-memory record is set before the write, as in
+        :meth:`persist_plan_mode`; a failed write therefore leaves memory ahead
+        of disk, and what recovery reads is the durable marker — the absence of
+        which is the recognized row-3 state, never a reported success. A disk-full
+        failure keeps its own type (``SessionDiskFullError``); every other
+        failure raises ``PlanEpisodeWriteError``.
+        """
+        async with self._save_lock:
+            session_info = self._get_session_info()
+            if session_info is None:
+                raise PlanEpisodeWriteError(
+                    "session logging is disabled; the plan-mode record cannot be "
+                    "written durably"
+                )
+            session_dir, session_metadata = session_info
+            session_metadata.plan_mode = record
+            try:
+                durable_mkdir(session_dir)
+            except OSError as e:
+                raise PlanEpisodeWriteError(
+                    f"Failed to create the session directory at {session_dir}: {e}"
+                ) from e
+            metadata_path = session_dir / METADATA_FILENAME
+            if metadata_path.exists():
+                try:
+                    raw = (await read_safe_async(metadata_path)).text
+                    metadata = json.loads(raw)
+                except (OSError, json.JSONDecodeError) as e:
+                    raise PlanEpisodeWriteError(
+                        f"Failed to read session metadata at {metadata_path}: {e}"
+                    ) from e
+            else:
+                metadata = session_metadata.model_dump(mode="json")
+            metadata["plan_mode"] = (
+                None if record is None else record.model_dump(mode="json")
+            )
+            try:
+                await self._persist_metadata_locked(
+                    metadata, session_dir, plan_scope=True
+                )
+            except SessionDiskFullError:
+                raise
+            except RuntimeError as error:
+                raise PlanEpisodeWriteError(str(error)) from error
 
     async def persist_loops(self) -> None:
         session_info = self._get_session_info()

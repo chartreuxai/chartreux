@@ -170,6 +170,16 @@ class AgentStats(BaseModel):
     known_cost_total: float = 0.0
     has_unknown_cost: bool = False
 
+    # P5 budget isolation: keep-alive ping usage accumulates ONLY into these
+    # fields. The session_* fields above, known_cost_total, and
+    # has_unknown_cost never see a ping, so the pilot cannot flip the token-
+    # or price-limit STOPs at core/middleware.py:64-106. The ledger's
+    # purpose=keepalive rows remain the single source of truth for ping spend.
+    keepalive_prompt_tokens: int = 0
+    keepalive_completion_tokens: int = 0
+    keepalive_cached_tokens: int = 0
+    keepalive_known_cost_usd: float = 0.0
+
     context_tokens: int = 0
 
     last_turn_prompt_tokens: int = 0
@@ -227,6 +237,12 @@ class AgentStats(BaseModel):
     @property
     def session_total_llm_tokens(self) -> int:
         return self.session_prompt_tokens + self.session_completion_tokens
+
+    @computed_field
+    @property
+    def keepalive_total_llm_tokens(self) -> int:
+        """P5: ping tokens, reported separately — never part of session totals."""
+        return self.keepalive_prompt_tokens + self.keepalive_completion_tokens
 
     @computed_field
     @property
@@ -313,6 +329,23 @@ class WorktreeContext(BaseModel):
     created_at: int
 
 
+LEGACY_UNVERIFIED_STATE = "legacy-unverified"
+
+
+class PlanScanDomain(BaseModel):
+    """The recorded P1 scan domain: the ``{save_dir, session_prefix}`` pair.
+
+    The episode extension mirrors the P1 logging domain into the record so a
+    sidecar-loss display path can bound its executor scan to the domain that
+    was known when the episode was claimed. The mirror is display-only: a
+    post-rotation record write is structurally impossible, so C3 re-records the
+    SIDECAR only and never this copy (DR-69).
+    """
+
+    save_dir: str
+    session_prefix: str
+
+
 class PlanModeRecord(BaseModel):
     """The persisted plan-mode record (design §7).
 
@@ -322,6 +355,13 @@ class PlanModeRecord(BaseModel):
     when the mode was entered. Optional in every direction: an absent record
     is "not planning", and the fields are plain strings so a record written by
     a build that knows more thinking levels still loads here.
+
+    The episode extension (design §4.1) is tolerated in both directions. This
+    model deliberately does NOT forbid extra fields, so a record written by a
+    build that knows more fields still loads here and the extension fields
+    below are ignored — never corrupting — by a reader that does not know them.
+    A pre-amendment record (one written before the extension existed) loads
+    with every episode field absent and surfaces as ``legacy_unverified``.
     """
 
     plan_path: str
@@ -330,6 +370,42 @@ class PlanModeRecord(BaseModel):
     planner_thinking: str
     pre_entry_active_model: str | None = None
     pre_entry_planner_thinking: str | None = None
+    # Episode extension (design §4.1). ``state`` is display-labeled: the
+    # sidecar stays the authority (DR-52), and ``snapshot_path`` references the
+    # P3 consent snapshot (``accepted-<episode_id>.md``).
+    episode_id: str | None = None
+    sidecar_path: str | None = None
+    draft_path: str | None = None
+    snapshot_path: str | None = None
+    state: str | None = None
+    consent_sha256: str | None = None
+    attempt_generation: int | None = None
+    scan_domain: PlanScanDomain | None = None
+
+    @property
+    def episode_bound(self) -> bool:
+        """True when the record carries an episode identity."""
+        return self.episode_id is not None
+
+    @property
+    def legacy_unverified(self) -> bool:
+        """The legacy marker: no episode identity means the record predates it.
+
+        Accept never arms on such a record (design §4.5); the user re-binds
+        into a NEW episode or cancels with pin restore.
+        """
+        return not self.episode_bound
+
+    @property
+    def display_state(self) -> str | None:
+        """The state to display; a legacy record never claims a live lifecycle.
+
+        The correlated sidecar is authoritative; this label is a mirror the
+        record writer copies at write time (DR-52).
+        """
+        if self.legacy_unverified:
+            return LEGACY_UNVERIFIED_STATE
+        return self.state
 
 
 class SessionMetadata(BaseModel):

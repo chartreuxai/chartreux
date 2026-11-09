@@ -19,7 +19,7 @@
 }
 #plan-consent-body {
     height: auto;
-    max-height: 60vh;
+    max-height: 50vh;
     overflow-y: auto;
 }
 .plan-consent-label {
@@ -30,6 +30,12 @@
 .plan-consent-value {
     height: auto;
     text-wrap: wrap;
+}
+#plan-consent-notice {
+    height: auto;
+    margin-bottom: 1;
+    text-wrap: wrap;
+    color: $warning;
 }
 #plan-consent-hint {
     height: 1;

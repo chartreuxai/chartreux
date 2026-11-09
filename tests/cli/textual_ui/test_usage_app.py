@@ -96,7 +96,7 @@ async def test_usage_notification_preserves_feedback_and_session_state(
         assert "Today $12.34" in rendered
         assert status.state.cwd == str(tmp_working_directory)
         assert tmp_working_directory.name in rendered
-        assert "0/400k (0%)" in rendered
+        assert "0/1.0M (0%)" in rendered
         assert tuple(app._pending_callbacks) == callbacks
         assert app._active_callback is active_callback
         assert app.app_server.turn_queue == queue

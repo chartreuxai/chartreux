@@ -8,6 +8,7 @@ from datetime import UTC, datetime
 import functools
 from http import HTTPStatus
 from itertools import count
+import threading
 import time
 from typing import ClassVar, Literal, Protocol
 from uuid import uuid4
@@ -21,6 +22,7 @@ from chartreux.core.agent_loop.errors import (
     EmptyLLMResponseError,
     EmptyReplayBudgetStop,
     ImagesNotSupportedError,
+    KeepaliveSinkRequiredError,
     OverrideStartDeniedError,
 )
 from chartreux.core.agent_loop.resume_progress import ResumeProgressWatch
@@ -94,6 +96,68 @@ class LiveRequestSource:
 
 
 @dataclass(frozen=True)
+class RequestShapeTelemetry:
+    """Content-free measurements of what one attempt serialized (P3 capture).
+
+    Every value measures the request shape, never its content. The byte counts
+    cover the serialized system prompt and tool definitions; the digests
+    identify the cacheable prefix (byte-level stability) and the (toolset,
+    prompt) configuration (structural identity, insensitive to wording); the
+    gap is the idle time since this loop's previous build; the concurrency
+    snapshot is the process-wide count of requests in flight at build time;
+    the declared limit is the request's own output cap.
+    """
+
+    system_prompt_bytes: int
+    tool_def_bytes: int
+    prefix_stability_hash: str
+    gap_since_previous_call_ms: int | None
+    concurrency_snapshot: int
+    toolset_prompt_fingerprint: str
+    declared_max_tokens: int | None
+
+    def attribution_fields(self) -> dict[str, object]:
+        """The measurements as attribution updates; unset ones stay unset."""
+        fields: dict[str, object] = {
+            "system_prompt_bytes": self.system_prompt_bytes,
+            "tool_def_bytes": self.tool_def_bytes,
+            "prefix_stability_hash": self.prefix_stability_hash,
+            "concurrency_snapshot": self.concurrency_snapshot,
+            "toolset_prompt_fingerprint": self.toolset_prompt_fingerprint,
+        }
+        if self.gap_since_previous_call_ms is not None:
+            fields["gap_since_previous_call_ms"] = self.gap_since_previous_call_ms
+        if self.declared_max_tokens is not None:
+            fields["declared_max_tokens"] = self.declared_max_tokens
+        return fields
+
+
+#: Requests in flight anywhere in this process. Agent loops (root and
+#: subagents) share it so a build-time snapshot reflects real parallelism, not
+#: the single loop that happens to be building.
+_in_flight_lock = threading.Lock()
+_in_flight_requests = 0
+
+
+def request_concurrency_snapshot() -> int:
+    """The process-wide count of requests in flight right now."""
+    with _in_flight_lock:
+        return _in_flight_requests
+
+
+def _request_started() -> None:
+    global _in_flight_requests
+    with _in_flight_lock:
+        _in_flight_requests += 1
+
+
+def _request_settled() -> None:
+    global _in_flight_requests
+    with _in_flight_lock:
+        _in_flight_requests = max(0, _in_flight_requests - 1)
+
+
+@dataclass(frozen=True)
 class CompletionInputs:
     model: ModelConfig
     provider_name: str
@@ -112,6 +176,10 @@ class CompletionInputs:
     # the naive preparation interface for unprovenanced inputs (a model
     # context projection, a sideband list, utility completions).
     live_source: LiveRequestSource | None = None
+    # P3 request-shape telemetry measured at the build site. Every attempt of
+    # this logical call records it on its own ledger row; None (the default)
+    # keeps builds outside the coordinator's mint site unmeasured.
+    request_shape: RequestShapeTelemetry | None = None
 
 
 @dataclass(frozen=True)
@@ -226,17 +294,31 @@ def apply_usage(
     time_seconds: float,
     model: ModelConfig,
     account_conversation: bool = True,
+    purpose: UsagePurpose = UsagePurpose.CONVERSATION,
 ) -> None:
-    """Price every call; only conversation calls replace the context measurement."""
-    if account_conversation:
+    """Price every call; only conversation calls replace the context measurement.
+
+    P5 budget isolation (the purpose split): a keepalive ping accumulates ONLY
+    into the stats' keepalive_* fields — never into the session totals,
+    known_cost_total, or has_unknown_cost — so the pilot cannot flip a token-
+    or price-limit STOP at core/middleware.py:64-106. The ledger's
+    purpose=keepalive rows are the single source of truth for ping spend.
+    """
+    keepalive = purpose is UsagePurpose.KEEPALIVE
+    if account_conversation and not keepalive:
         stats.last_turn_duration = time_seconds
         stats.last_turn_prompt_tokens = usage.prompt_tokens
         stats.last_turn_completion_tokens = usage.completion_tokens
         stats.last_turn_cached_tokens = usage.cached_tokens
-    stats.session_prompt_tokens += usage.prompt_tokens
-    stats.session_completion_tokens += usage.completion_tokens
-    stats.session_cached_tokens += usage.cached_tokens
-    if account_conversation:
+    if keepalive:
+        stats.keepalive_prompt_tokens += usage.prompt_tokens
+        stats.keepalive_completion_tokens += usage.completion_tokens
+        stats.keepalive_cached_tokens += usage.cached_tokens
+    else:
+        stats.session_prompt_tokens += usage.prompt_tokens
+        stats.session_completion_tokens += usage.completion_tokens
+        stats.session_cached_tokens += usage.cached_tokens
+    if account_conversation and not keepalive:
         stats.context_tokens = usage.prompt_tokens + usage.completion_tokens
     if usage.cached_tokens and model.cached_input_price_known:
         assert model.cached_input_price is not None
@@ -246,10 +328,18 @@ def apply_usage(
         cached_input_tokens=usage.cached_tokens,
         prices=capture_prices(model),
     )
-    stats.known_cost_total += pricing.known_cost_usd
-    if pricing.has_unknown_cost:
-        stats.has_unknown_cost = True
-    if account_conversation and time_seconds > 0 and usage.completion_tokens > 0:
+    if keepalive:
+        stats.keepalive_known_cost_usd += pricing.known_cost_usd
+    else:
+        stats.known_cost_total += pricing.known_cost_usd
+        if pricing.has_unknown_cost:
+            stats.has_unknown_cost = True
+    if (
+        account_conversation
+        and not keepalive
+        and time_seconds > 0
+        and usage.completion_tokens > 0
+    ):
         stats.tokens_per_second = usage.completion_tokens / time_seconds
 
 
@@ -258,6 +348,8 @@ class CallFinalizer:
 
     Backends trip start at the transport boundary, not on backend entry. Streaming
     and utility callers can reuse this primitive with their own accumulated usage.
+    The transport-start-to-settle span is also the process-wide in-flight request
+    count that later builds snapshot.
     """
 
     def __init__(
@@ -272,6 +364,7 @@ class CallFinalizer:
         self.outcome = UsageOutcome.FAILED
         self._settled = False
         self._sink = resources.accounting_sink
+        self._purpose = inputs.purpose
         self._attempt_ordinal = attempt_ordinal
         self._prices = capture_prices(inputs.model)
         attribution_updates: dict[str, object] = {
@@ -285,14 +378,28 @@ class CallFinalizer:
             # work-class label and no run identity.
             attribution_updates["content_class"] = None
             attribution_updates["run_id"] = None
+        if inputs.request_shape is not None:
+            # P3: the attempt records what its request build serialized, on the
+            # same row and through the same settlement as its usage.
+            attribution_updates.update(inputs.request_shape.attribution_fields())
         self._attribution = (
             resources.usage_attribution.model_copy(update=attribution_updates)
             if resources.usage_attribution is not None
             else None
         )
+        if inputs.purpose is UsagePurpose.KEEPALIVE and (
+            resources.accounting_sink is None or resources.usage_attribution is None
+        ):
+            # P5 strict sink: the ping path bypasses the finalize missing-sink
+            # tolerance in _settle — pings REQUIRE a sink and real attribution,
+            # so the ping is rejected here, before any transport.
+            raise KeepaliveSinkRequiredError()
 
     def start(self) -> None:
+        if self.started:
+            return
         self.started = True
+        _request_started()
 
     def capture_error_usage(self, error: BaseException) -> None:
         """Accept reported usage attached to a failure, never inferred counts."""
@@ -353,9 +460,23 @@ class CallFinalizer:
         if self._settled:
             return
         self._settled = True
-        if not self.started or self._sink is None:
+        try:
+            await self._settle()
+        finally:
+            if self.started:
+                _request_settled()
+
+    async def _settle(self) -> None:
+        if not self.started:
             return
-        if self._attribution is None:
+        if self._sink is None or self._attribution is None:
+            if self._purpose is UsagePurpose.KEEPALIVE:
+                # P5 strict sink: the missing-sink tolerance below is bypassed
+                # for the ping path — a ping without a sink or attribution is
+                # rejected, never silently unaccounted.
+                raise KeepaliveSinkRequiredError()
+            if self._sink is None:
+                return
             logger.warning(
                 "Usage attribution unavailable; recorded usage coverage is degraded"
             )
@@ -592,6 +713,7 @@ class LLMGateway:
                     time_seconds=elapsed,
                     model=inputs.model,
                     account_conversation=inputs.account_conversation,
+                    purpose=inputs.purpose,
                 )
                 raise
             if watch is not None:
@@ -609,6 +731,7 @@ class LLMGateway:
                     time_seconds=elapsed,
                     model=inputs.model,
                     account_conversation=inputs.account_conversation,
+                    purpose=inputs.purpose,
                 )
                 raise
             if result.usage is None:
@@ -621,6 +744,7 @@ class LLMGateway:
                 time_seconds=elapsed,
                 model=inputs.model,
                 account_conversation=inputs.account_conversation,
+                purpose=inputs.purpose,
             )
             return result
         except asyncio.CancelledError as error:
@@ -896,6 +1020,7 @@ class LLMGateway:
                 time_seconds=elapsed,
                 model=inputs.model,
                 account_conversation=inputs.account_conversation,
+                purpose=inputs.purpose,
             )
             usage_accounted = True
             transcript(TranscriptAppend(message=chunk_agg.message, kind="complete"))
@@ -924,6 +1049,7 @@ class LLMGateway:
                     time_seconds=time.perf_counter() - start_time,
                     model=inputs.model,
                     account_conversation=inputs.account_conversation,
+                    purpose=inputs.purpose,
                 )
             if not transcript_appended and published:
                 _append_interrupted(transcript, chunk_agg)
@@ -948,6 +1074,7 @@ class LLMGateway:
                     time_seconds=time.perf_counter() - start_time,
                     model=inputs.model,
                     account_conversation=inputs.account_conversation,
+                    purpose=inputs.purpose,
                 )
             if not transcript_appended and published:
                 _append_interrupted(transcript, chunk_agg)
@@ -978,6 +1105,7 @@ class LLMGateway:
                     time_seconds=time.perf_counter() - start_time,
                     model=inputs.model,
                     account_conversation=inputs.account_conversation,
+                    purpose=inputs.purpose,
                 )
             if not transcript_appended and published:
                 _append_interrupted(transcript, chunk_agg)
@@ -1146,10 +1274,17 @@ def _apply_interrupted_usage(
     time_seconds: float,
     model: ModelConfig,
     account_conversation: bool,
+    purpose: UsagePurpose = UsagePurpose.CONVERSATION,
 ) -> None:
-    """Account reported partial usage, or mark an interrupted stream unpriced."""
+    """Account reported partial usage, or mark an interrupted stream unpriced.
+
+    P5: a keepalive ping never marks ``has_unknown_cost`` — the budget-
+    unverifiable STOP at core/middleware.py:75-83 must not flip on ping
+    spend either.
+    """
     if usage is None:
-        stats.has_unknown_cost = True
+        if purpose is not UsagePurpose.KEEPALIVE:
+            stats.has_unknown_cost = True
         return
     apply_usage(
         stats,
@@ -1157,6 +1292,7 @@ def _apply_interrupted_usage(
         time_seconds=time_seconds,
         model=model,
         account_conversation=account_conversation,
+        purpose=purpose,
     )
 
 

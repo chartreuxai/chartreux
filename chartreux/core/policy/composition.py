@@ -26,6 +26,7 @@ from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
+import re
 from string import Template
 from typing import TYPE_CHECKING
 
@@ -305,6 +306,52 @@ def _resource_source(resource: ResolvedResource) -> str:
     return f"{resource.kind.value}:{resource.id}"
 
 
+_BACKTICKED_TOOL_NAME = re.compile(r"`([a-z][a-z0-9_]*)`")
+
+
+def taught_tool_names(text: str) -> frozenset[str]:
+    """The tool names one passage teaches: its backticked identifiers.
+
+    The harness teaches a tool by spelling its name in backticks — the only
+    instruction-bearing tool spelling the prompts use — so this is the
+    predicate the prompt-text-vs-definition consistency rule (v0.7.6 P1)
+    applies on both sides: to the passages the composition drops, and to the
+    composed prompt a consistency check reads.
+    """
+    return frozenset(_BACKTICKED_TOOL_NAME.findall(text))
+
+
+def without_unavailable_tool_passages(text: str, withheld: frozenset[str]) -> str:
+    """Drop shared-reference passages that teach a withheld tool (P1 rule).
+
+    A context whose catalog withholds a tool's definition must not read a
+    passage instructing the model to use it: the child would be taught a tool
+    it cannot invoke. Filtering is composition-only — the source documents are
+    never edited (design §5) — and paragraph-granular, so an unaffected
+    reference survives verbatim.
+    """
+    if not withheld:
+        return text
+    return "\n\n".join(
+        paragraph
+        for paragraph in text.split("\n\n")
+        if not taught_tool_names(paragraph) & withheld
+    )
+
+
+def context_withheld_tools(inputs: CompositionInputs) -> frozenset[str]:
+    """The tool names this composition's execution context cannot invoke.
+
+    Only a bounded child withholds definitions; every main context gets the
+    full harness-owned reference set back unchanged.
+    """
+    if inputs.execution_context is not ExecutionContext.BOUNDED_CHILD:
+        return frozenset()
+    from chartreux.core.tools.manager import child_withheld_tools
+
+    return child_withheld_tools(inputs.identity_facts)
+
+
 def compose_policy(inputs: CompositionInputs) -> CompositionResult:  # noqa: PLR0915
     """Assemble the nine-step composition (design §5).
 
@@ -400,7 +447,14 @@ def compose_policy(inputs: CompositionInputs) -> CompositionResult:  # noqa: PLR
     # it — that text is what the frozen-policy hash covers, and a bundle
     # persisted before the dedup must recompose the identical policy hash to
     # stay resumable, table included, so its integrity checks still apply.
-    shared_parts = [inputs.tool_semantics]
+    # The prompt-text-vs-definition consistency rule (v0.7.6 P1): a context
+    # whose catalog withholds a tool's definition never reads a
+    # shared-reference passage teaching it. Paragraph-granular and
+    # composition-only; the source documents are untouched.
+    tool_semantics = without_unavailable_tool_passages(
+        inputs.tool_semantics, context_withheld_tools(inputs)
+    )
+    shared_parts = [tool_semantics]
     if inputs.model_info:
         shared_parts.append(inputs.model_info)
     if inputs.skills:
@@ -420,11 +474,7 @@ def compose_policy(inputs: CompositionInputs) -> CompositionResult:  # noqa: PLR
         )
     )
     policy_parts.append(
-        "\n\n".join((
-            inputs.tool_semantics,
-            inputs.launch_targets,
-            inputs.communication,
-        ))
+        "\n\n".join((tool_semantics, inputs.launch_targets, inputs.communication))
     )
 
     # 8. AGENTS.md layers (canonical dedup; provenance from the same

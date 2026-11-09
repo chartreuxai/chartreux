@@ -179,6 +179,11 @@ from chartreux.core.middleware import (
     TurnLimitMiddleware,
 )
 from chartreux.core.model_catalog.availability import EligibleDeployment
+from chartreux.core.plan_episode import (
+    EpisodeObservation,
+    PlanEpisodeError,
+    restore_episode_record,
+)
 from chartreux.core.plan_mode import build_plan_mode_compaction_notice
 from chartreux.core.policy.bundle import (
     ActivatedPolicy,
@@ -3442,6 +3447,13 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
         ``SessionMetadata`` and reports nothing. Session logging disabled makes
         the metadata ``None`` by construction, which is the accepted behavior
         (no notice, symmetric with no resume restore).
+
+        The record is interpreted SIDECAR-FIRST before it is re-injected (design
+        §4.5): its state is a mirror, so an accepting episode re-injects its
+        accepting status and a terminal one re-injects as history that is NOT
+        active planning — a compaction can never re-arm a terminal episode. An
+        untrusted arbiter read is reported as the failure it is, never read as a
+        clean miss.
         """
         metadata = self.session_logger.session_metadata
         if metadata is None:
@@ -3449,7 +3461,17 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
         record = metadata.plan_mode
         if record is None:
             return None
-        return build_plan_mode_compaction_notice(record.plan_path, record.theme)
+        observation: EpisodeObservation | None = None
+        failure: str | None = None
+        try:
+            restored = restore_episode_record(record, session_id=self.session_id)
+        except PlanEpisodeError as error:
+            failure = str(error)
+        else:
+            observation = None if restored is None else restored.observation
+        return build_plan_mode_compaction_notice(
+            record.plan_path, record.theme, episode=observation, episode_failure=failure
+        )
 
     @requires_init
     async def relocate(self, cwd: Path) -> None:

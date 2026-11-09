@@ -204,7 +204,14 @@ The `[status_line]` table controls the bottom session status row. Unknown fields
 | `context_style` | `"tokens-percent"` | `tokens` or `tokens-percent`. |
 | `separator` | `"pipe"` | `space` or `pipe`. |
 
-Context renders without a label, for example `135k/400k (34%)`; the denominator is the effective automatic-compaction threshold, not the model's maximum context window. The `tokens` variant omits the percentage. Git branch lookup is asynchronous and cached. Configure this row in Settings > Status line; see the [configuration guide](../guides/configuration.md#status-line-and-message-timing) for editor controls.
+Context renders without a label, for example `135k/1.0M (14%)`; the denominator
+is the deployment's provider-documented context limit, not the effective
+automatic-compaction threshold. A deployment whose provider documents no
+context limit renders the unknown denominator as `—`. The `tokens` variant
+omits the percentage. Git branch lookup is asynchronous and cached. Configure
+this row in Settings > Status line; see the
+[configuration guide](../guides/configuration.md#status-line-and-message-timing)
+for editor controls.
 
 `background-jobs` is opt-in and renders `Jobs N`, including `Jobs 0` when no
 managed jobs are active. It counts committed jobs whose owned cleanup has not

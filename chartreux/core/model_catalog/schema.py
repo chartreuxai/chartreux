@@ -14,6 +14,7 @@ from pydantic import (
     BaseModel,
     ConfigDict,
     Field,
+    ValidationInfo,
     field_serializer,
     field_validator,
     model_validator,
@@ -127,6 +128,13 @@ class DeploymentDefinition(_FrozenCatalogModel):
     supports_images: bool = False
     supported_thinking_levels: tuple[str, ...] | None = None
     auto_compact_threshold: int | None = None
+    # Provider-documented deployment facts: ``None`` means the provider
+    # documents no value, so the fact stays unknown rather than being guessed.
+    # ``context_limit`` is the total context the provider serves and
+    # ``max_completion_tokens`` the provider's default output budget, which is
+    # the output reserve the threshold invariant subtracts.
+    context_limit: int | None = None
+    max_completion_tokens: int | None = None
     disabled: bool = False
 
     @field_validator("provider")
@@ -152,12 +160,19 @@ class DeploymentDefinition(_FrozenCatalogModel):
             )
         return value
 
-    @field_validator("auto_compact_threshold", mode="before")
+    @field_validator(
+        "auto_compact_threshold",
+        "context_limit",
+        "max_completion_tokens",
+        mode="before",
+    )
     @classmethod
-    def auto_compact_threshold_is_positive_integer(cls, value: Any) -> int | None:
+    def token_count_is_positive_integer(
+        cls, value: Any, info: ValidationInfo
+    ) -> int | None:
         if value is None:
             return None
-        error = "auto_compact_threshold must be a positive whole integer"
+        error = f"{info.field_name} must be a positive whole integer"
         if isinstance(value, bool) or not isinstance(value, (int, float)):
             raise ValueError(error)
         if isinstance(value, float) and (not isfinite(value) or not value.is_integer()):

@@ -313,6 +313,7 @@ from chartreux.app_server.protocol.sessions import (
     SessionPlanRecord as SessionPlanRecord,
     SessionPlanRecordWriteParams as SessionPlanRecordWriteParams,
     SessionPlanRecordWriteResponse as SessionPlanRecordWriteResponse,
+    SessionPlanScanDomain as SessionPlanScanDomain,
     SessionReadParams as SessionReadParams,
     SessionReadResponse as SessionReadResponse,
     SessionReadyReadParams as SessionReadyReadParams,

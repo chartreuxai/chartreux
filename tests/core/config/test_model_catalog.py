@@ -289,7 +289,7 @@ def test_16_shipped_defaults_validate_and_have_verified_wire_names() -> None:
         )
         for name, model in catalog.models.items()
     } == {
-        "glm-5-3": ("mistral", "zai-glm-5-3", 1.4, 4.4, 0.14, 400000),
+        "glm-5-3": ("mistral", "zai-glm-5-3", 1.4, 4.4, 0.14, 500000),
         "mistral-large-4": ("mistral", "mistral-large-4", 0.68, 2.09, 0.07, 400000),
     }
     assert {

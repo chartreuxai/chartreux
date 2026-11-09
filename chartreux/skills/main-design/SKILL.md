@@ -24,7 +24,7 @@ Own the what and why before implementation. The main agent gathers context and f
 task(task="Design analysis for: <problem>. Context: <relevant code, interfaces, constraints>. Requirements: <what the design must address, preserved behavior, non-goals>. Return a recommended approach with rationale, alternatives rejected, risks, and assumptions.", purpose="design-analysis")
 ```
 
-The launch runs in the background by default — collect the advisor's result with `wait_for_agent` before synthesizing.
+The launch runs in the background by default — a completion notification arrives when the advisor's run finishes; fetch the result then with `get_agent_result` (`mode="digest"` by default, `mode="full"` for the full body) before synthesizing, or block on the run with `wait_for_agent` (same modes).
 
 For large or cross-cutting changes, first dispatch a bounded exploration child (`purpose="exploration"`) that loads `sub-architecture-mapper` to map the affected subsystems, then use that output to frame the design question.
 

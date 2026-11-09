@@ -47,8 +47,24 @@ Provider definitions may supply extra headers and mark an endpoint as not emitti
 A deployment's `auto_compact_threshold` must be a positive whole integer token
 count; fractional values and `0` are rejected. If omitted, it uses the global
 `auto_compact_threshold` fallback in `config.toml`, where `0` disables automatic
-compaction. The TUI context denominator shows this effective threshold, not the
-model's maximum context window.
+compaction. The TUI context denominator shows the deployment's
+provider-documented `context_limit` (also a positive whole integer token count,
+and unknown unless the provider documentation states it), not this threshold; a
+deployment without a documented limit renders `—` as the denominator.
+
+Raising a deployment's `auto_compact_threshold` above its shipped value must
+satisfy the headroom invariant at config load and at launch: the threshold plus
+a 217,000-token one-turn growth allowance may not exceed the documented
+`context_limit` less the documented output reserve
+(`max_completion_tokens`). Only raises are validated, so a deployment the
+provider does not document still loads at its prior threshold. Every shipped
+deployment receiving the 500k threshold ships with a known limit and a known
+reserve; a deployment whose limit or reserve is undocumented keeps its prior
+threshold. A user overlay raising a threshold on an unknown-limit deployment
+must populate the limit field, or the overlay's file fails validation at load —
+the last accepted configuration stays active and the error names every rejected
+deployment with both resolution paths. Nothing silently raises, and nothing
+silently stays.
 
 Legacy catalog tables in `config.toml` are rejected. Preview migration with `chartreux models migrate`; apply it with `chartreux models migrate --apply`.
 

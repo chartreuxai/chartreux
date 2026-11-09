@@ -36,6 +36,9 @@ import asyncio
 from collections.abc import AsyncGenerator, Callable, Sequence
 import contextlib
 from dataclasses import replace
+import hashlib
+import json
+import time
 
 from chartreux.core.agent_loop._loop_types import RootAccountingOwner
 from chartreux.core.agent_loop.backend_lifetime import BackendLifetime, BackendPublish
@@ -45,7 +48,9 @@ from chartreux.core.agent_loop.llm_gateway import (
     CompletionInputs,
     LiveRequestSource,
     LLMGateway,
+    RequestShapeTelemetry,
     TranscriptAppend,
+    request_concurrency_snapshot,
 )
 from chartreux.core.agent_loop.resume_progress import ResumeProgressWatch
 from chartreux.core.compaction import reorder_for_tool_adjacency
@@ -55,7 +60,13 @@ from chartreux.core.config.orchestrator import ConfigOrchestrator
 from chartreux.core.llm.failures import RequestRetryBudget, classify
 from chartreux.core.llm.format import APIToolFormatHandler
 from chartreux.core.llm.types import BackendLike
-from chartreux.core.llm_models import AvailableTool, LLMChunk, LLMMessage, StrToolChoice
+from chartreux.core.llm_models import (
+    AvailableTool,
+    LLMChunk,
+    LLMMessage,
+    Role,
+    StrToolChoice,
+)
 from chartreux.core.message_list import (
     MessageList,
     RequestEnvelope,
@@ -79,12 +90,46 @@ from chartreux.observability.logging import logger
 from chartreux.utils.http import get_user_agent
 
 
+def _request_digest(text: str) -> str:
+    """A stable short digest over an already-serialized request shape."""
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
+
+
+def _serialized_tool_definitions(tools: list[AvailableTool] | None) -> str:
+    """The declared tool definitions as compact, key-ordered JSON."""
+    if not tools:
+        return ""
+    definitions = [tool.model_dump(mode="json") for tool in tools]
+    return json.dumps(
+        definitions, ensure_ascii=False, separators=(",", ":"), sort_keys=True
+    )
+
+
+def _toolset_prompt_signature(
+    tools: list[AvailableTool] | None, system_prompt: str
+) -> str:
+    """The (toolset, prompt) configuration identity, blind to wording.
+
+    Tool names plus their parameter names and the system prompt text identify
+    a configuration across sessions. Descriptions are deliberately excluded:
+    a wording change moves the prefix hash alone, which keeps this signature
+    comparable between differently-worded but structurally identical toolsets.
+    """
+    shapes: list[str] = []
+    for tool in tools or ():
+        properties = tool.function.parameters.get("properties")
+        names = ",".join(sorted(properties)) if isinstance(properties, dict) else ""
+        shapes.append(f"{tool.function.name}({names})")
+    return _request_digest(f"{system_prompt}\0{'|'.join(shapes)}")
+
+
 class CompletionCoordinator:
     """Own completion input/resource assembly, the attempt helpers, and the
     attempt generator.
 
-    ``build_completion_inputs`` assembles the frozen CompletionInputs, with
-    the header assembly in ``_extra_headers``; ``build_call_resources``
+    ``build_completion_inputs`` assembles the frozen CompletionInputs and the
+    request-shape telemetry of that build, with the header assembly in
+    ``_extra_headers``; ``build_call_resources``
     binds the live stats, accounting sink and usage attribution to a backend.
     ``failover_candidates`` enumerates eligible deployments;
     ``backend_for_attempt`` materializes the attempt backend through the
@@ -234,6 +279,12 @@ class CompletionCoordinator:
         # its own envelope rather than refreshing this one.
         self._last_request_envelope: RequestEnvelope | None = None
 
+    # P3 build clock: when this loop last built a request, so each build
+    # reports the idle gap before it. The class default keeps partially
+    # constructed collaborators (test doubles built with ``__new__``) measuring
+    # a first-call gap instead of failing.
+    _last_request_build_at: float | None = None
+
     def _extra_headers(self, provider: ProviderConfig | None = None) -> dict[str, str]:
         provider = (
             self._config_getter().get_active_provider()
@@ -261,6 +312,7 @@ class CompletionCoordinator:
             messages, model_alias=model.alias, supports_images=model.supports_images
         )
         self._last_request_envelope = envelope
+        max_tokens = self._max_tokens_getter()
         return CompletionInputs(
             model=model,
             provider_name=provider.name,
@@ -270,7 +322,7 @@ class CompletionCoordinator:
             tool_choice=tool_choice,
             extra_headers=self._extra_headers(provider),
             metadata=self._backend_metadata(call_type),
-            max_tokens=self._max_tokens_getter(),
+            max_tokens=max_tokens,
             account_conversation=account_conversation,
             purpose=purpose,
             # S1-A2 carrier population: the live source list rides the
@@ -282,6 +334,47 @@ class CompletionCoordinator:
                 if isinstance(messages, MessageList) and envelope is not None
                 else None
             ),
+            # P3: this build's own measurements ride to the gateway, so every
+            # attempt of the logical call records them on its ledger row.
+            request_shape=self._request_shape(
+                messages=frozen_messages, tools=tools, declared_max_tokens=max_tokens
+            ),
+        )
+
+    def _request_shape(
+        self,
+        *,
+        messages: Sequence[LLMMessage],
+        tools: list[AvailableTool] | None,
+        declared_max_tokens: int | None,
+    ) -> RequestShapeTelemetry:
+        """Measure the request this build serializes (P3 capture).
+
+        Content-free by construction: byte counts of the serialized system
+        prompt and tool definitions, digests over the same shapes, the idle
+        gap since this loop's previous build, the process-wide in-flight
+        request count at build time, and the request's own declared output
+        limit. The first build of a loop has no gap to report.
+        """
+        system_prompt = "".join(
+            message.content or "" for message in messages if message.role == Role.system
+        )
+        tool_definitions = _serialized_tool_definitions(tools)
+        built_at = time.monotonic()
+        previous_build_at = self._last_request_build_at
+        self._last_request_build_at = built_at
+        return RequestShapeTelemetry(
+            system_prompt_bytes=len(system_prompt.encode("utf-8")),
+            tool_def_bytes=len(tool_definitions.encode("utf-8")),
+            prefix_stability_hash=_request_digest(system_prompt + tool_definitions),
+            gap_since_previous_call_ms=(
+                None
+                if previous_build_at is None
+                else max(0, round((built_at - previous_build_at) * 1000))
+            ),
+            concurrency_snapshot=request_concurrency_snapshot(),
+            toolset_prompt_fingerprint=_toolset_prompt_signature(tools, system_prompt),
+            declared_max_tokens=declared_max_tokens,
         )
 
     @property

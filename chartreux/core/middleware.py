@@ -206,8 +206,11 @@ class ContextWarningMiddleware:
         if self.has_warned:
             return MiddlewareResult()
 
-        max_context = context.config.get_active_model().auto_compact_threshold
-        if max_context <= 0:
+        max_context = context.config.get_active_model().context_limit
+        # An undocumented context limit leaves no denominator: the warning
+        # states a percentage of the provider's total context, which the
+        # compaction threshold is not.
+        if max_context is None or max_context <= 0:
             return MiddlewareResult()
 
         if context.stats.context_tokens >= max_context * self.threshold_percent:

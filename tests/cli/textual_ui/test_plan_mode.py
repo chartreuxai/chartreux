@@ -25,6 +25,7 @@ from chartreux.cli.textual_ui.app import ChartreuxApp, StartupOptions
 from chartreux.cli.textual_ui.plan_mode import (
     PLAN_MODE_LABEL,
     PLAN_MODE_TINT_CLASS,
+    ConfirmedPlan,
     ExecutorSelection,
     PlanDocumentBrief,
     PlanModeState,
@@ -32,8 +33,8 @@ from chartreux.cli.textual_ui.plan_mode import (
     PlanWorkspacePaths,
     allocate_workspace,
     clear_ops,
+    digest_bytes,
     entry_ops,
-    executor_seed,
     handoff_failed_before_replacement,
     plan_section,
     planner_seed,
@@ -59,6 +60,7 @@ from chartreux.cli.textual_ui.widgets.session_picker import SessionPickerApp
 from chartreux.config_values import ThinkingLevel
 from chartreux.core.config import SessionLoggingConfig
 from chartreux.core.config.models import PlanSectionConfig
+from chartreux.core.plan_episode import EPISODE_FENCE_FILENAME, STATE_CANCELLED
 from chartreux.core.plan_mode import (
     PLAN_MARKER_FILENAME,
     PlanWorkspaceError,
@@ -103,7 +105,18 @@ def _fields(
                 else PlanSectionConfig().model_dump(mode="json")
             ),
             path="/plan",
-        )
+        ),
+        ConfigFieldWire(
+            name="session_logging",
+            kind=ConfigFieldKind.COMPLEX,
+            description="",
+            value={
+                "enabled": True,
+                "save_dir": "/tmp/chartreux-plan-test-sessions",
+                "session_prefix": "session",
+            },
+            path="/session_logging",
+        ),
     ]
     if active_model is not None:
         value, layer = active_model
@@ -148,8 +161,43 @@ def _marked_workspace(tmp_path: Path) -> PlanWorkspacePaths:
     return workspace
 
 
+_EPISODE_SESSION_ID = "01234567-89ab-cdef-0123-deadbeef1234"
+
+
+def _episode_workspace(
+    tmp_path: Path, *, text: str | None = None
+) -> PlanWorkspacePaths:
+    """An episode-bound workspace: the allocator's exclusive claim, on disk.
+
+    Its sidecar makes the episode observable, so accept binds the claim rather
+    than a legacy path.
+    """
+    allocated = allocate_plan_workspace(
+        _EPISODE_SESSION_ID,
+        project_root=tmp_path,
+        workspaces_root=tmp_path / "workspaces",
+    )
+    workspace = PlanWorkspacePaths(
+        directory=allocated.directory,
+        document_path=allocated.document_path,
+        episode_id=allocated.episode_id,
+        sidecar_path=allocated.sidecar_path,
+    )
+    if text is not None:
+        workspace.document_path.write_text(text, encoding="utf-8")
+    return workspace
+
+
 def _write_plan(workspace: PlanWorkspacePaths, text: str = _PLAN_TEXT) -> None:
     workspace.document_path.write_text(text, encoding="utf-8")
+
+
+def _confirmed(workspace: PlanWorkspacePaths) -> ConfirmedPlan:
+    """The consent result for the document as it stands on disk."""
+    content = workspace.document_path.read_bytes()
+    return ConfirmedPlan(
+        content=content, sha256=digest_bytes(content), summary="Do the thing carefully."
+    )
 
 
 def _state(
@@ -192,7 +240,9 @@ class _Harness:
         self._patchers: list[Any] = []
         self.handoff = AsyncMock(return_value=None)
         self.seed = AsyncMock()
-        self.consent = AsyncMock(return_value=True)
+        self.consent = AsyncMock(
+            return_value=ConfirmedPlan(content=b"", sha256="0" * 64, summary="")
+        )
         self.reload = AsyncMock(return_value=None)
         self._fields = fields
         self._workspace = workspace
@@ -467,10 +517,14 @@ async def test_plan_status_reports_the_mode_theme_and_document(
         assert harness.writes == []
         harness.seed.assert_not_called()
         [posted] = harness.messages(UserCommandMessage)
-        assert posted._content == (
+        lines = posted._content.splitlines()
+        assert lines[0] == (
             "Plan mode is active. "
             f"Plan document: {workspace.document_path}. Theme: Fix the widget."
         )
+        # The episode surface is reported too: a legacy record never arms accept.
+        assert "Plan episode (unidentified): legacy-unverified" in posted._content
+        assert "/plan rebind <path>" in posted._content
 
 
 @pytest.mark.asyncio
@@ -484,7 +538,7 @@ async def test_plan_status_omits_the_theme_clause_when_themeless(
             await app._plan_command("status")
 
         [posted] = harness.messages(UserCommandMessage)
-        assert posted._content == (
+        assert posted._content.splitlines()[0] == (
             f"Plan mode is active. Plan document: {workspace.document_path}."
         )
         assert "Theme:" not in posted._content
@@ -597,8 +651,7 @@ async def test_plan_accept_outside_plan_mode_reports_not_in_plan_mode(
 async def test_plan_accept_requires_a_readable_plan_with_a_summary(
     app: ChartreuxApp, tmp_path: Path
 ) -> None:
-    workspace = _workspace(tmp_path)
-    workspace.document_path.write_text("# Plan\n\nNo summary here.\n", encoding="utf-8")
+    workspace = _episode_workspace(tmp_path, text="# Plan\n\nNo summary here.\n")
     app._plan_mode = _state(workspace)
     async with app.run_test():
         with _Harness(app, fields=_fields(), workspace=workspace) as harness:
@@ -616,12 +669,11 @@ async def test_plan_accept_requires_a_readable_plan_with_a_summary(
 async def test_plan_accept_dismissal_keeps_planning(
     app: ChartreuxApp, tmp_path: Path
 ) -> None:
-    workspace = _workspace(tmp_path)
-    _write_plan(workspace)
+    workspace = _episode_workspace(tmp_path, text=_PLAN_TEXT)
     app._plan_mode = _state(workspace)
     async with app.run_test():
         with _Harness(app, fields=_fields(), workspace=workspace) as harness:
-            harness.consent.return_value = False
+            harness.consent.return_value = None
             await app._plan_accept()
 
         assert app._plan_mode is not None
@@ -632,11 +684,12 @@ async def test_plan_accept_dismissal_keeps_planning(
 
 
 @pytest.mark.asyncio
-async def test_plan_accept_applies_the_displayed_snapshot_and_seeds_the_executor(
+async def test_plan_accept_hands_over_the_confirmed_bytes_without_seeding(
     app: ChartreuxApp, tmp_path: Path
 ) -> None:
-    workspace = _workspace(tmp_path)
-    _write_plan(workspace)
+    # The handoff is the ONE byte authority: the confirmed bytes travel with the
+    # episode identity and the snapshot locator, and the TUI seeds nothing.
+    workspace = _episode_workspace(tmp_path, text=_PLAN_TEXT)
     plan = {
         "planner": {"model": "glm-5-3", "thinking": "high"},
         "executor": {
@@ -646,8 +699,10 @@ async def test_plan_accept_applies_the_displayed_snapshot_and_seeds_the_executor
         },
     }
     app._plan_mode = _state(workspace, pre_entry_planner_thinking="low")
+    confirmed = _confirmed(workspace)
     async with app.run_test():
         with _Harness(app, fields=_fields(plan=plan), workspace=workspace) as harness:
+            harness.consent.return_value = confirmed
             await app._plan_accept()
             harness.handoff.assert_awaited_once_with(
                 executor_model="mistral-large-4",
@@ -656,19 +711,21 @@ async def test_plan_accept_applies_the_displayed_snapshot_and_seeds_the_executor
                 plan_path=str(workspace.document_path),
                 planner_thinking_alias="glm-5-3",
                 planner_thinking_value="low",
+                episode_id=workspace.episode_id,
+                snapshot_path=str(
+                    workspace.directory / f"accepted-{workspace.episode_id}.md"
+                ),
+                snapshot_sha256=confirmed.sha256,
+                snapshot_bytes=confirmed.content,
             )
             consent_call = harness.consent.await_args
             assert consent_call is not None
-            snapshot = consent_call.args[1]
-            assert snapshot == ExecutorSelection(
+            assert consent_call.args[1] == confirmed.content
+            assert consent_call.args[2] == ExecutorSelection(
                 model="mistral-large-4", thinking="medium", identity="orchestrator"
             )
-            harness.seed.assert_awaited_once()
-            seed_call = harness.seed.await_args
-            assert seed_call is not None
-            seed = seed_call.args[0]
-            assert "Do the thing carefully." in seed
-            assert str(workspace.document_path) in seed
+            assert consent_call.args[4].episode_id == workspace.episode_id
+            harness.seed.assert_not_called()
             assert app._plan_mode is None
 
 
@@ -676,34 +733,28 @@ async def test_plan_accept_applies_the_displayed_snapshot_and_seeds_the_executor
 async def test_plan_accept_shows_the_theme_without_exporting_the_discussion(
     app: ChartreuxApp, tmp_path: Path
 ) -> None:
-    # The theme row is display-only: the executor seed is the plan summary and
-    # the document path, byte for byte, with no discussion-context export.
-    workspace = _workspace(tmp_path)
-    _write_plan(workspace)
+    # The theme row is display-only: the consent sees the document's own bytes,
+    # with no discussion-context export riding along.
+    workspace = _episode_workspace(tmp_path, text=_PLAN_TEXT)
     app._plan_mode = _state(workspace, theme="Fix the widget")
+    confirmed = _confirmed(workspace)
     async with app.run_test():
         with _Harness(app, fields=_fields(), workspace=workspace) as harness:
+            harness.consent.return_value = confirmed
             await app._plan_accept()
             consent_call = harness.consent.await_args
             assert consent_call is not None
-            assert consent_call.args[2] == "Fix the widget"
-            seed_call = harness.seed.await_args
-            assert seed_call is not None
-            seed = seed_call.args[0]
-            assert seed == (
-                f"Execute the plan at {workspace.document_path}.\n\n"
-                "Planner summary:\nDo the thing carefully.\n\n"
-                "Read the plan document at that path before executing."
-            )
-            assert "Fix the widget" not in seed
+            assert consent_call.args[3].theme == "Fix the widget"
+            assert consent_call.args[1] == _PLAN_TEXT.encode("utf-8")
+            assert b"Fix the widget" not in consent_call.args[1]
+            harness.seed.assert_not_called()
 
 
 @pytest.mark.asyncio
 async def test_plan_accept_admission_conflict_keeps_planning(
     app: ChartreuxApp, tmp_path: Path
 ) -> None:
-    workspace = _workspace(tmp_path)
-    _write_plan(workspace)
+    workspace = _episode_workspace(tmp_path, text=_PLAN_TEXT)
     app._plan_mode = _state(workspace)
     conflict = AppServerResponseError(
         ProtocolError(
@@ -727,8 +778,7 @@ async def test_plan_accept_admission_conflict_keeps_planning(
 async def test_plan_accept_post_bind_failure_names_the_plan_path(
     app: ChartreuxApp, tmp_path: Path
 ) -> None:
-    workspace = _workspace(tmp_path)
-    _write_plan(workspace)
+    workspace = _episode_workspace(tmp_path, text=_PLAN_TEXT)
     app._plan_mode = _state(workspace)
     failure = AppServerResponseError(
         ProtocolError(
@@ -754,8 +804,7 @@ async def test_plan_accept_clears_the_tint_and_the_label(
 ) -> None:
     # The handoff ends the mode, so the standing indicator ends with it: the
     # replaced session must not keep the amber border /plan entry applied.
-    workspace = _workspace(tmp_path)
-    _write_plan(workspace)
+    workspace = _episode_workspace(tmp_path, text=_PLAN_TEXT)
     app._plan_mode = _state(workspace)
     async with app.run_test() as pilot:
         app._set_plan_tint(True)
@@ -855,7 +904,7 @@ async def test_plan_cancel_removes_the_marker_only_workspace(
 
 
 @pytest.mark.asyncio
-async def test_plan_cancel_removes_the_workspace_the_allocator_created(
+async def test_plan_cancel_removes_the_allocated_workspaces_plan_owned_entries(
     app: ChartreuxApp, tmp_path: Path
 ) -> None:
     allocated = allocate_plan_workspace(
@@ -872,7 +921,13 @@ async def test_plan_cancel_removes_the_workspace_the_allocator_created(
         with _Harness(app, fields=_fields(), workspace=workspace):
             await app._plan_command("cancel")
 
-        assert not allocated.directory.exists()
+        # The declared accumulation rule: the marker and the sidecar go, while
+        # the never-unlinked transition fence keeps an ever-allocated episode
+        # directory rmdir-ineligible.
+        assert allocated.directory.is_dir()
+        assert [entry.name for entry in allocated.directory.iterdir()] == [
+            EPISODE_FENCE_FILENAME
+        ]
 
 
 @pytest.mark.asyncio
@@ -1100,7 +1155,13 @@ def test_plan_section_falls_back_to_the_shipped_defaults() -> None:
 def test_allocate_workspace_maps_the_core_workspace(tmp_path: Path) -> None:
     directory = tmp_path / "plan-session"
     document = directory / "plan.md"
-    core_workspace = SimpleNamespace(directory=directory, document_path=document)
+    sidecar = directory / "episode.json"
+    core_workspace = SimpleNamespace(
+        directory=directory,
+        document_path=document,
+        episode_id="ep-1",
+        sidecar_path=sidecar,
+    )
     with patch(
         "chartreux.core.plan_mode.allocate_plan_workspace",
         MagicMock(return_value=core_workspace),
@@ -1108,7 +1169,12 @@ def test_allocate_workspace_maps_the_core_workspace(tmp_path: Path) -> None:
         paths, error = allocate_workspace("sess-1", project_root=tmp_path)
 
     assert error is None
-    assert paths == PlanWorkspacePaths(directory=directory, document_path=document)
+    assert paths == PlanWorkspacePaths(
+        directory=directory,
+        document_path=document,
+        episode_id="ep-1",
+        sidecar_path=sidecar,
+    )
     allocate.assert_called_once_with("sess-1", project_root=tmp_path)
 
 
@@ -1147,15 +1213,6 @@ def test_seed_builders_carry_the_path_and_summary(tmp_path: Path) -> None:
     planner = planner_seed(workspace)
     assert "Plan mode is active" in planner
     assert str(workspace.document_path) in planner
-    executor = executor_seed(
-        PlanDocumentBrief(
-            path=workspace.document_path,
-            content=_PLAN_TEXT,
-            summary="Do the thing carefully.",
-        )
-    )
-    assert "Do the thing carefully." in executor
-    assert str(workspace.document_path) in executor
 
 
 # --- Consent modal -----------------------------------------------------------
@@ -1310,35 +1367,34 @@ async def _planning_session(
     *,
     theme: str | None = "Fix the widget",
     pre_entry_active_model: str | None = "mistral-large-4",
-    allocated_workspace: bool = False,
 ) -> tuple[str, SessionLoggingConfig, Path]:
-    """A persisted session whose record marks it as planning.
+    """A persisted session whose record marks it as a DRAFT plan episode.
 
-    ``allocated_workspace`` allocates the directory through the real allocator,
-    so it carries the ownership marker and no plan document.
+    The directory is allocated through the real allocator, so it carries the
+    ownership marker, an episode claim, and no plan document: a resume observes
+    a draft episode and continues planning.
     """
     logging = SessionLoggingConfig(enabled=True, save_dir=str(tmp_path / "sessions"))
     loop = build_test_agent_loop(
         config=build_test_vibe_config(session_logging=logging), cwd=tmp_path
     )
     await loop.persist_empty_session()
-    if allocated_workspace:
-        plan_directory = allocate_plan_workspace(
-            loop.session_id,
-            project_root=tmp_path,
-            workspaces_root=tmp_path / "workspaces",
-        ).directory
-    else:
-        plan_directory = tmp_path / "tasks" / "plan-initial"
-        plan_directory.mkdir(parents=True)
+    workspace = allocate_plan_workspace(
+        loop.session_id, project_root=tmp_path, workspaces_root=tmp_path / "workspaces"
+    )
+    plan_directory = workspace.directory
     await loop.session_logger.persist_plan_mode(
         PlanModeRecord(
-            plan_path=str(plan_directory / "plan.md"),
+            plan_path=str(workspace.document_path),
             theme=theme,
             planner_model="glm-5-3",
             planner_thinking="high",
             pre_entry_active_model=pre_entry_active_model,
             pre_entry_planner_thinking="low",
+            episode_id=workspace.episode_id,
+            sidecar_path=str(workspace.sidecar_path),
+            draft_path=str(workspace.document_path),
+            state="draft",
         )
     )
     session_id = loop.session_id
@@ -1362,6 +1418,17 @@ def _notices(loop: Any) -> list[str]:
         for message in loop.messages
         if message.content and "Plan mode resumed" in message.content
     ]
+
+
+def _resume_notice(
+    plan_directory: Path, episode_id: str | None, theme: str | None
+) -> str:
+    notice = f"Plan mode resumed. Plan document: {plan_directory / 'plan.md'}."
+    if theme:
+        notice = f"{notice} Theme: {theme}."
+    if episode_id:
+        notice = f"{notice} Episode: {episode_id}."
+    return notice
 
 
 def _tint_classes(app: ChartreuxApp) -> set[str]:
@@ -1424,7 +1491,7 @@ async def test_plan_entry_reports_a_record_write_failure(tmp_path: Path) -> None
 
 
 @pytest.mark.asyncio
-async def test_resumed_cancel_removes_the_record_and_restores_the_pins(
+async def test_resumed_cancel_marks_the_record_cancelled_and_restores_the_pins(
     tmp_path: Path,
 ) -> None:
     session_id, logging, plan_directory = await _planning_session(tmp_path)
@@ -1444,21 +1511,23 @@ async def test_resumed_cancel_removes_the_record_and_restores_the_pins(
         ]
 
     assert app._plan_mode is None
-    assert _persisted_record(loop) is None
+    # The episode is cancelled TERMINALLY; the record keeps that as history.
+    record = _persisted_record(loop)
+    assert record is not None
+    assert record.state == STATE_CANCELLED
     # This test built the directory itself, so it carries no ownership marker:
     # an unmarked directory is foreign and stays.
     assert plan_directory.is_dir()
 
 
 @pytest.mark.asyncio
-async def test_resumed_cancel_removes_the_record_the_allocated_workspace_and_the_pins(
+async def test_resumed_cancel_marks_the_record_and_cleans_the_workspace_entries(
     tmp_path: Path,
 ) -> None:
-    # The full restart -> resume -> cancel composite: the record and the empty
-    # allocated workspace go, and the pre-entry pins come back.
-    session_id, logging, plan_directory = await _planning_session(
-        tmp_path, allocated_workspace=True
-    )
+    # The full restart -> resume -> cancel composite: the record's terminal
+    # state, the allocated workspace's plan-owned entries, and the pre-entry
+    # pins all settle.
+    session_id, logging, plan_directory = await _planning_session(tmp_path)
     assert (plan_directory / PLAN_MARKER_FILENAME).is_file()
     assert not (plan_directory / "plan.md").exists()
     app, loop = _resumed_app(logging, tmp_path)
@@ -1478,8 +1547,14 @@ async def test_resumed_cancel_removes_the_record_the_allocated_workspace_and_the
         ]
 
     assert app._plan_mode is None
-    assert _persisted_record(loop) is None
-    assert not plan_directory.exists()
+    record = _persisted_record(loop)
+    assert record is not None
+    assert record.state == STATE_CANCELLED
+    # The retained transition fence keeps the episode directory (the declared
+    # accumulation rule); everything else plan-owned is gone.
+    assert [entry.name for entry in plan_directory.iterdir()] == [
+        EPISODE_FENCE_FILENAME
+    ]
 
 
 @pytest.mark.asyncio
@@ -1533,8 +1608,7 @@ async def test_continue_resume_restores_plan_mode_before_the_startup_prompt(
         assert state.pre_entry_planner_thinking == "low"
         assert PLAN_MODE_TINT_CLASS in _tint_classes(app)
         assert _notices(loop) == [
-            f"Plan mode resumed. Plan document: {plan_directory / 'plan.md'}. "
-            "Theme: Fix the widget."
+            _resume_notice(plan_directory, state.workspace.episode_id, "Fix the widget")
         ]
         # The notice is server-side history, not only a UI mount.
         assert [
@@ -1582,8 +1656,7 @@ async def test_picker_resume_restores_plan_mode_before_the_startup_prompt(
     assert state.plan_path == str(plan_directory / "plan.md")
     assert PLAN_MODE_TINT_CLASS in _tint_classes(app)
     assert _notices(loop) == [
-        f"Plan mode resumed. Plan document: {plan_directory / 'plan.md'}. "
-        "Theme: Fix the widget."
+        _resume_notice(plan_directory, state.workspace.episode_id, "Fix the widget")
     ]
 
 
@@ -1600,7 +1673,7 @@ async def test_resumed_themeless_plan_mode_posts_the_notice_without_a_theme(
     assert state is not None
     assert state.theme is None
     assert _notices(loop) == [
-        f"Plan mode resumed. Plan document: {plan_directory / 'plan.md'}."
+        _resume_notice(plan_directory, state.workspace.episode_id, None)
     ]
 
 

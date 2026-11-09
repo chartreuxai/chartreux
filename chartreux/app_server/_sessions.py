@@ -270,6 +270,31 @@ class SessionRuntime:
         self._closed = True
 
 
+@dataclass(frozen=True, slots=True)
+class QuiescenceSnapshot:
+    """One consistent read of the three quiescence conditions (design P2a).
+
+    Read only under the terminal-state registry acquisition (see
+    ``SessionRuntimeRegistry.acquire_run_state``): the three conditions are
+    always one snapshot, never a mix across a run-state transition.
+    """
+
+    # (i) owned runs the registry has not published terminal yet.
+    active_dependency_runs: tuple[tuple[str, str], ...]
+    # (ii) completion notifications queued but not delivered yet.
+    pending_notifications: tuple[tuple[str, str], ...]
+    # (iii) stored results neither notified nor fetched yet.
+    unnotified_unfetched_results: tuple[tuple[str, str], ...]
+
+    @property
+    def quiescent(self) -> bool:
+        return (
+            not self.active_dependency_runs
+            and not self.pending_notifications
+            and not self.unnotified_unfetched_results
+        )
+
+
 class SessionRuntimeRegistry(SubagentRunnerPort):  # noqa: PLR0904
     def __init__(  # noqa: PLR0915
         self,
@@ -318,6 +343,9 @@ class SessionRuntimeRegistry(SubagentRunnerPort):  # noqa: PLR0904
         self._wait_leases: dict[tuple[str, str], int] = {}
         self._pending_notifications: set[tuple[str, str]] = set()
         self._result_write_tokens: dict[tuple[str, str], object] = {}
+        # P2d: declared eagerly so the registry satisfies ResultsStateView;
+        # RunResults still lazily installs it on a bare (object.__new__) registry.
+        self._delivery_markings: dict[tuple[str, str], dict[str, float]] = {}
         # WP5: per-work-package replacement counter (keyed by work_package_id)
         # against recovery.fallback_replacements_max_per_package; the budget
         # spans replacements — a package's replacements are counted, never
@@ -331,6 +359,11 @@ class SessionRuntimeRegistry(SubagentRunnerPort):  # noqa: PLR0904
         self._monitor_tasks: set[asyncio.Task[None]] = set()
         self._eviction_tasks: set[asyncio.Task[bool]] = set()
         self._registry_lock = asyncio.Lock()
+        # P2a: the terminal-state registry acquisition — the serialization
+        # point. Every run-state writer in _subagent_execution.py and the
+        # final quiescence check + termination declaration acquire it through
+        # acquire_run_state(), mutually exclusive with each other.
+        self._run_state_lock = asyncio.Lock()
         # B2/U1: the agents/update emission state. The guard admits a single
         # in-flight delivery; the dirty flag makes the in-flight (or next)
         # delivery re-project the inventory; the queue carries eviction
@@ -362,6 +395,11 @@ class SessionRuntimeRegistry(SubagentRunnerPort):  # noqa: PLR0904
         # reaper): drain must still emit its final empty inventory so the
         # disappearance is never lost.
         self._drain_suppressed_inventory = False
+        # P2a: termination is declared only by the final quiescence check
+        # while HOLDING the registry acquisition (see
+        # check_quiescence_and_declare_termination); a transition-triggered
+        # re-check alone never declares.
+        self._termination_declared = False
         self._suppressed_notifications: set[str] = set()
         self._suppression_owners: dict[str, int] = {}
         self._admission_closed = False
@@ -403,6 +441,87 @@ class SessionRuntimeRegistry(SubagentRunnerPort):  # noqa: PLR0904
             self._recovery_controller = controller
             return controller
         raise AttributeError(f"SessionRuntimeRegistry has no attribute {name!r}")
+
+    @asynccontextmanager
+    async def acquire_run_state(self) -> AsyncIterator[None]:
+        """The terminal-state registry acquisition — the P2 serialization point.
+
+        Every run-state writer (the admission RUNNING write and every
+        terminal transition in ``_subagent_execution.py``) and the final
+        quiescence check + termination declaration hold this acquisition, so
+        a run transitioning terminal either completes before the quiescence
+        read or waits for it. The quiescence machinery additionally holds
+        ``_registry_lock`` so its snapshot is consistent with all registry
+        state; the writers take only this acquisition — short and synchronous
+        — so they never nest inside a ``_registry_lock`` region.
+        """
+        async with self._run_state_lock:
+            yield
+
+    @property
+    def termination_declared(self) -> bool:
+        """Whether a final quiescence check declared termination (P2a)."""
+        return self._termination_declared
+
+    def _quiescence_snapshot_locked(self) -> QuiescenceSnapshot:
+        """Read the three quiescence conditions as ONE snapshot (locked).
+
+        The caller must hold ``_registry_lock`` and the run-state
+        acquisition (acquire_run_state). (i) Active dependency runs: an
+        admitted run the registry has not published terminal yet —
+        ``current_run`` is installed at admission and cleared only inside
+        the publication's locked block, so admission and terminal retirement
+        are both serialized against this read. (ii) Pending notifications.
+        (iii) Stored results neither notified (no pending notification) nor
+        fetched (no collection marker).
+        """
+        active = tuple(
+            sorted(
+                (record.agent_id, record.current_run.run_id)
+                for record in self._agent_records.values()
+                if record.current_run is not None
+            )
+        )
+        pending = tuple(sorted(self._pending_notifications))
+        stranded = tuple(
+            sorted(
+                key
+                for key in self._result_store
+                if key not in self._pending_notifications
+                and key not in self._collected_results
+            )
+        )
+        return QuiescenceSnapshot(
+            active_dependency_runs=active,
+            pending_notifications=pending,
+            unnotified_unfetched_results=stranded,
+        )
+
+    async def quiescence_snapshot(self) -> QuiescenceSnapshot:
+        """Read the three quiescence conditions as one consistent snapshot.
+
+        Holds ``_registry_lock`` (consistent with all registry state) and the
+        run-state acquisition (mutually exclusive with every run-state
+        writer) across the read.
+        """
+        async with self._registry_lock, self.acquire_run_state():
+            return self._quiescence_snapshot_locked()
+
+    async def check_quiescence_and_declare_termination(self) -> QuiescenceSnapshot:
+        """Final quiescence check + termination declaration under held acquisitions.
+
+        The check and the declaration execute while HOLDING the terminal-state
+        registry acquisition (acquire_run_state) together with
+        ``_registry_lock``, mutually exclusive with every run-state writer:
+        the snapshot is read and, when quiescent, termination is declared
+        inside the same held acquisitions. A transition-triggered re-check
+        alone (``quiescence_snapshot``) never declares termination.
+        """
+        async with self._registry_lock, self.acquire_run_state():
+            snapshot = self._quiescence_snapshot_locked()
+            if snapshot.quiescent:
+                self._termination_declared = True
+            return snapshot
 
     def _policy_runtimes(self, root: SessionRuntime) -> tuple[SessionRuntime, ...]:
         """Include detached runtimes until their outstanding turns have settled."""

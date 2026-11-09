@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Awaitable, Callable, Coroutine, Mapping, Sequence
-from contextlib import suppress
+from contextlib import AbstractAsyncContextManager, suppress
 from dataclasses import dataclass
 import json
 from pathlib import Path
@@ -99,6 +99,60 @@ if TYPE_CHECKING:
 
 _BACKGROUND_PROGRESS_LIMIT = 32
 _MAX_RUN_HISTORY = 32
+
+# P2b: the reconciliation sweep — the guaranteed notification backstop. The
+# five sweep triggers (design P2a): at continuation start, at drain
+# completion, on every run-state terminal transition, on a bounded periodic
+# timer while the continuation is active, and at the wall-clock cap
+# boundary.
+SWEEP_TRIGGER_CONTINUATION_START = "continuation-start"
+SWEEP_TRIGGER_DRAIN_COMPLETE = "drain-complete"
+SWEEP_TRIGGER_TERMINAL_TRANSITION = "terminal-transition"
+SWEEP_TRIGGER_TIMER = "timer"
+SWEEP_TRIGGER_CAP_BOUNDARY = "cap-boundary"
+SWEEP_TRIGGERS = frozenset({
+    SWEEP_TRIGGER_CONTINUATION_START,
+    SWEEP_TRIGGER_DRAIN_COMPLETE,
+    SWEEP_TRIGGER_TERMINAL_TRANSITION,
+    SWEEP_TRIGGER_TIMER,
+    SWEEP_TRIGGER_CAP_BOUNDARY,
+})
+# The bounded periodic interval: a dropped/suppressed notification is
+# surfaced within one interval while the continuation is active.
+_SWEEP_INTERVAL_SECONDS = 0.25
+# Hard backstop so the timer task can never outlive its bounds.
+_SWEEP_TIMER_MAX_TICKS = 100_000
+_BUDGET_STOP_REASONS = frozenset({
+    RunStopReason.BUDGET_EXCEEDED,
+    RunStopReason.BUDGET_UNVERIFIABLE,
+})
+
+
+def _completion_status_word(
+    status: RunStatus, stop_reason: RunStopReason | None
+) -> str:
+    """The completion-notification status word.
+
+    Mirrors the delivered-notification builder's wording exactly (sweep
+    notifications are channel-equivalent and naming-unified with delivered
+    ones); kept as a separate function because the delivered builder's site
+    is pinned untouched.
+    """
+    return (
+        "budget-stopped (budget exceeded)"
+        if stop_reason is RunStopReason.BUDGET_EXCEEDED
+        else "budget-stopped (budget unverifiable)"
+        if stop_reason is RunStopReason.BUDGET_UNVERIFIABLE
+        else "completed"
+        if status is RunStatus.COMPLETED
+        else "failed"
+        if status is RunStatus.FAILED
+        else "cancelled (by user)"
+        if stop_reason is RunStopReason.USER_CANCELLED
+        else "retasked"
+        if stop_reason is RunStopReason.RETASKED
+        else "cancelled"
+    )
 
 
 def cancellation_finalization(
@@ -571,13 +625,21 @@ class ExecutionStateView(Protocol):
     _children: dict[str, SessionRuntime]
     _latest_run_ids: dict[str, str]
     _registry_lock: asyncio.Lock
+    _run_state_lock: asyncio.Lock
     _result_store: dict[tuple[str, str], StoredRunResult]
     _pending_notifications: set[tuple[str, str]]
+    # P2b: read by the sweep to exclude fetched results from the gap scan; the
+    # sweep never writes it (delivery markings are result-body fetches only).
+    _collected_results: set[tuple[str, str]]
     _monitor_tasks: set[asyncio.Task[None]]
     _draining_children: bool
     _suppressed_notifications: set[str]
     _retention_policy: RetentionPolicy
     _clock: Callable[[], float]
+
+    # P2a: the terminal-state registry acquisition — the serialization point
+    # every run-state writer below acquires around its write.
+    def acquire_run_state(self) -> AbstractAsyncContextManager[None]: ...
 
     # C4: the launch-admission collaborator owns the override mint.
     _launch_admission: ChildLaunchAdmission
@@ -843,10 +905,26 @@ class SubagentExecution:
     path is not driven through spec'd mock registries, so its moved regions
     read registry state through the view — instance patches and the manual
     clock still shadow.
+    P2b carve-out: the reconciliation sweep (sweep_unnotified and its bounded
+    periodic timer task) is the sanctioned exception — its bookkeeping lives
+    on this instance, every registry read goes through the view, and it
+    writes no delivery marking (result-body fetches own those).
     """
 
     def __init__(self, view: ExecutionStateView) -> None:
         self._view = view
+        # P2b sweep state. `_sweep_surfaced` records the keys the sweep has
+        # already synthesized a notification for; `_delivered_notification_keys`
+        # records the keys the DELIVERED path surfaced — together they make
+        # the surfaced-notification channel exactly-once per completion event.
+        # Neither is a delivery marking: `_collected_results` (fetch markings)
+        # and `_pending_notifications` are only ever read by the sweep.
+        self._sweep_interval = _SWEEP_INTERVAL_SECONDS
+        self._sweep_surfaced: set[tuple[str, str]] = set()
+        self._delivered_notification_keys: set[tuple[str, str]] = set()
+        self._sweep_triggers_seen: set[str] = set()
+        self._sweep_task: asyncio.Task[None] | None = None
+        self._sweep_parent: SessionRuntime | None = None
 
     @staticmethod
     async def teardown_foreground(context: ForegroundExecutionContext) -> None:
@@ -1245,29 +1323,34 @@ class SubagentExecution:
                 run_budget.run_max_price, run_budget.run_max_session_tokens
             ),
         )
-        run_record = RunRecord(
-            run_id=run_id,
-            agent_id=agent_id,
-            identity=record.identity,
-            identity_revision=record.identity_revision,
-            status=RunStatus.RUNNING,
-            completion_task=completion_placeholder,
-            task_summary=normalize_task_summary(
-                args.task_summary, fallback=effective_task
-            ),
-            # P1-c2: the run's claimed difficulty category — non-None only on
-            # a demanding-route launch, surfaced on the acknowledgment.
-            difficulty=(
-                args.config.difficulty.value
-                if args.config is not None and args.config.difficulty is not None
-                else None
-            ),
-            completion_contract=completion_contract,
-            admission_head=admission_head,
-        )
-        record.current_run = run_record
-        record.latest_run_id = run_id
-        self._view._latest_run_ids[agent_id] = run_id
+        # P2a: the admission's run-state write — the RUNNING anchor and the
+        # current/latest-run bindings — executes under the terminal-state
+        # registry acquisition, the serialization point shared with every
+        # other run-state writer and the final quiescence check.
+        async with self._view.acquire_run_state():
+            run_record = RunRecord(
+                run_id=run_id,
+                agent_id=agent_id,
+                identity=record.identity,
+                identity_revision=record.identity_revision,
+                status=RunStatus.RUNNING,
+                completion_task=completion_placeholder,
+                task_summary=normalize_task_summary(
+                    args.task_summary, fallback=effective_task
+                ),
+                # P1-c2: the run's claimed difficulty category — non-None only on
+                # a demanding-route launch, surfaced on the acknowledgment.
+                difficulty=(
+                    args.config.difficulty.value
+                    if args.config is not None and args.config.difficulty is not None
+                    else None
+                ),
+                completion_contract=completion_contract,
+                admission_head=admission_head,
+            )
+            record.current_run = run_record
+            record.latest_run_id = run_id
+            self._view._latest_run_ids[agent_id] = run_id
         # The run's attribution join key: the child loop stamps every ledger
         # record made during this run with the run id (cleared at run end).
         runtime.agent_loop.run_identity = run_id
@@ -1575,9 +1658,15 @@ class SubagentExecution:
                 for message in context.runtime.agent_loop.messages
             )
             turns_used = end_count - context.run_record.start_count
-            context.run_record.status, context.run_record.stop_reason = (
-                self._view._resolve_run_outcome(context.run_record, turn)
-            )
+            # P2a: the terminal resolution write holds the registry
+            # acquisition; _resolve_run_outcome stays the ONLY terminal
+            # resolver.
+            async with self._view.acquire_run_state():
+                context.run_record.status, context.run_record.stop_reason = (
+                    self._view._resolve_run_outcome(context.run_record, turn)
+                )
+            # P2b: the sweep runs on every run-state terminal transition.
+            await self.sweep_unnotified(parent, SWEEP_TRIGGER_TERMINAL_TRANSITION)
             # P6b case (a): a run cancelled before the audit starts takes
             # the cancellation disposition — the reason is recorded, the
             # stub finalization is cached, and no check spawns.
@@ -1637,22 +1726,28 @@ class SubagentExecution:
             # agree.
             envelope = rejection_envelope(context, result)
             if envelope is not None:
-                context.run_record.status = RunStatus.FAILED
-                context.run_record.stop_reason = RunStopReason.ERROR
-                context.run_record.failure = envelope
+                async with self._view.acquire_run_state():
+                    context.run_record.status = RunStatus.FAILED
+                    context.run_record.stop_reason = RunStopReason.ERROR
+                    context.run_record.failure = envelope
                 failure_envelope = envelope
+                # P2b: terminal transition (publication rejection).
+                await self.sweep_unnotified(parent, SWEEP_TRIGGER_TERMINAL_TRANSITION)
             context.run_record.result = result.model_copy(
                 update=self._result_update(
                     context, failure_envelope, context.run_record.status
                 )
             )
         except asyncio.CancelledError:
-            context.run_record.status, context.run_record.stop_reason = (
-                self._view._resolve_run_outcome(
-                    context.run_record,
-                    context.runtime.turns.operation_terminal_turn(turn_id),
+            async with self._view.acquire_run_state():
+                context.run_record.status, context.run_record.stop_reason = (
+                    self._view._resolve_run_outcome(
+                        context.run_record,
+                        context.runtime.turns.operation_terminal_turn(turn_id),
+                    )
                 )
-            )
+            # P2b: terminal transition (cancellation resolution).
+            await self.sweep_unnotified(parent, SWEEP_TRIGGER_TERMINAL_TRANSITION)
             # P6b: the cancelled run takes the cancellation disposition even
             # when the monitor never reached the normal path — the reason is
             # recorded (no worker credit), the stub finalization is cached,
@@ -1703,8 +1798,11 @@ class SubagentExecution:
                 run_id=context.run_id,
             )
             record_observation(monitor_observation)
-            context.run_record.status = RunStatus.FAILED
-            context.run_record.stop_reason = RunStopReason.ERROR
+            async with self._view.acquire_run_state():
+                context.run_record.status = RunStatus.FAILED
+                context.run_record.stop_reason = RunStopReason.ERROR
+            # P2b: terminal transition (monitor failure).
+            await self.sweep_unnotified(parent, SWEEP_TRIGGER_TERMINAL_TRANSITION)
             # Measure turns from observed work (assistant messages), never
             # from a synthetic zero: a monitor failure after real work must
             # not erase the run's progress (WP0 F5 zero-turn fix).
@@ -1920,6 +2018,12 @@ class SubagentExecution:
                     parent.agent_loop._pending_injected_messages.append(
                         LLMMessage(role=Role.user, content=notification, injected=True)
                     )
+                # P2b: record the DELIVERED notification so the sweep never
+                # re-surfaces the same completion event — one channel, no
+                # double-messaging. (Outside the pinned gate/builder/wake
+                # ranges; if the wake above raised, this line is skipped and
+                # the sweep re-surfaces the gap.)
+                self._delivered_notification_keys.add(key)
             except Exception as exc:
                 logger.warning(
                     "Failed to finalize background agent notification", exc_info=exc
@@ -1973,6 +2077,202 @@ class SubagentExecution:
                             "Failed to publish agent completion transition",
                             exc_info=exc,
                         )
+            # P2b: the sweep at drain completion — this run's notification
+            # drain has finished, so any gap it left (a dropped or suppressed
+            # notification) is surfaced here.
+            await self.sweep_unnotified(parent, SWEEP_TRIGGER_DRAIN_COMPLETE)
+            # P2b: the cap boundary — the run's budget cap (a never-
+            # completing child's budget stop) or the session drain boundary.
+            if (
+                context.run_record.stop_reason in _BUDGET_STOP_REASONS
+                or self._view._draining_children
+            ):
+                await self.sweep_unnotified(parent, SWEEP_TRIGGER_CAP_BOUNDARY)
+
+    # ------------------------------------------------------------------
+    # P2b: the reconciliation sweep (the guaranteed notification backstop).
+    # ------------------------------------------------------------------
+
+    def _find_run_record(self, agent_id: str, run_id: str) -> RunRecord | None:
+        """Locate a terminal run record for the notification payload (view read)."""
+        record = self._view._agent_records.get(agent_id)
+        if record is None:
+            return None
+        if record.current_run is not None and record.current_run.run_id == run_id:
+            return record.current_run
+        for run in record.run_history:
+            if run.run_id == run_id:
+                return run
+        return None
+
+    def _continuation_active_locked(self) -> bool:
+        """Whether the continuation is active (caller holds the registry lock).
+
+        Mirrors the three quiescence conditions: an active dependency run, a
+        pending notification, or a stored result neither notified nor fetched.
+        """
+        if any(
+            record.current_run is not None
+            for record in self._view._agent_records.values()
+        ):
+            return True
+        if self._view._pending_notifications:
+            return True
+        return any(
+            key not in self._view._pending_notifications
+            and key not in self._view._collected_results
+            for key in self._view._result_store
+        )
+
+    def _ensure_sweep_timer(self, parent: SessionRuntime) -> None:
+        """Arm the bounded periodic timer while the continuation is active."""
+        self._sweep_parent = parent
+        if self._sweep_task is not None and not self._sweep_task.done():
+            return
+        self._sweep_task = asyncio.create_task(
+            self._sweep_timer_loop(), name="vibe-subagent-sweep"
+        )
+
+    async def _sweep_timer_loop(self) -> None:
+        """The bounded periodic timer: one bounded interval per tick (P2b)."""
+        parent = self._sweep_parent
+        try:
+            ticks = 0
+            while ticks < _SWEEP_TIMER_MAX_TICKS:
+                await asyncio.sleep(self._sweep_interval)
+                ticks += 1
+                if parent is None or parent._closed or self._view._draining_children:
+                    break
+                async with self._view._registry_lock:
+                    active = self._continuation_active_locked()
+                if not active:
+                    break
+                await self.sweep_unnotified(parent, SWEEP_TRIGGER_TIMER)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning("P2b sweep timer failed", exc_info=exc)
+
+    def _synthesize_notification(
+        self, key: tuple[str, str], record: AgentRecord, run: RunRecord | None
+    ) -> str:
+        """Build the channel-equivalent notification text for one gap.
+
+        Same shape and naming as the delivered completion notification
+        (the delivered builder's site is pinned untouched, so the wording is
+        mirrored here via _completion_status_word).
+        """
+        stored = self._view._result_store[key]
+        if run is not None:
+            status, stop_reason = run.status, run.stop_reason
+        else:
+            status = stored.result.run_status or RunStatus.COMPLETED
+            stop_reason = stored.result.stop_reason
+        status_word = _completion_status_word(status, stop_reason)
+        return (
+            f"Background agent {self._view._record_name(record)} "
+            f"({key[0]}, run {key[1]})"
+            f" {status_word}."
+            " Use get_agent_result to retrieve the result."
+        )
+
+    def _deliver_synthesized(
+        self, parent: SessionRuntime, run: RunRecord | None, text: str
+    ) -> None:
+        """Drive the parent's next turn exactly like the delivered wake path.
+
+        Channel-equivalent: start a fresh turn when the parent is idle, else
+        queue the notification as a pending injected message. At the session
+        boundary (draining or closed parent) there is no next turn to drive,
+        so nothing is injected.
+        """
+        if self._view._draining_children or parent._closed:
+            return
+        allow_start = run is None or run.stop_reason is not RunStopReason.USER_CANCELLED
+        if (
+            allow_start
+            and parent.turns.active_turn is None
+            and parent.turns._active_task is None
+            and not parent.turns.queue_state.items
+        ):
+            try:
+                _response, _start = parent.turns.start(
+                    TurnStartParams(
+                        session_id=parent.agent_loop.session_id,
+                        message=[TextContentBlock(text=text)],
+                    )
+                )
+                _start()
+                return
+            except Exception:
+                pass
+        parent.agent_loop._pending_injected_messages.append(
+            LLMMessage(role=Role.user, content=text, injected=True)
+        )
+
+    async def sweep_unnotified(
+        self, parent: SessionRuntime, trigger: str
+    ) -> tuple[tuple[str, str], ...]:
+        """The P2b reconciliation sweep — unconditional and mechanical.
+
+        Scans for completed-but-unnotified runs (stored in the result store,
+        not pending a delivered notification, not collected, not already
+        surfaced by either notification channel) and synthesizes a
+        notification channel-equivalent to a delivered completion
+        notification for each, driving the parent's next turn. The scan runs
+        under the registry lock AND the terminal-state registry acquisition
+        (acquire_run_state) — the same acquisitions the final quiescence
+        check holds — so a run transitioning terminal either completes
+        before the sweep reads or waits for it. The sweep writes NO delivery
+        marking: `_collected_results` and `_pending_notifications` are only
+        read, never written.
+        """
+        self._sweep_triggers_seen.add(trigger)
+        self._ensure_sweep_timer(parent)
+        payloads: list[tuple[tuple[str, str], AgentRecord, RunRecord | None, str]] = []
+        async with self._view._registry_lock, self._view.acquire_run_state():
+            store = self._view._result_store
+            # Bookkeeping dies with the result state it annotates (eviction
+            # removes the key from the store; the drain clears it).
+            self._sweep_surfaced.intersection_update(store)
+            self._delivered_notification_keys.intersection_update(store)
+            for key in store:
+                if (
+                    key in self._view._pending_notifications
+                    or key in self._view._collected_results
+                    or key in self._delivered_notification_keys
+                    or key in self._sweep_surfaced
+                ):
+                    continue
+                record = self._view._agent_records.get(key[0])
+                if record is None or not self._view._generation_is_current(
+                    record.root_generation
+                ):
+                    continue
+                run = self._find_run_record(key[0], key[1])
+                # Mark surfaced BEFORE delivering (under the acquisitions, so
+                # concurrent sweeps serialize on the same gap exactly once).
+                self._sweep_surfaced.add(key)
+                payloads.append((
+                    key,
+                    record,
+                    run,
+                    self._synthesize_notification(key, record, run),
+                ))
+        surfaced: list[tuple[str, str]] = []
+        for key, _record, run, text in payloads:
+            try:
+                self._deliver_synthesized(parent, run, text)
+            except Exception as exc:
+                logger.warning(
+                    "P2b sweep failed to deliver a synthesized notification",
+                    exc_info=exc,
+                )
+                # Undo the marking so a later trigger retries the delivery.
+                self._sweep_surfaced.discard(key)
+            else:
+                surfaced.append(key)
+        return tuple(surfaced)
 
     async def accept_background(
         self,
@@ -2043,7 +2343,7 @@ class SubagentExecution:
         context.record.compacting = False
         context.record.compaction_entry_id = None
         context.record.context_window = (
-            context.runtime.agent_loop.config.get_active_model().auto_compact_threshold
+            context.runtime.agent_loop.config.get_active_model().context_limit
         )
         if context.prepared_reconfiguration is not None:
             # Acceptance makes the new envelope authoritative in memory
@@ -2081,6 +2381,11 @@ class SubagentExecution:
             context.runtime.agent_loop.finalize_launch_reconfiguration(
                 context.prepared_reconfiguration, context.backend_publication
             )
+        # P2b: the sweep at continuation start — admitting this dependency
+        # run opens the continuation window, so any completed-but-unnotified
+        # result left over from before it is surfaced here (and the bounded
+        # periodic timer is armed while the continuation is active).
+        await self.sweep_unnotified(parent, SWEEP_TRIGGER_CONTINUATION_START)
 
     async def acknowledge_background(
         self,

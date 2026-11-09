@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import binascii
 from collections.abc import Awaitable, Callable, Iterator
 from contextlib import ExitStack, contextmanager, suppress
 from dataclasses import dataclass
@@ -196,13 +198,38 @@ from chartreux.core.git.worktree import (
 )
 from chartreux.core.git.worktree.record import OwnershipToken, release_holder
 from chartreux.core.llm_models import LLMMessage
+from chartreux.core.plan_episode import (
+    LOGGING_REQUIRED_MESSAGE,
+    STATE_ACCEPTED,
+    STATE_ACCEPTING,
+    CommitAttempt,
+    LoggingDomain,
+    LoggingObservation,
+    PlanDigestMismatchError,
+    PlanEpisodeError,
+    PlanEpisodeWriteError,
+    PlanFenceBusyError,
+    PlanTransitionError,
+    begin_commit,
+    build_handoff_context,
+    observe_logging_domain,
+    prepare_accept,
+    read_sidecar,
+    release_claim,
+    require_no_executor,
+    sha256_bytes,
+)
+from chartreux.core.plan_mode import extract_plan_summary
 from chartreux.core.rewind import ArchivedHistorySource, archived_history_for
 from chartreux.core.session.image_snapshot import ImageSnapshotError
 from chartreux.core.session.session_loader import (
     SessionFileContainmentError,
     SessionLoader,
 )
+from chartreux.core.session.session_logger import SessionDiskFullError
 from chartreux.core.session_types import (
+    PlanModeRecord,
+    PlanScanDomain,
     ScheduledLoop as CoreScheduledLoop,
     SessionMetadata,
 )
@@ -213,6 +240,7 @@ from chartreux.core.subagents import (
     UnknownAgentError,
 )
 from chartreux.observability.logging import logger
+from chartreux.utils.io import decode_safe
 
 DEFAULT_HISTORY_LIMIT = 200
 
@@ -222,6 +250,11 @@ DEFAULT_HISTORY_LIMIT = 200
 # is not a cap on the operation or on the response: settlement still runs after
 # it fires, so an already-published boundary is reported, never dropped.
 _MANUAL_COMPACTION_TIMEOUT_SECONDS = 720.0
+
+# A competing accept either busy-retries a bounded moment and then loses to the
+# expected-state verify, or reports that the transaction is in progress. The
+# commit fence is never waited on indefinitely (DR-44).
+_PLAN_COMMIT_FENCE_RETRY_SECONDS = 5.0
 
 _RELEASE_REASONS: dict[ReleaseAgentOutcome, str] = {
     ReleaseAgentOutcome.RELEASED: (
@@ -1510,7 +1543,7 @@ class CoreRequestHandler:
             after_response,
         )
 
-    async def _plan_handoff(
+    async def _plan_handoff(  # noqa: PLR0914, PLR0915 - one ordered transaction
         self, params: SessionPlanHandoffParams
     ) -> tuple[SessionPlanHandoffResponse, Callable[[], None] | None]:
         """Start the consented executor session for an accepted plan.
@@ -1521,6 +1554,24 @@ class CoreRequestHandler:
         consent snapshot in ``params`` is applied exactly — any patch failure
         or a read-back that cannot match the displayed selection is reported
         and execution is not started.
+
+        An episode-bound request runs the FULL transaction. PREPARE (P1-P3) runs
+        first; COMMIT (C1-C5) then acquires the episode's transition fence and
+        holds it to the end, so the pre-launch re-scan, the executor's durable
+        marker, the terminal flip, and the derived rename are one bounded,
+        uninterleaved sequence.
+
+        The session's plan record decides the route. A session with no record
+        keeps the pre-episode (legacy) request shape and runs none of the
+        transaction; a record that names no episode is legacy-unverified and
+        never accepts; an episode-bound record admits only the integrity path
+        carrying its own episode identity.
+
+        A request that re-enters an ACCEPTING claim held by this session skips
+        PREPARE and enters COMMIT directly: the re-offer continuation carries
+        the surviving snapshot's bytes, and post-consent the draft is never
+        consulted again, so no draft read may stand between the consent and the
+        commit (design sec.4.2/4.4).
         """
         self._require_session(params.session_id)
         if self._turns.active_turn is not None:
@@ -1541,123 +1592,486 @@ class CoreRequestHandler:
                     f"Cannot start plan execution while background work is "
                     f"active: {exc}. Finish or stop the work first.",
                 ) from exc
-            orchestrator = self._agent_loop.config_orchestrator
-            # The executor identity rides as a session-scoped override written
-            # BEFORE the fresh root bind, so the reset binds it; the bound
-            # bundle freezes it and the pin is removed again after the bind.
-            identity_failures = await set_session_agent_identity_override(
-                orchestrator,
-                params.executor_identity,
-                reason="plan handoff executor identity",
-            )
-            if identity_failures:
-                raise RequestFailure(
-                    ProtocolErrorCode.INTERNAL_ERROR,
-                    f"Failed to install plan executor identity: {identity_failures[0]}",
+            # The record decides the route before anything is read or claimed.
+            body = _handoff_verified_body(params)
+            self._plan_handoff_require_route(body)
+            # A re-offer continuation re-enters the commit of a claim this
+            # session already holds from the surviving snapshot's bytes; the
+            # draft is never consulted post-consent, so PREPARE is skipped.
+            if body is None or not self._plan_handoff_continuation(params, body):
+                # PREPARE (P1-P3): claim the episode, verify the previewed bytes
+                # against the draft, and publish the consent snapshot. Each step
+                # fences itself; every observed failure returns the episode to
+                # draft, and success leaves the claim held for the commit half.
+                await self._plan_handoff_prepare(params)
+            with ExitStack() as stack:
+                commit: CommitAttempt | None = None
+                retired: PlanModeRecord | None = None
+                if body is not None:
+                    # COMMIT's fence is acquired here and held through C5.
+                    commit = self._plan_handoff_begin_commit(params, body)
+                    stack.callback(commit.close)
+                    # C2 runs while params.session_id still names the root: the
+                    # reset below rotates it, and the source record becomes
+                    # unaddressable on the sanctioned write path.
+                    retired = await self._plan_handoff_retire_source(params, commit)
+                orchestrator = self._agent_loop.config_orchestrator
+                # The executor identity rides as a session-scoped override
+                # written BEFORE the fresh root bind, so the reset binds it; the
+                # bound bundle freezes it and the pin is removed again after it.
+                identity_failures = await set_session_agent_identity_override(
+                    orchestrator,
+                    params.executor_identity,
+                    reason="plan handoff executor identity",
                 )
-            previous_history = self._turns.history
-            session_model_pinned = (
-                self._agent_loop.session_logger.active_model is not None
-            )
-            try:
-                await self._agent_loop.clear_history()
-            except BaseException as exc:
-                # The reset failed after the identity write: best-effort
-                # removal of the leftover pin, reported honestly.
-                cleanup = await clear_session_agent_identity_override(
-                    orchestrator, reason="plan handoff reset failure cleanup"
-                )
-                if not isinstance(exc, Exception):
-                    raise
-                detail = (
-                    "leftover identity pin removed"
-                    if not cleanup
-                    else f"leftover identity pin could not be removed: {cleanup[0]}"
-                )
-                raise RequestFailure(
-                    ProtocolErrorCode.INTERNAL_ERROR,
-                    f"Plan handoff reset failed: {exc} ({detail})",
-                ) from exc
-            unpin_failures = await clear_session_agent_identity_override(
-                orchestrator, reason="plan handoff identity unpin after bind"
-            )
-            if unpin_failures:
-                raise RequestFailure(
-                    ProtocolErrorCode.INTERNAL_ERROR,
-                    f"Failed to remove plan executor identity pin: {unpin_failures[0]}",
-                )
-            if session_model_pinned:
-                failures = await clear_session_active_model_override(
-                    orchestrator, reason="plan handoff active model unpin"
-                )
-                if failures:
+                if identity_failures:
                     raise RequestFailure(
                         ProtocolErrorCode.INTERNAL_ERROR,
-                        f"Failed to clear session active model: {failures[0]}",
+                        f"Failed to install plan executor identity: "
+                        f"{identity_failures[0]}",
                     )
-            # Restore the planner-alias thinking key /plan wrote at entry
-            # BEFORE the executor install, so the executor install stays the
-            # final write on its own alias even when both share it.
-            restore_failures = await self._plan_handoff_restore_planner_key(
-                orchestrator, params
-            )
-            if restore_failures:
-                raise RequestFailure(
-                    ProtocolErrorCode.INTERNAL_ERROR,
-                    f"Failed to restore planner thinking key: {restore_failures[0]}",
+                previous_history = self._turns.history
+                session_model_pinned = (
+                    self._agent_loop.session_logger.active_model is not None
                 )
-            # Executor install, pinned between the unpin above and the reload
-            # below so the reload refreshes the prompt with post-install
-            # values instead of reset-time config.
-            model_failures = await set_session_active_model_override(
-                orchestrator,
-                params.executor_model,
-                reason="plan handoff executor model",
-            )
-            thinking_failures = await set_session_thinking_override(
-                orchestrator,
-                params.executor_model,
-                params.executor_thinking,
-                reason="plan handoff executor thinking",
-            )
-            install_failures = [*model_failures, *thinking_failures]
-            if install_failures:
-                raise RequestFailure(
-                    ProtocolErrorCode.INTERNAL_ERROR,
-                    f"Failed to install plan executor selection: {install_failures[0]}",
+                try:
+                    await self._agent_loop.clear_history()
+                except BaseException as exc:
+                    # The reset failed after the identity write: best-effort
+                    # removal of the leftover pin, reported honestly.
+                    cleanup = await clear_session_agent_identity_override(
+                        orchestrator, reason="plan handoff reset failure cleanup"
+                    )
+                    if not isinstance(exc, Exception):
+                        raise
+                    detail = (
+                        "leftover identity pin removed"
+                        if not cleanup
+                        else f"leftover identity pin could not be removed: {cleanup[0]}"
+                    )
+                    raise RequestFailure(
+                        ProtocolErrorCode.INTERNAL_ERROR,
+                        f"Plan handoff reset failed: {exc} ({detail})",
+                    ) from exc
+                unpin_failures = await clear_session_agent_identity_override(
+                    orchestrator, reason="plan handoff identity unpin after bind"
                 )
-            # Apply-exactly-or-fail: read the installed session state back and
-            # compare with the consented snapshot before starting execution.
-            mismatch = self._plan_handoff_selection_mismatch(orchestrator, params)
-            if mismatch is not None:
-                raise RequestFailure(
-                    ProtocolErrorCode.CONFLICT,
-                    "Plan handoff could not apply the consented executor "
-                    "selection exactly; execution was not started",
-                    mismatch,
+                if unpin_failures:
+                    raise RequestFailure(
+                        ProtocolErrorCode.INTERNAL_ERROR,
+                        f"Failed to remove plan executor identity pin: "
+                        f"{unpin_failures[0]}",
+                    )
+                if session_model_pinned:
+                    failures = await clear_session_active_model_override(
+                        orchestrator, reason="plan handoff active model unpin"
+                    )
+                    if failures:
+                        raise RequestFailure(
+                            ProtocolErrorCode.INTERNAL_ERROR,
+                            f"Failed to clear session active model: {failures[0]}",
+                        )
+                # Restore the planner-alias thinking key /plan wrote at entry
+                # BEFORE the executor install, so the executor install stays the
+                # final write on its own alias even when both share it.
+                restore_failures = await self._plan_handoff_restore_planner_key(
+                    orchestrator, params
                 )
-            # Prompt refresh: reload_with_initial_messages is the only refresh
-            # hook, and the clear route reaches it solely inside its
-            # logger-gated pinned branch — so for the unpinned case this call
-            # is the named refresh step, and it runs after the executor
-            # install in both cases.
-            await self._agent_loop.reload_with_initial_messages()
-            after_response = await self._turns.reset()
-            handoff = self._root_session.replace_idle(
-                params.session_id,
-                current_history=previous_history,
-                checkpoint_kind="plan",
-                checkpoint_message="Plan execution started",
-                checkpoint_details=(
-                    {"planPath": params.plan_path} if params.plan_path else None
-                ),
-            )
+                if restore_failures:
+                    raise RequestFailure(
+                        ProtocolErrorCode.INTERNAL_ERROR,
+                        f"Failed to restore planner thinking key: "
+                        f"{restore_failures[0]}",
+                    )
+                # Executor install, pinned between the unpin above and the
+                # reload below so the reload refreshes the prompt with
+                # post-install values instead of reset-time config.
+                model_failures = await set_session_active_model_override(
+                    orchestrator,
+                    params.executor_model,
+                    reason="plan handoff executor model",
+                )
+                thinking_failures = await set_session_thinking_override(
+                    orchestrator,
+                    params.executor_model,
+                    params.executor_thinking,
+                    reason="plan handoff executor thinking",
+                )
+                install_failures = [*model_failures, *thinking_failures]
+                if install_failures:
+                    raise RequestFailure(
+                        ProtocolErrorCode.INTERNAL_ERROR,
+                        f"Failed to install plan executor selection: "
+                        f"{install_failures[0]}",
+                    )
+                # Apply-exactly-or-fail: read the installed session state back
+                # and compare with the consented snapshot before starting
+                # execution.
+                mismatch = self._plan_handoff_selection_mismatch(orchestrator, params)
+                if mismatch is not None:
+                    raise RequestFailure(
+                        ProtocolErrorCode.CONFLICT,
+                        "Plan handoff could not apply the consented executor "
+                        "selection exactly; execution was not started",
+                        mismatch,
+                    )
+                if commit is not None:
+                    # C3: one frozen logging observation, the pre-marker domain
+                    # record, the fenced pre-launch re-scan, the durable marker,
+                    # then the injection of the carried bytes.
+                    assert retired is not None
+                    await self._plan_handoff_mark_and_inject(commit, retired)
+                # Prompt refresh: reload_with_initial_messages is the only
+                # refresh hook, and the clear route reaches it solely inside its
+                # logger-gated pinned branch — so for the unpinned case this
+                # call is the named refresh step, and it runs after the executor
+                # install in both cases.
+                await self._agent_loop.reload_with_initial_messages()
+                after_response = await self._turns.reset()
+                handoff = self._root_session.replace_idle(
+                    params.session_id,
+                    current_history=previous_history,
+                    checkpoint_kind="plan",
+                    checkpoint_message="Plan execution started",
+                    checkpoint_details=(
+                        {"planPath": params.plan_path} if params.plan_path else None
+                    ),
+                )
+                if commit is not None:
+                    # C4/C5: the executor session exists, so its id is recorded
+                    # first (the executor scan's discriminator against a restored
+                    # planning mirror), the terminal flip is the last
+                    # arbiter-visible change, and the derived rename follows it.
+                    self._plan_handoff_record_executor(commit, handoff.new_session_id)
+                    self._plan_handoff_finalize(commit, handoff.new_session_id)
         return (
             SessionPlanHandoffResponse(
                 state=handoff.state, session_log=handoff.session_log
             ),
             after_response,
         )
+
+    def _plan_handoff_require_route(self, body: tuple[str, Path, bytes] | None) -> None:
+        """Refuse a handoff whose shape contradicts this session's plan record.
+
+        Once ANY episode record exists the integrity path is the only handoff
+        path. A record naming no episode is legacy-unverified and never accepts
+        (criterion 9: "accept never arms on legacy") — the user re-binds into a
+        new episode or cancels. An episode-bound record admits only a request
+        carrying that episode's verifiable body. A session with NO record at all
+        is the pre-P10 client shape and keeps its old behavior untouched.
+        """
+        record = self._plan_handoff_record()
+        if record is None:
+            return
+        if record.episode_id is None:
+            raise RequestFailure(
+                ProtocolErrorCode.CONFLICT,
+                "This plan record is legacy-unverified, so it cannot accept: "
+                "re-bind the draft into a new plan episode and accept again, or "
+                "cancel plan mode",
+            )
+        if body is None:
+            raise RequestFailure(
+                ProtocolErrorCode.INVALID_PARAMS,
+                f"The plan record for episode {record.episode_id} admits only the "
+                "integrity handoff: the request must carry the episode id, the "
+                "snapshot path and digest, and the snapshot bytes",
+            )
+        if body[0] != record.episode_id:
+            raise RequestFailure(
+                ProtocolErrorCode.INVALID_PARAMS,
+                f"The handoff episode {body[0]} is not this session's episode "
+                f"{record.episode_id}; execution was not started",
+            )
+
+    def _plan_handoff_continuation(
+        self, params: SessionPlanHandoffParams, body: tuple[str, Path, bytes]
+    ) -> bool:
+        """Whether this request RE-ENTERS the commit of a claim already held.
+
+        Row 3's re-offer keeps the claim held and re-enters COMMIT with the
+        located surviving snapshot's bytes, so the continuation leg must not run
+        PREPARE's draft read at all (post-consent the draft is never consulted).
+        Only an ACCEPTING claim held by this same session, already carrying a
+        recorded consent digest, qualifies. The digest itself is verified by C1
+        against the carried bytes — that is where a wrong body refuses and
+        releases the claim — so this predicate decides the route only. Every
+        other shape is a fresh accept and prepares normally, where its own
+        refusals (already claimed, foreign claim, domain mismatch) surface.
+        """
+        episode_id, snapshot_path, _content = body
+        try:
+            sidecar = read_sidecar(snapshot_path.parent)
+        except PlanEpisodeError:
+            return False
+        if sidecar is None:
+            return False
+        return (
+            sidecar.episode_id == episode_id
+            and sidecar.state == STATE_ACCEPTING
+            and sidecar.claiming_session_id == params.session_id
+            and sidecar.consent_sha256 is not None
+        )
+
+    def _plan_handoff_record(self) -> PlanModeRecord | None:
+        """The root session's own plan record, or ``None`` when it has none."""
+        metadata = self._agent_loop.session_logger.session_metadata
+        return None if metadata is None else metadata.plan_mode
+
+    def _plan_handoff_logging_domain(self) -> LoggingDomain:
+        """The episode's PREPARE-side logging domain (the P1 owner domain)."""
+        logger = self._agent_loop.session_logger
+        save_dir = logger.save_dir
+        session_prefix = logger.session_prefix
+        if not logger.enabled or save_dir is None or session_prefix is None:
+            raise RequestFailure(ProtocolErrorCode.CONFLICT, LOGGING_REQUIRED_MESSAGE)
+        return LoggingDomain(save_dir=str(save_dir), session_prefix=session_prefix)
+
+    def _plan_handoff_begin_commit(
+        self, params: SessionPlanHandoffParams, body: tuple[str, Path, bytes]
+    ) -> CommitAttempt:
+        """COMMIT entry: acquire the fence and run C1, or refuse.
+
+        A mismatch releases the claim (the episode returns to draft and the
+        planning session is untouched — no destructive step has run) and surfaces
+        as a pre-replacement CONFLICT.
+        """
+        episode_id, snapshot_path, content = body
+        domain = self._plan_handoff_logging_domain()
+        try:
+            return begin_commit(
+                snapshot_path.parent,
+                episode_id=episode_id,
+                session_id=params.session_id,
+                owner_domain=domain,
+                carried_bytes=content,
+                snapshot_path=snapshot_path,
+                retry_timeout=_PLAN_COMMIT_FENCE_RETRY_SECONDS,
+            )
+        except PlanFenceBusyError as exc:
+            raise RequestFailure(
+                ProtocolErrorCode.CONFLICT,
+                f"{exc} — an accept transaction is in progress; retry after it "
+                "completes, or inspect the episode status",
+            ) from exc
+        except PlanDigestMismatchError as exc:
+            detail = self._plan_handoff_release_refused_claim(
+                snapshot_path.parent, params.session_id, domain
+            )
+            raise RequestFailure(ProtocolErrorCode.CONFLICT, f"{exc}{detail}") from exc
+        except PlanTransitionError as exc:
+            raise RequestFailure(ProtocolErrorCode.CONFLICT, str(exc)) from exc
+        except PlanEpisodeError as exc:
+            raise RequestFailure(ProtocolErrorCode.INTERNAL_ERROR, str(exc)) from exc
+
+    def _plan_handoff_release_refused_claim(
+        self, directory: Path, session_id: str, domain: LoggingDomain
+    ) -> str:
+        """Release a refused C1 claim; report, never hide, a release failure."""
+        try:
+            release_claim(directory, session_id=session_id, owner_domain=domain)
+        except PlanEpisodeError as exc:
+            return (
+                f" (the accept claim could not be released: {exc}; inspect the "
+                "episode status before retrying)"
+            )
+        return " The accept claim was released and planning can continue."
+
+    async def _plan_handoff_retire_source(
+        self, params: SessionPlanHandoffParams, commit: CommitAttempt
+    ) -> PlanModeRecord:
+        """C2: retire the planning session's record durably as accepted.
+
+        The retirement is a FORCED, checked durable write: a write that cannot be
+        proven durable fails the handoff loudly instead of reporting a clean
+        success, and it runs before the reset, while the request's session id
+        still names the root.
+        """
+        if params.session_id != self._agent_loop.session_id:
+            raise RequestFailure(
+                ProtocolErrorCode.CONFLICT,
+                "The plan record belongs to the root session",
+            )
+        logger = self._agent_loop.session_logger
+        metadata = logger.session_metadata
+        source = None if metadata is None else metadata.plan_mode
+        if source is None:
+            raise RequestFailure(
+                ProtocolErrorCode.CONFLICT,
+                "The planning session records no plan mode to retire",
+            )
+        retired = source.model_copy(
+            update={
+                "episode_id": commit.episode_id,
+                "state": STATE_ACCEPTED,
+                "consent_sha256": commit.sidecar.consent_sha256,
+                "snapshot_path": commit.snapshot_path.name,
+                "attempt_generation": commit.attempt_generation,
+                "scan_domain": _record_scan_domain(commit.sidecar.owner_domain),
+            }
+        )
+        try:
+            await logger.persist_plan_mode_durable(retired)
+        except (PlanEpisodeWriteError, SessionDiskFullError) as exc:
+            raise RequestFailure(
+                ProtocolErrorCode.CONFLICT,
+                f"Plan handoff could not retire the planning record durably: "
+                f"{exc}. The planning session is unchanged, but this accept "
+                "attempt is committed — inspect the episode status before "
+                "retrying or cancelling.",
+            ) from exc
+        return retired
+
+    async def _plan_handoff_mark_and_inject(
+        self, commit: CommitAttempt, retired: PlanModeRecord
+    ) -> None:
+        """C3: one logging observation, the domain record, the marker, injection.
+
+        The observation is read ONCE: its domain is recorded in the sidecar and
+        its session directory is the marker's destination, so the recorded
+        discovery domain can always find the marker it was recorded for. The
+        pre-launch re-scan then runs INSIDE the held fence, the marker is the
+        executor's first durable act, and only then are the carried bytes
+        injected. A marker that cannot be made durable is a loud transition
+        failure with row-3 semantics: it is never reported as success and never
+        auto-retried.
+        """
+        logger = self._agent_loop.session_logger
+        observation: LoggingObservation = observe_logging_domain(
+            save_dir=logger.save_dir,
+            session_prefix=logger.session_prefix,
+            session_dir=logger.session_dir,
+        )
+        try:
+            commit.record_scan_domain(observation.domain)
+            # DR-19's final guard: a marker that appeared after the recovery
+            # decision refuses the launch; an untrusted scan fails closed. The
+            # source session's own record carries the episode too, so it is
+            # excluded — it is the caller, never a launched executor.
+            require_no_executor(
+                observation.domain,
+                commit.episode_id,
+                excluding_session_id=commit.sidecar.claiming_session_id,
+            )
+        except PlanEpisodeError as exc:
+            raise RequestFailure(ProtocolErrorCode.INTERNAL_ERROR, str(exc)) from exc
+        if logger.session_dir != observation.session_dir:
+            raise RequestFailure(
+                ProtocolErrorCode.INTERNAL_ERROR,
+                "The executor session dir moved away from the observed logging "
+                "configuration; the episode marker was not written",
+            )
+        marker = retired.model_copy(
+            update={
+                "state": STATE_ACCEPTING,
+                "episode_id": commit.episode_id,
+                "consent_sha256": commit.sidecar.consent_sha256,
+                "snapshot_path": commit.snapshot_path.name,
+                "attempt_generation": commit.attempt_generation,
+                "scan_domain": _record_scan_domain(observation.domain),
+            }
+        )
+        try:
+            await logger.persist_plan_mode_durable(marker)
+        except (PlanEpisodeWriteError, SessionDiskFullError) as exc:
+            raise RequestFailure(
+                ProtocolErrorCode.INTERNAL_ERROR,
+                f"Plan handoff could not mark the executor session durably: "
+                f"{exc}. The episode was not reported as accepted; inspect its "
+                "status before retrying.",
+            ) from exc
+        try:
+            await self._agent_loop.inject_user_context(
+                build_handoff_context(
+                    content=commit.carried_bytes,
+                    episode_id=commit.episode_id,
+                    snapshot_path=commit.snapshot_path,
+                    consent_sha256=commit.sidecar.consent_sha256 or "",
+                ),
+                as_message=True,
+            )
+        except Exception as exc:
+            raise RequestFailure(
+                ProtocolErrorCode.INTERNAL_ERROR,
+                f"Plan handoff could not inject the accepted plan into the "
+                f"executor session: {exc}. The executor marker is durable, so "
+                "the episode is possibly executed — inspect its status.",
+            ) from exc
+
+    def _plan_handoff_record_executor(
+        self, commit: CommitAttempt, executor_session_id: str
+    ) -> None:
+        """C4: record the rotated executor id while the episode is accepting.
+
+        design §4.2 C4: the id is known only after the replacement. Recording it
+        before C5 is what lets the executor scan tell the launch apart from a
+        planning session that restored the same accepting episode; a write that
+        cannot be made durable fails loudly with row-3 semantics — the marker is
+        already durable, so the episode is possibly executed.
+        """
+        try:
+            commit.record_executor_session(executor_session_id)
+        except PlanEpisodeError as exc:
+            raise RequestFailure(
+                ProtocolErrorCode.INTERNAL_ERROR,
+                f"Plan handoff could not record the executor session: {exc}. The "
+                "executor marker is durable, so the episode is possibly executed "
+                "— inspect its status.",
+            ) from exc
+
+    def _plan_handoff_finalize(
+        self, commit: CommitAttempt, executor_session_id: str
+    ) -> None:
+        """C5: the terminal flip once the executor exists, then the rename."""
+        try:
+            commit.finalize(executor_session_id=executor_session_id)
+        except PlanEpisodeError as exc:
+            raise RequestFailure(
+                ProtocolErrorCode.INTERNAL_ERROR,
+                f"Plan handoff could not record the accepted episode: {exc}",
+            ) from exc
+
+    async def _plan_handoff_prepare(self, params: SessionPlanHandoffParams) -> None:
+        """Run the PREPARE half (P1-P3) of an episode-bound handoff.
+
+        The request's snapshot bytes are the sole verified artifact. The
+        episode is claimed under the fence, the draft's raw bytes are retained
+        and byte-compared against the previewed bytes (a change demands a
+        re-preview), and the retained bytes are published EXCLUSIVELY with
+        their digest recorded in the sidecar. Every observed failure releases
+        the claim and returns the episode to draft; success leaves the claim
+        held for the commit half.
+
+        A request without the episode fields is the legacy, pre-episode path
+        and prepares nothing.
+
+        The consented bytes must also BE a usable plan document. The consent
+        modal refuses an empty or summary-less draft too; the server repeats the
+        check (design sec.4.2's refusal matrix) so the raw wire route cannot
+        consent to a document the matrix forbids. The refusal happens BEFORE the
+        claim, so it leaves the episode exactly as it was and names its recovery.
+        """
+        body = _handoff_verified_body(params)
+        if body is None:
+            return
+        episode_id, snapshot_path, content = body
+        refusal = _draft_refusal(content)
+        if refusal is not None:
+            raise RequestFailure(ProtocolErrorCode.CONFLICT, refusal)
+        try:
+            prepare_accept(
+                snapshot_path.parent,
+                episode_id=episode_id,
+                session_id=params.session_id,
+                owner_domain=self._plan_handoff_logging_domain(),
+                previewed_bytes=content,
+                previewed_sha256=sha256_bytes(content),
+            )
+        except PlanTransitionError as exc:
+            raise RequestFailure(ProtocolErrorCode.CONFLICT, str(exc)) from exc
+        except PlanEpisodeError as exc:
+            raise RequestFailure(ProtocolErrorCode.INTERNAL_ERROR, str(exc)) from exc
 
     async def _plan_handoff_restore_planner_key(
         self,
@@ -2162,6 +2576,116 @@ class CoreRequestHandler:
             raise RequestFailure(
                 ProtocolErrorCode.NOT_FOUND, f"Session not found: {session_id}"
             )
+
+
+def _record_scan_domain(domain: LoggingDomain | None) -> PlanScanDomain | None:
+    """The persisted record's scan-domain mirror of a logging domain."""
+    if domain is None:
+        return None
+    return PlanScanDomain(
+        save_dir=domain.save_dir, session_prefix=domain.session_prefix
+    )
+
+
+def _handoff_verified_body(
+    params: SessionPlanHandoffParams,
+) -> tuple[str, Path, bytes] | None:
+    """Decode and validate an episode-bound handoff's consent body.
+
+    The episode identity, snapshot path, digest, and bytes travel together or
+    not at all. The bytes are the authority: their digest must equal the
+    carried digest, and the snapshot path must be one of the episode's own names
+    in the episode's own directory — the path locates the workspace, it never
+    supplies the content. ``None`` means the legacy, pre-episode request.
+    """
+    episode_id = params.episode_id
+    snapshot_path = params.snapshot_path
+    snapshot_sha256 = params.snapshot_sha256
+    encoded = params.snapshot_bytes_b64
+    if (
+        episode_id is None
+        and snapshot_path is None
+        and snapshot_sha256 is None
+        and encoded is None
+    ):
+        return None
+    if (
+        episode_id is None
+        or snapshot_path is None
+        or snapshot_sha256 is None
+        or encoded is None
+    ):
+        raise RequestFailure(
+            ProtocolErrorCode.INVALID_PARAMS,
+            "An episode handoff carries its episode id, snapshot path, "
+            "snapshot digest, and snapshot bytes together",
+        )
+    try:
+        content = base64.b64decode(encoded, validate=True)
+    except (binascii.Error, ValueError) as exc:
+        raise RequestFailure(
+            ProtocolErrorCode.INVALID_PARAMS,
+            "The plan handoff snapshot bytes are not valid base64",
+        ) from exc
+    if sha256_bytes(content) != snapshot_sha256:
+        raise RequestFailure(
+            ProtocolErrorCode.INVALID_PARAMS,
+            "The plan handoff snapshot digest does not match its bytes",
+        )
+    path = Path(snapshot_path)
+    if not _is_episode_snapshot_name(path.name, episode_id):
+        raise RequestFailure(
+            ProtocolErrorCode.INVALID_PARAMS,
+            f"The plan handoff snapshot path must be the episode's "
+            f"accepted-{episode_id}.md, or its surviving "
+            f"provenance-{episode_id}-<generation>.md",
+        )
+    return episode_id, path, content
+
+
+def _is_episode_snapshot_name(name: str, episode_id: str) -> bool:
+    """True for either of the episode's own snapshot names.
+
+    The live name is the pre-completion carrier; the attempt's provenance name
+    is what the re-offer locates after a crash in the cancel window. Both are
+    legitimate locators — the carried bytes and the sidecar's digest decide the
+    content, never the name.
+    """
+    if name == f"accepted-{episode_id}.md":
+        return True
+    prefix = f"provenance-{episode_id}-"
+    if not name.startswith(prefix) or not name.endswith(".md"):
+        return False
+    generation = name[len(prefix) : len(name) - len(".md")]
+    return generation.isdigit() and int(generation) >= 1
+
+
+def _draft_refusal(content: bytes) -> str | None:
+    """The refusal for consented bytes that are not a usable plan document.
+
+    The design's refusal matrix (:234) refuses a bound draft that is empty or
+    summary-less, for the same reason ``read_plan_document`` does: the executor
+    would be seeded with a document that has nothing to execute. The message
+    names the recovery the matrix names — bind another document and re-consent,
+    or cancel.
+    """
+    recovery = (
+        " Bind another document (re-bind the draft and re-consent) or cancel plan mode."
+    )
+    if not content.strip():
+        return f"The plan document is empty; execution was not started.{recovery}"
+    summary = extract_plan_summary(decode_safe(content).text)
+    if summary is None:
+        return (
+            "The plan document has no ## Summary section; execution was not "
+            f"started.{recovery}"
+        )
+    if not summary:
+        return (
+            "The plan document's ## Summary section is empty; execution was not "
+            f"started.{recovery}"
+        )
+    return None
 
 
 def _read_authorized_agent_transcript(

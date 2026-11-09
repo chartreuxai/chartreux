@@ -604,6 +604,48 @@ class PlanSectionConfig(BaseModel):
     )
 
 
+DEFAULT_KEEPALIVE_MAX_ATTEMPTS = 100
+DEFAULT_KEEPALIVE_MAX_SPEND_USD = 1.0
+DEFAULT_KEEPALIVE_MIN_IDLE_GAP_SECONDS = 240.0
+
+
+class KeepaliveSectionConfig(BaseModel):
+    """The ``[keepalive]`` config section: the P5 cache keep-alive pilot.
+
+    The pilot SHIPS OFF: ``enabled`` defaults to FALSE, and while disabled
+    the pilot has zero behavior — no snapshot, no timer, no ledger row; the
+    wiring reads this flag first and does nothing when it is off. The caps
+    are the ABSOLUTE per-session bounds the strict accountant enforces:
+    ``max_attempts`` is the count cap (ATTEMPTS, superseded ones included,
+    not completions) and ``max_spend_usd`` the spend cap in USD;
+    ``min_idle_gap_seconds`` is the idle-gap floor the scheduler requires
+    before any ping may be considered. Validated like every other section:
+    unknown keys are rejected and the caps carry strict bounds.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = Field(default=False, strict=True)
+    max_attempts: int = Field(default=DEFAULT_KEEPALIVE_MAX_ATTEMPTS, ge=1, strict=True)
+    max_spend_usd: Annotated[float, BeforeValidator(_reject_bool_duration)] = Field(
+        default=DEFAULT_KEEPALIVE_MAX_SPEND_USD, ge=0.0, allow_inf_nan=False
+    )
+    min_idle_gap_seconds: Annotated[float, BeforeValidator(_reject_bool_duration)] = (
+        Field(
+            default=DEFAULT_KEEPALIVE_MIN_IDLE_GAP_SECONDS, ge=0.0, allow_inf_nan=False
+        )
+    )
+
+    @model_validator(mode="after")
+    def _validate_enabled_needs_spend_room(self) -> KeepaliveSectionConfig:
+        if self.enabled and self.max_spend_usd <= 0.0:
+            raise ValueError(
+                "keepalive.enabled requires max_spend_usd > 0: an enabled pilot "
+                "with a zero spend cap could never reserve a ping"
+            )
+        return self
+
+
 type StatusLineSegment = Literal[
     "directory",
     "pid",
@@ -967,6 +1009,11 @@ class ModelConfig(BaseModel):
     supported_thinking_levels: list[ThinkingLevel] | None = None
     supports_images: bool = False
     auto_compact_threshold: int = DEFAULT_AUTO_COMPACT_THRESHOLD
+    # Provider facts, not policy knobs: None means the provider documents no
+    # such value, so readers must treat it as unknown instead of substituting
+    # the compaction threshold or an assumed output budget.
+    context_limit: int | None = None
+    max_completion_tokens: int | None = None
     _default_alias_to_name = model_validator(mode="before")(_default_alias_to_name)
 
 

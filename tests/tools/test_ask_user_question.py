@@ -454,8 +454,12 @@ class TestChildAdmission:
         }
         child_specs = {spec.name for spec in child.available_tool_specs()}
         assert "ask_user_question" not in child_specs
-        # Per-tool withholding, not a blanket child catalog cut.
-        assert "task" in child_specs
+        # Per-tool withholding, not a blanket child catalog cut: a working
+        # tool stays advertised. ``task`` was the witness here until the
+        # v0.7.6 P1 per-identity rule began withholding the spawn/recovery
+        # set from bounded children (tests/tools/test_v076_child_catalog.py).
+        assert "read_file" in child_specs
+        assert "task" not in child_specs
 
     @pytest.mark.asyncio
     async def test_explicit_child_tool_selection_cannot_reenable_the_question(

@@ -287,10 +287,12 @@ class WaitForAgentResult(BaseModel):
 
     ``completed`` carries the finished run's TaskResult; ``still_running``
     carries the wait progress (agent_id, run_id, elapsed_seconds, run_status,
-    turns_used) plus guidance instructing the model to yield its turn and
-    re-invoke wait_for_agent in a later turn. The variants are mutually
-    exclusive: ``completed`` rejects the progress fields and ``still_running``
-    rejects ``result``.
+    turns_used) plus guidance instructing the model to yield its turn —
+    re-invoke wait_for_agent in a later turn to keep waiting, or rely on the
+    completion notification that arrives when the run finishes and fetch the
+    result then (mode "digest" by default, "full" on demand). The variants
+    are mutually exclusive: ``completed`` rejects the progress fields and
+    ``still_running`` rejects ``result``.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -708,15 +710,234 @@ def still_running_guidance(
     A tool result does not end the turn by itself: the model must yield so
     queued user input can drain between turns. The guidance therefore
     instructs ending the turn or continuing other work now and re-invoking
-    ``wait_for_agent`` in a later turn — never a same-turn re-invocation.
+    ``wait_for_agent`` in a later turn — never a same-turn re-invocation —
+    or relying on the completion notification and fetching the result later
+    (digest/full modes).
     """
     turn_word = "turn" if turns_used == 1 else "turns"
     return (
         f"Agent {agent_id} (run {run_id}) is still {run_status.value} after "
         f"{elapsed_seconds:g}s and {turns_used} {turn_word}. End your turn or "
         "continue other work now: queued user input is only delivered between "
-        "turns. Re-invoke wait_for_agent in a later turn to keep waiting, or "
-        "call check_agents to inspect progress."
+        "turns. Re-invoke wait_for_agent in a later turn to keep waiting "
+        "(same mode), or end your turn: the completion notification arrives "
+        "when the run finishes — fetch the result then with get_agent_result "
+        '(mode="digest" by default, mode="full" on demand), or call '
+        "check_agents to inspect progress."
+    )
+
+
+#: P2e worker-digest contract: the always-contains list — the disclosure
+#: fields EVERY assembled worker digest carries, whether or not the run
+#: produced them. A consumer adjudicating from a digest alone never has to
+#: wonder whether a field was omitted: each of these keys is always present
+#: in the digest's claims, with its ``*_missing`` indicator marking a value
+#: the run's retained material could not establish.
+WORKER_DIGEST_ALWAYS_CONTAINS: tuple[str, ...] = (
+    "touched_paths",
+    "denial_record",
+    "check_status",
+)
+
+#: Cap on the worker-authored decision summary a digest carries (P2e). The
+#: full response body stays fetchable with mode="full"; the digest's summary
+#: is bounded so the default fetch mode stays small.
+WORKER_DIGEST_SUMMARY_MAX_CHARS = 2000
+
+
+class WorkerDigestDisclosures(BaseModel):
+    """The disclosure inputs of one worker-digest assembly (P2e).
+
+    The always-contains bundle a route extracts from the worker's final
+    report before assembling the digest: the cumulative touched-path set,
+    the denial record, and the check status. Any field left None is
+    "not established" — the assembled digest still carries it, as an empty
+    entry with its ``*_missing`` indicator set.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    touched_paths: list[str] | None = Field(
+        default=None,
+        description="Cumulative touched paths, or None when not established.",
+    )
+    denial_record: list[str] | None = Field(
+        default=None, description="Denied commands with stated reasons, or None."
+    )
+    check_status: str | None = Field(
+        default=None, description="Worker-reported check status, or None."
+    )
+
+
+class WorkerDigestClaims(BaseModel):
+    """The worker-authored half of a worker digest (P2e contract).
+
+    Everything here is a WORKER CLAIM — authored by the worker in its final
+    report, not audited by the harness — carried on the digest so a reviewer
+    can adjudicate without fetching the full body. The always-contains list
+    (:data:`WORKER_DIGEST_ALWAYS_CONTAINS`) is always present: an
+    unestablished value reads as an empty entry plus its ``*_missing`` flag,
+    never as an absent field. An empty ``denial_record`` with
+    ``denial_record_missing=False`` is the worker's explicit "none";
+    ``denial_record_missing=True`` means the record could not be established.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    summary: str = Field(
+        description="Bounded head of the worker's final report (a claim)."
+    )
+    summary_truncated: bool = Field(
+        description="True when the report exceeded the summary cap and was cut."
+    )
+    touched_paths: list[str] = Field(
+        description="The worker's cumulative touched-path set, or empty when missing."
+    )
+    touched_paths_missing: bool = Field(
+        description="True when the touched-path set could not be established."
+    )
+    denial_record: list[str] = Field(
+        description="Each denied command with the runtime's stated reason, or empty."
+    )
+    denial_record_missing: bool = Field(
+        description="True when the denial record could not be established."
+    )
+    check_status: str = Field(
+        description=(
+            "The worker-reported check status (recorded commands and exit "
+            "statuses), or empty when missing."
+        )
+    )
+    check_status_missing: bool = Field(
+        description="True when no check status could be established."
+    )
+
+
+class WorkerDigest(BaseModel):
+    """The decision-sufficient worker digest (P2e; design b/d).
+
+    The default fetch mode's representation of a completed run: run identity,
+    disposition, elapsed/turns, and recovery state, plus the worker-authored
+    claims and the harness-audited stamp as SEPARATE provenance — worker
+    claims are never presented as audited evidence and vice versa. Explicit
+    indicators mark what the run's retained material could not establish:
+    ``response_available`` for the full body, and the claims' ``*_missing``
+    flags for the always-contains disclosures.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    agent_id: str = Field(description="Stable agent handle of the digested run.")
+    run_id: str = Field(description="Run handle of the digested run.")
+    name: str | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+        description="Human-facing agent name; display-only, agent_id is the handle.",
+    )
+    completed: bool = Field(description="Whether the run completed normally.")
+    run_status: RunStatus | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+        description="Terminal run status, when the run is terminal.",
+    )
+    stop_reason: RunStopReason | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+        description="Winning stop reason for a stopped run.",
+    )
+    turns_used: int = Field(description="Turns the run used.")
+    elapsed_seconds: float | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+        description="Wall-clock seconds from run start to terminal transition.",
+    )
+    failure: FailureEnvelope | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+        description="Public typed failure envelope; failed runs only.",
+    )
+    recovery: RecoveryReference | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+        description="Recovery-chain linkage for a failed run.",
+    )
+    response_available: bool = Field(
+        description=(
+            "False when the run retained no response body — the explicit "
+            'missing indicator for the full text (fetch mode="full").'
+        )
+    )
+    claims: WorkerDigestClaims = Field(
+        description=(
+            "Worker-authored claims; the always-contains disclosure list lives here."
+        )
+    )
+    audited: CompletionAuditClassification | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+        description=(
+            "The harness-stamped completion-audit classification: audited "
+            "evidence, distinct from the worker claims."
+        ),
+    )
+
+
+def build_worker_digest(
+    *,
+    agent_id: str,
+    run_id: str,
+    result: TaskResult,
+    disclosures: WorkerDigestDisclosures | None = None,
+    name: str | None = None,
+    run_status: RunStatus | None = None,
+    stop_reason: RunStopReason | None = None,
+    elapsed_seconds: float | None = None,
+    max_summary_chars: int = WORKER_DIGEST_SUMMARY_MAX_CHARS,
+) -> WorkerDigest:
+    """Assemble the decision-sufficient worker digest of one run (P2e).
+
+    The shared assembly the fetch routes' digest rendering calls:
+    mode="digest" delivers a ``WorkerDigest`` built from the retained run
+    identity and result, while mode="full" still delivers the raw
+    ``TaskResult``. The run-record facts (``name``, ``run_status``,
+    ``stop_reason``, ``elapsed_seconds``) override the result's own fields
+    when supplied — the registry's run record is the authoritative
+    disposition source. The always-contains list is populated
+    unconditionally from ``disclosures`` — fields left None become empty
+    entries with their ``*_missing`` indicators set — and the worker's
+    report is carried as a bounded, truncation-flagged summary.
+    """
+    if max_summary_chars < 1:
+        raise ValueError("max_summary_chars must be at least 1")
+    response = result.response or ""
+    truncated = len(response) > max_summary_chars
+    summary = response[:max_summary_chars] if truncated else response
+    touched_paths = disclosures.touched_paths if disclosures is not None else None
+    denial_record = disclosures.denial_record if disclosures is not None else None
+    check_status = disclosures.check_status if disclosures is not None else None
+    return WorkerDigest(
+        agent_id=agent_id,
+        run_id=run_id,
+        name=name if name is not None else result.name,
+        completed=result.completed,
+        run_status=run_status if run_status is not None else result.run_status,
+        stop_reason=stop_reason if stop_reason is not None else result.stop_reason,
+        turns_used=result.turns_used,
+        elapsed_seconds=elapsed_seconds,
+        failure=result.failure,
+        recovery=result.recovery,
+        response_available=bool(response),
+        claims=WorkerDigestClaims(
+            summary=summary,
+            summary_truncated=truncated,
+            touched_paths=list(touched_paths) if touched_paths is not None else [],
+            touched_paths_missing=touched_paths is None,
+            denial_record=list(denial_record) if denial_record is not None else [],
+            denial_record_missing=denial_record is None,
+            check_status=check_status or "",
+            check_status_missing=check_status is None,
+        ),
+        audited=result.completion_audit,
     )
 
 

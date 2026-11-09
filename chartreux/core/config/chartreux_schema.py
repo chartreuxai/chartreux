@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Callable, MutableMapping
+from collections.abc import Callable, MutableMapping, Sequence
 import os
 from pathlib import Path
 from typing import TYPE_CHECKING, Annotated, Any
@@ -14,6 +14,7 @@ from pydantic import (
     Field,
     PrivateAttr,
     ValidationError,
+    ValidationInfo,
     ValidatorFunctionWrapHandler,
     WrapValidator,
     model_validator,
@@ -36,6 +37,7 @@ from chartreux.core.config._defaults import (
 from chartreux.core.config.models import (
     AgentSelectionConfig,
     CompletionSectionConfig,
+    KeepaliveSectionConfig,
     MCPServer,
     MissingAPIKeyError,
     ModelConfig,
@@ -212,6 +214,114 @@ def _normalize_log_level(value: Any) -> Any:
     return normalized
 
 
+#: The one-turn growth allowance in the compaction-threshold invariant: the
+#: measured worst-case corpus growth for a single turn (design P4(c), "measured
+#: headroom ... starts ~217k corpus max"). It is a measurement, never a
+#: guarantee: the reactive ContextTooLongError self-heal stays authoritative.
+ONE_TURN_GROWTH_ALLOWANCE = 217_000
+
+_THRESHOLD_RESOLUTION_PATHS = (
+    "Populate the deployment's provider facts in models.toml (its "
+    "context_limit, and its max_completion_tokens where the provider documents "
+    "an output default), or revert the threshold raise."
+)
+
+
+def shipped_threshold_baseline(base_model: str, provider: str) -> int | None:
+    """The threshold a deployment carries without any raise, or ``None``.
+
+    The shipped catalog's own threshold for that deployment is the comparison
+    point. A deployment the shipped catalog does not carry has no prior value
+    to raise from, so the answer is ``None``: there is no raise to gate.
+    """
+    from chartreux.core.model_catalog.defaults import SHIPPED_CATALOG
+
+    definition = SHIPPED_CATALOG.models.get(base_model)
+    for deployment in definition.deployments if definition is not None else ():
+        if deployment.provider == provider:
+            return deployment.auto_compact_threshold
+    return None
+
+
+def compaction_threshold_violation(
+    *,
+    label: str,
+    threshold: int,
+    baseline: int | None,
+    context_limit: int | None,
+    max_completion_tokens: int | None,
+) -> str | None:
+    """Return one deployment's invariant violation, or ``None`` when it holds.
+
+    Only a *raise* over the baseline is validated, so an unraised threshold
+    keeps its prior behavior and a deployment whose limit or reserve the
+    provider does not document still loads. A raise fails closed on either
+    unknown term: the inequality is never evaluated with an unknown value.
+
+    The invariant itself is ``threshold + one-turn growth allowance <=
+    provider context limit - output reserve``.
+    """
+    if baseline is None or threshold <= baseline:
+        return None
+    if context_limit is None:
+        return (
+            f"{label} raises its compaction threshold to {threshold} while its "
+            "provider context limit is unknown"
+        )
+    if max_completion_tokens is None:
+        return (
+            f"{label} raises its compaction threshold to {threshold} while no "
+            "provider output reserve is documented"
+        )
+    budget = context_limit - max_completion_tokens
+    if threshold + ONE_TURN_GROWTH_ALLOWANCE > budget:
+        return (
+            f"{label} raises its compaction threshold to {threshold}, which "
+            f"leaves less than the {ONE_TURN_GROWTH_ALLOWANCE}-token one-turn "
+            f"growth allowance inside {context_limit} context less "
+            f"{max_completion_tokens} output reserve ({budget})"
+        )
+    return None
+
+
+def compaction_threshold_violations(
+    catalog: Any, *, fallback_threshold: int
+) -> list[str]:
+    """Every deployment-level violation of the threshold invariant in *catalog*.
+
+    The comparison point is the shipped defaults catalog, which is also what a
+    first load applies: a deployment the shipped catalog carries is compared
+    with its shipped threshold, so a config file that raises it is validated
+    exactly like a shipped raise. A deployment the shipped catalog does not
+    carry has no prior threshold, hence no raise, hence nothing to gate.
+    """
+    violations: list[str] = []
+    for base_model, definition in catalog.models.items():
+        for deployment in definition.deployments:
+            threshold = (
+                deployment.auto_compact_threshold
+                if deployment.auto_compact_threshold is not None
+                else fallback_threshold
+            )
+            violation = compaction_threshold_violation(
+                label=f"{deployment.provider}/{deployment.name}",
+                threshold=threshold,
+                baseline=shipped_threshold_baseline(base_model, deployment.provider),
+                context_limit=deployment.context_limit,
+                max_completion_tokens=deployment.max_completion_tokens,
+            )
+            if violation is not None:
+                violations.append(violation)
+    return violations
+
+
+def _compaction_threshold_error(violations: Sequence[str]) -> ValueError:
+    return ValueError(
+        "The model catalog's compaction thresholds exceed the provider context "
+        f"budget: {'; '.join(violations)}. {_THRESHOLD_RESOLUTION_PATHS}"
+    )
+
+
 class ChartreuxConfigSchema(ConfigSchema):
     @model_validator(mode="before")
     @classmethod
@@ -234,6 +344,34 @@ class ChartreuxConfigSchema(ConfigSchema):
                 "It has no effect."
             )
         return value
+
+    @model_validator(mode="after")
+    def _validate_compaction_thresholds(
+        self, info: ValidationInfo
+    ) -> ChartreuxConfigSchema:
+        """Reject a configuration whose catalog raises a threshold out of budget.
+
+        Config load is the first half of design P4(c)'s "at config load AND at
+        launch": the builder supplies the effective catalog through the
+        validation context, and the whole configuration fails when any
+        deployment's raised threshold violates the invariant. Because the
+        builder accepts a candidate only after validation, the rejection leaves
+        the last accepted configuration active; a first load applies the same
+        rule with the shipped defaults catalog.
+        """
+        snapshot = (info.context or {}).get("catalog_snapshot")
+        if snapshot is not None:
+            catalog = snapshot.catalog
+        else:
+            from chartreux.core.model_catalog.defaults import SHIPPED_CATALOG
+
+            catalog = SHIPPED_CATALOG
+        violations = compaction_threshold_violations(
+            catalog, fallback_threshold=self.auto_compact_threshold
+        )
+        if violations:
+            raise _compaction_threshold_error(violations)
+        return self
 
     _validation_warnings: list[str] = PrivateAttr(default_factory=list)
     _catalog_snapshot: Any = PrivateAttr(default=None)
@@ -482,6 +620,14 @@ class ChartreuxConfigSchema(ConfigSchema):
     # An ordinary typed section: deep-merge semantics, no resolution machinery.
     plan: Annotated[PlanSectionConfig, WithDeepMerge()] = Field(
         default_factory=PlanSectionConfig
+    )
+
+    # P5 (chunk 5b): the [keepalive] section carries the cache keep-alive
+    # pilot's flag-gated surface — enabled (DEFAULT FALSE), the absolute
+    # count cap, the spend cap, and the idle-gap floor. An ordinary typed
+    # section: deep-merge semantics, validated like every other section.
+    keepalive: Annotated[KeepaliveSectionConfig, WithDeepMerge()] = Field(
+        default_factory=KeepaliveSectionConfig
     )
 
     def _resolve_main_model(self) -> ResolvedModel:

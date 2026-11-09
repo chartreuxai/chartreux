@@ -873,7 +873,7 @@ class ResourceRequestHandler:
 
     def _context_window(self) -> int | None:
         try:
-            return self._agent_loop.config.get_active_model().auto_compact_threshold
+            return self._agent_loop.config.get_active_model().context_limit
         except ValueError:
             return None
 

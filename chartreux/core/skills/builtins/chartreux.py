@@ -725,7 +725,7 @@ Chartreux ships identity-based agent selection; use `identity` rather than the r
 
 The global `[subagents]` settings control retention defaults and capacity: `retain_agents`, `idle_ttl_seconds`, `max_idle_agents`, `tombstone_ttl_seconds`, and `max_tombstones`. By default, background agents close when their run completes unless they are retained; completed results remain retrievable until result expiry. A per-launch `retain` overrides the global `[subagents].retain_agents` default. Its precedence is the launch argument, then the global `[subagents].retain_agents` setting; there is no identity-specific retention setting. On reuse, omit `retain` to inherit the instance's committed retention policy.
 
-Use `task(identity="researcher", task=...)` to create an agent instance. `agent_id` identifies that instance, with a display-only name; `agent_id` remains the only handle. Launch in the background even when the result is a dependency, then wait for it with `wait_for_agent`. A wait returns `completed` or `still_running`; the default timeout is 1500 seconds and does not stop the run. `task_summary` identifies retained work in `check_agents`; `get_agent_result` retrieves completed results. The inventory reports `ttl_remaining_seconds` as an advisory estimate. Retained instances can be reused for a genuine continuation; `check_agents` shows their availability, effective model and thinking, task summaries, and TTL estimate. Reuse an `idle` agent only for a genuine continuation with the same identity and feature or subsystem; include current scope and intervening changes because retained conversation is not proof the working tree is unchanged. Persona is immutable on re-task. A `running` agent is busy; wait if its result is needed. Idle retained agents may be evicted by TTL or capacity. Closed and evicted agents cannot be reused, though results remain retrievable until expiry. `release_agent` discards retained results, so retrieve them first. Background agents cannot launch background agents.
+Use `task(identity="researcher", task=...)` to create an agent instance. `agent_id` identifies that instance, with a display-only name; `agent_id` remains the only handle. Launch in the background even when the result is a dependency: the launch acknowledgment is only a handle — a completion notification arrives when the run finishes, and you fetch the result then with `get_agent_result` (`mode="digest"` by default, `mode="full"` for the full body); use `wait_for_agent` when you would rather block on the run. A wait returns `completed` or `still_running`; the default timeout is 1500 seconds and does not stop the run. `task_summary` identifies retained work in `check_agents`; `get_agent_result` retrieves completed results after their completion notification. The inventory reports `ttl_remaining_seconds` as an advisory estimate. Retained instances can be reused for a genuine continuation; `check_agents` shows their availability, effective model and thinking, task summaries, and TTL estimate. Reuse an `idle` agent only for a genuine continuation with the same identity and feature or subsystem; include current scope and intervening changes because retained conversation is not proof the working tree is unchanged. Persona is immutable on re-task. A `running` agent is busy; its completion notification arrives on its own, so fetch the result with `get_agent_result` when it lands. Idle retained agents may be evicted by TTL or capacity. Closed and evicted agents cannot be reused, though results remain retrievable until expiry. `release_agent` discards retained results, so retrieve them first. Background agents cannot launch background agents.
 
 The `/agents` browser shows identity and agent lifecycle state alongside task summaries, model, run status, and idle/TTL information. Use it to inspect or manage active, idle, and recent agents; release discards retained results.
 
@@ -762,18 +762,36 @@ The evidence is per-run and bounded: the chronology caps at 128 entries, and evi
   commented template when absent and reloads configuration after editing if the
   file changed
 - `/clear`, `/new` - Start a new conversation. Optionally pass a prompt to seed it
-- `/plan`, `/plan accept`, `/plan cancel` - Plan first, then execute the accepted
-  plan in a fresh session. `/plan` switches this conversation to the configured
-  planner model (default: GLM high) with unchanged permissions and allocates a
-  `plan.md` in this project's task workspace; the planner writes it with a
-  `## Summary` section. `/plan accept` shows the plan path, the summary, and the
-  snapshotted executor selection (default: ML4 medium with the orchestrator
-  identity) in a consent modal; Start execution replaces this conversation with
-  an executor session seeded with the summary and the absolute plan path, while
-  Cancel or Escape stays in plan mode. `/plan cancel` exits plan mode and restores
-  the model and thinking selections that were active before `/plan`. `/clear`
-  while planning ends plan mode as well. Configure the selections in `[plan.planner]`
-  and `[plan.executor]`.
+- `/plan`, `/plan status`, `/plan accept`, `/plan cancel`, `/plan rebind` - Plan
+  first, then execute the accepted plan in a fresh session. `/plan` switches this
+  conversation to the configured planner model (default: GLM high) with unchanged
+  permissions and allocates a `plan.md` in this project's task workspace; the
+  planner writes it with a `## Summary` section. Plan mode refuses to start, and a
+  stored episode refuses to resume, when session logging is disabled: the episode
+  lease that enforces one owner per session depends on the logging domain.
+  `/plan status` reports the episode identity and its observed state — draft,
+  accepting, accepted, cancelled, possibly-executed, executed, legacy-unverified,
+  or unresolvable — as the episode sidecar reports it, along with the plan
+  document and the recovery actions that state allows; a terminal or
+  unidentifiable episode is still displayed. `/plan accept` previews the episode's
+  bound draft and, for an unfinished accept transaction, re-offers it to the
+  owning session (release the claim and restart, or verify the surviving bytes and
+  re-consent); accept is disabled on a legacy-unverified record. A
+  possibly-executed episode is adjudicated with `/plan mark-accepted` after
+  inspecting the recorded executor session, and terminal episodes offer a fresh
+  start or a cancel that restores the pre-entry selections. The consent modal
+  shows the episode, its lifecycle state, the plan document, the theme, the
+  document content, summary, size, SHA-256 digest, and the snapshotted executor
+  selection (default: ML4 medium with the orchestrator identity); Start execution
+  replaces this conversation with an executor session seeded with exactly the
+  confirmed bytes, while Cancel or Escape (the default) stays in plan mode.
+  `/plan cancel` exits plan mode and restores the model and thinking selections
+  that were active before `/plan`. `/plan rebind <path>` binds the episode, or
+  allocates a fresh one, to a canonicalized document inside the authorized roots
+  (the session cwd or chartreux plan storage) and refuses an outside path; the
+  rebound document requires a fresh consent. `/clear` while planning ends plan
+  mode as well. Configure the selections in `[plan.planner]` and
+  `[plan.executor]`.
 - `/log` - Show path to current interaction log file
 - `/log-level` - Show the effective log-level chain (session, environment,
   configuration, effective).

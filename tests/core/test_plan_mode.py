@@ -7,6 +7,7 @@ import stat
 import pytest
 
 from chartreux.core.config.models import PlanExecutorConfig, PlanSectionConfig
+from chartreux.core.plan_episode import EPISODE_FENCE_FILENAME, EPISODE_SIDECAR_FILENAME
 from chartreux.core.plan_mode import (
     PLAN_DIRECTORY_PREFIX,
     PLAN_DOCUMENT_FILENAME,
@@ -401,9 +402,14 @@ def test_allocation_marks_a_directory_it_created(
 
     marker = workspace.directory / PLAN_MARKER_FILENAME
     assert marker.is_file()
-    assert [entry.name for entry in workspace.directory.iterdir()] == [
-        PLAN_MARKER_FILENAME
-    ]
+    # The episode claim (sidecar) and the retained transition fence are part of
+    # allocation: the sidecar is the directory claim and the fence is never
+    # removed afterwards.
+    assert sorted(entry.name for entry in workspace.directory.iterdir()) == sorted([
+        PLAN_MARKER_FILENAME,
+        EPISODE_SIDECAR_FILENAME,
+        EPISODE_FENCE_FILENAME,
+    ])
 
 
 def test_allocation_leaves_a_reused_directory_unmarked(

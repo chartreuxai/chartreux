@@ -10,6 +10,7 @@ selection snapshots the consent modal displays and the handoff applies.
 
 from __future__ import annotations
 
+from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
 import re
@@ -17,6 +18,17 @@ import re
 from chartreux.config_values import ThinkingLevel
 from chartreux.core.config.models import PlanSectionConfig
 from chartreux.core.paths import CHARTREUX_HOME
+from chartreux.core.plan_episode import (
+    RECOVERY_ROW_UNRESOLVABLE,
+    EpisodeObservation,
+    PlanEpisodeSidecar,
+    cleanup_episode_workspace,
+    create_sidecar,
+    ensure_episode_fence,
+    fence_path,
+    new_episode_id,
+    sidecar_path,
+)
 from chartreux.core.session.session_id import extract_suffix
 from chartreux.utils.io import read_safe
 from chartreux.utils.private_paths import create_private_directory
@@ -89,10 +101,12 @@ class PlanSummaryEmptyError(PlanDocumentError):
 
 @dataclass(frozen=True, slots=True)
 class PlanWorkspace:
-    """The allocated task directory and the document path inside it."""
+    """The allocated task directory, its document, and the episode it holds."""
 
     directory: Path
     document_path: Path
+    episode_id: str | None = None
+    sidecar_path: Path | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -162,14 +176,17 @@ def derive_session_suffix(session_id: str) -> str:
 def allocate_plan_workspace(
     session_id: str, *, project_root: Path, workspaces_root: Path | None = None
 ) -> PlanWorkspace:
-    """Allocate the session-derived plan workspace, never overwriting a plan.
+    """Allocate the session's plan workspace and claim it as an episode.
 
     Uses ``<workspaces_root>/<project>/tasks/plan-<suffix>/plan.md``; when that
-    document already exists, the first free numbered alternative
-    (``plan-<suffix>-2``, ...) is allocated instead. The task directory is
-    created owner-only; the document itself is left for the planner to write.
-    A directory this call created carries :data:`PLAN_MARKER_FILENAME`; a
-    reused one keeps whatever it already held, marker or not.
+    name already holds a plan document OR an episode sidecar, the first free
+    numbered alternative (``plan-<suffix>-2``, ...) is allocated instead. The
+    sidecar create is EXCLUSIVE and IS the directory claim: a directory still
+    holding a draft is never reused, so two sequential entries in one session
+    get distinct episodes and directories. The task directory is created
+    owner-only; the document itself is left for the planner to write. A
+    directory this call created carries :data:`PLAN_MARKER_FILENAME`; a reused
+    one keeps whatever it already held, marker or not.
     """
     suffix = derive_session_suffix(session_id)
     project_name = derive_project_name(project_root)
@@ -179,7 +196,7 @@ def allocate_plan_workspace(
     for attempt in range(1, _MAX_NAME_ATTEMPTS + 1):
         directory = tasks_root / (base if attempt == 1 else f"{base}-{attempt}")
         document_path = directory / PLAN_DOCUMENT_FILENAME
-        if document_path.exists():
+        if _episode_claimed(directory, document_path):
             continue
         # Ownership is what the exclusive create reports, never a pre-call
         # exists() test: a concurrent creator can win that interval, and a
@@ -189,24 +206,74 @@ def allocate_plan_workspace(
             raise PlanWorkspaceError(
                 f"cannot create plan workspace directory: {directory}"
             )
-        if document_path.exists():
+        if _episode_claimed(directory, document_path):
             if created_here:
-                _discard_created_directory(directory)
+                _relinquish_marker(directory)
             continue
-        if created_here:
-            # Allocation is the directory plus its marker: a created-but-
-            # unmarked directory must never be left behind as foreign content.
-            try:
-                _write_plan_marker(directory)
-            except OSError as error:
-                _discard_created_directory(directory)
-                raise PlanWorkspaceError(
-                    f"cannot mark the plan workspace directory: {directory}: {error}"
-                ) from error
-        return PlanWorkspace(directory=directory, document_path=document_path)
+        sidecar = _claim_episode(directory, document_path, created_here=created_here)
+        if sidecar is None:
+            continue
+        return PlanWorkspace(
+            directory=directory,
+            document_path=document_path,
+            episode_id=sidecar.episode_id,
+            sidecar_path=sidecar_path(directory),
+        )
     raise PlanWorkspaceError(
         f"no free plan workspace name for session {session_id!r} under {tasks_root}"
     )
+
+
+def _episode_claimed(directory: Path, document_path: Path) -> bool:
+    """The allocation probe: a draft document or an episode sidecar takes the name."""
+    return document_path.exists() or sidecar_path(directory).exists()
+
+
+def _claim_episode(
+    directory: Path, document_path: Path, *, created_here: bool
+) -> PlanEpisodeSidecar | None:
+    """Claim the directory with the exclusive sidecar; None when another won."""
+    sidecar = PlanEpisodeSidecar(episode_id=new_episode_id(), draft_path=document_path)
+    if created_here:
+        # Allocation is the directory plus its marker: a created-but-unmarked
+        # directory must never be left behind as foreign content.
+        try:
+            _write_plan_marker(directory)
+        except OSError as error:
+            _relinquish_marker(directory)
+            raise PlanWorkspaceError(
+                f"cannot mark the plan workspace directory: {directory}: {error}"
+            ) from error
+    try:
+        create_sidecar(directory, sidecar)
+    except FileExistsError:
+        # A concurrent claimer owns this directory now; only our own marker
+        # goes, and the foreign sidecar is never touched.
+        if created_here:
+            _relinquish_marker(directory)
+        return None
+    except OSError as error:
+        _abandon_claim(directory, created_here=created_here)
+        raise PlanWorkspaceError(
+            f"cannot claim the plan episode directory: {directory}: {error}"
+        ) from error
+    try:
+        ensure_episode_fence(directory)
+    except OSError as error:
+        _abandon_claim(directory, created_here=created_here)
+        raise PlanWorkspaceError(
+            f"cannot open the plan episode fence: {directory}: {error}"
+        ) from error
+    return sidecar
+
+
+def _abandon_claim(directory: Path, *, created_here: bool) -> None:
+    """Undo this call's claim after a later allocation step failed."""
+    if created_here:
+        _discard_created_directory(directory)
+        return
+    with suppress(OSError):
+        sidecar_path(directory).unlink()
 
 
 def _create_workspace_directory(directory: Path) -> bool:
@@ -220,30 +287,22 @@ def _create_workspace_directory(directory: Path) -> bool:
 
 
 def remove_empty_plan_workspace(directory: Path) -> bool:
-    """Remove an allocated plan workspace that holds nothing but its marker.
+    """Release an allocated plan workspace, removing only plan-owned entries.
 
     Ownership is the marker file, not the path convention: a reused,
-    convention-matching directory that carries no marker is foreign and never
-    removed, while a marker-only directory from an earlier allocation is
-    chartreux's own leftover. A plan document or any other content keeps the
-    directory. Removal is a guarded ``rmdir`` — never a recursive delete — and
-    a directory that has already gone missing is a no-op.
+    convention-matching directory that carries no marker is foreign and is never
+    touched. The removal whitelist (the marker, the sidecar, PRE-COMMIT
+    snapshots, and ``.chartreux-plan-tmp-*`` temps) never includes the episode's
+    transition fence or any provenance-named file, so an ever-allocated episode
+    directory is kept — the declared accumulation behavior. Returns ``True``
+    only when the directory itself went away; a claim in flight refuses loudly
+    and a guarded ``rmdir`` never deletes anything recursive.
     """
     if directory.is_symlink() or not directory.is_dir():
         return False
     if not _is_plan_directory_name(directory.name):
         return False
-    marker = directory / PLAN_MARKER_FILENAME
-    if not marker.is_file():
-        return False
-    try:
-        if any(entry.name != PLAN_MARKER_FILENAME for entry in directory.iterdir()):
-            return False
-        marker.unlink()
-        directory.rmdir()
-    except OSError:
-        return False
-    return True
+    return cleanup_episode_workspace(directory, marker_name=PLAN_MARKER_FILENAME)
 
 
 def _write_plan_marker(directory: Path) -> None:
@@ -254,15 +313,30 @@ def _write_plan_marker(directory: Path) -> None:
 
 
 def _discard_created_directory(directory: Path) -> None:
-    """Undo a directory this call created, never removing foreign content."""
-    try:
-        (directory / PLAN_MARKER_FILENAME).unlink()
-    except OSError:
-        pass
-    try:
+    """Undo a directory this call created, never removing foreign content.
+
+    This is allocation rollback of a directory this call made and never handed
+    out, not a fence release: the marker, the sidecar claim, and the fence file
+    this call wrote all go, and the directory is removed only when nothing else
+    remains.
+    """
+    for path in (
+        directory / PLAN_MARKER_FILENAME,
+        sidecar_path(directory),
+        fence_path(directory),
+    ):
+        with suppress(OSError):
+            path.unlink()
+    with suppress(OSError):
         directory.rmdir()
-    except OSError:
-        pass
+
+
+def _relinquish_marker(directory: Path) -> None:
+    """Drop the marker this call wrote, leaving a foreign claim untouched."""
+    with suppress(OSError):
+        (directory / PLAN_MARKER_FILENAME).unlink()
+    with suppress(OSError):
+        directory.rmdir()
 
 
 def _is_plan_directory_name(name: str) -> bool:
@@ -360,14 +434,57 @@ def build_planner_seed(workspace: PlanWorkspace, theme: str | None = None) -> st
     )
 
 
-def build_plan_mode_compaction_notice(plan_path: str, theme: str | None = None) -> str:
+def build_plan_mode_compaction_notice(
+    plan_path: str,
+    theme: str | None = None,
+    *,
+    episode: EpisodeObservation | None = None,
+    episode_failure: str | None = None,
+) -> str:
     """The one-line notice re-injected after a compaction rewrote the history.
 
     The same text is the ``/plan status`` line. The theme clause follows the
     seed's iff-theme discipline: a themeless mode never renders
     "Theme: None.".
+
+    ``episode`` is the record's sidecar-first observation (design §4.5). The
+    record's state is a mirror, so the re-injected binding follows the SIDECAR:
+    a draft or accepting episode re-injects its live status, while a terminal,
+    possibly-executed, or unresolvable episode is re-injected as history that is
+    NOT active planning — a compaction can never re-arm a terminal episode.
+    ``episode_failure`` reports an untrusted arbiter read: the binding cannot be
+    asserted, so the mode is not re-injected as active.
     """
+    if episode_failure is not None:
+        return (
+            f"Plan episode state could not be validated ({episode_failure}); "
+            "plan mode is not re-injected. Rebind to a fresh episode or start "
+            f"new. Plan document: {plan_path}."
+        )
+    if episode is not None and episode.terminal:
+        return (
+            f"Plan episode {episode.episode_id or '(unidentified)'} is "
+            f"{episode.state or 'terminal'} (terminal): plan mode is not active "
+            "in this session. Start a new episode to plan again. Plan document: "
+            f"{plan_path}."
+        )
+    if episode is not None and episode.possibly_executed:
+        return (
+            f"Plan episode {episode.episode_id or '(unidentified)'} was already "
+            "executed by session "
+            f"{episode.executor_session_id or '(unrecorded)'}: plan mode is not "
+            f"active in this session. Plan document: {plan_path}."
+        )
+    if episode is not None and episode.row == RECOVERY_ROW_UNRESOLVABLE:
+        return (
+            f"Plan episode {episode.episode_id or '(unidentified)'} is "
+            "unresolvable (no sidecar and no executor session): rebind to a "
+            "fresh episode or start new; plan mode is not active in this "
+            f"session. Plan document: {plan_path}."
+        )
     notice = f"Plan mode is active. Plan document: {plan_path}."
+    if episode is not None and episode.episode_id is not None:
+        notice = f"{notice} Plan episode {episode.episode_id}: {episode.state}."
     if theme:
         return f"{notice} Theme: {theme}."
     return notice

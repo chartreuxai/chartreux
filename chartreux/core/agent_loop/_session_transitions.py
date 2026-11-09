@@ -60,10 +60,11 @@ from chartreux.core.file_state import FileStateStore
 from chartreux.core.llm_models import LLMMessage
 from chartreux.core.message_list import MessageList
 from chartreux.core.middleware import MiddlewarePipeline
+from chartreux.core.plan_episode import restored_plan_record
 from chartreux.core.session.session_id import extract_suffix
 from chartreux.core.session.session_lease import SessionLease
 from chartreux.core.session.session_logger import SessionLogger
-from chartreux.core.session_types import AgentStats, SessionMetadata
+from chartreux.core.session_types import AgentStats, PlanModeRecord, SessionMetadata
 from chartreux.core.skills.manager import SkillManager
 from chartreux.core.tools.builtins.todo import TodoState
 from chartreux.core.tools.manager import NoSuchToolError, ToolManager
@@ -551,8 +552,11 @@ class SessionTransitions:
                         "Prepare accounting ownership before resetting a root"
                     )
                 owner = owner.owner_factory(session_id, owner.project_key)
-            self._session_logger_getter().reset_session(
-                session_id, parent_session_id=parent_session_id
+            self._reset_and_restore_plan_mode(
+                session_id=session_id,
+                parent_session_id=parent_session_id,
+                keep_parent=keep_parent,
+                old_session_id=old_session_id,
             )
         except BaseException:
             if lease is not None:
@@ -575,6 +579,37 @@ class SessionTransitions:
             owner=owner,
             lease=lease,
         )
+
+    def _reset_and_restore_plan_mode(
+        self,
+        *,
+        session_id: str,
+        parent_session_id: str | None,
+        keep_parent: bool,
+        old_session_id: str,
+    ) -> None:
+        """Reset the session, re-installing a rewind fork's plan-mode record.
+
+        A reset installs FRESH session metadata, so a rewind would otherwise
+        silently drop plan mode. The departing record is read BEFORE the
+        rotation and re-installed from the episode sidecar at restore time
+        (design §4.5): a rewind to a pre-accept checkpoint of an accepted
+        episode shows accepted, and no checkpoint resurrects a terminal record
+        as active planning. ``old_session_id`` is the session the record was
+        written under, so the bounded executor scan excludes its P1 mirror
+        rather than reading it as a launched executor. A clear (``keep_parent``
+        False) restores nothing: it starts a fresh conversation.
+        """
+        session_logger = self._session_logger_getter()
+        departing_metadata = session_logger.session_metadata
+        departing: PlanModeRecord | None = (
+            None if departing_metadata is None else departing_metadata.plan_mode
+        )
+        session_logger.reset_session(session_id, parent_session_id=parent_session_id)
+        metadata = session_logger.session_metadata
+        if not keep_parent or departing is None or metadata is None:
+            return
+        metadata.plan_mode = restored_plan_record(departing, session_id=old_session_id)
 
     async def clear_history(self) -> None:
         """Run the distinct history-clear protocol: save, reset, trim, republish.

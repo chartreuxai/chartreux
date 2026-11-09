@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 import hashlib
@@ -58,6 +58,41 @@ class _MemoryDescriptorRecord:
     descriptors: tuple[RemoteTool, ...]
 
 
+@dataclass(frozen=True, slots=True)
+class MCPServerGate:
+    """Per-SERVER admission for one discovery consumer (v0.7.6 P1b).
+
+    MCP servers register FLAT — one proxy class per remote tool, keyed by the
+    server alias ``MCPTool.get_server_name()`` carries — so gating is keyed by
+    that alias, never by a group wrapper. ``opted_in`` names the aliases this
+    consumer admits, and the empty default admits NONE: that is a bounded
+    child's default, where every MCP group is OFF unless the launch or the
+    identity explicitly names the server. A root session is UNGATED (the
+    registry holds ``None``) and admits every configured server exactly as it
+    did before this primitive existed.
+
+    Admission is a discovery-time decision: a gated-out server is never
+    discovered, so its proxy classes never reach a manager — a non-opted child
+    has neither the definition nor the resolution path. Classes already handed
+    to a manager keep working, so a legitimate in-flight call completes.
+    """
+
+    opted_in: frozenset[str] = frozenset()
+
+    def admits(self, alias: str) -> bool:
+        return alias in self.opted_in
+
+    def constrained_by(self, ceiling: MCPServerGate | None) -> MCPServerGate:
+        """This opt-in narrowed to what ``ceiling`` admits (parent authority).
+
+        A bounded child may never widen past what it was cloned from: an
+        ancestor that does not admit a server cannot have it admitted below.
+        """
+        if ceiling is None:
+            return self
+        return MCPServerGate(self.opted_in & ceiling.opted_in)
+
+
 class MCPRegistry:
     """Host-scoped legacy discovery with an independent persistent raw cache."""
 
@@ -82,6 +117,11 @@ class MCPRegistry:
         self._authorization_required_sink: MCPAuthorizationRequiredSink | None = None
         self._descriptor_cache_root = descriptor_cache_root
         self._descriptor_cache_ttl_s = descriptor_cache_ttl_s
+        # Per-SERVER admission (v0.7.6 P1b): None is an ungated consumer (a
+        # root session); a bounded child carries an MCPServerGate, with the
+        # clone's ceiling recording what its ancestor admits.
+        self._server_gate: MCPServerGate | None = None
+        self._server_gate_ceiling: MCPServerGate | None = None
         self._descriptor_cache = (
             LegacyMCPDescriptorCache(
                 descriptor_cache_root, ttl_s=descriptor_cache_ttl_s
@@ -192,6 +232,12 @@ class MCPRegistry:
         ] = []
         now = _utc_now()
         for server in servers:
+            if not self.admits_server(server.name):
+                # Gated out for this consumer: no authorization resolution, no
+                # discovery, and no definition. The alias stays in the active
+                # server set (status and projections still report it) but it is
+                # never part of this consumer's catalog.
+                continue
             reference = self._authorization_refs.get(server.name)
             if server.disabled and server.name not in self._force_refresh:
                 if reference is not None:
@@ -239,7 +285,67 @@ class MCPRegistry:
                 descriptor_cache_root=self._descriptor_cache_root,
                 descriptor_cache_ttl_s=self._descriptor_cache_ttl_s,
             )
+        # A clone continues its source's consumer context (a fork keeps the
+        # authority it forked from), so the per-server admission travels with
+        # it rather than silently widening to "everything configured".
+        clone._server_gate = self._server_gate
+        clone._server_gate_ceiling = self._server_gate_ceiling
         return clone
+
+    def for_bounded_child(self, opted_in: Iterable[str] = ()) -> MCPRegistry:
+        """A bounded child's consumer view of this registry (v0.7.6 P1b).
+
+        MCP groups are OFF for bounded children: the view starts with an empty
+        opt-in set and discovers NO server until a launch or identity names
+        one. ``opted_in`` is that explicit opt-in, and it is a REQUEST: it is
+        intersected with this registry's own admission, so a child can never
+        reach a server its parent does not (parent authority).
+
+        The view owns its discovery state; this registry's cache, authorization
+        bindings, and per-server gate are untouched. A change to the view's
+        gate takes effect at its next discovery call — the next spec assembly's
+        catalog source — while proxy classes already handed to a manager keep
+        working, so a legitimate in-flight call completes.
+        """
+        child = self.clone_configuration()
+        child._server_gate_ceiling = self._server_gate
+        child._server_gate = MCPServerGate(frozenset(opted_in)).constrained_by(
+            self._server_gate
+        )
+        return child
+
+    @property
+    def server_gate(self) -> MCPServerGate | None:
+        """This consumer's per-server admission, or None when ungated."""
+        return self._server_gate
+
+    def admits_server(self, alias: str) -> bool:
+        """Whether this consumer admits the MCP server ``alias``.
+
+        An ungated consumer (a root session) admits every configured server.
+        """
+        gate = self._server_gate
+        return gate is None or gate.admits(alias)
+
+    def configure_server_gate(self, gate: MCPServerGate | None) -> None:
+        """Set this consumer's per-server admission.
+
+        ``None`` means "admit whatever the ceiling admits": an ungated root
+        clears its gate, while a bounded child view falls back to its parent's
+        admission — never to "everything configured". Aliases the new gate
+        excludes are dropped from the cache so no later discovery call can
+        serve a definition the gate just closed; classes already handed to a
+        manager are untouched, so in-flight calls complete.
+        """
+        ceiling = self._server_gate_ceiling
+        if gate is None:
+            gate = ceiling
+        elif ceiling is not None:
+            gate = gate.constrained_by(ceiling)
+        self._server_gate = gate
+        for alias in tuple(self._servers_by_alias):
+            if not self.admits_server(alias):
+                self._drop_alias_cache(alias)
 
     async def _memory_hit(
         self, key: str, server: MCPServer, reference: MCPAuthorizationRef, now: datetime

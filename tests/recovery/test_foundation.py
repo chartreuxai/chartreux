@@ -994,6 +994,7 @@ class _StubResultsView:
         self._result_store: dict[tuple[str, str], Any] = {}
         self._expired_results: set[tuple[str, str]] = set()
         self._collected_results: set[tuple[str, str]] = set()
+        self._delivery_markings: dict[tuple[str, str], dict[str, float]] = {}
         self._latest_run_ids: dict[str, str] = {}
         self._wait_leases: dict[tuple[str, str], int] = {}
         self._pending_notifications: set[tuple[str, str]] = set()

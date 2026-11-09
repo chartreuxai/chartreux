@@ -149,7 +149,7 @@
 </text><text class="terminal-r5" x="0" y="508" textLength="1464" clip-path="url(#terminal-line-20)">────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────</text><text class="terminal-r1" x="1464" y="508" textLength="12.2" clip-path="url(#terminal-line-20)">
 </text><text class="terminal-r7" x="0" y="532.4" textLength="12.2" clip-path="url(#terminal-line-21)">&gt;</text><text class="terminal-r1" x="1464" y="532.4" textLength="12.2" clip-path="url(#terminal-line-21)">
 </text><text class="terminal-r5" x="0" y="556.8" textLength="1464" clip-path="url(#terminal-line-22)">────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────</text><text class="terminal-r1" x="1464" y="556.8" textLength="12.2" clip-path="url(#terminal-line-22)">
-</text><text class="terminal-r1" x="0" y="581.2" textLength="353.8" clip-path="url(#terminal-line-23)">workdir&#160;|&#160;pid&#160;0&#160;|&#160;0/400k&#160;(0%)</text>
+</text><text class="terminal-r1" x="0" y="581.2" textLength="353.8" clip-path="url(#terminal-line-23)">workdir&#160;|&#160;pid&#160;0&#160;|&#160;0/1.0M&#160;(0%)</text>
     </g>
     </g>
 </svg>

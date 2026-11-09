@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 from collections.abc import AsyncGenerator, Awaitable, Callable, Sequence
 from contextlib import suppress
 from dataclasses import dataclass
@@ -1030,11 +1031,17 @@ class AppServerSession:  # noqa: PLR0904
         plan_path: str,
         planner_thinking_alias: str | None,
         planner_thinking_value: str | None,
+        episode_id: str | None = None,
+        snapshot_path: str | None = None,
+        snapshot_sha256: str | None = None,
+        snapshot_bytes: bytes | None = None,
     ) -> SessionPlanHandoffResponse:
         """Start the consented executor session for an accepted plan.
 
         The consent snapshot is sent verbatim; the server applies exactly these
-        values or fails without starting execution.
+        values or fails without starting execution. An episode-bound handoff
+        also carries the previewed document bytes — the request's sole verified
+        artifact — base64-encoded for the newline-delimited JSON transport.
         """
         response = await self.resources.sessions.plan_handoff(
             SessionPlanHandoffParams(
@@ -1045,6 +1052,14 @@ class AppServerSession:  # noqa: PLR0904
                 plan_path=plan_path,
                 planner_thinking_alias=planner_thinking_alias,
                 planner_thinking_value=planner_thinking_value,
+                episode_id=episode_id,
+                snapshot_path=snapshot_path,
+                snapshot_sha256=snapshot_sha256,
+                snapshot_bytes_b64=(
+                    None
+                    if snapshot_bytes is None
+                    else base64.b64encode(snapshot_bytes).decode("ascii")
+                ),
             )
         )
         await self.resources.refresh()
