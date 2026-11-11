@@ -100,6 +100,11 @@ from chartreux.app_server.protocol import (
     validate_json_rpc_envelope,
     validate_notification_method,
 )
+from chartreux.app_server.registry_manifest import (
+    CallbackTarget,
+    LiveAgentUnavailableError,
+    RegistryManifest,
+)
 from chartreux.app_server.transport import JsonRpcTransport
 from chartreux.core.config.harness_files import HarnessFilesManager
 from chartreux.core.subagents import LaunchConfigError
@@ -175,6 +180,7 @@ class CallbackDelivery:
     session_id: str
     callback_id: str
     answered: bool = False
+    target: CallbackTarget | None = None
 
 
 @dataclass(slots=True)
@@ -1309,13 +1315,22 @@ class AppServer:
         transport = self._transport
         if transport is None or not self._connection_attached or self._attaching:
             return
+        try:
+            target = self._callback_delivery_target(callback.callback_id)
+        except LiveAgentUnavailableError:
+            # Bidirectional invalidation reaches prompts, not just frames: the
+            # routing row went away with its agent's incarnation, so no answer
+            # could be routed back. Showing the prompt would strand the client.
+            return
         callback_kind = callback.detail.kind
         if callback_kind not in self._client_capabilities.callback_kinds:
             raise RuntimeError(f"Client does not support {callback_kind} callbacks")
         request_id = self._next_request_id
         self._next_request_id += 1
         self._callback_requests[request_id] = CallbackDelivery(
-            session_id=callback.session_id, callback_id=callback.callback_id
+            session_id=callback.session_id,
+            callback_id=callback.callback_id,
+            target=target,
         )
         params = CallbackCallParams(callback=callback)
         try:
@@ -1334,6 +1349,30 @@ class AppServer:
         if root is not None and await root.publish_callback(callback):
             return
         await self._deliver_callback(callback)
+
+    def _registry_manifest(self) -> RegistryManifest | None:
+        """The registry manifest of the root session, when it has one.
+
+        The manifest belongs to the runtime factory keyed by the root agent
+        loop, so the app server reaches it through the root backend's request
+        handler — the only surface that names that loop. A backend without a
+        handler, or without a registered manifest, is an in-process runtime
+        whose callbacks stay in memory.
+        """
+        handler = getattr(self._root, "handler", None)
+        factory = getattr(handler, "_runtime_factory", None)
+        loop = getattr(handler, "_agent_loop", None)
+        if factory is None or loop is None:
+            return None
+        manifest: RegistryManifest | None = factory.registry_manifest(loop)
+        return manifest
+
+    def _callback_delivery_target(self, callback_id: str) -> CallbackTarget | None:
+        """The manifest route a callback prompt is delivered for, if routed."""
+        manifest = self._registry_manifest()
+        if manifest is None:
+            return None
+        return manifest.delivery_target(callback_id)
 
     async def _request_client_result[ResultT: ProtocolModel](
         self, method: str, params: ProtocolModel, response_type: type[ResultT]

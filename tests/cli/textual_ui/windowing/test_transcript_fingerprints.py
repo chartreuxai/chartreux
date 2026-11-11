@@ -554,10 +554,15 @@ def test_tuple_payload_values_are_always_changed() -> None:
 
 
 def test_lone_surrogate_payloads_are_always_changed() -> None:
-    # A JSON payload can decode to a lone surrogate ("\ud800"), and such text
-    # has no UTF-8 encoding. The canonical form cannot be built, so admission
-    # must fall back to always-changed instead of raising.
-    surrogate = _message(blocks=[TextContentBlock(text="a\ud800b")])
+    # A JSON payload can decode to a lone surrogate (the UTF-16 code unit
+    # U+D800), and such text has no UTF-8 encoding. The canonical form cannot
+    # be built, so admission must fall back to always-changed instead of
+    # raising.
+    lone = chr(0xD800)
+    surrogate_text = f"a{lone}b"
+    with pytest.raises(UnicodeEncodeError):
+        surrogate_text.encode()
+    surrogate = _message(blocks=[TextContentBlock(text=surrogate_text)])
     clean = _message(blocks=[TextContentBlock(text="ab")])
     assert fingerprint_entry(surrogate) != fingerprint_entry(surrogate)
     assert fingerprint_entry(surrogate) != fingerprint_entry(clean)
@@ -566,7 +571,7 @@ def test_lone_surrogate_payloads_are_always_changed() -> None:
     window.admit([surrogate], start_index=0)
     unit = window.units["message-1"]
     first = unit.entry_fingerprints[0]
-    window.update_entry(_message(blocks=[TextContentBlock(text="a\ud800b")]))
+    window.update_entry(_message(blocks=[TextContentBlock(text=f"a{chr(0xD800)}b")]))
     # Always-changed, so an update is never mistaken for an unchanged record.
     assert unit.entry_fingerprints[0] != first
     assert unit.geometry_version > 0

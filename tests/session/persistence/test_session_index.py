@@ -95,6 +95,47 @@ def test_skips_missing_messages_and_missing_session_id(save_dir: Path) -> None:
     assert {s["session_id"] for s in result} == {"valid-id"}
 
 
+def test_strict_listing_skips_sidecars_files_and_unsaved_directory(
+    save_dir: Path,
+) -> None:
+    _make_session(save_dir, "valid", "valid-id")
+    (save_dir / "session_valid.registry.json").write_text("{}")
+    (save_dir / "session_other").write_text("")
+    unsaved = save_dir / "session_unsaved"
+    unsaved.mkdir()
+    (unsaved / ".writer-fence.lock").touch()
+
+    result = SessionIndex(save_dir, "session").list(strict_io=True)
+
+    assert [session["session_id"] for session in result] == ["valid-id"]
+
+
+def test_strict_listing_rejects_corrupt_metadata(save_dir: Path) -> None:
+    folder = _make_session(save_dir, "bad", "bad-id")
+    (folder / "meta.json").write_text("invalid json")
+    index = SessionIndex(save_dir, "session")
+
+    assert index.list() == []
+    with pytest.raises(json.JSONDecodeError):
+        index.list(strict_io=True)
+
+
+def test_strict_listing_propagates_metadata_permission_error(
+    save_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    folder = _make_session(save_dir, "bad", "bad-id")
+    original_stat = Path.stat
+
+    def denied_stat(path: Path, *args: object, **kwargs: object) -> os.stat_result:
+        if path == folder / "meta.json":
+            raise PermissionError("metadata inaccessible")
+        return original_stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "stat", denied_stat)
+    with pytest.raises(PermissionError):
+        SessionIndex(save_dir, "session").list(strict_io=True)
+
+
 def test_nonexistent_save_dir_returns_empty_without_creating(tmp_path: Path) -> None:
     missing = tmp_path / "does_not_exist"
     index = SessionIndex(missing, "session")

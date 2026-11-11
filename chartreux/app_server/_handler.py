@@ -44,6 +44,10 @@ from chartreux.app_server._runtime import (
     RuntimeSessionNotFoundError,
     close_agent_loop,
 )
+from chartreux.app_server._session_backend_port import (
+    AgentTranscriptReadSource,
+    LiveTranscriptSourceRefused,
+)
 from chartreux.app_server._session_model import (
     clear_session_active_model_override,
     clear_session_agent_identity_override,
@@ -184,6 +188,10 @@ from chartreux.app_server.protocol import (
     WorkspacePromptPrepareParams,
     WorkspacePromptPrepareResponse,
     WorkspaceTrustDecisionParams,
+)
+from chartreux.app_server.registry_manifest import (
+    LiveAgentUnavailableError,
+    RegistryManifest,
 )
 from chartreux.core.agent_loop import AgentLoop, AgentLoopStateError
 from chartreux.core.compaction import CompactionFailedError
@@ -579,14 +587,79 @@ class CoreRequestHandler:
         if method != "agent/transcript/get":
             raise method_not_found(method)
         params = validate_wire(AgentTranscriptGetParams, raw_params)
+        self._require_attached(self._agent_loop.session_id)
+        if self.agent_is_live(params.agent_id):
+            return DispatchResult(
+                await self.read_agent_transcript_page(
+                    params.agent_id,
+                    source="live",
+                    before=params.before,
+                    limit=params.limit,
+                )
+            )
+        return DispatchResult(
+            await self._read_local_agent_transcript_page(
+                params.agent_id, params.before, params.limit
+            )
+        )
+
+    def agent_is_live(self, agent_id: str) -> bool:
+        """Whether the agent is currently served by a registered live route."""
+        registry = self._registry_manifest()
+        return registry is not None and registry.is_live(agent_id)
+
+    async def read_agent_transcript_page(
+        self,
+        agent_id: str,
+        *,
+        source: AgentTranscriptReadSource,
+        before: str | None = None,
+        limit: int = 50,
+    ) -> AgentTranscriptGetResponse:
+        """Serve one page from a live agent's view or from the local session.
+
+        A live agent is always paged from its registered in-memory reader, so
+        an explicit disk request for that agent is refused rather than served
+        from a disk copy that would silently diverge from the live view.
+        """
+        registry = self._registry_manifest()
+        live = registry is not None and registry.is_live(agent_id)
+        if source == "disk":
+            if live:
+                raise LiveTranscriptSourceRefused(
+                    agent_id, reason="disk_read_for_live_agent"
+                )
+            return await self._read_local_agent_transcript_page(agent_id, before, limit)
+        if registry is None or not live:
+            raise LiveTranscriptSourceRefused(agent_id, reason="live_agent_unavailable")
+        try:
+            return await registry.read_live_page(agent_id, before=before, limit=limit)
+        except LiveAgentUnavailableError as exc:
+            raise LiveTranscriptSourceRefused(
+                agent_id, reason="live_agent_unavailable"
+            ) from exc
+
+    def _registry_manifest(self) -> RegistryManifest | None:
+        """The registry manifest of the root session this handler serves."""
+        factory = getattr(self, "_runtime_factory", None)
+        if factory is None:
+            return None
+        registry: RegistryManifest | None = factory.registry_manifests.get(
+            self._agent_loop
+        )
+        return registry
+
+    async def _read_local_agent_transcript_page(
+        self, agent_id: str, before: str | None, limit: int
+    ) -> AgentTranscriptGetResponse:
+        """Serve one page from the resident view, else the saved transcript."""
         parent_identity = (
             self._agent_loop.session_id,
             self._agent_loop._session_generation,
         )
-        self._require_attached(parent_identity[0])
         try:
             resident_snapshot = await self._sessions.resolve_resident_transcript_read(
-                params.agent_id
+                agent_id
             )
         except UnknownAgentError as exc:
             raise RequestFailure(
@@ -601,8 +674,8 @@ class CoreRequestHandler:
             response = await asyncio.to_thread(
                 read_live_agent_transcript,
                 resident_snapshot.messages,
-                before=params.before,
-                limit=params.limit,
+                before=before,
+                limit=limit,
             )
             if not await self._sessions.resident_transcript_read_is_current(
                 resident_snapshot
@@ -611,9 +684,9 @@ class CoreRequestHandler:
                     ProtocolErrorCode.CONFLICT,
                     "Transcript read is no longer authorized",
                 )
-            return DispatchResult(response)
+            return response
         try:
-            snapshot = await self._sessions.resolve_transcript_read(params.agent_id)
+            snapshot = await self._sessions.resolve_transcript_read(agent_id)
         except UnknownAgentError as exc:
             raise RequestFailure(
                 ProtocolErrorCode.NOT_FOUND, "Agent not found"
@@ -623,14 +696,12 @@ class CoreRequestHandler:
                 ProtocolErrorCode.CONFLICT, "Transcript parent changed while reading"
             )
         if not snapshot.has_saved_transcript:
-            return DispatchResult(
-                AgentTranscriptGetResponse(
-                    state=AgentTranscriptState.NO_SAVED_TRANSCRIPT
-                )
+            return AgentTranscriptGetResponse(
+                state=AgentTranscriptState.NO_SAVED_TRANSCRIPT
             )
         try:
             response = await asyncio.to_thread(
-                _read_authorized_agent_transcript, snapshot, params.before, params.limit
+                _read_authorized_agent_transcript, snapshot, before, limit
             )
         except SessionFileContainmentError as exc:
             raise RequestFailure(
@@ -640,7 +711,7 @@ class CoreRequestHandler:
             raise RequestFailure(
                 ProtocolErrorCode.CONFLICT, "Transcript read is no longer authorized"
             )
-        return DispatchResult(response)
+        return response
 
     async def _dispatch_session(
         self, method: str, raw_params: dict[str, Any]

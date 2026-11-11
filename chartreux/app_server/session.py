@@ -6,6 +6,7 @@ from collections.abc import AsyncGenerator, Awaitable, Callable, Sequence
 from contextlib import suppress
 from dataclasses import dataclass
 import time
+from typing import Any
 from uuid import uuid4
 
 from pydantic import ValidationError
@@ -21,11 +22,13 @@ from chartreux.app_server.connection import (
     AppServerResourceConnection,
 )
 from chartreux.app_server.events import (
+    DEFAULT_PRESENTATION_STREAM_ID,
     AppServerEvent,
     CallbackRequested,
     ChildCallbackClosed,
     EventSequenceError,
     HistoryEntryAdded,
+    PresentationConsumer,
     SessionCompacted,
     SessionUpdated,
     StatsUpdated,
@@ -152,6 +155,14 @@ _RECONNECT_BACKOFF_MAX_SECONDS = 5.0
 _EXPECTED_CLOSE_ERRORS = (ConnectionError, EOFError, AppServerConnectionClosed)
 _DROPPED_NOTIFICATION_METHODS_MAX = 64
 _RESYNC_COALESCE_WINDOW_SECONDS = 0.5
+# How often the session drives the presentation consumer's generation-scoped
+# timers once the route carries relay frames.
+_PRESENTATION_TIMER_TICK_SECONDS = 0.25
+
+# A connection listener is told ``(True, reason)`` when the app-server
+# connection drops and ``(False, "")`` when a reconnect re-attaches; the TUI
+# surfaces the typed connection-failure state from these.
+type ConnectionStateListener = Callable[[bool, str], None]
 
 
 class AppServerTurnError(RuntimeError):
@@ -206,6 +217,20 @@ class AppServerSession:  # noqa: PLR0904
                     "Client tool capabilities require a client tool handler"
                 )
         self._state = ClientSessionState(bootstrap)
+        # The consumer side of the relay's presentation protocol: it tracks
+        # the announced incarnation per stream, installs snapshot pages
+        # atomically per generation, and keeps registration timers
+        # generation-scoped. Relay frames reach it through the client's
+        # presentation handler, attached by the connection (and re-attached
+        # on every reconnect).
+        self.presentation = PresentationConsumer()
+        self._presentation_stream_id = DEFAULT_PRESENTATION_STREAM_ID
+        self._presentation_timer_task: asyncio.Task[None] | None = None
+        self._presentation_timer_sleep: Callable[[float], Awaitable[None]] = (
+            asyncio.sleep
+        )
+        self._connection_listeners: list[ConnectionStateListener] = []
+        self._connection_lost = False
         self._connection = AppServerConnection(
             client,
             self._state,
@@ -213,6 +238,8 @@ class AppServerSession:  # noqa: PLR0904
             capabilities,
             session_options,
             client_factory=client_factory,
+            presentation_handler=self._on_presentation_frame,
+            presentation_stream_id=self._presentation_stream_id,
         )
         resource_connection = AppServerResourceConnection(
             self._connection, self._ensure_attached, self._ensure_host_connected
@@ -382,6 +409,83 @@ class AppServerSession:  # noqa: PLR0904
 
     async def connect(self) -> None:
         await self._ensure_attached()
+
+    @property
+    def connection_lost(self) -> bool:
+        """Whether the app-server connection is currently down (reconnecting)."""
+        return self._connection_lost
+
+    def add_connection_listener(self, listener: ConnectionStateListener) -> None:
+        """Observe connection loss/resume for the TUI's typed failure state."""
+        self._connection_listeners.append(listener)
+
+    def remove_connection_listener(self, listener: ConnectionStateListener) -> None:
+        with suppress(ValueError):
+            self._connection_listeners.remove(listener)
+
+    def _notify_connection(self, lost: bool, reason: str) -> None:
+        self._connection_lost = lost
+        # getattr: partially constructed sessions (tests) may not carry the
+        # listener list yet.
+        listeners = getattr(self, "_connection_listeners", None)
+        if listeners:
+            for listener in list(listeners):
+                listener(lost, reason)
+
+    def _on_presentation_frame(
+        self, stream_id: str, generation: int | None, message: dict[str, Any]
+    ) -> bool:
+        # The first relay frame proves this route carries the presentation
+        # protocol; only then are the consumer's deadlines driven, so a run
+        # without relay frames (in-process escape) never fails its stream on
+        # a timer.
+        self._ensure_presentation_timer_driver()
+        return self.presentation.receive_frame(stream_id, generation, message)
+
+    def _ensure_presentation_timer_driver(self) -> None:
+        task = self._presentation_timer_task
+        if task is None or task.done():
+            self._presentation_timer_task = asyncio.create_task(
+                self._drive_presentation_timers(), name="presentation-timers"
+            )
+
+    async def _drive_presentation_timers(self) -> None:
+        # One session-scoped driver: reconnects re-attach the same consumer and
+        # never start a second loop, so each generation-scoped deadline fires
+        # exactly once.
+        while not self._closing:
+            await self._presentation_timer_sleep(_PRESENTATION_TIMER_TICK_SECONDS)
+            if self._closing:
+                break
+            try:
+                self.presentation.fire_due()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("Presentation timer driver failed")
+
+    def _stop_presentation_timer_driver(self) -> None:
+        task = getattr(self, "_presentation_timer_task", None)
+        self._presentation_timer_task = None
+        if task is not None:
+            task.cancel()
+
+    def _reannounce_presentation(self) -> None:
+        """Retire the current incarnation after a resume.
+
+        The replacement announcement arrives on the re-attached connection and
+        installs a fresh snapshot atomically; the registration-await deadline
+        is armed exactly once, scoped to the retired generation.
+        """
+        presentation = getattr(self, "presentation", None)
+        if presentation is None:
+            return
+        stream_id = getattr(
+            self, "_presentation_stream_id", DEFAULT_PRESENTATION_STREAM_ID
+        )
+        stream = presentation.stream(stream_id)
+        if stream.terminal is None and stream.current is not None:
+            stream.retire(stream.current)
 
     async def act(
         self,
@@ -1075,10 +1179,15 @@ class AppServerSession:  # noqa: PLR0904
         """
         self._closing = True
         self._pump_stop.set()
+        self._stop_presentation_timer_driver()
 
     async def close(self) -> None:
         self._closing = True
         self._pump_stop.set()
+        timer_task = getattr(self, "_presentation_timer_task", None)
+        self._stop_presentation_timer_driver()
+        if timer_task is not None:
+            await asyncio.gather(timer_task, return_exceptions=True)
         if self._deferred_resync_task is not None:
             self._deferred_resync_task.cancel()
             await asyncio.gather(self._deferred_resync_task, return_exceptions=True)
@@ -1132,6 +1241,9 @@ class AppServerSession:  # noqa: PLR0904
                 if self._closing:
                     self._close_event_streams(error)
                     return
+                # The connection dropped and a reconnect is being attempted:
+                # surface the typed connection-failure state while it is down.
+                self._notify_connection(True, str(error))
                 if not await self._wait_for_reconnect(self._reconnect_backoff_seconds):
                     self._close_event_streams()
                     break
@@ -1147,6 +1259,11 @@ class AppServerSession:  # noqa: PLR0904
                     return
                 client = await self._attach_with_backoff(attach_session=was_attached)
                 if client is not None and not self._closing:
+                    # Resumed: re-announce through the presentation consumer so
+                    # the replacement incarnation installs a fresh snapshot (or
+                    # the stream fails typed) — no second timer driver starts.
+                    self._notify_connection(False, "")
+                    self._reannounce_presentation()
                     try:
                         await self.resources.usage.refresh_after_reconnect()
                     except Exception:

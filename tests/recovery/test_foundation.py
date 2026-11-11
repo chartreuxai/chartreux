@@ -999,6 +999,7 @@ class _StubResultsView:
         self._wait_leases: dict[tuple[str, str], int] = {}
         self._pending_notifications: set[tuple[str, str]] = set()
         self._result_write_tokens: dict[tuple[str, str], object] = {}
+        self._child_result_receipts: dict[str, set[str]] = {}
         self._evicted_agents: dict[str, Any] = {}
         self._children: dict[str, Any] = {}
         self._admission_closed = False

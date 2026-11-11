@@ -4,7 +4,10 @@ import asyncio
 from contextlib import suppress
 from io import BytesIO
 import json
+import os
 import socket
+import subprocess
+import sys
 from threading import Event
 from typing import Any
 from unittest.mock import AsyncMock
@@ -25,6 +28,7 @@ from chartreux.app_server.session import AppServerSession
 from chartreux.app_server.transport import (
     InvalidJsonRpcMessage,
     MemoryJsonRpcTransport,
+    ProcessPipeJsonRpcTransport,
     StdioJsonRpcTransport,
 )
 from chartreux.utils.terminal import TerminalEmulator
@@ -148,6 +152,76 @@ async def test_stdio_transport_uses_one_ordered_writer() -> None:
         {"jsonrpc": "2.0", "id": 1, "result": {}},
         {"jsonrpc": "2.0", "method": "turn/started"},
     ]
+
+
+@pytest.mark.asyncio
+async def test_abortive_close_discards_queued_frames_and_closes_raw_pipe() -> None:
+    read_fd, write_fd = os.pipe()
+    raw = os.fdopen(write_fd, "wb", buffering=0)
+
+    class Writer(BlockingWriter):
+        def __init__(self) -> None:
+            super().__init__()
+            self.raw = raw
+
+        def close(self) -> None:
+            raise AssertionError("buffered close must not be called")
+
+    writer = Writer()
+    transport = StdioJsonRpcTransport(BytesIO(), writer, outbox_size=1)
+    try:
+        await transport.send({"id": 1})
+        assert await asyncio.to_thread(writer.started.wait, 1)
+        await transport.send({"id": 2})
+        await asyncio.wait_for(transport.abortive_close(), timeout=1)
+        assert (
+            await asyncio.wait_for(asyncio.to_thread(os.read, read_fd, 1), timeout=1)
+            == b""
+        )
+        assert transport._outbox.empty()
+        assert not writer.release.is_set()
+    finally:
+        writer.release.set()
+        os.close(read_fd)
+
+
+@pytest.mark.asyncio
+async def test_draining_close_waits_for_and_writes_queued_frames() -> None:
+    writer = BlockingWriter()
+    transport = StdioJsonRpcTransport(BytesIO(), writer, outbox_size=1)
+    await transport.send({"id": 1})
+    assert await asyncio.to_thread(writer.started.wait, 1)
+    await transport.send({"id": 2})
+    closing = asyncio.create_task(transport.close())
+    await asyncio.sleep(0)
+    assert not closing.done()
+    writer.release.set()
+    await asyncio.wait_for(closing, timeout=1)
+    assert [json.loads(line) for line in writer.output.getvalue().splitlines()] == [
+        {"id": 1},
+        {"id": 2},
+    ]
+
+
+@pytest.mark.asyncio
+async def test_process_pipe_abortive_close_reaps_child() -> None:
+    process = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(30)"],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+    )
+    assert process.stdin is not None
+    assert process.stdout is not None
+    transport = ProcessPipeJsonRpcTransport(
+        process.stdout, process.stdin, process=process, terminate_grace=0.2
+    )
+    try:
+        await asyncio.wait_for(transport.abortive_close(), timeout=2)
+        assert process.poll() is not None
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait()
 
 
 @pytest.mark.asyncio

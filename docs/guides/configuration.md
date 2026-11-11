@@ -87,6 +87,14 @@ See the [configuration reference](../reference/configuration.md#orchestration-ro
 for the full field list, seats, and diversity semantics, and
 [Subagents](subagents.md) for the delegation guide.
 
+## Runtime topology
+
+Interactive sessions run the multi-process topology: the terminal connects to a thin app-server coordinator, which runs one root agent process and one child process per retained subagent. Each agent process reads its own credentials, enforces its own permissions, and writes its own transcript, so agent work no longer blocks terminal input or painting.
+
+`CHARTREUX_TRANSPORT` overrides the route for a run: `stdio` selects the multi-process topology, and `in_process` is the escape that runs the app server and its agents in one process. To make the escape permanent, set `multi_process = false` in `config.toml`; an explicit `CHARTREUX_TRANSPORT` value still outranks it. Programmatic `-p`/`--prompt` runs stay in-process, and the retired `multi_process` selector spelling is rejected.
+
+A live root session additionally creates exactly two files: a registry manifest beside its session directory (`<session>.registry.json`) and a writer-fence lockfile inside the fenced session directory (`.writer-fence.lock`). See the [app-server integration](../integrations/app-server.md#process-topology) for the full contract.
+
 ## API keys and `.env`
 
 A provider declares the name of its credential variable. For example, the shipped Mistral provider uses `MISTRAL_API_KEY`:

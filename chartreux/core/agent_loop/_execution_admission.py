@@ -53,6 +53,7 @@ class ExecutionAdmission:
     only.
     """
 
+    policy_revision: int
     once_requirements: tuple[tuple[str, RepositoryScope], ...] | None = None
     remote_exec_requirements: tuple[RemoteExecGrantRequirement, ...] | None = None
 
@@ -76,6 +77,11 @@ def revalidate_execution_admission(
     call, never an unhandled error.
     """
     tool_name = tool.get_name()
+    if admission is not None and (
+        grant_store is None
+        or admission.policy_revision != grant_store.current_policy_revision
+    ):
+        return f"Tool '{tool_name}' denied: policy revision is stale"
     # The snapshot await is a world-change window: drop cached authority so
     # the revalidation reads the live world — an in-place config change, a
     # store revocation, a retirement — exactly as the grant flows invalidate

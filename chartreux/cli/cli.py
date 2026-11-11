@@ -190,6 +190,37 @@ def apply_invocation_selections(args: argparse.Namespace) -> None:
             os.environ[env] = value
 
 
+def _select_transport(
+    config: ChartreuxConfigSchema | None, *, interactive: bool
+) -> None:
+    """Resolve this run's app-server transport before any harness is built.
+
+    The config escape publishes the selector the environment spells, and so
+    does the interactive default (``stdio``), so the harness and the spawned
+    root agent resolve one channel. A malformed selector fails here, as a
+    startup error, instead of surfacing once the session is already starting.
+    """
+    from chartreux.app_server.transport import (
+        IN_PROCESS_TRANSPORT,
+        TRANSPORT_ENV_VAR,
+        TransportSelectionError,
+        resolve_transport_selection,
+    )
+
+    try:
+        selection = resolve_transport_selection(
+            multi_process=getattr(config, "multi_process", None),
+            interactive=interactive,
+        )
+    except TransportSelectionError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        sys.exit(1)
+    if selection.source == "config" or (
+        selection.source == "default" and selection.kind != IN_PROCESS_TRANSPORT
+    ):
+        os.environ[TRANSPORT_ENV_VAR] = selection.selector
+
+
 def _run_programmatic_mode(args: argparse.Namespace, stdin_prompt: str | None) -> None:
     from chartreux.app_server.local import ClientDescriptor, LocalHarnessOptions
     from chartreux.app_server.protocol import (
@@ -373,9 +404,12 @@ def run_cli(args: argparse.Namespace) -> None:
         restore_interactive_stdin(stdin_isatty=stdin_isatty)
 
     try:
-        require_api_key_or_onboard(
+        orchestrator = require_api_key_or_onboard(
             load_config_orchestrator_or_exit(),
             interactive=not is_programmatic and has_usable_terminal(),
+        )
+        _select_transport(
+            getattr(orchestrator, "config", None), interactive=not is_programmatic
         )
         if is_programmatic:
             _run_programmatic_mode(args=args, stdin_prompt=stdin_prompt)

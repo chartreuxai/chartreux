@@ -538,9 +538,10 @@ async def test_close_never_overwrites_an_answered_callback() -> None:
         await turns._cancel_callbacks("App server closed")
 
         # The terminal cancelled patch belongs to open entries only: the
-        # answered record keeps exactly one terminal result.
+        # answered record keeps exactly one terminal result. The waiter
+        # resolves with the core result, not the public callback output.
         assert observed == []
-        assert record.future.result() == answer
+        assert record.future.result() == answer.result
     finally:
         await _drain(events)
         await session.close()
@@ -574,7 +575,7 @@ async def test_answer_records_the_settlement_before_publishing_the_terminal_patc
         assert terminal_before_publish is True
         assert isinstance(state, AnsweredCallbackState)
         assert future_states == ["pending"]
-        assert record.future.result() == answer
+        assert record.future.result() == answer.result
         assert record.core_resolved is True
     finally:
         await _drain(events)

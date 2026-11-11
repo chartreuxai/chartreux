@@ -31,6 +31,7 @@ from chartreux.core.agent_loop._dangerous_command_grants import (
     DangerousCommandGrantStore,
 )
 from chartreux.core.agent_loop._execution_admission import (
+    ExecutionAdmission,
     revalidate_execution_admission,
 )
 from chartreux.core.agent_loop._loop_types import ToolDecision, ToolExecutionResponse
@@ -139,7 +140,7 @@ class ToolExecutor:
         self._tool_failure_event = tool_failure_event
         self._handle_tool_response = handle_tool_response
 
-    async def process(
+    async def process(  # noqa: PLR0915
         self, tool_call: ResolvedToolCall
     ) -> AsyncGenerator[ToolResultEvent | ToolStreamEvent | HookEvent]:
         # Run one complete tool lifecycle: lookup, serialization, pre-tool
@@ -206,6 +207,11 @@ class ToolExecutor:
                 async for ev in self._handle_tool_skip(tool_call, decision):
                     yield ev
                 return
+
+            if decision.admission is None:
+                decision.admission = ExecutionAdmission(
+                    policy_revision=self._dangerous_command_grants.current_policy_revision
+                )
 
             tool_started = True
             async for ev in self.invoke_tool(
@@ -343,12 +349,31 @@ class ToolExecutor:
         # unguarded await remains between the last admission decision and the
         # actual execution. The gate covers every execution path of the tool,
         # including the shell tool's client-terminal delegation.
+        admission = decision.admission
+        if admission is not None and (
+            admission.once_requirements is None
+            and admission.remote_exec_requirements is None
+        ):
+            # An admission backed only by live store authority is validated
+            # against the post-window world, not against the revision stamp:
+            # a revocation inside the window advanced the policy revision AND
+            # removed the authority from the store, so the revalidation below
+            # fails closed with the honest reason. Admissions carrying private
+            # once/remote-exec requirements keep their decision-time stamp —
+            # the gate re-arms those permits from the admission itself, so any
+            # revision advance must refuse them before the re-arm. Policy
+            # replacement cannot land inside this window (it requires an idle
+            # loop and turn), so refreshing the stamp never masks a policy
+            # change.
+            admission = ExecutionAdmission(
+                policy_revision=self._dangerous_command_grants.current_policy_revision
+            )
         admission_denial = revalidate_execution_admission(
             tool_instance,
             tool_call.validated_args,
             self._tool_manager_getter(),
             self._dangerous_command_grants,
-            decision.admission,
+            admission,
         )
         if admission_denial is not None:
             self._stats_getter().tool_calls_agreed -= 1

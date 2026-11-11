@@ -20,6 +20,8 @@ from chartreux.app_server._plan_record import plan_mode_record, session_plan_rec
 from chartreux.app_server._resources import ResourceRequestHandler
 from chartreux.app_server._root_session import RootSessionCoordinator
 from chartreux.app_server._session_backend_port import (
+    AgentTranscriptReadSource,
+    LiveTranscriptPages,
     MCPAuthorizationProvider,
     MCPAuthorizationRequired,
     ResolvedMCPCatalog,
@@ -46,6 +48,7 @@ from chartreux.app_server.events import (
 )
 from chartreux.app_server.models import PublicCallbackEntry, PublicSessionState
 from chartreux.app_server.protocol import (
+    AgentTranscriptGetResponse,
     CallbackResultError,
     CallbackResultParams,
     CallbackResultResponse,
@@ -175,6 +178,33 @@ def configure_mcp_registry_impl(
         required_sink=required_sink,
         descriptor_cache_root=descriptor_cache_root,
     )
+
+
+@dataclass(frozen=True, slots=True)
+class LiveTranscriptPagesImpl:
+    """Live-page proxy over the root handler's registered agent routes.
+
+    Agent paging lives with the session's request handler, which owns the
+    manifest routes and the saved-transcript authorization; this adapter
+    exposes exactly that surface as the live-page port.
+    """
+
+    handler: CoreRequestHandler
+
+    def is_live(self, agent_id: str) -> bool:
+        return self.handler.agent_is_live(agent_id)
+
+    async def read_page(
+        self,
+        agent_id: str,
+        *,
+        source: AgentTranscriptReadSource,
+        before: str | None = None,
+        limit: int = 50,
+    ) -> AgentTranscriptGetResponse:
+        return await self.handler.read_agent_transcript_page(
+            agent_id, source=source, before=before, limit=limit
+        )
 
 
 @dataclass(slots=True)  # noqa: PLR0904 - implements narrow app-server ports
@@ -612,6 +642,20 @@ class SessionBackendImpl:
                 after_event_id=response.last_event_id,
                 replay=pending_auth_required,
             ),
+        )
+
+    async def read_agent_transcript_page(
+        self,
+        agent_id: str,
+        *,
+        source: AgentTranscriptReadSource,
+        before: str | None = None,
+        limit: int = 50,
+    ) -> AgentTranscriptGetResponse:
+        """Serve one agent-transcript page through the live-page port."""
+        pages: LiveTranscriptPages = LiveTranscriptPagesImpl(self.handler)
+        return await pages.read_page(
+            agent_id, source=source, before=before, limit=limit
         )
 
     def guard_request(self) -> None:

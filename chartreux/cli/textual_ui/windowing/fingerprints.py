@@ -39,8 +39,8 @@ Canonicalization rules, each recorded against the equality behaviour it keeps:
   (entries arrive forced to lists) but deep-unequal to the list they would
   encode like.
 * Payload strings holding a lone surrogate (what JSON-decoding an escaped
-  surrogate such as ``\ud800`` produces) are always-changed: UTF-8 cannot
-  encode them, so no canonical byte form exists.
+  surrogate such as the UTF-16 code unit U+D800 produces) are always-changed:
+  UTF-8 cannot encode them, so no canonical byte form exists.
 * Any other unencodable value is always-changed, which is the safe direction.
 
 Two structural classes cannot collide through these rules: ``extra='forbid'``

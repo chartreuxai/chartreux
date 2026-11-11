@@ -13,6 +13,10 @@ from chartreux.app_server._subagent_records import (
     _AgentTombstone,
     _ReplacementClaim,
 )
+from chartreux.app_server.subagent_ports import (
+    MAX_SUBAGENT_DEPTH,
+    SubagentDepthDeniedError,
+)
 from chartreux.core.agents.manager import requested_identity_reference
 from chartreux.core.subagents import (
     AgentClosedError,
@@ -173,7 +177,8 @@ class ReplacementCoordinator:
         if args.agent_id is None or not args.background:
             raise ValueError("replace_run requires agent_id and background mode")
         if ctx.is_subagent:
-            raise RuntimeError("Agent depth limit of 1 reached")
+            # WP5 [5B]: typed depth denial (wire-visible, never a silent drop).
+            raise SubagentDepthDeniedError(depth=1, max_depth=MAX_SUBAGENT_DEPTH)
         parent = self._view._runtime(ctx.session_id)
         identity = (parent.agent_loop.session_id, parent.agent_loop._session_generation)
         async with self._view._registry_lock:

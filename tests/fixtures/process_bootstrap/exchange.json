@@ -1,0 +1,27 @@
+{
+  "description": "Transport-level JSON-RPC exchange replayed over the in-process and process-pipe topologies.",
+  "protocolVersion": 1,
+  "messages": [
+    {
+      "jsonrpc": "2.0",
+      "id": "fixture-initialize",
+      "method": "initialize",
+      "params": {
+        "clientInfo": {"name": "differential-fixture", "version": "1"},
+        "capabilities": {"callbackKinds": ["user_input"]}
+      }
+    },
+    {"jsonrpc": "2.0", "method": "initialized", "params": {}},
+    {
+      "jsonrpc": "2.0",
+      "method": "presentation/delta",
+      "params": {"sequence": 1, "patch": {"text": "fixture delta"}}
+    },
+    {
+      "jsonrpc": "2.0",
+      "id": "fixture-read",
+      "method": "session/read",
+      "params": {"sessionId": "fixture-session"}
+    }
+  ]
+}

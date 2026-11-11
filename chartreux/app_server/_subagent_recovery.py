@@ -42,7 +42,10 @@ Safety invariants (code, never config escape hatches):
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Callable, Coroutine, Sequence
+from collections.abc import Callable, Collection, Coroutine, Sequence
+from dataclasses import dataclass
+from datetime import UTC, datetime
+from pathlib import Path
 import time
 from typing import TYPE_CHECKING, Any, Protocol
 
@@ -55,6 +58,12 @@ from chartreux.app_server._subagent_records import (
     _AgentTombstone,
     _ResumeAdmission,
     _ResumeOperation,
+)
+from chartreux.app_server._subagent_transcript import (
+    ChildTranscriptAdjudication,
+    ChildTranscriptOutcome,
+    child_transcript_dirs,
+    read_child_transcript,
 )
 from chartreux.app_server.models import TextContentBlock
 from chartreux.app_server.protocol import TurnStartParams
@@ -998,3 +1007,189 @@ class SubagentRecovery:
         except Exception as exc:
             logger.warning("Failed to publish reconciliation update", exc_info=exc)
         return result
+
+
+# --- WP5 [5C]: child transcript reconciliation (coordinator side) ------------
+
+AGENT_TRANSCRIPT_RECONCILE_METHOD = "agent/transcripts/reconcile"
+"""The coordinator→root message that hands a dead child's state to the root."""
+
+
+@dataclass(frozen=True, slots=True)
+class ChildTranscriptReconciliation:
+    """One dead child's marker-based state, reconciled by the coordinator.
+
+    The coordinator reads the child transcript's durable markers (read-only,
+    path-confined) and reports exactly one of: never executed, started with
+    an unknown outcome, completed with an unconsumed result, or unreadable.
+    It never returns a replay instruction: an unknown or unreadable outcome
+    is surfaced to the user and the run is not re-executed (design.md:196-205).
+    A completed result is ``unconsumed`` until the root records its receipt,
+    which makes the handoff idempotent.
+    """
+
+    agent_id: str
+    child_dir: Path
+    outcome: ChildTranscriptOutcome
+    run_id: str | None = None
+    result_id: str | None = None
+    digest: str | None = None
+    unconsumed: bool = False
+    denial: str | None = None
+
+    @property
+    def has_unconsumed_result(self) -> bool:
+        """Whether the root still has to adopt this child's result."""
+        return self.unconsumed and self.result_id is not None
+
+    def coordinator_message(self) -> dict[str, object]:
+        """The explicit coordinator→root message carrying this reconciliation."""
+        return {
+            "method": AGENT_TRANSCRIPT_RECONCILE_METHOD,
+            "params": {
+                "agent_id": self.agent_id,
+                "transcript_dir": str(self.child_dir),
+                "outcome": self.outcome.value,
+                "run_id": self.run_id,
+                "result_id": self.result_id,
+                "digest": self.digest,
+                "unconsumed": self.unconsumed,
+                "denial": self.denial,
+            },
+        }
+
+
+def _never_executed_denial(agent_id: str, child_dir: Path) -> str:
+    return (
+        f"Subagent {agent_id} never executed: no start marker at {child_dir}. "
+        "Nothing was replayed."
+    )
+
+
+def _outcome_unknown_denial(agent_id: str, run_id: str | None) -> str:
+    run = f" (run {run_id})" if run_id else ""
+    return (
+        f"Subagent {agent_id} started{run} but its outcome is unknown: the "
+        "terminal result record is missing. It will not be replayed; verify "
+        "the effect yourself before retrying."
+    )
+
+
+def _unreadable_denial(agent_id: str, child_dir: Path, detail: str) -> str:
+    return (
+        f"Subagent {agent_id} transcript at {child_dir} is unreadable "
+        f"({detail}); it was skipped. Nothing was replayed."
+    )
+
+
+class ChildTranscriptReconciler:
+    """Read child transcript markers and reconcile a dead child (WP5 [5C]).
+
+    The coordinator owns physical child lifecycle, so it is the component that
+    adjudicates a crashed child: it reads the durable start marker and terminal
+    result record the CHILD wrote, classifies the run (never executed vs
+    started-outcome-unknown vs completed), and surfaces unreadable transcripts
+    instead of concealing them. It never writes a child transcript and never
+    replays a run.
+    """
+
+    def __init__(self, root_session_dir: Path) -> None:
+        self.root_session_dir = Path(root_session_dir)
+
+    def reconcile(
+        self, child_dir: Path, *, agent_id: str | None = None
+    ) -> ChildTranscriptReconciliation:
+        """Adjudicate one child transcript directory."""
+        return self._reconcile_dir(child_dir, agent_id=agent_id)
+
+    def scan(
+        self, *, consumed_result_ids: Collection[str] = ()
+    ) -> list[ChildTranscriptReconciliation]:
+        """Reconcile every child transcript under ``<root>/agents``.
+
+        ``consumed_result_ids`` are the result ids the root already recorded;
+        a matching completed result is reported as consumed (idempotent
+        receipt), never re-delivered. One unreadable transcript is surfaced
+        as its own UNREADABLE result and never aborts the scan.
+        """
+        consumed = set(consumed_result_ids)
+        return [
+            self._reconcile_dir(child_dir, consumed=consumed)
+            for child_dir in child_transcript_dirs(self.root_session_dir)
+        ]
+
+    def _reconcile_dir(
+        self,
+        child_dir: Path,
+        *,
+        agent_id: str | None = None,
+        consumed: Collection[str] = (),
+    ) -> ChildTranscriptReconciliation:
+        try:
+            adjudication = read_child_transcript(
+                child_dir, root_session_dir=self.root_session_dir
+            )
+        except Exception as exc:
+            # Path confinement or an unreadable directory: surface it, never
+            # conceal it and never retry the child.
+            resolved_agent = agent_id or Path(child_dir).name.split("_", 1)[0]
+            return ChildTranscriptReconciliation(
+                agent_id=resolved_agent,
+                child_dir=Path(child_dir),
+                outcome=ChildTranscriptOutcome.UNREADABLE,
+                denial=_unreadable_denial(
+                    resolved_agent, Path(child_dir), f"{type(exc).__name__}: {exc}"
+                ),
+            )
+        return self._reconcile_adjudication(
+            adjudication, agent_id=agent_id, consumed=consumed
+        )
+
+    def _reconcile_adjudication(
+        self,
+        adjudication: ChildTranscriptAdjudication,
+        *,
+        agent_id: str | None = None,
+        consumed: Collection[str] = (),
+    ) -> ChildTranscriptReconciliation:
+        resolved_agent = agent_id or _adjudicated_agent_id(adjudication)
+        return ChildTranscriptReconciliation(
+            agent_id=resolved_agent,
+            child_dir=adjudication.child_dir,
+            outcome=adjudication.outcome,
+            run_id=adjudication.run_id,
+            result_id=adjudication.result_id,
+            digest=adjudication.digest,
+            unconsumed=(
+                adjudication.result_id is not None
+                and adjudication.result_id not in consumed
+            ),
+            denial=_reconciliation_denial(resolved_agent, adjudication),
+        )
+
+
+def _adjudicated_agent_id(adjudication: ChildTranscriptAdjudication) -> str:
+    if adjudication.start_marker is not None:
+        return adjudication.start_marker.agent_id
+    if adjudication.result is not None:
+        return adjudication.result.agent_id
+    return adjudication.child_dir.name.split("_", 1)[0]
+
+
+def _reconciliation_denial(
+    agent_id: str, adjudication: ChildTranscriptAdjudication
+) -> str | None:
+    if adjudication.outcome is ChildTranscriptOutcome.NEVER_EXECUTED:
+        return _never_executed_denial(agent_id, adjudication.child_dir)
+    if adjudication.outcome is ChildTranscriptOutcome.STARTED_OUTCOME_UNKNOWN:
+        return _outcome_unknown_denial(agent_id, adjudication.run_id)
+    if adjudication.outcome is ChildTranscriptOutcome.UNREADABLE:
+        return _unreadable_denial(
+            agent_id, adjudication.child_dir, adjudication.detail or "unreadable"
+        )
+    return None
+
+
+def child_reconciliation_timestamp() -> str:
+    """The ISO timestamp a child terminal result record carries."""
+    return datetime.now(UTC).isoformat()

@@ -30,6 +30,7 @@ from chartreux.app_server.models import (
 )
 from chartreux.app_server.protocol import AppServerResponseError, ProtocolErrorCode
 from chartreux.app_server.server import AppServer
+from chartreux.app_server.subagent_ports import SubagentCapacityDeniedError
 from chartreux.core.agent_loop import AgentLoop
 from chartreux.core.agents.identity_launch import (
     InvalidChildIdentityError,
@@ -108,9 +109,13 @@ from tests.stubs.fake_backend import FakeBackend
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("finish", ["completion", "release"])
-async def test_running_subagent_cap_excludes_idle_and_frees_capacity(
+async def test_running_subagent_cap_counts_retained_idle_until_explicit_close(
     monkeypatch: pytest.MonkeyPatch, finish: str
 ) -> None:
+    """WP5 [5B] kill budget (design.md:448-456): retained idle agents COUNT
+    against the cap; over-cap is a typed denial; closure is an explicit user
+    action only — no automatic eviction, never silent queueing.
+    """
     backends = [BlockingBackend()]
 
     def create_backend(**_kwargs):
@@ -141,7 +146,7 @@ async def test_running_subagent_cap_excludes_idle_and_frees_capacity(
         await asyncio.wait_for(backends[0].started.wait(), timeout=5)
         for background in (True, False):
             with pytest.raises(
-                RuntimeError,
+                SubagentCapacityDeniedError,
                 match=r"Subagent launch rejected: 1 agents already running \(cap 1\); "
                 "wait for completion or release agents",
             ):
@@ -157,26 +162,38 @@ async def test_running_subagent_cap_excludes_idle_and_frees_capacity(
 
         backends[0].release.set()
         await registry.wait_for_agent(first.agent_id, first.run_id)
-        assert registry._agent_records[first.agent_id].state is _AgentState.IDLE
+        record = registry._agent_records[first.agent_id]
+        assert record.state is _AgentState.IDLE
+        # The retained idle agent still counts: a FRESH launch is denied typed,
+        # and the denial never evicts the idle agent.
+        with pytest.raises(SubagentCapacityDeniedError, match="cap 1"):
+            await _background_result(registry, args, ctx)
+        assert registry._agent_records[first.agent_id] is record
+        assert record.state is _AgentState.IDLE
+        assert create_child.await_count == 1
+        # Reusing the retained idle agent converts its retained occupancy into
+        # the new run's slot instead of double-counting it.
         backends.append(BlockingBackend())
-        second = await _background_result(registry, args, ctx)
-        assert second.agent_id is not None and second.run_id is not None
-        await asyncio.wait_for(backends[1].started.wait(), timeout=5)
-        # An idle retained agent cannot bypass the active-work cap by being reused.
-        with pytest.raises(RuntimeError, match="cap 1"):
-            await _background_result(
-                registry, args.model_copy(update={"agent_id": first.agent_id}), ctx
-            )
-        assert create_child.await_count == 2
-        if finish == "release":
-            await registry.release_agent(second.agent_id)
-        else:
-            backends[1].release.set()
-            await registry.wait_for_agent(second.agent_id, second.run_id)
-        third = await _background_result(
+        second = await _background_result(
             registry, args.model_copy(update={"agent_id": first.agent_id}), ctx
         )
-        assert third.agent_id == first.agent_id
+        assert second.agent_id == first.agent_id and second.run_id is not None
+        await asyncio.wait_for(backends[1].started.wait(), timeout=5)
+        # While the reused agent runs, the cap is exhausted again.
+        with pytest.raises(SubagentCapacityDeniedError, match="cap 1"):
+            await _background_result(registry, args, ctx)
+        if finish == "release":
+            # Explicit user closure of the retained agent frees the budget.
+            await registry.release_agent(first.agent_id)
+        else:
+            backends[1].release.set()
+            await registry.wait_for_agent(first.agent_id, second.run_id)
+            assert registry._agent_records[first.agent_id].state is _AgentState.IDLE
+            await registry.release_agent(first.agent_id)
+        assert first.agent_id not in registry._agent_records
+        backends.append(BlockingBackend())
+        third = await _background_result(registry, args, ctx)
+        assert third.agent_id is not None and third.agent_id != first.agent_id
     finally:
         for backend in backends:
             backend.release.set()

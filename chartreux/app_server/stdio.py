@@ -2,8 +2,13 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import sys
 
 from chartreux.app_server._runtime import create_harness_server
+from chartreux.app_server.process_bootstrap import (
+    bootstrap_requested,
+    write_ready_frame,
+)
 from chartreux.app_server.transport import (
     BinaryLineReader,
     BinaryLineWriter,
@@ -15,13 +20,19 @@ from chartreux.observability.logging import init_file_logging
 
 
 async def serve_stdio(
-    *, reader: BinaryLineReader | None = None, writer: BinaryLineWriter | None = None
+    *,
+    reader: BinaryLineReader | None = None,
+    writer: BinaryLineWriter | None = None,
+    announce_ready: bool = False,
 ) -> None:
-    transport = (
-        StdioJsonRpcTransport.from_standard_streams()
-        if reader is None or writer is None
-        else StdioJsonRpcTransport(reader, writer)
-    )
+    if reader is None or writer is None:
+        transport = StdioJsonRpcTransport.from_standard_streams()
+        ready_writer: BinaryLineWriter = sys.stdout.buffer
+    else:
+        transport = StdioJsonRpcTransport(reader, writer)
+        ready_writer = writer
+    if announce_ready:
+        write_ready_frame(ready_writer)
     harness = await create_harness_server(transport, transport_kind="stdio")
     await harness.serve()
 
@@ -38,4 +49,4 @@ def main() -> None:
     init_harness_files_manager("user", "project")
     init_file_logging(LOG_FILE.path, repair_path=LITERAL_LOG_FILE.path)
     load_dotenv_values()
-    asyncio.run(serve_stdio())
+    asyncio.run(serve_stdio(announce_ready=bootstrap_requested()))

@@ -2,6 +2,94 @@
 
 All notable changes to Chartreux are documented in this file.
 
+## 0.7.7 (2026-11-11)
+
+Agent work moves into separate processes: a thin app-server coordinator relays
+typed JSON-RPC to a root agent process and one process per retained subagent,
+so tools, provider calls, projection, and saves no longer share the client's
+event loop. Presentation loss becomes a bounded invalidation and
+re-registration contract, and the interactive default is the multi-process
+route with an in-process escape.
+
+### Added
+
+- **The multi-process execution topology (design v5.2), default for
+  interactive runs.** The terminal client talks to a thin app-server
+  coordinator, which spawns a root agent process and one child process per
+  retained subagent identity. The coordinator carries user input ingress,
+  relay, the process registry, and liveness only; each agent process owns its
+  own loop, tools, permission policy and grant store, transcript, saves,
+  provider calls, compaction, hooks, and MCP clients. Programmatic
+  (`-p`/`--prompt`) runs keep the single-process route as the differential
+  baseline.
+- **`CHARTREUX_TRANSPORT` selects the run's route.** `stdio` selects the
+  multi-process topology and is the interactive default; `in_process` is the
+  escape that runs the same components with every process boundary removed,
+  and `multi_process = false` in `config.toml` selects the same escape. The
+  legacy `multi_process` spelling is rejected, naming the supported selectors
+  rather than echoing the supplied value.
+- **A framed spawn/ready handshake.** A spawned process announces readiness
+  with one newline-delimited frame carrying `chartreuxBootstrap`, which no
+  JSON-RPC envelope can claim. The installing protocol version must match,
+  EOF or a foreign frame before readiness is a typed failure with no retry
+  negotiation, and the wait is one startup deadline on a monotonic clock.
+  Physical spawns pass through a process-tree budget whose exhaustion is a
+  typed spawn denial, and a zero-child spawn is never queued silently.
+- **Two persistent artifacts, and only two.** A root session's live routing
+  lives in a registry manifest beside the session directory
+  (`<session>.registry.json`), and the fenced session directory carries one
+  writer-fence lockfile (`.writer-fence.lock`). The manifest holds live
+  routes, callbacks, and policy transaction records with no credentials and
+  no pending approvals, and it is disposable: a restart rebuilds it.
+- **Presentation loss is invalidation plus bounded re-registration.** A
+  detected shed, sequence gap, buffer or outbox overflow, or snapshot capture
+  or delivery failure retires that generation by first-winner. The client
+  shows transient stale/refreshing state and then installs a fresh producer
+  snapshot atomically at its final page, or the stream ends in a persistent
+  typed failure after a bounded attempt limit. Late frames from a retired
+  incarnation are discarded, a notice for an already-retired incarnation is
+  stale, and a presentation refresh never cancels agent compute, approvals, or
+  results.
+- **Abortive discard at a relay that cannot drain.** Each relay demultiplexes
+  its own streams, and a path that cannot carry its queued teardown inside its
+  bound closes abortively: it discards its own demux-scoped outbox and closes
+  the channel so the peer observes EOF instead of waiting on a drain that will
+  never come.
+- **Python 3.14 source compatibility (WP0).** The TUI fingerprint module that
+  failed to compile on 3.14 is fixed, and import, CLI entrypoint, and terminal
+  startup were exercised on a CPython 3.14 interpreter.
+
+### Changed
+
+- **Ordered process-tree shutdown under one 10-second bound.** Shutdown stops
+  admission, interrupts, drains saves, escalates SIGTERM then SIGKILL, closes
+  IPC, and reaps the tree under a single bound. A tree that cannot be reaped
+  inside it reports a typed timeout instead of success, and no new tree starts
+  before the old one is reaped.
+- **Credentials stay out of the wire.** Each agent process reads credentials at
+  spawn from the standard local sources (environment and dotenv), exactly as
+  the single-process route does. The coordinator never reads credential
+  variables, and no provider key appears in a wire frame, log, transcript, or
+  crash report. A mid-session key change reaches agents spawned afterwards;
+  a running agent keeps its spawn-time value.
+- **The differential and fault-injection gate covers both topologies.** Seeded
+  traces replay in both modes with matching digests, including 19 presentation
+  traces, programmatic stdout/stderr/exit parity, root permission and
+  revocation, save and shutdown oracles, child crash and reconciliation
+  oracles, and a subprocess egress proof. The escape gate exercises the same
+  component code with the process boundaries removed.
+- **Offline end measurements (WP9) ship with the release.** Seeded,
+  egress-blocked, single-machine runs cover PTY input and paint gaps, zero-delay
+  turn wall time, per-process and total memory at 0 and 8 children, coordinator
+  loop delay, CPU, drops and control latency, and process start-to-ready, with
+  command, exit status, seed, tree, interpreter, machine, and raw output
+  recorded outside the repository.
+- **WP8 projector batching was omitted.** The plan allowed omission when it
+  could not land cleanly, and the probe showed that batching the per-event
+  generator stream would hide retry-turn context from the generator body
+  without restructuring the turn path. The end measurements were taken without
+  it.
+
 ## 0.7.6 (2026-11-08)
 
 Plan-mode handoff becomes a fenced, crash-recoverable episode transaction; a

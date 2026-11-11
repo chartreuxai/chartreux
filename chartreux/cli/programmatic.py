@@ -53,6 +53,10 @@ class ProgrammaticLimitError(RuntimeError):
     pass
 
 
+class ProgrammaticPersistenceError(RuntimeError):
+    """The session could not be durably persisted before the final response."""
+
+
 class ProgrammaticOutput:
     def __init__(
         self, output_format: OutputFormat, stream: TextIO | None = None
@@ -181,6 +185,34 @@ class ContinuationOutcome:
     # (agent_id, run_id, stop reason) named separately from the surfaced bodies.
     cancelled: list[tuple[str, str, str]] = field(default_factory=list)
     recovery_notice: str | None = None
+
+
+async def _persist_session_before_response(
+    session: AppServerSession, registry: SessionRuntimeRegistry | None
+) -> None:
+    """Save-before-response (WP3 [3D]): the final response is emitted only
+    after the session transcript is durably persisted.
+
+    Forces one save on the root writer and fails closed when the save did not
+    persist (a recorded fail-closed save diagnostic, or logging enabled but
+    nothing persisted): the response is never emitted over an unsaved session.
+    """
+    if registry is None:
+        registry = _resolve_session_registry(session)
+    root = getattr(registry, "_root", None) if registry is not None else None
+    loop = getattr(root, "agent_loop", None)
+    if loop is None:
+        return
+    session_logger = getattr(loop, "session_logger", None)
+    if session_logger is None or not session_logger.enabled:
+        return
+    await loop._save_messages()
+    diagnostic = getattr(session_logger, "last_save_diagnostic", None)
+    if diagnostic is not None or not session_logger.persisted:
+        raise ProgrammaticPersistenceError(
+            f"Session {session.session_id} could not be durably persisted "
+            "before the final response was emitted"
+        )
 
 
 def _resolve_session_registry(
@@ -545,8 +577,19 @@ def run_programmatic(
                 outcome.recovery_notice = recovery_notice
             output.set_terminal_notice(_render_terminal_notice(outcome))
 
+            # WP3 [3D] save-before-response: persist the session durably
+            # before the final response (or the limit error) is emitted.
+            await _persist_session_before_response(session, registry)
+
             turn = next(reversed(session.state.turns or []), None)
-            if turn is not None and turn.stop_reason is PublicTurnStopReason.LIMIT:
+            # A mid-continuation STOP is recorded on the outcome itself: a
+            # notification-driven turn started after the LIMIT turn must not
+            # mask the limit from the final check.
+            limit_reached = (
+                outcome.stop_reason is ContinuationStopReason.LIMIT_STOP
+                or (turn is not None and turn.stop_reason is PublicTurnStopReason.LIMIT)
+            )
+            if limit_reached:
                 message = _last_assistant_text(session.history) or (
                     "The configured conversation limit was reached"
                 )

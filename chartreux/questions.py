@@ -13,6 +13,7 @@ __all__ = [
     "UnansweredQuestions",
     "UnattendedDefault",
     "UnattendedDefaultAction",
+    "UnattendedExpiryPolicy",
     "UserAnswer",
     "UserQuestion",
     "UserQuestionRequest",
@@ -237,3 +238,16 @@ class UnansweredQuestions(UserQuestionResult):
     continuation_guidance: str = Field(
         description="Model-facing guidance for continuing after expiry"
     )
+
+
+class UnattendedExpiryPolicy(QuestionModel):
+    """The agent-side admission snapshot of an armed unattended-expiry policy.
+
+    Computed by the root loop at request admission (plan U/OD1): it carries the
+    effective timeout and the echoed questions with their declared defaults, so
+    a host relaying the request can present an honest countdown without owning
+    the decision. Expiry defers the affected work; it never approves anything.
+    """
+
+    timeout_seconds: float = Field(gt=0.0)
+    questions: list[UnansweredQuestion] = Field(min_length=1)

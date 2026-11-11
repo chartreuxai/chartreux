@@ -24,6 +24,88 @@ not private server modules. Its exported surface is:
 - `AppServerConnectionClosed` for attached-session connection closure; and
 - `SessionExitSummary` for shutdown presentation.
 
+## Process topology
+
+An interactive run is three process classes: the terminal client, one thin
+app-server coordinator, and one agent process per agent — the root agent plus
+each retained subagent identity. They speak the same typed JSON-RPC over stdio,
+so a delivery surface sees one connection while agent work happens outside its
+event loop.
+
+| Process | Owns | Must never own |
+| --- | --- | --- |
+| Client (terminal, ACP, programmatic) | Presentation, input history, a bounded disposable backfill cache | Tools, permission evaluation, transcripts, approval authority, credentials on the wire |
+| Coordinator (app server) | User input ingress, relay with per-producer sequences and incarnation IDs, process registry and liveness, approval-prompt routing, paged-read proxying, secret-free usage aggregation | Tools, permission policy or enforcement, transcript writes, provider calls, compaction, MCP, credentials, approval futures |
+| Root agent process | Root loop, turn controller, projector, tool batch runner, permission policy and grant store, root transcript and saves, provider calls, compaction, MCP, hooks, subagent admission and supervision, config writes | UI state |
+| Subagent process | Its own loop, tools, permission stack, transcript under `<root>/agents/<agent_id>/`, projection, provider calls, MCP clients, compaction | Root history, other children's transcripts |
+
+A subagent transcript is scoped to the root session; only root sessions are
+independently resumable.
+
+### Transport selection
+
+`CHARTREUX_TRANSPORT` accepts two selectors:
+
+- `stdio` selects the multi-process topology and is the interactive default.
+- `in_process` is the escape: the same components run in one process with every
+  process boundary removed.
+
+Omitting the variable leaves an interactive run on `stdio` and a programmatic
+(`-p`/`--prompt`) run in-process. The config key `multi_process = false`
+selects the same escape as `in_process`, and an explicit environment selector
+outranks it. The legacy `multi_process` spelling is rejected as unusable;
+diagnostics name the supported selectors and never echo the supplied value.
+
+### Spawn and readiness
+
+The coordinator spawns each agent process and reads exactly one
+newline-delimited readiness frame carrying `chartreuxBootstrap` before any
+JSON-RPC frame flows. The installing protocol version must match; EOF, a
+foreign frame, or a version mismatch is a typed failure with no retry
+negotiation, and the whole handshake is one startup deadline on a monotonic
+clock. Physical spawns draw on a process-tree budget: an exhausted budget is a
+typed spawn denial surfaced to the user, and the coordinator never queues a
+spawn silently.
+
+### Credentials
+
+Each agent process reads credentials at spawn from the standard local sources
+(environment and dotenv), exactly as the single-process route does. The
+coordinator never reads credential variables, and no provider key is sent over
+the wire. A key changed mid-session reaches agents spawned afterwards; a
+running agent keeps its spawn-time value.
+
+### Presentation loss
+
+Presentation frames carry a per-producer sequence and an opaque incarnation ID.
+A detected shed, sequence gap, presentation buffer or outbox overflow, or
+snapshot capture or delivery failure invalidates that generation at the
+detecting hop. The client shows transient stale or refreshing state, then
+installs a fresh producer snapshot atomically at its final page, or the stream
+ends in a persistent typed failure after the bounded re-registration attempt
+limit. Frames from a retired incarnation are discarded, and a notice for an
+already-retired incarnation cannot affect its replacement. Presentation
+refresh alone never cancels agent compute, approvals, or results.
+
+### Shutdown
+
+Process-tree shutdown is ordered under one 10-second bound: stop admission,
+interrupt, drain saves, send SIGTERM then SIGKILL, close IPC, and reap. No new
+tree starts before the old tree is reaped, and a tree that cannot be reaped
+inside the bound reports a typed timeout rather than success.
+
+### Persistent artifacts
+
+The topology adds exactly two persistent artifacts:
+
+- The **registry manifest** (`<session>.registry.json`) sits beside the session
+  directory, never inside it, because the root agent is the fenced directory's
+  only writer. It holds live routes, callbacks, and policy transaction records
+  — no credentials and no pending approvals — and it is disposable: a restart
+  rebuilds it.
+- The **writer-fence lockfile** (`.writer-fence.lock`) lives inside the fenced
+  session directory and serializes that session's writer.
+
 ## RPC surface
 
 `chartreux.app_server.protocol.SERVER_METHODS` is the authoritative current RPC

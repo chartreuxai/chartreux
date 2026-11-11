@@ -9,7 +9,7 @@ import time
 from typing import Literal, cast
 from uuid import uuid4
 
-from pydantic import JsonValue
+from pydantic import BaseModel, JsonValue
 
 from chartreux.app_server._execution import (
     ActiveSessionExecution,
@@ -90,6 +90,14 @@ from chartreux.app_server.protocol import (
     TurnUpdatedParams,
 )
 from chartreux.core.agent_loop import AgentLoop, AgentTurnOptions
+from chartreux.core.agent_loop._execution_port import ExecutionTurnRequest
+from chartreux.core.agent_loop._request_broker import (
+    EXPIRED_CALLBACK_REASON,
+    CallbackRecord,
+    ChildQuestionRefusedError,
+    UserInputSettlement,
+    UserInputSettleOutcome,
+)
 from chartreux.core.agent_loop._transcript_integrity import (
     TranscriptIntegrityError,
     live_archive_authority,
@@ -104,7 +112,6 @@ from chartreux.core.events import (
     BaseEvent,
     CompactEndEvent,
     ToolWaitStateChangedEvent,
-    UserInputOrigin,
     UserInputRequestEvent,
     UserMessageEvent,
 )
@@ -123,7 +130,7 @@ from chartreux.core.subagents import SubagentRunnerPort
 from chartreux.core.tools.io_port import ToolIOPort
 from chartreux.core.utils.retry import RetryCategory, RetryReason
 from chartreux.observability.logging import logger
-from chartreux.questions import QuestionKind, UnansweredQuestion, UnansweredQuestions
+from chartreux.questions import UserQuestionResult
 from chartreux.user_content import UserResource
 
 type Notify = Callable[[str, ProtocolModel], Awaitable[None]]
@@ -176,43 +183,32 @@ class CallbackRejectedError(RuntimeError):
     pass
 
 
-class ChildQuestionRefusedError(RuntimeError):
-    """A child (subagent) loop's model question, refused at admission.
+# ChildQuestionRefusedError is defined agent-side (the admission decision
+# lives in the root loop's request broker); it stays importable from here for
+# the coordinator-side wire error mapping and existing tests.
 
-    Raised into the core broker waiter so the asking tool call resolves with a
-    typed denial instead of opening a callback or hanging (plan D2).
+
+def _settle_outcome(callback_id: str, outcome: UserInputSettleOutcome) -> str:
+    """Map an agent-side arbitration outcome to this controller's wire result.
+
+    The decision was made by the root loop's request broker under the
+    record's resolution lock; this only translates the outcome back to the
+    error types the request handler maps to protocol codes.
     """
+    match outcome:
+        case "accepted" | "duplicate":
+            return outcome
+        case "not_found":
+            raise CallbackNotFoundError(f"Callback not found: {callback_id}")
+        case "expired":
+            raise CallbackClosedError(f"Callback expired unanswered: {callback_id}")
+        case "closed":
+            raise CallbackClosedError(f"Callback is closed: {callback_id}")
+        case "conflict":
+            raise CallbackConflictError("Callback already has a different answer")
 
 
 _STEER_RECEIPT_CAPACITY = 128
-
-# The unattended-expiry floor mirrors the [user_questions] config validation
-# (both configured timeout bounds are >= 60s); an override outside the
-# configured range is rejected, never clamped (plan U/OD1).
-_MIN_UNATTENDED_TIMEOUT_SECONDS = 60.0
-
-# The terminal history reason for an expired-unanswered callback (plan U/OD1).
-EXPIRED_CALLBACK_REASON = "unanswered_timeout"
-
-# Model-facing denial for a child-origin model question refused at admission
-# (plan D2). Identical to the ask tool's own child refusal so the model reads
-# one contract whichever layer stops the question.
-CHILD_QUESTION_REFUSAL = (
-    "ask_user_question is not available to subagents; return a blocker naming "
-    "the question instead of asking the user"
-)
-
-# Model-facing continuation guidance carried by the server-owned unanswered
-# disposition (plan U/OD1).
-UNANSWERED_CONTINUATION_GUIDANCE = (
-    "The user did not answer in time, so no choice was made and no permission "
-    "was granted. The declared unattended default describes how to proceed "
-    "without the answer: defer the affected work or keep the existing "
-    "choice. Do not re-ask the same question in a loop; continue with the "
-    "deferred outcome, or ask a new, different question if one is still "
-    "needed. If the user later provides the answer explicitly, treat it as "
-    "a new user message."
-)
 
 
 @dataclass(slots=True)
@@ -223,39 +219,6 @@ class SteerReceipt:
     events: list[BaseEvent] = field(default_factory=list)
     pending_updates: list[ProjectedUpdate] = field(default_factory=list)
     recovery_error: BaseException | None = None
-
-
-@dataclass(slots=True)
-class CallbackExpiry:
-    """Authoritative unattended-expiry timer state (plan U/OD1).
-
-    Owned by the callback record — not the tool and not the TUI. The policy
-    is snapshotted at callback open; the monotonic deadline arbitrates
-    against answer/keep-waiting/cancel/reconnect under the record's
-    resolution lock, so exactly one terminal disposition wins. A stale timer
-    (session or turn generation changed) never fires.
-    """
-
-    deadline: float
-    opened_at: float
-    timeout_seconds: float
-    questions: list[UnansweredQuestion]
-    session_id: str
-    session_generation: int
-    turn_id: str
-    timer: asyncio.Task[None] | None = None
-    kept_waiting: bool = False
-
-
-@dataclass(slots=True)
-class CallbackRecord:
-    event: UserInputRequestEvent
-    future: asyncio.Future[CallbackOutput | UnansweredQuestions]
-    resolution: CallbackOutput | CallbackResultError | None = None
-    core_resolved: bool = False
-    resolution_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
-    expiry: CallbackExpiry | None = None
-    expired: bool = False
 
 
 def _public_retry_category(category: RetryCategory) -> PublicRetryCategory:
@@ -350,11 +313,20 @@ class TurnController:  # noqa: PLR0904
         self._projector: EventProjector | None = None
         self._harness_effects: dict[str, EventProjector] = {}
         self._history: list[PublicHistoryEntry] = []
-        self._callbacks: dict[str, CallbackRecord] = {}
-        # Monotonic clock / wakeup seams for the unattended-expiry timer
-        # (plan U/OD1): tests override these per instance.
+        # Monotonic clock / wakeup seams for the agent-side unattended-expiry
+        # timer (plan U/OD1): tests override these per instance; the broker
+        # reads them through the bound getters at arm/fire time.
         self._clock: Callable[[], float] = time.monotonic
         self._wakeup: Callable[[float], Awaitable[None]] = asyncio.sleep
+        # The coordinator holds no approval/callback decision state: the
+        # records, resolution locks, and expiry timers live in the root loop's
+        # request broker. Bind this controller as the settlement publisher so
+        # the broker publishes the terminal state BEFORE the waiter unblocks.
+        broker = agent_loop.request_broker
+        broker.bind_timer_seams(
+            clock=lambda: self._clock(), wakeup=lambda: self._wakeup
+        )
+        broker.bind_settlement_publisher(self)
         self._scheduled_loop_id: str | None = None
         self._turn_queue = TurnQueue()
         self._queue_lock = asyncio.Lock()
@@ -386,6 +358,16 @@ class TurnController:  # noqa: PLR0904
     def root_recovery(self) -> RootRecoveryGate:
         """The R2 root automatic-recovery gate (the wire surface's target)."""
         return self._root_recovery_gate
+
+    @property
+    def _callbacks(self) -> dict[str, CallbackRecord]:
+        """Relay view of the agent-side request records.
+
+        The decision state (futures, resolution locks, expiry timers) is owned
+        by the root loop's request broker; this controller only relays
+        requests, answers, and cancellations through the execution port.
+        """
+        return self._agent_loop.request_broker.records()
 
     @property
     def active_turn(self) -> PublicTurn | None:
@@ -1078,108 +1060,44 @@ class TurnController:  # noqa: PLR0904
         return ContextInjectResponse(entries=projector.history)
 
     async def answer_callback(self, callback_id: str, output: CallbackOutput) -> str:
-        record = self._callbacks.get(callback_id)
-        if record is None:
-            raise CallbackNotFoundError(f"Callback not found: {callback_id}")
-        async with record.resolution_lock:
-            if record.expired:
-                # A definite expired response: the unattended timer already
-                # resolved this callback (plan U/OD1).
-                raise CallbackClosedError(f"Callback expired unanswered: {callback_id}")
-            if record.core_resolved and record.resolution is None:
-                raise CallbackClosedError(f"Callback is closed: {callback_id}")
-            if record.future.done() and record.resolution is None:
-                # The waiter is gone (its turn was cancelled) but cancellation
-                # has not published yet: no answer can land, so this is closed
-                # rather than a settlement that would strand the turn's state.
-                raise CallbackClosedError(f"Callback is closed: {callback_id}")
-            if record.resolution is not None:
-                if record.resolution.model_dump(mode="json") == output.model_dump(
-                    mode="json"
-                ):
-                    return "duplicate"
-                raise CallbackConflictError("Callback already has a different answer")
-            match record.event, output:
-                case UserInputRequestEvent(), UserInputCallbackOutput():
-                    pass
-                case _:
-                    raise CallbackConflictError("Callback answer has the wrong type")
-            # Settlement is authoritative under the resolution lock: the record
-            # carries the terminal disposition and the terminal patch is
-            # published BEFORE the core waiter resolves (plan U). Presentation
-            # failure never loses an accepted settlement — the answer is
-            # recorded even when the terminal patch cannot be delivered.
-            record.resolution = output
-            record.core_resolved = True
-            self._cancel_expiry_timer(record)
-            try:
-                if self._projector is not None:
-                    for update in self._projector.resolve_callback(callback_id, output):
-                        await self._emit_projected(update)
-                await self._emit_status("running")
-            finally:
-                if not record.future.done():
-                    record.future.set_result(output)
-            return "accepted"
+        """Relay a user answer to the agent-side arbiter.
+
+        The arbitration (duplicate/conflict/expired/closed, one winner under
+        the resolution lock) and the settlement of the core waiter happen in
+        the root loop; this controller only relays the answer through the
+        execution port and maps the agent-side outcome to the wire errors.
+        """
+        if not isinstance(output, UserInputCallbackOutput):
+            raise CallbackConflictError("Callback answer has the wrong type")
+        outcome = await self._agent_loop.execution_port.settle_user_input_answer(
+            callback_id, output.result
+        )
+        return _settle_outcome(callback_id, outcome)
 
     async def reject_callback(
         self, callback_id: str, error: CallbackResultError
     ) -> str:
-        record = self._callbacks.get(callback_id)
-        if record is None:
-            raise CallbackNotFoundError(f"Callback not found: {callback_id}")
-        async with record.resolution_lock:
-            if record.expired:
-                raise CallbackClosedError(f"Callback expired unanswered: {callback_id}")
-            if record.core_resolved and record.resolution is None:
-                raise CallbackClosedError(f"Callback is closed: {callback_id}")
-            if record.resolution is not None:
-                if record.resolution.model_dump(mode="json") == error.model_dump(
-                    mode="json"
-                ):
-                    return "duplicate"
-                raise CallbackConflictError("Callback already has a different answer")
-            # Settlement is authoritative under the resolution lock: publish
-            # the terminal cancelled state BEFORE the waiter settles (mirrors
-            # answer_callback), so a client or a reconnect sees a closed entry,
-            # never a ghost open callback. A delivery failure still rejects the
-            # core waiter — the rejection is authoritative, presentation is not.
-            record.resolution = error
-            try:
-                await self._publish_callback_closed(callback_id, error.message)
-            finally:
-                self._reject_callback_record(
-                    record, CallbackRejectedError(error.message)
-                )
-            return "accepted"
+        """Relay a user rejection; the agent-side arbiter settles the waiter."""
+        outcome = await self._agent_loop.execution_port.settle_user_input_rejection(
+            callback_id, CallbackRejectedError(error.message)
+        )
+        return _settle_outcome(callback_id, outcome)
 
     async def keep_waiting_callback(
         self, callback_id: str
     ) -> Literal["kept", "already_terminal", "no_deadline"]:
         """Lift the unattended-expiry deadline for a callback (plan U/OD1).
 
-        The question stays open without a deadline (OPEN_WITHOUT_DEADLINE);
-        the expiry timer is cancelled under the record's resolution lock so
-        the answer/expiry/keep-waiting race still has exactly one winner.
+        The deadline decision is made agent-side, under the record's
+        resolution lock, so the answer/expiry/keep-waiting race still has
+        exactly one winner.
         """
-        record = self._callbacks.get(callback_id)
-        if record is None:
+        outcome = await self._agent_loop.execution_port.keep_waiting_user_input(
+            callback_id
+        )
+        if outcome == "not_found":
             raise CallbackNotFoundError(f"Callback not found: {callback_id}")
-        async with record.resolution_lock:
-            expiry = record.expiry
-            if expiry is None:
-                return "no_deadline"
-            if (
-                record.resolution is not None
-                or record.core_resolved
-                or record.future.done()
-            ):
-                return "already_terminal"
-            expiry.kept_waiting = True
-            if expiry.timer is not None:
-                expiry.timer.cancel()
-                expiry.timer = None
-            return "kept"
+        return outcome
 
     async def close(self) -> None:
         self._closing = True
@@ -1460,24 +1378,25 @@ class TurnController:  # noqa: PLR0904
         try:
             last_context_tokens = await self._announce_turn_started(turn)
             await self._inject_queued_contexts(queued_contexts)
+            request = ExecutionTurnRequest(
+                message=prompt,
+                client_message_id=params.client_user_message_id,
+                auto_title=params.auto_title,
+                images=images or None,
+                input_text=input_text,
+                resources=resources or None,
+                user_display_content=params.user_display_content,
+                subagent_runner=self._subagent_runner,
+                tool_io=self._tool_io,
+                turn_options=AgentTurnOptions(
+                    turn_id=turn.id,
+                    retry_sink=self._emit_retrying,
+                    injected=params.injected,
+                    user_initiated_retry=params.user_initiated_retry,
+                ),
+            )
             async with aclosing(
-                self._agent_loop.act(
-                    prompt,
-                    client_message_id=params.client_user_message_id,
-                    auto_title=params.auto_title,
-                    images=images or None,
-                    input_text=input_text,
-                    resources=resources or None,
-                    user_display_content=params.user_display_content,
-                    subagent_runner=self._subagent_runner,
-                    tool_io=self._tool_io,
-                    turn_options=AgentTurnOptions(
-                        turn_id=turn.id,
-                        retry_sink=self._emit_retrying,
-                        injected=params.injected,
-                        user_initiated_retry=params.user_initiated_retry,
-                    ),
-                )
+                self._agent_loop.execution_port.run_turn(request)
             ) as events:
                 async for event in events:
                     if isinstance(event, ToolWaitStateChangedEvent):
@@ -1958,34 +1877,47 @@ class TurnController:  # noqa: PLR0904
         except Exception as exc:
             record = self._callbacks.get(event.request_id)
             if record is None:
-                self._agent_loop.reject_request(event.request_id, exc)
+                self._agent_loop.execution_port.reject_user_input(event.request_id, exc)
             else:
                 self._reject_callback_record(record, exc)
             raise
 
     async def _request_user_input(self, event: UserInputRequestEvent) -> None:
+        """Relay one agent-emitted user-input request; decide nothing here.
+
+        Admission (child-question refusal, unattended-expiry policy) ran
+        agent-side when the request was opened; this relays the refusal or
+        admission failure into the agent-side waiter and otherwise delivers
+        the callback for the user to answer.
+        """
         if not isinstance(event.args, UserQuestionRequest):
             raise TypeError(
                 f"Unsupported user-input request: {type(event.args).__name__}"
             )
-        if (
-            event.origin is UserInputOrigin.MODEL_QUESTION
-            and self._agent_loop.is_subagent
-        ):
+        record = self._callbacks.get(event.request_id)
+        if record is not None and record.admission_error is not None:
+            # The agent-side admission rejected the request (e.g. an
+            # out-of-range timeout override, rejected not clamped): relay the
+            # rejection into the waiter and fail the turn with it.
+            self._agent_loop.execution_port.reject_user_input(
+                event.request_id, record.admission_error
+            )
+            raise record.admission_error
+        if record is not None and record.refusal is not None:
             # Child-origin admission refusal (plan D2): a subagent's model
-            # question never opens a user-input callback. Settling the broker
-            # waiter is the whole refusal — the asking tool call resolves with
-            # the typed denial, nothing is granted, and no authority state is
-            # touched. Returning (not raising) keeps the child turn alive.
-            self._agent_loop.reject_request(
-                event.request_id, ChildQuestionRefusedError(CHILD_QUESTION_REFUSAL)
+            # question never opens a user-input callback. Settling the
+            # broker waiter is the whole refusal — the asking tool call
+            # resolves with the typed denial, nothing is granted, and no
+            # authority state is touched. Returning (not raising) keeps the
+            # child turn alive.
+            self._agent_loop.execution_port.reject_user_input(
+                event.request_id, ChildQuestionRefusedError(record.refusal)
             )
             return
-        # Admission for unattended expiry (plan U/OD1): the public snapshot
-        # rides on the callback detail for clients. An out-of-range timeout
-        # override is rejected here, before any callback is opened.
+        # Admission for unattended expiry (plan U/OD1) ran agent-side; the
+        # public snapshot rides on the callback detail for clients.
         expiry = self._unattended_expiry(event)
-        output = await self._open_callback(
+        await self._open_callback(
             event,
             UserInputCallbackDetail(
                 request=event.args,
@@ -1995,105 +1927,24 @@ class TurnController:  # noqa: PLR0904
             ),
             title="User input required",
         )
-        record = self._callbacks[event.request_id]
-        if isinstance(output, UnansweredQuestions):
-            # Server-owned expiry disposition: resolve the core broker request
-            # with it and record exactly one deferred-question record. Expiry
-            # never approves anything; the tool result IS the unanswered
-            # disposition.
-            self._agent_loop.resolve_user_input_request(event.request_id, output)
-            record.core_resolved = True
-            self._agent_loop.deferred_questions.record_unanswered(
-                session_id=self._agent_loop.session_id,
-                request_id=event.request_id,
-                unanswered=output,
-            )
-            return
-        if not isinstance(output, UserInputCallbackOutput):
-            raise RuntimeError("Client returned the wrong user-input result")
-        self._agent_loop.resolve_user_input_request(event.request_id, output.result)
-        record.core_resolved = True
-
-    @staticmethod
-    def _echoed_questions(
-        request_id: str, args: UserQuestionRequest
-    ) -> list[UnansweredQuestion] | None:
-        """Echoed questions with stable IDs, or None when not defaultable.
-
-        Every question must be explicitly defaultable (plan U/OD1): a
-        requires_user question (or a missing default) blocks the whole batch,
-        so a mixed or protected batch never expires.
-        """
-        echoed: list[UnansweredQuestion] = []
-        for index, question in enumerate(args.questions):
-            default = question.unattended_default
-            if question.kind is QuestionKind.REQUIRES_USER or default is None:
-                return None
-            echoed.append(
-                UnansweredQuestion(
-                    question_id=f"{request_id}:{index}",
-                    question=question.question,
-                    header=question.header,
-                    kind=question.kind,
-                    unattended_default=default,
-                )
-            )
-        return echoed or None
 
     def _unattended_expiry(
         self, event: UserInputRequestEvent
     ) -> UserInputCallbackExpiry | None:
-        """Admission for unattended expiry (plan U/OD1).
+        """Relay the agent-side admission computation (plan U/OD1).
 
         Returns the public expiry snapshot to attach to the callback detail,
-        or None when the request is permanently ineligible. Raises
-        ValueError when a model-supplied timeout override does not fit the
-        configured range (rejected, never clamped).
-
-        Every gate is provenance- or policy-based, never model-controlled:
-        runtime approvals (dangerous-command and root-access grants) share
-        the broker and callback plumbing but are permanently ineligible, and
-        a requires_user question (or a missing default) blocks the batch.
+        or None when the request is permanently ineligible. Raises ValueError
+        when a model-supplied timeout override does not fit the configured
+        range (rejected, never clamped) — the decision itself lives in the
+        root loop's admission policy.
         """
-        args = event.args
-        if not isinstance(args, UserQuestionRequest):
+        policy = self._agent_loop.request_broker.expiry_policy(event)
+        if policy is None:
             return None
-        loop = self._agent_loop
-        eligible = (
-            # Runtime approvals are permanently ineligible (see docstring).
-            event.origin is UserInputOrigin.MODEL_QUESTION
-            # Root agent in a supported interactive session only.
-            and not loop.is_subagent
-            and loop.user_input_capability
-            and loop.config.user_questions.unattended_timeout_enabled
+        return UserInputCallbackExpiry(
+            timeout_seconds=policy.timeout_seconds, questions=policy.questions
         )
-        if not eligible:
-            return None
-        questions = self._echoed_questions(event.request_id, args)
-        if questions is None:
-            return None
-        config = loop.config.user_questions
-        # The only actions a default may declare are defer_affected_work and
-        # preserve_existing_choice: neither authorizes anything new, and no
-        # option label can become an answer through expiry.
-        timeout = config.default_timeout_seconds
-        # The timeout override is tool-owned (AskUserQuestionArgs); the
-        # generic runtime request stays free of it.
-        override = getattr(args, "timeout_seconds", None)
-        if override is not None:
-            if (
-                override < _MIN_UNATTENDED_TIMEOUT_SECONDS
-                or override > config.max_timeout_seconds
-            ):
-                raise ValueError(
-                    "ask_user_question timeout_seconds must fit the configured "
-                    "[user_questions] range "
-                    f"[{_MIN_UNATTENDED_TIMEOUT_SECONDS:g}, "
-                    f"{config.max_timeout_seconds:g}] seconds; got "
-                    f"{override:g} (rejected, not clamped)"
-                )
-            timeout = override
-        return UserInputCallbackExpiry(timeout_seconds=timeout, questions=questions)
 
     async def _open_callback(
         self,
@@ -2101,18 +1952,23 @@ class TurnController:  # noqa: PLR0904
         detail: UserInputCallbackDetail,
         *,
         title: str,
-    ) -> CallbackOutput | UnansweredQuestions:
+    ) -> BaseModel:
+        """Deliver one callback to the client; the agent owns its record.
+
+        A request the broker produced already has its agent-side record; a
+        host-injected request is adopted agent-side here. The unattended-
+        expiry timer is armed agent-side at admission — a delivery failure
+        is not user silence, because the error path relays a raw rejection
+        that cancels the timer. A detached client is a silent no-op
+        delivery, so server-side expiry works detached.
+        """
         projector = self._projector
-        turn = self._active_turn
-        if projector is None or turn is None:
+        if projector is None or self._active_turn is None:
             raise RuntimeError("Cannot open callback without an active turn")
         callback_id = event.request_id
-        record = CallbackRecord(
-            event=event, future=asyncio.get_running_loop().create_future()
-        )
-        if callback_id in self._callbacks:
-            raise RuntimeError(f"Duplicate callback request: {callback_id}")
-        self._callbacks[callback_id] = record
+        if callback_id not in self._callbacks:
+            self._agent_loop.execution_port.relay_user_input_request(event)
+        record = self._callbacks[callback_id]
         for update in projector.open_callback(callback_id, detail, title):
             await self._emit_projected(update)
         entry = next(
@@ -2123,97 +1979,50 @@ class TurnController:  # noqa: PLR0904
         )
         await self._emit_status("blocked", callback=entry)
         await self._deliver_callback(entry)
-        # The authoritative unattended-expiry timer lives beside the callback
-        # record (plan U/OD1) and is armed only AFTER delivery succeeds: a
-        # delivery failure is not user silence. A detached client is a
-        # silent no-op delivery, so server-side expiry works detached.
-        if detail.unattended_expiry is not None:
-            record.expiry = self._arm_expiry(
-                callback_id, detail.unattended_expiry, turn.id
-            )
+        # The agent-side arbiter settles the waiter (publishing the terminal
+        # state first); awaiting the relayed future only observes the
+        # settlement — a rejection fails the turn through this path.
         return await record.future
 
-    def _arm_expiry(
-        self, callback_id: str, policy: UserInputCallbackExpiry, turn_id: str
-    ) -> CallbackExpiry:
-        """Arm the authoritative unattended-expiry timer (plan U/OD1)."""
-        opened_at = self._clock()
-        expiry = CallbackExpiry(
-            deadline=opened_at + policy.timeout_seconds,
-            opened_at=opened_at,
-            timeout_seconds=policy.timeout_seconds,
-            questions=policy.questions,
-            session_id=self._agent_loop.session_id,
-            session_generation=self._agent_loop.session_generation,
-            turn_id=turn_id,
-        )
-        expiry.timer = asyncio.create_task(
-            self._expire_callback(callback_id, expiry),
-            name=f"app-server-question-expiry:{callback_id}",
-        )
-        return expiry
+    async def publish_user_input_settlement(
+        self, request_id: str, settlement: UserInputSettlement
+    ) -> None:
+        """Publish the terminal callback state BEFORE the waiter unblocks.
 
-    async def _expire_callback(self, callback_id: str, expiry: CallbackExpiry) -> None:
-        """Fire the unattended-expiry timer (plan U/OD1).
-
-        Waits out the monotonic deadline, then arbitrates under the callback
-        record's resolution lock: answer, expiry, keep-waiting, cancellation,
-        and reconnect races have exactly one winner. A stale timer (session
-        or turn generation changed) never fires, and there is no timer
-        restoration after a restart.
+        Called by the agent-side broker under the record's resolution lock;
+        the terminal patch lands while the related effect is still running —
+        a completed effect is frozen, and a rejected patch drops the
+        notification, gaps the client's event sequence, and triggers a resync.
         """
-        try:
-            await self._wakeup(max(0.0, expiry.deadline - self._clock()))
-        except asyncio.CancelledError:
-            # Keep-waiting, cancellation, or controller close won the race.
-            return
-        record = self._callbacks.get(callback_id)
-        if record is None:
-            return
-        async with record.resolution_lock:
-            if (
-                record.resolution is not None
-                or record.core_resolved
-                or record.future.done()
-                or record.expiry is not expiry
-                or expiry.kept_waiting
-            ):
-                return
-            loop = self._agent_loop
-            if (
-                loop.session_id != expiry.session_id
-                or loop.session_generation != expiry.session_generation
-            ):
-                return
-            turn = self._active_turn
-            if turn is None or turn.id != expiry.turn_id:
-                return
-            record.expired = True
-            record.core_resolved = True
-            unanswered = UnansweredQuestions(
-                questions=expiry.questions,
-                elapsed_seconds=self._clock() - expiry.opened_at,
-                timeout_seconds=expiry.timeout_seconds,
-                continuation_guidance=UNANSWERED_CONTINUATION_GUIDANCE,
-            )
-            # Closure is published BEFORE the future resolves (mirrors
-            # answer_callback): the effect-unblock patch must land while the
-            # related effect is still running — a completed effect is frozen,
-            # and a rejected patch drops the notification, gaps the client's
-            # event sequence, and triggers a resync.
-            if self._projector is not None:
-                for update in self._projector.expire_callback(
-                    callback_id, EXPIRED_CALLBACK_REASON
-                ):
-                    await self._emit_projected(update)
-            record.future.set_result(unanswered)
-        await self._emit_status("running")
+        match settlement.kind:
+            case "answered":
+                output = UserInputCallbackOutput(
+                    result=cast(UserQuestionResult, settlement.result)
+                )
+                projector = self._projector
+                if projector is not None:
+                    for update in projector.resolve_callback(request_id, output):
+                        await self._emit_projected(update)
+                await self._emit_status("running")
+            case "rejected" | "cancelled":
+                message = settlement.message or ""
+                await self._publish_callback_closed(request_id, message)
+                if settlement.was_open:
+                    await self._publish_child_callback_closed(request_id, message)
+            case "expired":
+                projector = self._projector
+                if projector is not None:
+                    for update in projector.expire_callback(
+                        request_id, EXPIRED_CALLBACK_REASON
+                    ):
+                        await self._emit_projected(update)
 
-    def _cancel_expiry_timer(self, record: CallbackRecord) -> None:
-        expiry = record.expiry
-        if expiry is not None and expiry.timer is not None:
-            expiry.timer.cancel()
-            expiry.timer = None
+    async def after_user_input_settlement(
+        self, request_id: str, settlement: UserInputSettlement
+    ) -> None:
+        """Run after the agent-side waiter settled (the resumed status)."""
+        if settlement.kind == "expired":
+            await self._emit_status("running")
 
     async def _project_events(
         self,
@@ -2409,21 +2218,27 @@ class TurnController:  # noqa: PLR0904
 
     async def _cancel_callbacks(self, reason: str) -> None:
         for record in list(self._callbacks.values()):
-            # Settle under the record's resolution lock (plan U): an answer,
-            # expiry, or rejection that won the race owns the callback, so a
+            # The arbitration and the terminal publication happen agent-side,
+            # under the record's resolution lock (plan U): an answer, expiry,
+            # or rejection that won the race owns the request, so a
             # cancellation can neither publish a second terminal state over it
-            # nor race the entry-state check that guards the patch.
-            async with record.resolution_lock:
-                # Terminal projection BEFORE the future resolves (mirrors
-                # _expire_callback): a reconnect, or a client answering a dead
-                # callback, must see a closed entry, never a ghost open callback.
-                was_open = not record.core_resolved
-                await self._publish_callback_closed(record.event.request_id, reason)
-                if was_open:
-                    await self._publish_child_callback_closed(
-                        record.event.request_id, reason
-                    )
-                self._reject_callback_record(record, CallbackRejectedError(reason))
+            # nor race the entry-state check that guards the patch. The
+            # terminal projection still lands BEFORE the waiter settles: a
+            # reconnect, or a client answering a dead request, must see a
+            # closed entry, never a ghost open callback.
+            was_open = not record.core_resolved
+            error = CallbackRejectedError(reason)
+            await self._agent_loop.execution_port.cancel_user_input(
+                record.event.request_id, error
+            )
+            if was_open:
+                # The waiter's core-side rejection still crosses the raw port
+                # relay, so a cancelled request fails in core through the same
+                # entry point as any other rejection (already-terminal records
+                # are not re-rejected).
+                self._agent_loop.execution_port.reject_user_input(
+                    record.event.request_id, error
+                )
 
     async def _publish_callback_closed(self, callback_id: str, reason: str) -> None:
         projector = self._projector
@@ -2461,10 +2276,14 @@ class TurnController:  # noqa: PLR0904
     def _reject_callback_record(
         self, record: CallbackRecord, error: BaseException
     ) -> None:
+        """Relay a raw rejection into the agent-side waiter (no publication).
+
+        The broker marks the record core-resolved and cancels its expiry
+        timer agent-side; this path publishes nothing — it fails a request
+        whose callback could not be opened.
+        """
         if record.core_resolved:
             return
-        record.core_resolved = True
-        self._cancel_expiry_timer(record)
-        self._agent_loop.reject_request(record.event.request_id, error)
-        if not record.future.done():
-            record.future.set_exception(error)
+        self._agent_loop.execution_port.reject_user_input(
+            record.event.request_id, error
+        )

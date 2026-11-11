@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from uuid import uuid4
 
+from chartreux.app_server._child_runtime_lifecycle import TreeNotReapedError
 from chartreux.app_server._dispatch import RequestFailure
 from chartreux.app_server._execution import (
     SessionExecution,
@@ -469,13 +470,18 @@ class SessionRuntimeControllerImpl:
                 task.cancel()
             self._resume_tasks.clear()
             agent_loop = previous.session.agent_loop
+            # WP7 [7C]: the old tree is closed in full — the [7B] ordered
+            # shutdown — before the new session is opened. A tree that could
+            # not be reaped refuses the switch, so the two trees never overlap.
             try:
-                await self._sessions.drain_children()
-            except Exception:
-                logger.exception(
-                    "Failed to drain child sessions while resuming session_id=%s",
-                    session_id,
-                )
+                await self._sessions.close_tree_for_switch()
+            except TreeNotReapedError as exc:
+                raise RequestFailure(ProtocolErrorCode.CONFLICT, str(exc)) from exc
+            except Exception as exc:
+                raise RequestFailure(
+                    ProtocolErrorCode.INTERNAL_ERROR,
+                    f"Failed to close the previous session tree: {exc}",
+                ) from exc
             try:
                 await self._runtime_factory.resume_root(agent_loop, session_id)
             except RuntimeSessionNotFoundError as exc:
@@ -513,6 +519,9 @@ class SessionRuntimeControllerImpl:
                 history_limit=history_limit,
             )
             self._sessions.begin_root_generation()
+            # WP7 [7C]: anything still parented to the session this switch
+            # left behind is an orphan: reap it now, reconciled, never replayed.
+            await self._sessions.reap_orphaned_children()
             self._sessions.reopen_child_admission()
             return state
 

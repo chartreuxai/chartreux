@@ -2,11 +2,8 @@ from __future__ import annotations
 
 from collections.abc import Awaitable, Callable, Generator
 from dataclasses import replace
-import ipaddress
 import os
 from pathlib import Path
-import shutil
-import socket
 import sys
 import tempfile
 from tempfile import TemporaryDirectory
@@ -43,6 +40,7 @@ from chartreux.core.model_catalog.schema import ModelCatalog
 from chartreux.core.utils.concurrency import run_sync
 from chartreux.ui.theme import resolve_auto_theme
 from chartreux.utils import keyring as keyring_utils
+from tests.differential import egress
 from tests.stubs.app_server import create_test_app_server_session
 from tests.stubs.fake_backend import FakeBackend
 from tests.stubs.fake_config_orchestrator import FakeConfigOrchestrator
@@ -68,77 +66,42 @@ _PROVIDER_CREDENTIALS = (
 
 @pytest.fixture(scope="session", autouse=True)
 def _isolate_provider_transport() -> Generator[None]:
-    """Remove real provider credentials and block non-loopback INET sockets."""
-    guard_dir = Path(tempfile.mkdtemp(prefix="chartreux-provider-guard-"))
-    guard = guard_dir / "sitecustomize.py"
-    guard.write_text(
-        "import ipaddress, socket\n"
-        "_connect = socket.socket.connect\n"
-        "_connect_ex = socket.socket.connect_ex\n"
-        "_allowed = {'localhost', '127.0.0.1', '::1', '::', '0.0.0.0'}\n"
-        "def _check(address):\n"
-        "    if not isinstance(address, tuple): return False\n"
-        "    if len(address) != 2: raise OSError('malformed socket address blocked by test isolation')\n"
-        "    host = address[0]\n"
-        "    if host in _allowed: return False\n"
-        "    try: return not ipaddress.ip_address(host).is_loopback\n"
-        "    except ValueError: return True\n"
-        "def _blocked(self, address):\n"
-        "    if _check(address): raise OSError('provider network blocked by test isolation')\n"
-        "    return _connect(self, address)\n"
-        "def _blocked_ex(self, address):\n"
-        "    if _check(address): return 111\n"
-        "    return _connect_ex(self, address)\n"
-        "socket.socket.connect = _blocked\n"
-        "socket.socket.connect_ex = _blocked_ex\n",
-        encoding="utf-8",
-    )
-    original_connect = socket.socket.connect
-    original_connect_ex = socket.socket.connect_ex
+    """Remove real provider credentials and block egress in-process and in children.
+
+    The block lives in ``tests/differential/egress.py``: the session installs it
+    in-process and exports the spawn marker plus the ``sitecustomize`` bootstrap
+    that applies it in a spawned test process before any provider import (WP6
+    [6A], consumed by WP1 [1C]'s spawn-time env pass-through).
+    """
     provider_env = {name: os.environ.get(name) for name in _PROVIDER_CREDENTIALS}
     original_pythonpath = os.environ.get("PYTHONPATH")
+    original_environment = {
+        egress.EGRESS_BLOCK_ENV: os.environ.get(egress.EGRESS_BLOCK_ENV),
+        egress.EGRESS_GUARD_ENV: os.environ.get(egress.EGRESS_GUARD_ENV),
+    }
     for name in _PROVIDER_CREDENTIALS:
         os.environ.pop(name, None)
-
-    def _is_blocked(address: Any) -> bool:
-        if not isinstance(address, tuple):
-            return False
-        if len(address) != 2:
-            raise OSError("malformed socket address blocked by test isolation")
-        host = address[0]
-        if host in {"localhost", "127.0.0.1", "::1", "::", "0.0.0.0"}:
-            return False
+    with egress.bootstrap_directory() as guard_dir:
+        restore_transport = egress.install(egress.MODE_NON_LOOPBACK)
+        os.environ.update(egress.child_environment(egress.MODE_NON_LOOPBACK))
+        os.environ["PYTHONPATH"] = (
+            str(guard_dir) + os.pathsep + (original_pythonpath or "")
+        )
         try:
-            return not ipaddress.ip_address(host).is_loopback
-        except ValueError:
-            return True
-
-    def _blocked(self: socket.socket, address: Any) -> Any:
-        if _is_blocked(address):
-            raise OSError("provider network blocked by test isolation")
-        return original_connect(self, address)
-
-    def _blocked_ex(self: socket.socket, address: Any) -> int:
-        if _is_blocked(address):
-            return 111
-        return original_connect_ex(self, address)
-
-    socket.socket.connect = _blocked
-    socket.socket.connect_ex = _blocked_ex
-    os.environ["PYTHONPATH"] = str(guard_dir) + os.pathsep + (original_pythonpath or "")
-    try:
-        yield
-    finally:
-        socket.socket.connect = original_connect
-        socket.socket.connect_ex = original_connect_ex
-        if original_pythonpath is None:
-            os.environ.pop("PYTHONPATH", None)
-        else:
-            os.environ["PYTHONPATH"] = original_pythonpath
-        for name, value in provider_env.items():
-            if value is not None:
-                os.environ[name] = value
-        shutil.rmtree(guard_dir, ignore_errors=True)
+            yield
+        finally:
+            restore_transport()
+            for name, value in {
+                "PYTHONPATH": original_pythonpath,
+                **original_environment,
+            }.items():
+                if value is None:
+                    os.environ.pop(name, None)
+                else:
+                    os.environ[name] = value
+            for name, value in provider_env.items():
+                if value is not None:
+                    os.environ[name] = value
 
 
 _LOCAL_XDIST_GROUPS = {

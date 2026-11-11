@@ -3220,6 +3220,10 @@ class ChartreuxApp(App):  # noqa: PLR0904
         self._app_server_events_worker = self.run_worker(
             self._listen_app_server_events(), exclusive=False
         )
+        # Observe the session's presentation consumer and connection state so
+        # presentation loss surfaces as stale/refreshing, an atomic fresh
+        # snapshot, or a persistent typed failure (WP4 [4B]).
+        self._session_flow.attach_presentation_listeners(self.app_server)
 
     async def _resume_history_from_messages(self) -> None:
         await self._transcript_presenter.resume_history_from_messages()
@@ -3444,6 +3448,7 @@ class ChartreuxApp(App):  # noqa: PLR0904
 
     async def _stop_app_server_event_listener(self) -> None:
         await self._begin_shutdown()
+        self._session_flow.detach_presentation_listeners()
         worker = self._app_server_events_worker
         if worker is None:
             return
@@ -3491,8 +3496,13 @@ class ChartreuxApp(App):  # noqa: PLR0904
                                 event
                             )
                         self._maybe_settle_interrupt()
-        except AppServerConnectionClosed:
+        except AppServerConnectionClosed as exc:
             if not self._shutdown_started:
+                # The event stream ended on a connection failure: surface the
+                # typed connection-failure state (never silent loss) before the
+                # worker unwinds with the error.
+                with suppress(Exception):
+                    await self._session_flow.show_connection_failure(str(exc))
                 raise
 
     def _turn_ui_lock(self) -> asyncio.Lock:

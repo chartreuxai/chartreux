@@ -539,6 +539,15 @@ class ChartreuxConfigSchema(ConfigSchema):
         ),
     )
     # Top-level scalars
+    multi_process: Annotated[bool, WithReplaceMerge()] = Field(
+        default=True,
+        description=(
+            "Escape hatch from the multi-process topology: false runs the app "
+            "server and its agents in one process over the in-process "
+            "transport. Interactive runs default to the multi-process stdio "
+            "route; CHARTREUX_TRANSPORT=in_process selects the same escape."
+        ),
+    )
     theme: Annotated[str, WithReplaceMerge()] = DEFAULT_THEME
     disable_welcome_banner_animation: Annotated[bool, WithReplaceMerge()] = False
     autocopy_to_clipboard: Annotated[bool, WithReplaceMerge()] = True

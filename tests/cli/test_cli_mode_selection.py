@@ -2,9 +2,19 @@ from __future__ import annotations
 
 import argparse
 import io
+import os
+from types import SimpleNamespace
 
 import pytest
 
+from chartreux.app_server.transport import (
+    IN_PROCESS_TRANSPORT,
+    STDIO_TRANSPORT,
+    TRANSPORT_ENV_VAR,
+    TransportSelection,
+    parse_transport_selector,
+    resolve_transport_selection,
+)
 from chartreux.cli import cli as cli_mod
 from chartreux.core.config import MissingAPIKeyError
 
@@ -284,3 +294,222 @@ def test_explicit_prompt_takes_precedence_over_piped_prompt(
 
     assert exc_info.value.code == 0
     assert capsys.readouterr().out == f"{expected}\n"
+
+
+def test_malformed_transport_selector_fails_before_mode_dispatch(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setenv("CHARTREUX_TRANSPORT", "carrier_pigeon")
+    monkeypatch.setattr("sys.stdin", _PipedStdin("hello from pipe\n"))
+    monkeypatch.setattr(cli_mod, "load_dotenv_values", lambda: None)
+    monkeypatch.setattr(cli_mod, "bootstrap_config_files", lambda: None)
+    monkeypatch.setattr(cli_mod, "load_config_orchestrator_or_exit", lambda: object())
+    monkeypatch.setattr(
+        cli_mod, "require_api_key_or_onboard", lambda *_args, **_kwargs: None
+    )
+    dispatched: list[str] = []
+    monkeypatch.setattr(
+        cli_mod, "_run_programmatic_mode", lambda **_kwargs: dispatched.append("p")
+    )
+    monkeypatch.setattr(
+        cli_mod, "_run_interactive_mode", lambda **_kwargs: dispatched.append("t")
+    )
+
+    with pytest.raises(SystemExit) as exc_info:
+        cli_mod.run_cli(_make_args())
+
+    assert exc_info.value.code == 1
+    assert dispatched == []
+    error = capsys.readouterr().err
+    assert "CHARTREUX_TRANSPORT" in error
+    assert "carrier_pigeon" not in error
+
+
+def test_config_escape_key_selects_the_in_process_transport(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv(TRANSPORT_ENV_VAR, raising=False)
+    monkeypatch.setattr("sys.stdin", _PipedStdin("hello from pipe\n"))
+    monkeypatch.setattr(cli_mod, "load_dotenv_values", lambda: None)
+    monkeypatch.setattr(cli_mod, "bootstrap_config_files", lambda: None)
+    monkeypatch.setattr(cli_mod, "load_config_orchestrator_or_exit", lambda: object())
+    monkeypatch.setattr(
+        cli_mod,
+        "require_api_key_or_onboard",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            config=SimpleNamespace(multi_process=False)
+        ),
+    )
+    dispatched: list[str] = []
+    monkeypatch.setattr(
+        cli_mod, "_run_programmatic_mode", lambda **_kwargs: dispatched.append("p")
+    )
+
+    cli_mod.run_cli(_make_args())
+
+    # The escape publishes the one selector spelling every consumer resolves.
+    assert os.environ[TRANSPORT_ENV_VAR] == "in_process"
+    assert dispatched == ["p"]
+
+
+def test_default_run_publishes_no_transport_selector(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv(TRANSPORT_ENV_VAR, raising=False)
+    monkeypatch.setattr("sys.stdin", _PipedStdin("hello from pipe\n"))
+    monkeypatch.setattr(cli_mod, "load_dotenv_values", lambda: None)
+    monkeypatch.setattr(cli_mod, "bootstrap_config_files", lambda: None)
+    monkeypatch.setattr(cli_mod, "load_config_orchestrator_or_exit", lambda: object())
+    monkeypatch.setattr(
+        cli_mod,
+        "require_api_key_or_onboard",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            config=SimpleNamespace(multi_process=True)
+        ),
+    )
+    dispatched: list[str] = []
+    monkeypatch.setattr(
+        cli_mod, "_run_programmatic_mode", lambda **_kwargs: dispatched.append("p")
+    )
+
+    cli_mod.run_cli(_make_args())
+
+    assert TRANSPORT_ENV_VAR not in os.environ
+    assert dispatched == ["p"]
+
+
+# --- WP4 [4B]: stdio is the interactive default -------------------------------
+
+
+def _run_interactive_selection(
+    monkeypatch: pytest.MonkeyPatch, *, config_multi_process: bool
+) -> list[str]:
+    """Drive run_cli through an interactive (empty-pipe) launch; return dispatches."""
+    monkeypatch.setattr("sys.stdin", _PipedStdin(" \n"))
+    monkeypatch.setattr(cli_mod, "load_dotenv_values", lambda: None)
+    monkeypatch.setattr(cli_mod, "bootstrap_config_files", lambda: None)
+    monkeypatch.setattr(cli_mod, "load_config_orchestrator_or_exit", lambda: object())
+    monkeypatch.setattr(
+        cli_mod,
+        "require_api_key_or_onboard",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            config=SimpleNamespace(multi_process=config_multi_process)
+        ),
+    )
+    monkeypatch.setattr(cli_mod, "restore_interactive_stdin", lambda **_kwargs: None)
+    dispatched: list[str] = []
+    monkeypatch.setattr(
+        cli_mod, "_run_programmatic_mode", lambda **_kwargs: dispatched.append("p")
+    )
+    monkeypatch.setattr(
+        cli_mod, "_run_interactive_mode", lambda **_kwargs: dispatched.append("t")
+    )
+    cli_mod.run_cli(_make_args())
+    return dispatched
+
+
+def test_interactive_default_publishes_the_stdio_selector(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv(TRANSPORT_ENV_VAR, raising=False)
+
+    dispatched = _run_interactive_selection(monkeypatch, config_multi_process=True)
+
+    assert os.environ[TRANSPORT_ENV_VAR] == STDIO_TRANSPORT
+    assert dispatched == ["t"]
+
+
+def test_interactive_default_is_overridden_by_the_in_process_escape(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(TRANSPORT_ENV_VAR, "in_process")
+
+    dispatched = _run_interactive_selection(monkeypatch, config_multi_process=True)
+
+    assert os.environ[TRANSPORT_ENV_VAR] == IN_PROCESS_TRANSPORT
+    assert dispatched == ["t"]
+
+
+def test_interactive_default_keeps_an_explicit_stdio_environment_selector(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(TRANSPORT_ENV_VAR, "stdio")
+
+    dispatched = _run_interactive_selection(monkeypatch, config_multi_process=True)
+
+    assert os.environ[TRANSPORT_ENV_VAR] == STDIO_TRANSPORT
+    assert dispatched == ["t"]
+
+
+def test_config_escape_wins_over_the_interactive_stdio_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv(TRANSPORT_ENV_VAR, raising=False)
+
+    dispatched = _run_interactive_selection(monkeypatch, config_multi_process=False)
+
+    assert os.environ[TRANSPORT_ENV_VAR] == IN_PROCESS_TRANSPORT
+    assert dispatched == ["t"]
+
+
+def test_programmatic_default_stays_in_process_and_unpublished(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv(TRANSPORT_ENV_VAR, raising=False)
+    monkeypatch.setattr("sys.stdin", _PipedStdin("hello from pipe\n"))
+    monkeypatch.setattr(cli_mod, "load_dotenv_values", lambda: None)
+    monkeypatch.setattr(cli_mod, "bootstrap_config_files", lambda: None)
+    monkeypatch.setattr(cli_mod, "load_config_orchestrator_or_exit", lambda: object())
+    monkeypatch.setattr(
+        cli_mod,
+        "require_api_key_or_onboard",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            config=SimpleNamespace(multi_process=True)
+        ),
+    )
+    dispatched: list[str] = []
+    monkeypatch.setattr(
+        cli_mod, "_run_programmatic_mode", lambda **_kwargs: dispatched.append("p")
+    )
+
+    cli_mod.run_cli(_make_args())
+
+    assert dispatched == ["p"]
+    assert TRANSPORT_ENV_VAR not in os.environ
+
+
+@pytest.mark.parametrize("value", ["stdio", "STDIO", " stdio "])
+def test_stdio_is_a_supported_selector(value: str) -> None:
+    assert parse_transport_selector(value) == STDIO_TRANSPORT
+
+
+def test_interactive_default_selection_is_stdio() -> None:
+    selection = resolve_transport_selection(environ={}, interactive=True)
+
+    assert selection == TransportSelection(
+        kind=STDIO_TRANSPORT, selector=STDIO_TRANSPORT, source="default"
+    )
+
+
+def test_non_interactive_default_selection_stays_in_process() -> None:
+    selection = resolve_transport_selection(environ={}, interactive=False)
+
+    assert selection == TransportSelection(
+        kind=IN_PROCESS_TRANSPORT, selector=IN_PROCESS_TRANSPORT, source="default"
+    )
+
+
+def test_environment_stdio_selector_selects_stdio() -> None:
+    selection = resolve_transport_selection(environ={TRANSPORT_ENV_VAR: "stdio"})
+
+    assert selection.kind == STDIO_TRANSPORT
+    assert selection.source == "environment"
+
+
+def test_config_escape_outranks_the_interactive_default() -> None:
+    selection = resolve_transport_selection(
+        multi_process=False, environ={}, interactive=True
+    )
+
+    assert selection.kind == IN_PROCESS_TRANSPORT
+    assert selection.source == "config"

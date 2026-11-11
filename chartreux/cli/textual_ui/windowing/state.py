@@ -39,6 +39,17 @@ class SessionWindowing:
         self._backfill_entries = backfill_entries
         self._backfill_cursor = len(backfill_entries)
 
+    def adopt_snapshot(self, backfill_entries: list[PublicHistoryEntry]) -> None:
+        """Atomically adopt a freshly installed snapshot's bounded backfill.
+
+        Called when a replacement incarnation's snapshot installs: the previous
+        generation's backfill is discarded wholesale, so Load More can never
+        serve pre-snapshot content, and the new backfill is the snapshot plan's
+        own bounded prefix (everything before the admitted tail).
+        """
+        self._backfill_entries = list(backfill_entries)
+        self._backfill_cursor = len(self._backfill_entries)
+
     def next_load_more_batch(self) -> LoadMoreBatch | None:
         if self._backfill_cursor == 0:
             return None

@@ -10,6 +10,7 @@ import pytest
 
 from chartreux.app_server import _runtime as runtime
 from chartreux.app_server._execution import SessionExecutionKind
+from chartreux.app_server._runtime import close_agent_loop
 from chartreux.app_server._session_backend_impl import SessionBackendHostImpl
 import chartreux.app_server._sessions as _sessions
 from chartreux.app_server.client import AppServerClient
@@ -23,6 +24,7 @@ from chartreux.app_server.protocol import (
     SessionResumeParams,
     SessionStartParams,
 )
+from chartreux.app_server.registry_manifest import SessionWriterFence
 from chartreux.app_server.session import AppServerSession
 from chartreux.app_server.transport import memory_transport_pair
 from chartreux.core.agent_loop import AgentLoop
@@ -234,3 +236,57 @@ async def test_production_legacy_root_holds_lease_until_runtime_shutdown(
 
     await root.aclose()
     SessionLease(tmp_path, session_id).acquire().release()
+
+
+@pytest.mark.asyncio
+async def test_open_root_holds_writer_fence_until_root_close(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The blueprint resume path takes the session-dir write fence (flock).
+
+    While the opened root is the session dir's writer, a competing fence
+    acquisition — same or other process — is refused with the typed
+    SessionBusyError; the lockfile sits inside the session dir and is never
+    unlinked. Closing the root releases the fence.
+    """
+    config = build_test_vibe_config(
+        session_logging=SessionLoggingConfig(
+            enabled=True, save_dir=str(tmp_path), session_prefix="session"
+        )
+    )
+    saved = build_test_agent_loop(config=config)
+    await saved.persist_empty_session()
+    session_id = saved.session_id
+    session_dir = saved.session_logger.session_dir
+    assert session_dir is not None
+    await saved.aclose()
+
+    process = runtime.HarnessProcess()
+    blueprint = Mock()
+    blueprint.config = config
+    blueprint.config_orchestrator = FakeConfigOrchestrator(config)
+    blueprint.harness_files = saved.harness_files
+    blueprint.cwd = tmp_path
+    blueprint.build.side_effect = lambda **kwargs: build_test_agent_loop(
+        config=config, **kwargs
+    )
+    monkeypatch.setattr(
+        process, "build_root_blueprint", AsyncMock(return_value=blueprint)
+    )
+    request = runtime.RootOpenRequest(
+        options=SessionOptions(cwd=str(tmp_path)),
+        client_info=ClientInfo(name="test", version="1"),
+        session_id=session_id,
+    )
+
+    root = await process.open_root(request)
+    fence_path = session_dir / ".writer-fence.lock"
+    assert fence_path.is_file()
+    inode = fence_path.stat().st_ino
+    with pytest.raises(SessionBusyError):
+        SessionWriterFence(session_dir, session_id).acquire()
+
+    await close_agent_loop(root)
+    # The lockfile survives the release (stable inode, never unlinked in scope).
+    assert fence_path.stat().st_ino == inode
+    SessionWriterFence(session_dir, session_id).acquire().release()

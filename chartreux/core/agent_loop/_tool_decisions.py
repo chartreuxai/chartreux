@@ -34,7 +34,12 @@ from chartreux.core.agent_loop._dangerous_command_grants import (
 )
 from chartreux.core.agent_loop._execution_admission import ExecutionAdmission
 from chartreux.core.agent_loop._loop_types import ToolDecision, ToolExecutionResponse
-from chartreux.core.agent_loop._request_broker import InteractionRequestBroker
+from chartreux.core.agent_loop._request_broker import (
+    CHILD_QUESTION_REFUSAL,
+    MIN_UNATTENDED_TIMEOUT_SECONDS,
+    InteractionRequestBroker,
+    UserInputAdmission,
+)
 from chartreux.core.agent_loop._root_grants import (
     ROOT_GRANT_DECLINED_FEEDBACK,
     ROOT_GRANT_DENY,
@@ -59,12 +64,20 @@ from chartreux.core.dangerous_commands import (
     GrantChoice,
     RepositoryScope,
 )
-from chartreux.core.events import UserInputOrigin
+from chartreux.core.deferred_questions import DeferredQuestionStore
+from chartreux.core.events import UserInputOrigin, UserInputRequestEvent
 from chartreux.core.root_grants import RootGrantPort
 from chartreux.core.tools.base import BaseTool, ToolPermission
 from chartreux.core.tools.manager import ToolManager
 from chartreux.core.tools.permissions import PermissionContext
 from chartreux.observability.logging import logger
+from chartreux.questions import (
+    QuestionKind,
+    UnansweredQuestion,
+    UnansweredQuestions,
+    UnattendedExpiryPolicy,
+    UserQuestionRequest,
+)
 
 
 def _out_of_root_denial(ctx: PermissionContext, tool_name: str) -> ToolDecision:
@@ -387,6 +400,7 @@ class ToolDecisionCoordinator:
         rolled back here.
         """
         store = self._grants_store
+        policy_revision = store.current_policy_revision
         permit = None
         try:
             if choice == "allow_once":
@@ -446,10 +460,11 @@ class ToolDecisionCoordinator:
                 # the admission carries its requirements so the execution
                 # gate can revalidate exactly this invocation without
                 # authorizing any other call.
-                admission=(
-                    ExecutionAdmission(once_requirements=tuple(requirements))
-                    if choice == "allow_once"
-                    else None
+                admission=ExecutionAdmission(
+                    policy_revision=policy_revision,
+                    once_requirements=(
+                        tuple(requirements) if choice == "allow_once" else None
+                    ),
                 ),
             )
         finally:
@@ -602,6 +617,7 @@ class ToolDecisionCoordinator:
         exit path, and recheck once more after a persistence await.
         """
         store = self._grants_store
+        policy_revision = store.current_policy_revision
         permit = None
         try:
             if choice == "allow_once":
@@ -641,10 +657,11 @@ class ToolDecisionCoordinator:
                 verdict=ToolExecutionResponse.EXECUTE,
                 approval_type=ToolPermission.ALWAYS,
                 result_note=result_note,
-                admission=(
-                    ExecutionAdmission(remote_exec_requirements=tuple(requirements))
-                    if choice == "allow_once"
-                    else None
+                admission=ExecutionAdmission(
+                    policy_revision=policy_revision,
+                    remote_exec_requirements=(
+                        tuple(requirements) if choice == "allow_once" else None
+                    ),
                 ),
             )
         finally:
@@ -878,3 +895,147 @@ class ToolDecisionCoordinator:
         """
         for asker in tuple(self._root_grant_askers):
             asker.cancel()
+
+
+class LoopUserInputAdmission(UserInputAdmission):
+    """The loop's user-input admission policy (plan U/OD1, plan D2).
+
+    Implements the broker's :class:`UserInputAdmission` protocol from live
+    loop state, so the decision runs in the executing agent process: child
+    model questions are refused at admission, and the unattended-expiry
+    policy is computed from provenance- and policy-based gates only — never
+    from model-controlled values beyond the validated timeout override.
+    """
+
+    def __init__(
+        self,
+        *,
+        is_subagent_getter: Callable[[], bool],
+        user_input_capability_getter: Callable[[], bool],
+        config_getter: Callable[[], ChartreuxConfigSchema],
+        session_id_getter: Callable[[], str],
+        session_generation_getter: Callable[[], int],
+        active_turn_id_getter: Callable[[], str | None],
+        deferred_questions: DeferredQuestionStore,
+    ) -> None:
+        self._is_subagent_getter = is_subagent_getter
+        self._user_input_capability_getter = user_input_capability_getter
+        self._config_getter = config_getter
+        self._session_id_getter = session_id_getter
+        self._session_generation_getter = session_generation_getter
+        self._active_turn_id_getter = active_turn_id_getter
+        self._deferred_questions = deferred_questions
+
+    def child_refusal(self, event: UserInputRequestEvent) -> str | None:
+        """Child-origin admission refusal (plan D2).
+
+        A subagent's model question never opens a user-input callback. The
+        settling of the broker waiter is the whole refusal — the asking tool
+        call resolves with the typed denial, nothing is granted, and no
+        authority state is touched.
+        """
+        if (
+            event.origin is UserInputOrigin.MODEL_QUESTION
+            and self._is_subagent_getter()
+        ):
+            return CHILD_QUESTION_REFUSAL
+        return None
+
+    def expiry_policy(
+        self, event: UserInputRequestEvent
+    ) -> UnattendedExpiryPolicy | None:
+        """Admission for unattended expiry (plan U/OD1).
+
+        Returns the expiry policy snapshot to attach to the request, or None
+        when the request is permanently ineligible. Raises ValueError when a
+        model-supplied timeout override does not fit the configured range
+        (rejected, never clamped).
+
+        Every gate is provenance- or policy-based, never model-controlled:
+        runtime approvals (dangerous-command and root-access grants) share
+        the broker but are permanently ineligible, and a requires_user
+        question (or a missing default) blocks the batch.
+        """
+        args = event.args
+        if not isinstance(args, UserQuestionRequest):
+            return None
+        eligible = (
+            # Runtime approvals are permanently ineligible (see docstring).
+            event.origin is UserInputOrigin.MODEL_QUESTION
+            # Root agent in a supported interactive session only.
+            and not self._is_subagent_getter()
+            and self._user_input_capability_getter()
+            and self._config_getter().user_questions.unattended_timeout_enabled
+        )
+        if not eligible:
+            return None
+        questions = self._echoed_questions(event.request_id, args)
+        if questions is None:
+            return None
+        config = self._config_getter().user_questions
+        # The only actions a default may declare are defer_affected_work and
+        # preserve_existing_choice: neither authorizes anything new, and no
+        # option label can become an answer through expiry.
+        timeout = config.default_timeout_seconds
+        # The timeout override is tool-owned (AskUserQuestionArgs); the
+        # generic runtime request stays free of it.
+        override = getattr(args, "timeout_seconds", None)
+        if override is not None:
+            if (
+                override < MIN_UNATTENDED_TIMEOUT_SECONDS
+                or override > config.max_timeout_seconds
+            ):
+                raise ValueError(
+                    "ask_user_question timeout_seconds must fit the configured "
+                    "[user_questions] range "
+                    f"[{MIN_UNATTENDED_TIMEOUT_SECONDS:g}, "
+                    f"{config.max_timeout_seconds:g}] seconds; got "
+                    f"{override:g} (rejected, not clamped)"
+                )
+            timeout = override
+        return UnattendedExpiryPolicy(timeout_seconds=timeout, questions=questions)
+
+    @staticmethod
+    def _echoed_questions(
+        request_id: str, args: UserQuestionRequest
+    ) -> list[UnansweredQuestion] | None:
+        """Echoed questions with stable IDs, or None when not defaultable.
+
+        Every question must be explicitly defaultable (plan U/OD1): a
+        requires_user question (or a missing default) blocks the whole batch,
+        so a mixed or protected batch never expires.
+        """
+        echoed: list[UnansweredQuestion] = []
+        for index, question in enumerate(args.questions):
+            default = question.unattended_default
+            if question.kind is QuestionKind.REQUIRES_USER or default is None:
+                return None
+            echoed.append(
+                UnansweredQuestion(
+                    question_id=f"{request_id}:{index}",
+                    question=question.question,
+                    header=question.header,
+                    kind=question.kind,
+                    unattended_default=default,
+                )
+            )
+        return echoed or None
+
+    def session_id(self) -> str:
+        return self._session_id_getter()
+
+    def session_generation(self) -> int:
+        return self._session_generation_getter()
+
+    def active_turn_id(self) -> str | None:
+        return self._active_turn_id_getter()
+
+    def record_unanswered(
+        self, request_id: str, unanswered: UnansweredQuestions
+    ) -> None:
+        """Record exactly one deferred-question record for an expiry."""
+        self._deferred_questions.record_unanswered(
+            session_id=self._session_id_getter(),
+            request_id=request_id,
+            unanswered=unanswered,
+        )

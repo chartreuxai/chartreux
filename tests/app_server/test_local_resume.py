@@ -26,6 +26,7 @@ from chartreux.app_server.protocol import (
     SessionListParams,
     SessionOptions,
 )
+from chartreux.app_server.registry_manifest import SessionWriterFence
 from chartreux.app_server.session import AppServerSession
 from chartreux.app_server.transport import memory_transport_pair
 from chartreux.core.agent_loop import AgentLoop
@@ -39,6 +40,7 @@ from chartreux.core.llm_models import (
 )
 from chartreux.core.message_list import MessageList
 from chartreux.core.session.resume_sessions import ResumeSessionInfo
+from chartreux.core.session.session_lease import SessionBusyError
 from chartreux.core.session.session_loader import MESSAGES_FILENAME, SessionLoader
 import chartreux.core.session.session_logger as session_logger_module
 from chartreux.core.session.session_logger import SessionLogger
@@ -107,6 +109,71 @@ async def test_local_root_close_retires_accounting_and_resume_reopens_ledger(
         assert set((config_dir / "usage").rglob("*.jsonl")) == paths
         assert not process._root_usage_writers
         assert not process._accounting_loops
+    finally:
+        await host.close()
+        if resumed_host is not None:
+            await resumed_host.close()
+        await harness.close()
+
+
+@pytest.mark.asyncio
+async def test_durable_resume_round_trip_holds_writer_fence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """WP3 [3D]: a live root holds the session-dir write fence; the durable
+    resume round-trip persists both turns and re-takes the fence after close.
+    """
+    _configure_local_accounting(monkeypatch, tmp_path, logging_enabled=True)
+    logging_config = SessionLoggingConfig(
+        enabled=True, save_dir=str(tmp_path / "sessions")
+    )
+    harness = LocalHarnessHost()
+    options = runtime.LocalHarnessOptions(
+        session_options=SessionOptions(cwd=str(tmp_path), headless=True)
+    )
+    host = await harness.connect(options)
+    resumed_host = None
+    try:
+        session = await host.open_session()
+        root_id = session.session_id
+        async for _ in session.act("first turn"):
+            pass
+        session_dir = SessionLoader.find_session_by_id(root_id, logging_config)
+        assert session_dir is not None
+        fence_path = session_dir / ".writer-fence.lock"
+        assert fence_path.is_file()
+        # The live root writer holds the flock: a second writer is refused.
+        with pytest.raises(SessionBusyError):
+            SessionWriterFence(session_dir, root_id).acquire()
+        messages, _ = SessionLoader.load_session(session_dir)
+        contents = [m.content for m in messages if isinstance(m.content, str)]
+        assert "first turn" in contents
+        assert "answer" in contents
+        await session.close()
+
+        # Root close released the fence; the lockfile is kept (stable inode).
+        inode = fence_path.stat().st_ino
+        SessionWriterFence(session_dir, root_id).acquire().release()
+        assert fence_path.stat().st_ino == inode
+
+        resumed_host = await harness.connect(
+            runtime.LocalHarnessOptions(
+                session_options=options.session_options,
+                session=runtime.ResumeSessionIntent(root_id),
+            )
+        )
+        resumed = await resumed_host.open_session()
+        assert resumed.session_id == root_id
+        with pytest.raises(SessionBusyError):
+            SessionWriterFence(session_dir, root_id).acquire()
+        async for _ in resumed.act("second turn"):
+            pass
+        messages, _ = SessionLoader.load_session(session_dir)
+        contents = [m.content for m in messages if isinstance(m.content, str)]
+        assert "first turn" in contents
+        assert "second turn" in contents
+        await resumed.close()
+        SessionWriterFence(session_dir, root_id).acquire().release()
     finally:
         await host.close()
         if resumed_host is not None:

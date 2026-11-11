@@ -6,8 +6,9 @@ from contextlib import suppress
 from dataclasses import dataclass
 
 from chartreux.app_server._model import validate_wire
-from chartreux.app_server.client import AppServerClient
+from chartreux.app_server.client import AppServerClient, PresentationFrameHandler
 from chartreux.app_server.client_state import ClientSessionState
+from chartreux.app_server.events import DEFAULT_PRESENTATION_STREAM_ID
 from chartreux.app_server.models import PublicSessionState
 from chartreux.app_server.protocol import (
     ClientCapabilities,
@@ -33,6 +34,9 @@ class AppServerConnection:
         capabilities: ClientCapabilities,
         session_options: SessionOptions,
         client_factory: Callable[[], AppServerClient] | None = None,
+        *,
+        presentation_handler: PresentationFrameHandler | None = None,
+        presentation_stream_id: str = DEFAULT_PRESENTATION_STREAM_ID,
     ) -> None:
         self._client: AppServerClient | None = client
         self._state = state
@@ -40,11 +44,26 @@ class AppServerConnection:
         self._capabilities = capabilities
         self._session_options = session_options
         self._client_factory = client_factory
+        self._presentation_handler = presentation_handler
+        self._presentation_stream_id = presentation_stream_id
         self._initialized = False
         self._attached_session_id: str | None = None
         self._snapshot: ConnectionSnapshot | None = None
         self._lock = asyncio.Lock()
         self._closed = False
+        self._attach_presentation(client)
+
+    def _attach_presentation(self, client: AppServerClient) -> None:
+        """Keep the presentation consumer wired across reconnects.
+
+        Every client this connection manages — the initial one and any the
+        factory builds later — routes relay presentation frames to the same
+        consumer, so the announced incarnation survives reconnects.
+        """
+        if self._presentation_handler is not None:
+            client.attach_presentation(
+                self._presentation_handler, stream_id=self._presentation_stream_id
+            )
 
     @property
     def current(self) -> AppServerClient | None:
@@ -133,6 +152,7 @@ class AppServerConnection:
                 self._client = None
                 return False
             self._client = self._client_factory()
+            self._attach_presentation(self._client)
             self._initialized = False
             self._attached_session_id = None
             return True

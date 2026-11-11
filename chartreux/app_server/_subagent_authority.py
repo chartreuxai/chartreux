@@ -19,7 +19,6 @@ from chartreux.app_server.protocol import (
 from chartreux.core.agent_loop import AgentLoop
 from chartreux.core.agent_loop._dangerous_command_grants import (
     DangerousCommandGrantStore,
-    RemoteExecGrantRequirement,
 )
 from chartreux.core.config._dangerous_command_persistence import (
     read_saved_dangerous_command_grants,
@@ -179,27 +178,7 @@ class DangerousCommandAuthority:
         destination_identity: RemoteDestination | None,
     ) -> None:
         """Remove the live session authority, destination-scoped or whole-scope."""
-        if destination_identity is not None:
-            # Destination-scoped live removal: only that destination's session
-            # grants, in every scope that holds them; whole once permits
-            # containing it are invalidated, never trimmed.
-            store.revoke_remote_exec_session(
-                RemoteExecGrantRequirement(
-                    scope=scope, destination=destination_identity
-                )
-                for scope in store.remote_exec_scopes_for_destination(
-                    destination_identity
-                )
-            )
-            store.invalidate_pending_destinations({destination_identity})
-            return
-        requirements = {
-            (operation_id, authority.scope)
-            for authority in store.dangerous_command_authorities()
-            if operation_id in authority.operations
-        }
-        store.revoke_session(requirements)
-        store.invalidate_pending(requirements)
+        store.revoke_live_authority(operation_id, destination_identity)
 
     @staticmethod
     def _accepted_keeps_warning(

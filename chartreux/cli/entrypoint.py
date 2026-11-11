@@ -528,6 +528,20 @@ def _dispatch_sessionless_command(argv: list[str]) -> bool:
     return True
 
 
+def _reject_unusable_transport_selector() -> None:
+    """Fail on an unusable CHARTREUX_TRANSPORT before any startup work begins."""
+    from chartreux.app_server.transport import (
+        TransportSelectionError,
+        resolve_transport_selection,
+    )
+
+    try:
+        resolve_transport_selection()
+    except TransportSelectionError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        sys.exit(1)
+
+
 def main() -> None:
     _set_process_title()
 
@@ -535,6 +549,7 @@ def main() -> None:
         return
 
     args = parse_arguments()
+    _reject_unusable_transport_selector()
     worktree_session: PreparedWorktree | None = None
     cli_token: OwnershipToken | None = None
 

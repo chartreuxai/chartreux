@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Awaitable, Callable, Coroutine
+from collections.abc import Awaitable, Callable, Coroutine, Mapping
 from contextlib import suppress
+from dataclasses import dataclass
+from enum import StrEnum
 from pathlib import Path
+import time
 from typing import TYPE_CHECKING, Any, Protocol
 
 from chartreux.app_server._execution import (
@@ -26,6 +29,11 @@ from chartreux.app_server._subagent_records import (
     _AgentState,
     _AgentTombstone,
 )
+from chartreux.app_server._subagent_recovery import (
+    ChildTranscriptReconciler,
+    ChildTranscriptReconciliation,
+)
+from chartreux.app_server._subagent_transcript import resolve_child_root_session_dir
 from chartreux.app_server._turns import DeliverCallback, TurnController
 from chartreux.app_server.models import (
     OpenCallbackState,
@@ -34,6 +42,12 @@ from chartreux.app_server.models import (
     PublicHistoryEntry,
     PublicSessionState,
     PublicTurn,
+)
+from chartreux.app_server.process_bootstrap import (
+    DEFAULT_SHUTDOWN_TIMEOUT,
+    ProcessTreeShutdown,
+    ProcessTreeShutdownReport,
+    ShutdownPhase,
 )
 from chartreux.app_server.protocol import (
     HistoryEntryAddedParams,
@@ -391,6 +405,8 @@ class ChildDrainView(Protocol):
     _agent_records: dict[str, AgentRecord]
     _admission_closed: bool
     _draining_children: bool
+    _shutdown_timeout: float
+    _clock: Callable[[], float]
     _registry_lock: asyncio.Lock
     _reaper_task: asyncio.Task[None] | None
     _reaper_deadline: float | None
@@ -408,6 +424,7 @@ class ChildDrainView(Protocol):
     _wait_leases: dict[tuple[str, str], int]
     _pending_notifications: set[tuple[str, str]]
     _result_write_tokens: dict[tuple[str, str], object]
+    _child_result_receipts: dict[str, set[str]]
     _children: dict[str, SessionRuntime]
     _child_links: dict[str, tuple[SessionRuntime, str]]
     _stored_children: dict[str, StoredChildSession]
@@ -426,7 +443,9 @@ class ChildDrainView(Protocol):
     @staticmethod
     def _retire_teardown_task(task: asyncio.Task[None]) -> None: ...
 
-    def drain_children(self) -> Coroutine[Any, Any, None]: ...
+    def drain_children(self) -> Coroutine[Any, Any, ChildDrainReport]: ...
+
+    async def close_admission(self) -> None: ...
 
     def _emit_agents_update(
         self, evictions: list[AgentEviction] | None = None
@@ -451,6 +470,40 @@ class DrainContext:
         self.agents_changed: bool = False
         self.children: list[SessionRuntime] = []
         self.pending_close_runtimes: list[SessionRuntime] = []
+
+
+class ChildDrainStatus(StrEnum):
+    """The typed disposition of one coordinator-side child drain ([5E])."""
+
+    DRAINED = "drained"
+    TIMED_OUT = "timed_out"
+
+
+@dataclass(frozen=True, slots=True)
+class ChildDrainReport:
+    """What one child drain actually achieved, typed.
+
+    A drain bounded out by the shutdown deadline reports ``TIMED_OUT`` and
+    the children it had to terminate — never a successful drain: a caller
+    must not conclude that every child reached a terminal state and was
+    published after a timeout.
+    """
+
+    status: ChildDrainStatus
+    drained_children: int = 0
+    terminated_children: int = 0
+    remaining_children: int = 0
+    elapsed: float = 0.0
+
+    @property
+    def timed_out(self) -> bool:
+        """Whether the shutdown bound expired before the drain completed."""
+        return self.status is ChildDrainStatus.TIMED_OUT
+
+    @property
+    def complete(self) -> bool:
+        """Whether the drain finished inside its bound with nothing left."""
+        return self.status is ChildDrainStatus.DRAINED and not self.remaining_children
 
 
 class ChildDrain:
@@ -511,31 +564,170 @@ class ChildDrain:
                 )
             self._view._admission_closed = True
 
-    async def close_children(self) -> None:
+    async def close_admission(self) -> None:
+        """Stop new child admission without starting the drain.
+
+        The ordered tree shutdown closes admission before it interrupts
+        anything, so a launch arriving while the old tree is being stopped is
+        refused typed instead of starting beside it.
+        """
+        async with self._view._ensure_child_lock:
+            self._view._admission_closed = True
+
+    async def close_children(self) -> ChildDrainReport:
         self._view._require_policy_unreserved()
         self._view._admission_closed = True
-        await self._view.drain_children()
+        return await self._view.drain_children()
 
-    async def drain_children(self) -> None:
-        """Run the drain phases in producer order over one DrainContext."""
+    async def drain_children(self) -> ChildDrainReport:
+        """Run the drain phases in producer order under the shutdown bound.
+
+        Quiescence is established first: the drain flag makes the registry's
+        synchronous admission refuse every new child launch for the whole
+        drain. The phase sequence then runs as ONE producer-ordered unit,
+        bounded by the registry's shutdown timeout on the injected monotonic
+        clock; in-flight turns are interrupted and their saves drain inside
+        that bound. When the bound expires the phase task is terminated, the
+        remaining children are closed, and the drain reports TIMED_OUT — a
+        timed-out drain is never reported as successful.
+        """
         self._view._require_policy_unreserved()
         self._view._draining_children = True
+        clock = getattr(self._view, "_clock", time.monotonic)
+        shutdown_timeout = getattr(self._view, "_shutdown_timeout", 10.0)
+        started = clock()
+        deadline = started + shutdown_timeout
         async with self._view._registry_lock:
             for record in self._view._agent_records.values():
                 if record.reserved_for_replacement:
                     self._view._clear_replacement_locked(record)
         context = DrainContext()
+        report: ChildDrainReport
+        phases = asyncio.create_task(
+            self._run_phases(context), name="vibe-subagent-child-drain"
+        )
         try:
-            await self._drain_reapers(context)
-            await self._drain_monitors(context)
-            await self._drain_evictions(context)
-            await self._drain_remaining_runs(context)
-            await self._drain_tracked_teardowns(context)
-            await self._drain_retryable_runtimes(context)
-            await self._drain_final_inventory(context)
+            if not await self._wait_for_phases(phases, deadline):
+                report = await self._settle_drain_timeout(context, phases, started)
+            else:
+                # Surface the phases' accumulated errors exactly as before.
+                phases.result()
+                report = ChildDrainReport(
+                    status=ChildDrainStatus.DRAINED,
+                    drained_children=len(context.children),
+                    elapsed=clock() - started,
+                )
         finally:
             self._view._draining_children = False
             self._view._drain_suppressed_inventory = False
+        return report
+
+    async def _run_phases(self, context: DrainContext) -> None:
+        """The producer-ordered phase sequence of one drain."""
+        await self._drain_reapers(context)
+        await self._drain_monitors(context)
+        await self._drain_evictions(context)
+        await self._drain_remaining_runs(context)
+        await self._drain_tracked_teardowns(context)
+        await self._drain_retryable_runtimes(context)
+        await self._drain_final_inventory(context)
+
+    async def _wait_for_phases(
+        self, phases: asyncio.Task[None], deadline: float
+    ) -> bool:
+        """Wait for the phase sequence; False once the monotonic bound expires."""
+        clock = getattr(self._view, "_clock", time.monotonic)
+        while not phases.done():
+            remaining = deadline - clock()
+            if remaining <= 0:
+                return False
+            await asyncio.wait({phases}, timeout=remaining)
+        return True
+
+    async def _settle_drain_timeout(
+        self, context: DrainContext, phases: asyncio.Task[None], started: float
+    ) -> ChildDrainReport:
+        """Terminate the remaining children after the bound; report TIMED_OUT."""
+        phases.cancel()
+        await asyncio.gather(phases, return_exceptions=True)
+        for task in (
+            *self._view._monitor_tasks,
+            *self._view._eviction_tasks,
+            *self._view._teardown_tasks,
+        ):
+            if task is not asyncio.current_task() and not task.done():
+                task.cancel()
+        runtimes = self._remaining_runtimes(context)
+        # The termination half of the shutdown budget (save drain +
+        # terminate/reap): a hung close is bounded, and whatever it could not
+        # close stays counted as remaining rather than reported as drained.
+        loop = asyncio.get_running_loop()
+        termination_deadline = loop.time() + getattr(
+            self._view, "_shutdown_timeout", 10.0
+        )
+        terminated = 0
+        for runtime in runtimes:
+            remaining = termination_deadline - loop.time()
+            if remaining <= 0:
+                break
+            try:
+                await asyncio.wait_for(runtime.close(), timeout=remaining)
+            except BaseException:
+                continue
+            terminated += 1
+        self._clear_inventory_after_timeout()
+        with suppress(Exception):
+            await self._view._emit_agents_update()
+        clock = getattr(self._view, "_clock", time.monotonic)
+        return ChildDrainReport(
+            status=ChildDrainStatus.TIMED_OUT,
+            # A timed-out drain claims no drained child: the status and the
+            # terminated/remaining counts are the honest report.
+            drained_children=0,
+            terminated_children=terminated,
+            remaining_children=len(runtimes),
+            elapsed=clock() - started,
+        )
+
+    def _remaining_runtimes(self, context: DrainContext) -> list[SessionRuntime]:
+        """Every child runtime still live when the drain bound expired."""
+        collected: dict[int, SessionRuntime] = {}
+        for runtime in (
+            *context.children,
+            *context.pending_close_runtimes,
+            *self._view._children.values(),
+            *(runtime for runtime, _ in self._view._pending_child_closes.values()),
+        ):
+            collected[id(runtime)] = runtime
+        return list(collected.values())
+
+    def _clear_inventory_after_timeout(self) -> None:
+        """Drop the registry inventory a timed-out drain could not settle."""
+        view = self._view
+        view._agent_records.clear()
+        view._evicted_agents.clear()
+        view._pending_evictions.clear()
+        view._pending_agents_evictions = []
+        view._result_store.clear()
+        view._expired_results.clear()
+        view._collected_results.clear()
+        view._latest_run_ids.clear()
+        view._wait_leases.clear()
+        view._pending_notifications.clear()
+        view._result_write_tokens.clear()
+        getattr(view, "_child_result_receipts", {}).clear()
+        view._children.clear()
+        view._child_links.clear()
+        view._stored_children.clear()
+        view._readable_children.clear()
+        view._readable_children_identities.clear()
+        view._detached_child_ids.clear()
+        view._pending_child_closes.clear()
+        view._suppression_owners.clear()
+        view._suppressed_notifications.clear()
+        # The empty inventory is the final payload: never leave a ghost row
+        # behind for a registry whose children were force-terminated.
+        view._drain_suppressed_inventory = True
 
     async def _drain_reapers(self, context: DrainContext) -> None:
         """Cancel and join the live reaper and the displaced reapers."""
@@ -624,6 +816,9 @@ class ChildDrain:
             self._view._wait_leases.clear()
             self._view._pending_notifications.clear()
             self._view._result_write_tokens.clear()
+            child_receipts = getattr(self._view, "_child_result_receipts", None)
+            if child_receipts is not None:
+                child_receipts.clear()
             context.children = list(self._view._children.values())
             context.pending_close_runtimes = list(
                 {
@@ -700,3 +895,325 @@ class ChildDrain:
     ) -> None:
         with suppress(Exception):
             await close_loop(child)
+
+
+class OrphanReapView(ChildDrainView, Protocol):
+    """Narrow typed view over the registry state an orphan sweep reads.
+
+    Dynamic access, like every other collaborator view: the root, the child
+    maps, and the lock are read at call time so a registry mutated or rebound
+    after construction stays visible.
+    """
+
+    _root: SessionRuntime | None
+
+
+@dataclass(frozen=True, slots=True)
+class OrphanReconciliation:
+    """One child whose parent session is gone, and what reaping achieved.
+
+    ``reconciliation`` is the [5C] marker-based classification of the child's
+    durable transcript (never executed, outcome unknown, completed, or
+    unreadable). It is a report, never a replay instruction: an orphan is
+    adjudicated and reaped, and its run is not restarted.
+    """
+
+    agent_id: str
+    session_id: str
+    reconciliation: ChildTranscriptReconciliation | None = None
+    reaped: bool = False
+    error: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class OrphanReapReport:
+    """What one orphan sweep actually achieved, typed (WP7 [7C])."""
+
+    orphans: tuple[OrphanReconciliation, ...] = ()
+
+    @property
+    def reaped(self) -> int:
+        """How many orphans were reaped (closed, or already closed)."""
+        return sum(1 for orphan in self.orphans if orphan.reaped)
+
+    @property
+    def reconciled(self) -> int:
+        """How many orphans had a durable transcript to adjudicate."""
+        return sum(1 for orphan in self.orphans if orphan.reconciliation is not None)
+
+    @property
+    def complete(self) -> bool:
+        """Whether every orphan was reaped."""
+        return all(orphan.reaped for orphan in self.orphans)
+
+
+class OrphanReaper:
+    """Reap children whose parent session is gone (WP7 [7C]).
+
+    A child is orphaned when its parent session is not the registry's live
+    root session — a session switch left it behind — or when there is no root
+    at all (the root died). The sweep drops the child's registry rows, closes
+    its runtime, and adjudicates its durable transcript through the [5C]
+    reconciler. The run is never replayed: the report carries what the markers
+    say and nothing is restarted.
+    """
+
+    def __init__(self, view: OrphanReapView) -> None:
+        self._view = view
+
+    async def reap(self) -> OrphanReapReport:
+        view = self._view
+        root = view._root
+        live_session = None if root is None else root.agent_loop.session_id
+        async with view._ensure_child_lock:
+            live = [
+                (session_id, runtime)
+                for session_id, runtime in view._children.items()
+                if runtime.agent_loop.parent_session_id != live_session
+            ]
+            stored = [
+                (session_id, stored)
+                for session_id, stored in view._stored_children.items()
+                if stored.root_session_id != live_session
+            ]
+            readable = [
+                (session_id, runtime)
+                for session_id, runtime in view._readable_children.items()
+                if view._readable_children_identities.get(session_id, ("", 0))[0]
+                != live_session
+            ]
+            if not live and not stored and not readable:
+                return OrphanReapReport()
+            orphan_sessions = {
+                session_id for session_id, _ in (*live, *stored, *readable)
+            }
+            agent_by_session = {
+                record.session_id: agent_id
+                for agent_id, record in view._agent_records.items()
+                if record.session_id in orphan_sessions
+            }
+            # Each orphan is adjudicated where its own transcript lives: a
+            # switch or a root death leaves it under the session that owned
+            # it, never under the session that replaced it.
+            child_dirs: dict[str, Path] = {}
+            for session_id, runtime in live:
+                child_dir = runtime.agent_loop.session_logger.session_dir
+                if child_dir is not None:
+                    child_dirs[session_id] = child_dir
+            for session_id, stored_child in stored:
+                child_dirs[session_id] = stored_child.child_dir
+            for session_id, _ in live:
+                view._children.pop(session_id, None)
+                view._child_links.pop(session_id, None)
+            for session_id, _ in stored:
+                view._stored_children.pop(session_id, None)
+            for session_id, _ in readable:
+                view._readable_children.pop(session_id, None)
+                view._readable_children_identities.pop(session_id, None)
+            for agent_id, record in list(view._agent_records.items()):
+                if record.session_id in orphan_sessions:
+                    view._agent_records.pop(agent_id, None)
+        reconciliations = await self._reconcile(child_dirs)
+        results: list[OrphanReconciliation] = []
+        for session_id, runtime in live:
+            agent_id = agent_by_session.get(session_id, session_id)
+            error: str | None = None
+            reaped = False
+            try:
+                await runtime.close()
+                reaped = True
+            except BaseException as exc:
+                error = f"{type(exc).__name__}: {exc}"
+            results.append(
+                OrphanReconciliation(
+                    agent_id=agent_id,
+                    session_id=session_id,
+                    reconciliation=reconciliations.get(session_id),
+                    reaped=reaped,
+                    error=error,
+                )
+            )
+        for session_id, _ in (*stored, *readable):
+            agent_id = agent_by_session.get(session_id, session_id)
+            results.append(
+                OrphanReconciliation(
+                    agent_id=agent_id,
+                    session_id=session_id,
+                    reconciliation=reconciliations.get(session_id),
+                    reaped=True,
+                )
+            )
+        with suppress(Exception):
+            await view._emit_agents_update()
+        return OrphanReapReport(
+            orphans=tuple(
+                sorted(results, key=lambda orphan: (orphan.agent_id, orphan.session_id))
+            )
+        )
+
+    async def _reconcile(
+        self, child_dirs: Mapping[str, Path]
+    ) -> dict[str, ChildTranscriptReconciliation]:
+        """Adjudicate each orphan's own durable transcript, read-only.
+
+        Keyed by child session id, read where the transcript lives: a switch
+        or a root death leaves it under the session that owned the child, so
+        scanning the LIVE root session's ``agents`` directory would never
+        reach it. A child with no transcript directory (logging disabled) has
+        nothing durable to adjudicate and reports none. The scan only reads
+        markers; no run is ever replayed.
+        """
+        scanned_by_root: dict[Path, list[ChildTranscriptReconciliation]] = {}
+        for child_dir in set(child_dirs.values()):
+            root_session_dir = resolve_child_root_session_dir(child_dir)
+            if root_session_dir is None or root_session_dir in scanned_by_root:
+                continue
+            reconciler = ChildTranscriptReconciler(root_session_dir)
+            try:
+                scanned_by_root[root_session_dir] = await asyncio.to_thread(
+                    reconciler.scan
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Failed to scan orphaned child transcripts", exc_info=exc
+                )
+        reconciliations: dict[str, ChildTranscriptReconciliation] = {}
+        for session_id, child_dir in child_dirs.items():
+            root_session_dir = resolve_child_root_session_dir(child_dir)
+            if root_session_dir is None:
+                continue
+            for reconciliation in scanned_by_root.get(root_session_dir, []):
+                if reconciliation.child_dir == Path(child_dir):
+                    reconciliations[session_id] = reconciliation
+                    break
+        return reconciliations
+
+
+class TreeNotReapedError(RuntimeError):
+    """The old tree could not be fully reaped; no new tree may start.
+
+    Raised where a switch or a respawn would open a new tree: the old tree is
+    still live, so starting the new one would overlap it.
+    """
+
+    def __init__(self, report: TreeShutdownReport) -> None:
+        self.report = report
+        super().__init__(
+            "The previous session tree was not fully reaped inside its bound; "
+            "no new tree starts before the old one is reaped. Nothing was switched."
+        )
+
+
+class TreeShutdownStatus(StrEnum):
+    """The typed disposition of one ordered session-tree shutdown ([7B])."""
+
+    COMPLETE = "complete"
+    TIMED_OUT = "timed_out"
+
+
+@dataclass(frozen=True, slots=True)
+class TreeShutdownReport:
+    """What one ordered tree shutdown actually achieved, typed.
+
+    The sequence is design R2-W1: stop admission → interrupt in-flight work →
+    drain/fence saves → terminate/kill → close IPC → reap. The child drain and
+    the process-tree stop share ONE shutdown bound, and a drain bounded out by
+    it reports ``TIMED_OUT`` — never a successful shutdown. When no process
+    tree is attached (in-process children), the drain's own runtime closes are
+    the terminate/close-IPC/reap half, so those phases are not claimed.
+    """
+
+    status: TreeShutdownStatus
+    phases: tuple[ShutdownPhase, ...] = ()
+    drain: ChildDrainReport | None = None
+    process_tree: ProcessTreeShutdownReport | None = None
+    elapsed: float = 0.0
+
+    @property
+    def timed_out(self) -> bool:
+        """Whether any stage ran out of the one shutdown bound."""
+        return self.status is TreeShutdownStatus.TIMED_OUT
+
+    @property
+    def complete(self) -> bool:
+        """Whether admission stopped, the drain finished, and the tree is gone."""
+        return (
+            self.status is TreeShutdownStatus.COMPLETE
+            and self.drain is not None
+            and self.drain.complete
+            and (self.process_tree is None or self.process_tree.complete)
+        )
+
+
+class TreeShutdown:
+    """The ordered shutdown of one coordinator-owned session/process tree.
+
+    Runs the six named phases in design order over the registry-owned drain
+    and an optional attached :class:`~chartreux.app_server.process_bootstrap.
+    ProcessTreeShutdown`. Admission closes first, so no child work starts while
+    the tree is stopping; the drain then interrupts in-flight work and drains
+    saves inside its bound; the attached process tree is stopped with whatever
+    remains of the SAME bound — terminate/kill, close IPC, reap. A timed-out
+    stage makes the whole report ``TIMED_OUT``: success is never implied after
+    the bound expires. In-process children have no process tail; the drain's
+    runtime closes are that half, so those phases are not reported.
+    """
+
+    def __init__(self, view: ChildDrainView) -> None:
+        self._view = view
+        self._process_tree: ProcessTreeShutdown | None = None
+
+    @property
+    def process_tree(self) -> ProcessTreeShutdown | None:
+        """The attached process-tree stop, when this tree owns processes."""
+        return self._process_tree
+
+    def attach_process_tree(self, process_tree: ProcessTreeShutdown) -> None:
+        """Attach the process half the coordinator owns for this tree."""
+        self._process_tree = process_tree
+
+    async def shutdown(self) -> TreeShutdownReport:
+        """Run the ordered phases under the registry's one shutdown bound."""
+        view = self._view
+        clock = getattr(view, "_clock", time.monotonic)
+        timeout = getattr(view, "_shutdown_timeout", DEFAULT_SHUTDOWN_TIMEOUT)
+        started = clock()
+        deadline = started + timeout
+        phases: list[ShutdownPhase] = []
+        await view.close_admission()
+        phases.append(ShutdownPhase.STOP_ADMISSION)
+        # Interrupt in-flight turns/approvals and drain their saves: the
+        # drain owns both, bounded by the same shutdown timeout.
+        drain = await view.drain_children()
+        phases.extend((ShutdownPhase.INTERRUPT, ShutdownPhase.DRAIN_SAVES))
+        process_tree: ProcessTreeShutdownReport | None = None
+        if self._process_tree is not None:
+            remaining = max(0.0, deadline - clock())
+            process_tree = await self._process_tree.shutdown(timeout=remaining)
+            phases.extend(process_tree.phases)
+        timed_out = drain.timed_out or (
+            process_tree is not None and process_tree.timed_out
+        )
+        return TreeShutdownReport(
+            status=(
+                TreeShutdownStatus.TIMED_OUT
+                if timed_out
+                else TreeShutdownStatus.COMPLETE
+            ),
+            phases=tuple(phases),
+            drain=drain,
+            process_tree=process_tree,
+            elapsed=clock() - started,
+        )
+
+    async def reap_before_restart(self) -> TreeShutdownReport:
+        """Fully reap this tree before a switch or respawn opens a new one.
+
+        WP7 [7C]: no new tree starts before the old one is reaped. The ordered
+        shutdown runs first; a tree that could not be reaped raises the typed
+        refusal, so the caller never overlaps two trees.
+        """
+        report = await self.shutdown()
+        if not report.complete:
+            raise TreeNotReapedError(report)
+        return report

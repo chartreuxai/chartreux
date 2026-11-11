@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, Any
 
 from textual.widget import Widget
 
+from chartreux.app_server.events import PresentationStreamState, StreamPhase
 from chartreux.app_server.models import (
     COMMITTED_MODEL_RECOVERY_ISSUE_FILE,
     PublicHistoryEntry,
@@ -35,8 +36,25 @@ from chartreux.observability.logging import logger
 from chartreux.ui.chrome_glyphs import chrome_glyph
 
 if TYPE_CHECKING:
+    from chartreux.app_server.session import AppServerSession
     from chartreux.cli.textual_ui.app import ChartreuxApp
     from chartreux.cli.textual_ui.widgets.session_picker import SessionPickerApp
+
+
+@dataclass(frozen=True, slots=True)
+class PresentationSurfaceState:
+    """What the TUI surfaces for one presentation stream right now.
+
+    ``refreshing`` is the transient stale/refreshing state shown while a
+    replacement incarnation registers; ``installed_generation`` is the last
+    atomically installed snapshot; ``failure`` is the persistent typed failure
+    that ended the stream (never silent loss).
+    """
+
+    stream_id: str
+    refreshing: bool
+    installed_generation: int | None
+    failure: str | None
 
 
 @dataclass(slots=True)
@@ -65,7 +83,7 @@ class _PickerState:
         return was_previewing
 
 
-class SessionFlowController:
+class SessionFlowController:  # noqa: PLR0904 - the app's flow surface, one method per flow step
     """Owns the session-picker preview/origin state and the resume flow for one app.
 
     Plain object (no mixins): the app binds itself late via ``_bind_app``
@@ -88,10 +106,209 @@ class SessionFlowController:
         self.resume_adopted = False
         self.rewind_mode = False
         self.rewind_highlighted_widget: UserMessage | None = None
+        # Presentation-loss / connection-loss UX (WP4 [4B]): the session's
+        # PresentationConsumer states and connection loss/resume drive these.
+        self._presentation_bound_session: AppServerSession | None = None
+        self._presentation_stream_states: dict[str, PresentationSurfaceState] = {}
+        self._presentation_refresh_notice: Widget | None = None
+        self._presentation_failure_banner: ErrorMessage | None = None
+        self._connection_notice: Widget | None = None
 
     def _bind_app(self, app: ChartreuxApp) -> None:
         """Bind the host app after construction."""
         self._app = app
+
+    # -- Presentation-loss and connection-loss UX (WP4 [4B]) -----------------
+
+    def attach_presentation_listeners(self, session: AppServerSession) -> None:
+        """Observe the session's presentation consumer and connection state."""
+        if self._presentation_bound_session is session:
+            return
+        self.detach_presentation_listeners()
+        self._presentation_bound_session = session
+        session.presentation.set_listener(self._on_presentation_stream_state)
+        session.add_connection_listener(self._on_connection_state)
+
+    def detach_presentation_listeners(self) -> None:
+        session = self._presentation_bound_session
+        if session is not None:
+            session.presentation.set_listener(None)
+            session.remove_connection_listener(self._on_connection_state)
+        self._presentation_bound_session = None
+
+    def _on_presentation_stream_state(
+        self, stream_id: str, stream: PresentationStreamState
+    ) -> None:
+        """Consumer listener: map the stream state to what the TUI surfaces."""
+        try:
+            install = stream.last_install
+            state = PresentationSurfaceState(
+                stream_id=stream_id,
+                # A replacement registering after an installed view is the
+                # transient stale/refreshing state; the initial incarnation's
+                # first install is the ordinary startup load, not staleness.
+                refreshing=(
+                    stream.phase in {StreamPhase.AWAITING, StreamPhase.INSTALLING}
+                    and install is not None
+                ),
+                installed_generation=install.generation
+                if install is not None
+                else None,
+                failure=stream.terminal.reason if stream.terminal is not None else None,
+            )
+            previous = self._presentation_stream_states.get(stream_id)
+            if previous == state:
+                return
+            self._presentation_stream_states[stream_id] = state
+            self._schedule_presentation_apply(stream_id, state, previous)
+        except Exception:
+            logger.exception("Presentation state observer failed")
+
+    def _on_connection_state(self, lost: bool, reason: str) -> None:
+        """Connection listener: typed connection-failure state while down."""
+        try:
+            if not self._app.is_running:
+                return
+            text = (
+                f"Connection to the app server was lost ({reason}); reconnecting…"
+                if lost
+                else None
+            )
+            self._app.run_worker(
+                self._apply_connection_notice(text),
+                exclusive=True,
+                group="connection-ux",
+                name="connection-ux",
+            )
+        except Exception:
+            logger.exception("Connection state observer failed")
+
+    def _schedule_presentation_apply(
+        self,
+        stream_id: str,
+        state: PresentationSurfaceState,
+        previous: PresentationSurfaceState | None,
+    ) -> None:
+        if not self._app.is_running:
+            return
+        self._app.run_worker(
+            self._apply_presentation_surface(stream_id, state, previous),
+            exclusive=True,
+            group="presentation-ux",
+            name=f"presentation-ux:{stream_id}",
+        )
+
+    async def _apply_presentation_surface(
+        self,
+        stream_id: str,
+        state: PresentationSurfaceState,
+        previous: PresentationSurfaceState | None,
+    ) -> None:
+        if state.failure is not None:
+            await self._show_presentation_failure(stream_id, state.failure)
+            return
+        if state.installed_generation is not None and (
+            previous is None
+            or previous.installed_generation != state.installed_generation
+        ):
+            # A fresh snapshot installed atomically: reinstall the transcript
+            # from it and clear any transient refreshing notice.
+            await self._clear_presentation_refresh_notice()
+            await self.install_presentation_snapshot()
+            return
+        if state.refreshing:
+            await self._show_presentation_refresh_notice()
+        else:
+            await self._clear_presentation_refresh_notice()
+
+    async def _show_presentation_refresh_notice(self) -> None:
+        if self._presentation_refresh_notice is not None:
+            return
+        notice = UserCommandMessage(
+            "Session view is stale; refreshing from a fresh snapshot…"
+        )
+        self._presentation_refresh_notice = notice
+        with self._app.batch_update():
+            await self._app._messages_area.mount(notice, before=0)
+
+    async def _clear_presentation_refresh_notice(self) -> None:
+        notice = self._presentation_refresh_notice
+        self._presentation_refresh_notice = None
+        if notice is not None and notice.parent is not None:
+            await notice.remove()
+
+    async def _show_presentation_failure(self, stream_id: str, reason: str) -> None:
+        """Persistent typed failure banner — presentation loss is never silent."""
+        if self._presentation_failure_banner is not None:
+            return
+        await self._clear_presentation_refresh_notice()
+        banner = ErrorMessage(
+            f"Session presentation failed permanently ({stream_id}): {reason}. "
+            "The displayed transcript may be stale and is never silently "
+            "dropped. Resume or restart the session to recover.",
+            collapsed=False,
+        )
+        self._presentation_failure_banner = banner
+        await self._app._mount_and_scroll(banner)
+        self._app.notify(f"Presentation stream failed: {reason}", severity="error")
+
+    async def install_presentation_snapshot(self) -> None:
+        """Atomically reinstall the transcript from a freshly installed snapshot.
+
+        The whole messages area is rebuilt in one batch from the current
+        session history, and the windowing backfill is re-adopted bounded by
+        the snapshot plan's tail, so Load More can never serve content from
+        the replaced incarnation.
+        """
+        app = self._app
+        history = app.app_server.history
+        plan = create_resume_plan(history, HISTORY_RESUME_TAIL_MESSAGES)
+        app._reset_ui_state()
+        with app.batch_update():
+            await app._load_more.hide()
+            await app._messages_area.remove_children()
+            if plan is not None:
+                await app._mount_history_batch(
+                    plan.tail_entries,
+                    app._messages_area,
+                    start_index=plan.tail_start_index,
+                )
+        if plan is not None:
+            app._windowing.adopt_snapshot(plan.backfill_entries)
+            app.call_after_refresh(app._chat_widget.anchor)
+            await app._load_more.set_visible(
+                app._messages_area,
+                visible=app._has_older_history,
+                remaining=app._history_backfill_remaining,
+            )
+
+    async def _apply_connection_notice(self, text: str | None) -> None:
+        notice = self._connection_notice
+        if text is None:
+            self._connection_notice = None
+            if notice is not None and notice.parent is not None:
+                await notice.remove()
+            return
+        if notice is not None:
+            return
+        new_notice = UserCommandMessage(text)
+        self._connection_notice = new_notice
+        with self._app.batch_update():
+            await self._app._messages_area.mount(new_notice, before=0)
+
+    async def show_connection_failure(self, reason: str) -> None:
+        """Persistent typed connection-failure banner (event stream ended)."""
+        notice = self._connection_notice
+        self._connection_notice = None
+        if notice is not None and notice.parent is not None:
+            await notice.remove()
+        banner = ErrorMessage(
+            f"Connection to the app server was lost: {reason}. "
+            "The session is not updating. Resume or restart to recover.",
+            collapsed=False,
+        )
+        await self._app._mount_and_scroll(banner)
+        self._app.notify("App-server connection lost", severity="error")
 
     async def on_session_picker_app_session_highlighted(
         self, event: SessionPickerApp.SessionHighlighted

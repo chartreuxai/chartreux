@@ -108,3 +108,25 @@ def test_backfill_release_spares_aliased_entries_collects_superseded() -> None:
     # held only by the backfill list are collectable after full admission.
     assert all(ref() is not None for ref in aliased_refs)
     assert all(ref() is None for ref in superseded_refs)
+
+
+def test_adopt_snapshot_replaces_the_old_backfill_atomically() -> None:
+    w = SessionWindowing(LOAD_MORE_BATCH_SIZE)
+    stale: list[PublicHistoryEntry] = [_message(index) for index in range(5)]
+    w.set_backfill(stale)
+    assert w.has_backfill
+
+    # A fresh snapshot installs: the previous generation's backfill is
+    # discarded wholesale and replaced by the snapshot plan's bounded prefix.
+    snapshot_backfill: list[PublicHistoryEntry] = [
+        _message(index) for index in range(25, 30)
+    ]
+    w.adopt_snapshot(snapshot_backfill)
+
+    assert w.remaining == 5
+    served: list[str] = []
+    while (batch := w.next_load_more_batch()) is not None:
+        served.extend(entry.id for entry in batch.entries)
+    assert served == [f"message-{index}" for index in range(25, 30)]
+    # The stale pre-snapshot entries are gone from the backfill entirely.
+    assert not any(f"message-{index}" in served for index in range(5))

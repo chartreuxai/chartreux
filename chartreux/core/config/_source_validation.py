@@ -34,6 +34,10 @@ _ENVIRONMENT_CONTROLS = frozenset({
     "ACP_LOGGING_ENABLED",
     "TEST_DISABLE_KEYRING",
     "TEST_DISABLE_AUTO_TITLE",
+    # Transport selection (WP1 [1C]) and the spawned-process readiness marker
+    # (WP1 [1A]): read by the CLI and the app-server bootstrap, never config.
+    "TRANSPORT",
+    "PROCESS_BOOTSTRAP",
 })
 
 # Retired configuration inputs (design §12; package 16a) are recognized BEFORE

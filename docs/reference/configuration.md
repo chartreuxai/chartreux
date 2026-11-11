@@ -34,6 +34,14 @@ The `[agent]` table selects who performs the work and how it is orchestrated; th
 
 New-conversation precedence is CLI flag (`--identity`, `--workflow`, `--orchestration-strategy`) > environment (`CHARTREUX_AGENT__IDENTITY`, `CHARTREUX_AGENT__WORKFLOW`, `CHARTREUX_AGENT__ORCHESTRATION_STRATEGY`) > `config.toml` > shipped default; an omitted flag is distinguished from an explicit selection at every level. Saved changes apply to new conversations only — `/reload` reports them as pending — and the Settings > Identity & Orchestration group edits the same keys with the same next-conversation timing. Unknown or malformed selections fail loudly at conversation start with actionable errors; reserved shipped names cannot be shadowed by custom files. `chartreux doctor` resolves the selections offline and reports retired settings with their successors.
 
+### Runtime topology
+
+| Key | Default | Accepted value |
+| --- | --- | --- |
+| `multi_process` | `true` | Strict boolean. `false` forces the in-process route for every run: the app server and its agents run in one process with every boundary removed. At the default, an interactive run uses the multi-process topology (a thin app-server coordinator plus one process per agent) and a programmatic (`-p`/`--prompt`) run stays in-process. `CHARTREUX_TRANSPORT` outranks this key. |
+
+The multi-process route adds exactly two persistent artifacts to a live root session: a registry manifest beside its session directory (`<session>.registry.json`) and a writer-fence lockfile inside the fenced session directory (`.writer-fence.lock`). See the [app-server integration](../integrations/app-server.md#process-topology).
+
 ### Tools and integrations
 
 | Key | Default | Accepted value |
@@ -376,6 +384,7 @@ thinking = "high"
 | --- | --- |
 | `CHARTREUX_HOME` | Changes the home directory; default `~/.chartreux`. Set it in the process environment before launch. |
 | `CHARTREUX_<FIELD>` | Overrides a `config.toml` field. Use `__` for nesting, for example `CHARTREUX_PROJECT_CONTEXT__TIMEOUT_SECONDS`. Names are case-insensitive; empty values are still supplied and must validate. |
+| `CHARTREUX_TRANSPORT` | Selects the run's app-server route and is a runtime selection, not a `config.toml` field: `stdio` selects the multi-process topology, `in_process` selects the in-process escape, and an explicit value outranks `multi_process`. The retired `multi_process` spelling is rejected. |
 | `CHARTREUX_AGENT__IDENTITY`, `CHARTREUX_AGENT__WORKFLOW`, `CHARTREUX_AGENT__ORCHESTRATION_STRATEGY` | New-conversation `[agent]` selections, outranked only by the `--identity`, `--workflow`, and `--orchestration-strategy` CLI flags. An unset variable means no override; see [Agent selections](#agent-selections). |
 | Provider key named by `api_key_env_var` | Credential for that catalog provider; the shipped Mistral provider uses `MISTRAL_API_KEY`. |
 | `EXA_API_KEY`, `BRAVE_SEARCH_API_KEY`, or the variable selected by `tools.web_search.api_key_env_var` | Credentials for web-search providers. Exa and Brave use their corresponding variable by default. Mistral/auto uses `tools.web_search.api_key_env_var` when set; otherwise it selects the configured Mistral provider key, or `MISTRAL_API_KEY` if no Mistral provider is configured. Chartreux checks only the selected variable and reports a missing-key diagnostic if it is unavailable. |

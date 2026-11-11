@@ -15,6 +15,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from chartreux.core.dispatch.route_models import AppliedRouteChange
 from chartreux.core.llm_models import ImageAttachment
 from chartreux.core.session_types import AgentStats
+from chartreux.questions import UnattendedExpiryPolicy
 from chartreux.user_content import UserDisplayContent, UserResource
 from chartreux.utils.tool_presentation import (
     ToolCallPresentation,
@@ -149,6 +150,10 @@ class UserInputRequestEvent(RequestEvent):
     args: BaseModel
     tool_call_id: str
     origin: UserInputOrigin = UserInputOrigin.RUNTIME_APPROVAL
+    # Agent-side admission snapshot (plan U/OD1): stamped by the request broker
+    # when the request is admitted, so a relaying host can present the countdown
+    # without owning the expiry decision. None when the request is ineligible.
+    unattended_expiry: UnattendedExpiryPolicy | None = None
 
 
 class TokenUsageUpdatedEvent(BaseEvent):

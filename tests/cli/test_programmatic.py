@@ -13,15 +13,18 @@ from chartreux.cli.programmatic import (
     OutputFormat,
     ProgrammaticLimitError,
     ProgrammaticOutput,
+    ProgrammaticPersistenceError,
     run_programmatic,
 )
-from chartreux.core.config import ChartreuxConfigSchema
+from chartreux.core.config import ChartreuxConfigSchema, SessionLoggingConfig
 from chartreux.core.config.harness_files import HarnessFilesManager
 from chartreux.core.config.layers.default import DefaultConfigLayer
 from chartreux.core.config.layers.overrides import OverridesLayer
 from chartreux.core.config.layers.user import UserConfigLayer
 from chartreux.core.config.orchestrator import ConfigOrchestrator
 from chartreux.core.llm_models import Backend
+from chartreux.core.session.session_loader import SessionLoader
+from chartreux.core.session.session_logger import ArchiveUnavailableError, SessionLogger
 from tests.conftest import build_test_vibe_config
 from tests.mock.mock_backend_factory import mock_backend_factory
 from tests.mock.utils import mock_llm_chunk
@@ -208,3 +211,75 @@ def test_plain_prompt_runs_normal_turn(
         )
 
     assert result == "Normal response."
+
+
+def _logging_config(tmp_path: Path) -> ChartreuxConfigSchema:
+    return build_test_vibe_config(
+        include_model_info=False,
+        include_commit_signature=False,
+        session_logging=SessionLoggingConfig(
+            enabled=True, save_dir=str(tmp_path / "sessions"), generate_titles=False
+        ),
+    )
+
+
+def test_programmatic_persists_the_session_before_returning_the_response(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """WP3 [3D] save-before-response: once run_programmatic returns the final
+    response, the session transcript on disk already carries it.
+    """
+    _use_runtime_config(monkeypatch, _logging_config(tmp_path), tmp_path)
+
+    with mock_backend_factory(
+        Backend.MISTRAL,
+        lambda provider, **kwargs: FakeBackend([
+            mock_llm_chunk(content="Persisted answer.")
+        ]),
+    ):
+        result = run_programmatic(
+            harness_options=_options(), prompt="Hello", output_format=OutputFormat.TEXT
+        )
+
+    assert result == "Persisted answer."
+    sessions = [
+        path for path in (tmp_path / "sessions").glob("session_*") if path.is_dir()
+    ]
+    assert len(sessions) == 1
+    # The root writer's fence lockfile lives inside the session dir.
+    assert (sessions[0] / ".writer-fence.lock").is_file()
+    messages, _metadata = SessionLoader.load_session(sessions[0])
+    contents = [
+        message.content for message in messages if isinstance(message.content, str)
+    ]
+    assert "Hello" in contents
+    assert "Persisted answer." in contents
+
+
+def test_programmatic_fails_closed_when_the_final_save_does_not_persist(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """WP3 [3D] save-before-response: a save that fails closed (recorded
+    diagnostic, nothing persisted) means no final response is emitted.
+    """
+    _use_runtime_config(monkeypatch, _logging_config(tmp_path), tmp_path)
+
+    def fail_save(*_args: object, **_kwargs: object) -> None:
+        raise ArchiveUnavailableError(
+            Path("messages.jsonl"), "injected save failure", recoverable_by_restart=True
+        )
+
+    monkeypatch.setattr(SessionLogger, "_save_interaction_sync", fail_save)
+
+    with mock_backend_factory(
+        Backend.MISTRAL,
+        lambda provider, **kwargs: FakeBackend([
+            mock_llm_chunk(content="Lost answer.")
+        ]),
+    ):
+        with pytest.raises(ProgrammaticPersistenceError, match="persisted"):
+            run_programmatic(
+                harness_options=_options(),
+                prompt="Hello",
+                output_format=OutputFormat.TEXT,
+            )

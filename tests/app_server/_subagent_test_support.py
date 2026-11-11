@@ -422,6 +422,7 @@ def _reaper_registry(
         wakeup=wakeup or _GatedWakeup(),
     )
     root = MagicMock()
+    root.agent_loop.session_logger.session_dir = None
     root.agent_loop.config.subagents.max_running_subagents = 16
     root.agent_loop.session_id = "root"
     root.agent_loop._session_generation = generation

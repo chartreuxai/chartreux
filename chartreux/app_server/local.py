@@ -13,7 +13,10 @@ from chartreux.app_server._runtime import (
 from chartreux.app_server.client import AppServerClient
 from chartreux.app_server.host import AppServerHost
 from chartreux.app_server.session import AppServerSession
-from chartreux.app_server.transport import memory_transport_pair
+from chartreux.app_server.transport import (
+    memory_transport_pair,
+    resolve_transport_selection,
+)
 
 __all__ = [
     "ClientDescriptor",
@@ -64,11 +67,12 @@ class LocalHarnessHost:
             raise
 
     async def connect(self, options: LocalHarnessOptions) -> AppServerHost:
+        selection = resolve_transport_selection()
         process = self._process_for()
         client_transport, server_transport = memory_transport_pair()
         harness = await create_harness_server(
             server_transport,
-            transport_kind="in_process",
+            transport_kind=selection.kind,
             process=process,
             startup_accounting=options.startup_accounting,
         )

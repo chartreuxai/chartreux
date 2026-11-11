@@ -1,8 +1,13 @@
 from __future__ import annotations
 
 from collections import OrderedDict
-from collections.abc import Callable
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
+from enum import StrEnum, auto
+import json
+import math
+import time
+from typing import Any
 
 from chartreux.app_server._model import validate_wire
 from chartreux.app_server._patch import (
@@ -46,6 +51,7 @@ from chartreux.app_server.protocol import (
     TurnStartedParams,
     TurnUpdatedParams,
 )
+from chartreux.app_server.relay import FrameClass, FrameSchemaError, classify_frame
 
 
 @dataclass(frozen=True, slots=True)
@@ -764,3 +770,679 @@ def _parse_event_params(notification: Notification) -> _KnownEventParams:
     if params_type is AgentsUpdateParams:
         params = _normalize_legacy_agents_update_params(params)
     return validate_wire(params_type, params)
+
+
+# --- Presentation consumer (the TUI side of the relay) ----------------------
+#
+# Every frame on an incarnation-enabled relay stream carries the hop-stamped
+# ``relay_incarnation`` generation; ``relay/retire`` retires one generation and
+# the next generation's frames announce its replacement. The consumer tracks
+# the announced incarnation per stream, installs each incarnation's paged
+# snapshot atomically at its boundary-bearing final page, and keeps its
+# registration timers generation-scoped: a retired incarnation's timers are
+# disarmed at retirement and can never fire into the replacement.
+
+# Numeric bounds from the v0.7.7 plan's table. They are validation candidates,
+# not constants: a consumer may be built with tighter limits per deployment.
+SNAPSHOT_PAGE_MAX_BYTES = 64 * 1024
+SNAPSHOT_MAX_PAGES = 256
+SNAPSHOT_MAX_BYTES = 16 * 1024 * 1024
+REGISTRATION_AWAIT_TIMEOUT = 30.0
+REGISTRATION_TO_INSTALL_TIMEOUT = 8.0
+REGISTRATION_MAX_ATTEMPTS = 3
+REGISTRATION_BACKOFF_SECONDS = (0.5, 1.0)
+
+# Relay wire methods, mirroring the closed schema owned by
+# ``chartreux.app_server.relay`` (the hop/producer side of the same contract).
+RELAY_INCARNATION_FIELD = "relay_incarnation"
+RETIRE_METHOD = "relay/retire"
+TERMINAL_METHOD = "relay/terminal"
+SNAPSHOT_PAGE_METHOD = "relay/snapshotPage"
+
+DEFAULT_PRESENTATION_STREAM_ID = "session"
+
+# A presentation-state listener observes one stream's state after every
+# frame-driven transition and every timer firing; the TUI uses it to surface
+# stale/refreshing, atomic installs, and persistent typed failures.
+type PresentationStateListener = Callable[[str, "PresentationStreamState"], None]
+
+
+class PresentationProtocolError(RuntimeError):
+    """A relay frame is outside the consumer's closed presentation schema.
+
+    Raised for a frame of an incarnation the registration protocol never
+    announced and for malformed relay control frames; the affected stream is
+    terminally failed typed.
+    """
+
+
+class SnapshotAttemptInvalidated(RuntimeError):
+    """One snapshot attempt failed; its generation is retired before retry."""
+
+
+def _is_control_frame(message: Mapping[str, Any]) -> bool:
+    """Whether one relay frame is control-class rather than a presentation delta.
+
+    The relay's closed schema owns the classification; a frame outside that
+    schema is not a control frame and stays an ordinary presentation frame.
+    """
+    try:
+        return classify_frame(message) is FrameClass.CONTROL
+    except FrameSchemaError:
+        return False
+
+
+@dataclass(frozen=True, slots=True)
+class SnapshotPage:
+    """One bounded page of one incarnation's initial snapshot."""
+
+    page_index: int
+    page_count: int
+    payload: str
+    sequence_boundary: int | None
+    encoded_size: int
+
+
+def parse_snapshot_page(params: object) -> SnapshotPage:
+    """Validate one snapshot-page frame's params, or fail typed."""
+    if not isinstance(params, Mapping):
+        raise PresentationProtocolError("snapshot page params must be an object")
+    page_index = params.get("pageIndex")
+    page_count = params.get("pageCount")
+    payload = params.get("payload")
+    boundary = params.get("sequenceBoundary")
+    if type(page_index) is not int or page_index < 0:
+        raise PresentationProtocolError(
+            "snapshot pageIndex must be a non-negative integer"
+        )
+    if type(page_count) is not int or page_count < 1:
+        raise PresentationProtocolError("snapshot pageCount must be a positive integer")
+    if not isinstance(payload, str):
+        raise PresentationProtocolError("snapshot payload must be a string")
+    if boundary is not None and (type(boundary) is not int or boundary < 0):
+        raise PresentationProtocolError(
+            "sequenceBoundary must be a non-negative integer or null"
+        )
+    encoded_size = len(json.dumps(params, separators=(",", ":")).encode())
+    return SnapshotPage(page_index, page_count, payload, boundary, encoded_size)
+
+
+@dataclass(frozen=True, slots=True)
+class SnapshotInstall:
+    """One atomically installed snapshot: every page of one generation."""
+
+    generation: int
+    sequence_boundary: int
+    pages: tuple[str, ...]
+
+
+class SnapshotAssembler:
+    """Assemble one generation's paged snapshot; install only at the final page.
+
+    All-or-nothing per snapshot generation: pages accumulate until the
+    boundary-bearing final page arrives, and only then does the complete
+    snapshot install as one unit — no delta may apply before that. An
+    oversized page, a page-count or total-byte overflow, a duplicate or
+    out-of-order page, or a final page without its sequence boundary
+    invalidates the whole attempt; nothing partial is ever installed. An
+    empty snapshot is a single final page carrying the boundary.
+    """
+
+    def __init__(
+        self,
+        generation: int,
+        *,
+        page_max_bytes: int = SNAPSHOT_PAGE_MAX_BYTES,
+        max_pages: int = SNAPSHOT_MAX_PAGES,
+        max_bytes: int = SNAPSHOT_MAX_BYTES,
+    ) -> None:
+        if type(generation) is not int or generation < 0:
+            raise ValueError("generation must be a non-negative integer")
+        if page_max_bytes < 1 or max_pages < 1 or max_bytes < 1:
+            raise ValueError("snapshot bounds must be positive")
+        self.generation = generation
+        self._page_max_bytes = page_max_bytes
+        self._max_pages = max_pages
+        self._max_bytes = max_bytes
+        self._pages: list[str] = []
+        self._bytes = 0
+        self._invalidated: str | None = None
+
+    @property
+    def invalidated(self) -> str | None:
+        """Why this attempt was invalidated, or ``None`` while it may proceed."""
+        return self._invalidated
+
+    @property
+    def accepted_pages(self) -> int:
+        """Pages accepted so far, in order."""
+        return len(self._pages)
+
+    def _invalidate(self, reason: str) -> None:
+        if self._invalidated is None:
+            self._invalidated = reason
+
+    def accept(self, page: SnapshotPage) -> SnapshotInstall | None:
+        """Accept one page; return the installed snapshot at the final page.
+
+        Raises :class:`SnapshotAttemptInvalidated` when the page violates a
+        bound or the ordering, invalidating the whole attempt.
+        """
+        if self._invalidated is not None:
+            raise SnapshotAttemptInvalidated(self._invalidated)
+        if page.page_count > self._max_pages:
+            self._invalidate("snapshot page count exceeds the per-snapshot page bound")
+            raise SnapshotAttemptInvalidated(self._invalidated)
+        if page.page_index >= page.page_count:
+            self._invalidate("snapshot page index outside its declared page count")
+            raise SnapshotAttemptInvalidated(self._invalidated)
+        if page.encoded_size > self._page_max_bytes:
+            self._invalidate("snapshot page exceeds the encoded page bound")
+            raise SnapshotAttemptInvalidated(self._invalidated)
+        if self._bytes + page.encoded_size > self._max_bytes:
+            self._invalidate("snapshot exceeds the total encoded byte bound")
+            raise SnapshotAttemptInvalidated(self._invalidated)
+        if page.page_index != len(self._pages):
+            self._invalidate("snapshot page disorder or duplicate")
+            raise SnapshotAttemptInvalidated(self._invalidated)
+        self._pages.append(page.payload)
+        self._bytes += page.encoded_size
+        if page.page_index == page.page_count - 1:
+            if page.sequence_boundary is None:
+                self._invalidate("final snapshot page carries no sequence boundary")
+                raise SnapshotAttemptInvalidated(self._invalidated)
+            return SnapshotInstall(
+                generation=self.generation,
+                sequence_boundary=page.sequence_boundary,
+                pages=tuple(self._pages),
+            )
+        return None
+
+
+class TimerKind(StrEnum):
+    """The generation-scoped deadlines the consumer arms."""
+
+    REGISTRATION_AWAIT = auto()
+    REGISTRATION_TO_INSTALL = auto()
+    BACKOFF = auto()
+
+
+@dataclass(frozen=True, slots=True)
+class Timer:
+    """One armed deadline, scoped to the generation it was armed for."""
+
+    kind: TimerKind
+    generation: int
+    deadline: float
+    attempt: int
+
+
+class StreamPhase(StrEnum):
+    """Where one stream's current incarnation stands."""
+
+    INSTALLING = auto()
+    INSTALLED = auto()
+    AWAITING = auto()
+    TERMINAL = auto()
+
+
+@dataclass(frozen=True, slots=True)
+class StreamFailure:
+    """The persistent typed failure that ended a stream."""
+
+    stream_id: str
+    reason: str
+
+
+def _validated_backoff_schedule(backoff_schedule: Sequence[float]) -> tuple[float, ...]:
+    if not backoff_schedule or not all(
+        math.isfinite(value) and value >= 0 for value in backoff_schedule
+    ):
+        raise ValueError("backoff schedule must be non-empty with non-negative entries")
+    return tuple(backoff_schedule)
+
+
+def _validated_registration_bounds(
+    registration_await_timeout: float,
+    registration_to_install_timeout: float,
+    max_attempts: int,
+    backoff_schedule: Sequence[float],
+) -> tuple[float, ...]:
+    if not all(
+        math.isfinite(value) and value > 0
+        for value in (registration_await_timeout, registration_to_install_timeout)
+    ):
+        raise ValueError("registration timeouts must be finite and positive")
+    if type(max_attempts) is not int or max_attempts < 1:
+        raise ValueError("max_attempts must be a positive integer")
+    return _validated_backoff_schedule(backoff_schedule)
+
+
+class PresentationStreamState:
+    """Consumer-side state of one relay presentation stream.
+
+    Tracks the announced incarnation (generation), installs paged snapshots
+    atomically per generation, and arms generation-scoped timers: retiring a
+    generation disarms its timers, so they can never fire into the
+    replacement. Retirement, deadlines, and completion race by first-winner:
+    exactly one terminal disposition is delivered.
+    """
+
+    def __init__(
+        self,
+        stream_id: str,
+        *,
+        registration_await_timeout: float = REGISTRATION_AWAIT_TIMEOUT,
+        registration_to_install_timeout: float = REGISTRATION_TO_INSTALL_TIMEOUT,
+        max_attempts: int = REGISTRATION_MAX_ATTEMPTS,
+        backoff_schedule: Sequence[float] = REGISTRATION_BACKOFF_SECONDS,
+        page_max_bytes: int = SNAPSHOT_PAGE_MAX_BYTES,
+        snapshot_max_pages: int = SNAPSHOT_MAX_PAGES,
+        snapshot_max_bytes: int = SNAPSHOT_MAX_BYTES,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        if not stream_id:
+            raise ValueError("stream_id must be non-empty")
+        self.stream_id = stream_id
+        self.registration_await_timeout = registration_await_timeout
+        self.registration_to_install_timeout = registration_to_install_timeout
+        self.max_attempts = max_attempts
+        self.backoff_schedule = _validated_registration_bounds(
+            registration_await_timeout,
+            registration_to_install_timeout,
+            max_attempts,
+            backoff_schedule,
+        )
+        self._page_max_bytes = page_max_bytes
+        self._snapshot_max_pages = snapshot_max_pages
+        self._snapshot_max_bytes = snapshot_max_bytes
+        self._clock = clock
+        # The stream's initial incarnation is announced by the stream itself;
+        # its snapshot is the first presentation frames of generation 0.
+        self._current: int | None = 0
+        self._retired: set[int] = set()
+        self._awaited: int | None = None
+        self._phase = StreamPhase.INSTALLING
+        self._timers: dict[TimerKind, Timer] = {}
+        self._assembler: SnapshotAssembler | None = self._new_assembler(0)
+        self._attempts = 0
+        self._terminal: StreamFailure | None = None
+        self._last_install: SnapshotInstall | None = None
+        self._arm(
+            TimerKind.REGISTRATION_TO_INSTALL,
+            0,
+            self.registration_to_install_timeout,
+            0,
+        )
+
+    @property
+    def current(self) -> int | None:
+        """The announced incarnation, or ``None`` while awaiting one."""
+        return self._current
+
+    @property
+    def phase(self) -> StreamPhase:
+        return self._phase
+
+    @property
+    def terminal(self) -> StreamFailure | None:
+        """The persistent typed failure that ended the stream, if any."""
+        return self._terminal
+
+    @property
+    def attempts(self) -> int:
+        """Failed registration attempts since the last successful install."""
+        return self._attempts
+
+    @property
+    def last_install(self) -> SnapshotInstall | None:
+        """The most recently installed snapshot."""
+        return self._last_install
+
+    @property
+    def timers(self) -> tuple[Timer, ...]:
+        """The currently armed timers."""
+        return tuple(self._timers.values())
+
+    def receive_frame(  # noqa: PLR0911 - one return per protocol disposition
+        self, generation: int | None, message: Mapping[str, Any]
+    ) -> bool:
+        """Accept one inbound relay frame; report whether the consumer ate it.
+
+        Returns ``False`` for a current-generation presentation frame that
+        must pass through to the ordinary projection, ``True`` for relay
+        control frames and stale frames the consumer discarded. Raises
+        :class:`PresentationProtocolError` for an incarnation the
+        registration protocol never announced.
+        """
+        if type(generation) is not int or generation < 0:
+            raise PresentationProtocolError(
+                "frame must carry a non-negative incarnation generation"
+            )
+        if self._terminal is not None:
+            return True
+        if generation in self._retired:
+            return True
+        method = message.get("method")
+        if method == TERMINAL_METHOD:
+            # Teardown for the announced incarnation ends the stream; teardown
+            # for a retired or unannounced incarnation is stale, not fatal.
+            if generation == self._effective_generation():
+                params = message.get("params")
+                reason = params.get("reason") if isinstance(params, Mapping) else None
+                detail = (
+                    reason if isinstance(reason, str) and reason else "terminal notice"
+                )
+                self._terminate(f"relay terminal notice: {detail}")
+            return True
+        if method == RETIRE_METHOD:
+            if generation == self._current:
+                self.retire(generation)
+            else:
+                raise PresentationProtocolError(
+                    f"retire notice for unannounced incarnation {generation}"
+                )
+            return True
+        if generation != self._current:
+            replacement_of = (
+                self._current if self._current is not None else self._awaited
+            )
+            if replacement_of is not None and generation == replacement_of + 1:
+                self._accept_announcement(generation)
+            else:
+                raise PresentationProtocolError(
+                    f"frame for unannounced incarnation {generation}"
+                )
+        if method == SNAPSHOT_PAGE_METHOD:
+            return self._accept_page(generation, message)
+        if self._phase is not StreamPhase.INSTALLED:
+            if _is_control_frame(message):
+                # Approvals, settlements, results, and revalidation ride the
+                # reserved control lane: they stay available while this
+                # incarnation's snapshot is still installing, and they are
+                # never presentation deltas.
+                return False
+            raise PresentationProtocolError(
+                "presentation delta before the incarnation's snapshot installed"
+            )
+        return False
+
+    def retire(self, generation: int) -> bool:
+        """Retire one announced generation; first-winner, exactly once.
+
+        Disarms the retired generation's timers so they can never fire into
+        its replacement, and arms the registration-await deadline that
+        governs the wait for the replacement announcement.
+        """
+        if self._terminal is not None or generation != self._current:
+            return False
+        self._retired.add(generation)
+        self._current = None
+        self._awaited = generation
+        self._assembler = None
+        self._phase = StreamPhase.AWAITING
+        self._disarm_generation(generation)
+        self._arm(
+            TimerKind.REGISTRATION_AWAIT,
+            generation,
+            self.registration_await_timeout,
+            self._attempts,
+        )
+        return True
+
+    def fire_due(self) -> list[Timer]:
+        """Fire due timers still in scope, then advance the state machine.
+
+        A retired incarnation's timers are disarmed at retirement, and an
+        armed timer fires only while its generation is still the one its kind
+        governs — so a stale timer can never fire into the replacement.
+        """
+        if self._terminal is not None:
+            return []
+        now = self._clock()
+        fired: list[Timer] = []
+        for kind in list(self._timers):
+            timer = self._timers[kind]
+            if now < timer.deadline:
+                continue
+            if not self._in_scope(timer):
+                self._disarm(kind)
+                continue
+            self._disarm(kind)
+            fired.append(timer)
+        for timer in fired:
+            self._on_timer(timer)
+        return fired
+
+    def _effective_generation(self) -> int | None:
+        """The generation frames may validly carry right now.
+
+        While a replacement is awaited, the retired generation's successor is
+        the effective one, so a terminal notice for it still terminates.
+        """
+        if self._current is not None:
+            return self._current
+        if self._awaited is not None:
+            return self._awaited + 1
+        return None
+
+    def _in_scope(self, timer: Timer) -> bool:
+        # An install deadline is in scope only while its generation is still
+        # the announced one; the await/backoff deadlines are scoped to the
+        # retired generation whose replacement they govern. Retirement and
+        # announcement acceptance disarm the old generation's timers outright,
+        # so a retired incarnation's timers can never fire into the new one.
+        if timer.kind is TimerKind.REGISTRATION_TO_INSTALL:
+            return timer.generation == self._current
+        return timer.generation == self._awaited
+
+    def _new_assembler(self, generation: int) -> SnapshotAssembler:
+        return SnapshotAssembler(
+            generation,
+            page_max_bytes=self._page_max_bytes,
+            max_pages=self._snapshot_max_pages,
+            max_bytes=self._snapshot_max_bytes,
+        )
+
+    def _arm(
+        self, kind: TimerKind, generation: int, timeout: float, attempt: int
+    ) -> Timer:
+        timer = Timer(kind, generation, self._clock() + timeout, attempt)
+        self._timers[kind] = timer
+        return timer
+
+    def _disarm(self, kind: TimerKind) -> None:
+        self._timers.pop(kind, None)
+
+    def _disarm_generation(self, generation: int) -> None:
+        for kind in list(self._timers):
+            if self._timers[kind].generation == generation:
+                self._disarm(kind)
+
+    def _accept_announcement(self, generation: int) -> None:
+        """Accept a replacement announcement; first-winner retires the old.
+
+        Acceptance retires the predecessor's await deadline and arms exactly
+        one registration-to-install deadline scoped to the announced
+        generation.
+        """
+        old = self._current if self._current is not None else self._awaited
+        if old is not None:
+            self._retired.add(old)
+            self._disarm_generation(old)
+        self._current = generation
+        self._awaited = None
+        self._phase = StreamPhase.INSTALLING
+        self._assembler = self._new_assembler(generation)
+        self._disarm(TimerKind.REGISTRATION_AWAIT)
+        self._arm(
+            TimerKind.REGISTRATION_TO_INSTALL,
+            generation,
+            self.registration_to_install_timeout,
+            self._attempts,
+        )
+
+    def _accept_page(self, generation: int, message: Mapping[str, Any]) -> bool:
+        assembler = self._assembler
+        if assembler is None or assembler.generation != generation:
+            raise PresentationProtocolError(
+                f"snapshot page for incarnation {generation} with no pending snapshot"
+            )
+        page = parse_snapshot_page(message.get("params"))
+        try:
+            install = assembler.accept(page)
+        except SnapshotAttemptInvalidated as exc:
+            self._fail_attempt(str(exc))
+            return True
+        if install is not None:
+            self._install(install)
+        return True
+
+    def _install(self, install: SnapshotInstall) -> None:
+        """Install the completed snapshot atomically; one terminal transition."""
+        self._last_install = install
+        self._phase = StreamPhase.INSTALLED
+        self._assembler = None
+        self._disarm(TimerKind.REGISTRATION_TO_INSTALL)
+        self._attempts = 0
+
+    def _fail_attempt(self, reason: str) -> None:
+        """Retire the failed attempt before any fresh incarnation is tried."""
+        generation = self._current if self._current is not None else self._awaited
+        if self._current is not None:
+            self._retired.add(self._current)
+            self._disarm_generation(self._current)
+            self._current = None
+        self._awaited = generation
+        self._assembler = None
+        self._attempts += 1
+        if self._attempts >= self.max_attempts:
+            self._terminate(f"registration attempts exhausted: {reason}")
+            return
+        self._phase = StreamPhase.AWAITING
+        backoff = self.backoff_schedule[
+            min(self._attempts - 1, len(self.backoff_schedule) - 1)
+        ]
+        self._arm(
+            TimerKind.BACKOFF,
+            generation if generation is not None else 0,
+            backoff,
+            self._attempts,
+        )
+
+    def _on_timer(self, timer: Timer) -> None:
+        if self._terminal is not None:
+            return
+        match timer.kind:
+            case TimerKind.REGISTRATION_AWAIT:
+                self._terminate(
+                    f"registration await expired for incarnation {timer.generation}"
+                )
+            case TimerKind.REGISTRATION_TO_INSTALL:
+                self._fail_attempt(
+                    "registration-to-install deadline expired for incarnation "
+                    f"{timer.generation}"
+                )
+            case TimerKind.BACKOFF:
+                self._arm(
+                    TimerKind.REGISTRATION_AWAIT,
+                    timer.generation,
+                    self.registration_await_timeout,
+                    timer.attempt,
+                )
+
+    def _terminate(self, reason: str) -> None:
+        if self._terminal is not None:
+            return
+        self._terminal = StreamFailure(self.stream_id, reason)
+        self._phase = StreamPhase.TERMINAL
+        self._timers.clear()
+        self._assembler = None
+
+
+class PresentationConsumer:
+    """The TUI-side consumer of the relay's per-stream presentation protocol.
+
+    Tracks the announced incarnation per stream, installs snapshot pages
+    atomically per generation, and keeps registration timers
+    generation-scoped. All deadlines derive from the injected monotonic
+    clock; tests pass a fake clock.
+    """
+
+    def __init__(
+        self,
+        *,
+        registration_await_timeout: float = REGISTRATION_AWAIT_TIMEOUT,
+        registration_to_install_timeout: float = REGISTRATION_TO_INSTALL_TIMEOUT,
+        max_attempts: int = REGISTRATION_MAX_ATTEMPTS,
+        backoff_schedule: Sequence[float] = REGISTRATION_BACKOFF_SECONDS,
+        page_max_bytes: int = SNAPSHOT_PAGE_MAX_BYTES,
+        snapshot_max_pages: int = SNAPSHOT_MAX_PAGES,
+        snapshot_max_bytes: int = SNAPSHOT_MAX_BYTES,
+        clock: Callable[[], float] = time.monotonic,
+        listener: PresentationStateListener | None = None,
+    ) -> None:
+        self._clock = clock
+        self._registration_await_timeout = registration_await_timeout
+        self._registration_to_install_timeout = registration_to_install_timeout
+        self._max_attempts = max_attempts
+        self._backoff_schedule = _validated_registration_bounds(
+            registration_await_timeout,
+            registration_to_install_timeout,
+            max_attempts,
+            backoff_schedule,
+        )
+        self._page_max_bytes = page_max_bytes
+        self._snapshot_max_pages = snapshot_max_pages
+        self._snapshot_max_bytes = snapshot_max_bytes
+        self._streams: dict[str, PresentationStreamState] = {}
+        self._listener = listener
+
+    def set_listener(self, listener: PresentationStateListener | None) -> None:
+        """Attach (or detach, with ``None``) the stream-state observer."""
+        self._listener = listener
+
+    def _notify(self, stream_id: str, stream_state: PresentationStreamState) -> None:
+        listener = self._listener
+        if listener is not None:
+            listener(stream_id, stream_state)
+
+    def stream(self, stream_id: str) -> PresentationStreamState:
+        """Return the stream's state, creating it on first use."""
+        existing = self._streams.get(stream_id)
+        if existing is None:
+            existing = PresentationStreamState(
+                stream_id,
+                registration_await_timeout=self._registration_await_timeout,
+                registration_to_install_timeout=self._registration_to_install_timeout,
+                max_attempts=self._max_attempts,
+                backoff_schedule=self._backoff_schedule,
+                page_max_bytes=self._page_max_bytes,
+                snapshot_max_pages=self._snapshot_max_pages,
+                snapshot_max_bytes=self._snapshot_max_bytes,
+                clock=self._clock,
+            )
+            self._streams[stream_id] = existing
+        return existing
+
+    def receive_frame(
+        self, stream_id: str, generation: int | None, message: Mapping[str, Any]
+    ) -> bool:
+        """Route one inbound relay frame to its stream; report consumption."""
+        stream_state = self.stream(stream_id)
+        consumed = stream_state.receive_frame(generation, message)
+        self._notify(stream_id, stream_state)
+        return consumed
+
+    def fire_due(self, stream_id: str | None = None) -> list[Timer]:
+        """Fire due timers, for one stream or all of them."""
+        if stream_id is not None:
+            stream_state = self.stream(stream_id)
+            fired = stream_state.fire_due()
+            self._notify(stream_id, stream_state)
+            return fired
+        fired: list[Timer] = []
+        for sid, stream_state in list(self._streams.items()):
+            fired.extend(stream_state.fire_due())
+            self._notify(sid, stream_state)
+        return fired

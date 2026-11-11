@@ -5,6 +5,9 @@ from __future__ import annotations
 import asyncio
 import json
 from pathlib import Path
+import signal
+import subprocess
+import sys
 import tomllib
 from typing import Any
 from unittest.mock import AsyncMock
@@ -39,6 +42,7 @@ from chartreux.core.config.orchestrator import ConfigOrchestrator
 from chartreux.core.config.types import ConfigSaveResult
 from chartreux.core.events import BaseEvent, ToolResultEvent, UserInputRequestEvent
 from chartreux.core.llm_models import FunctionCall, LLMChunk, Role, ToolCall
+from chartreux.core.session.session_loader import SessionLoader
 from chartreux.questions import (
     UserAnswer as QuestionAnswer,
     UserQuestionResult as QuestionResult,
@@ -49,6 +53,104 @@ from tests.stubs.fake_backend import FakeBackend
 from tests.stubs.fake_mcp_registry import FakeMCPRegistry
 
 pytestmark = pytest.mark.asyncio
+
+
+async def test_interrupted_full_transcript_rewrite_preserves_previous_snapshot(
+    tmp_path: Path,
+) -> None:
+    transcript = tmp_path / "messages.jsonl"
+    previous = b'{"role": "user", "content": "old"}\n'
+    transcript.write_bytes(previous)
+    script = """\
+import os
+from pathlib import Path
+import signal
+import socket
+import sys
+
+def deny_network(*args, **kwargs):
+    raise RuntimeError("network disabled")
+socket.socket.connect = deny_network
+from chartreux.core.session.session_logger import SessionLogger
+
+def records():
+    yield {"role": "user", "content": "x" * 100_000}
+    os.kill(os.getpid(), signal.SIGKILL)
+
+SessionLogger._overwrite_messages_sync(records(), Path(sys.argv[1]))
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", script, str(tmp_path)],
+        check=False,
+        capture_output=True,
+        timeout=15,
+    )
+    assert result.returncode == -signal.SIGKILL, result.stderr.decode()
+    assert transcript.read_bytes() == previous
+
+
+async def test_interrupted_incremental_append_leaves_a_loadable_prefix(
+    tmp_path: Path,
+) -> None:
+    """Crash atomicity of incremental appends (WP3 [3D]).
+
+    A SIGKILL landing mid-append leaves at most a torn final record; the
+    previously persisted prefix stays complete and loads (the torn tail is
+    dropped with the recovery warning), so a crashed writer never corrupts
+    the durable transcript.
+    """
+    transcript = tmp_path / "messages.jsonl"
+    previous = b'{"role": "user", "content": "old"}\n'
+    transcript.write_bytes(previous)
+    script = """\
+import os
+from pathlib import Path
+import signal
+import socket
+import sys
+
+def deny_network(*args, **kwargs):
+    raise RuntimeError("network disabled")
+socket.socket.connect = deny_network
+
+real_fdopen = os.fdopen
+class TornStream:
+    def __init__(self, stream):
+        self._stream = stream
+    def __getattr__(self, name):
+        return getattr(self._stream, name)
+    def __enter__(self):
+        return self
+    def __exit__(self, *exc):
+        return self._stream.__exit__(*exc)
+    def write(self, data):
+        self._stream.write(data[: len(data) // 2])
+        os.kill(os.getpid(), signal.SIGKILL)
+def torn_fdopen(fd, mode):
+    return TornStream(real_fdopen(fd, mode))
+os.fdopen = torn_fdopen
+
+from chartreux.core.session.session_logger import SessionLogger
+
+SessionLogger._persist_messages_sync(
+    [{"role": "user", "content": "x" * 100_000}], Path(sys.argv[1])
+)
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", script, str(tmp_path)],
+        check=False,
+        capture_output=True,
+        timeout=15,
+    )
+    assert result.returncode == -signal.SIGKILL, result.stderr.decode()
+    # The append landed only partially: the previous complete record survives
+    # and the torn tail is not a whole line.
+    raw = transcript.read_bytes()
+    assert raw.startswith(previous)
+    assert not raw.endswith(b"\n")
+    with pytest.warns(RuntimeWarning, match="malformed final session message"):
+        messages, _metadata = SessionLoader.load_session(tmp_path)
+    assert [message.content for message in messages] == ["old"]
 
 
 def _read_call(target: Path, call_id: str) -> ToolCall:

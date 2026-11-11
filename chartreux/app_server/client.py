@@ -7,6 +7,13 @@ import math
 from typing import Any
 
 from chartreux.app_server._model import ProtocolModel, validate_wire
+from chartreux.app_server.events import (
+    DEFAULT_PRESENTATION_STREAM_ID,
+    RELAY_INCARNATION_FIELD,
+    RETIRE_METHOD,
+    SNAPSHOT_PAGE_METHOD,
+    TERMINAL_METHOD,
+)
 from chartreux.app_server.protocol import (
     AppServerResponseError,
     ClientCapabilities,
@@ -67,6 +74,28 @@ class _ClientResponse:
     incoming_sequence: int
 
 
+type PresentationFrameHandler = Callable[[str, int | None, dict[str, Any]], bool]
+
+_RELAY_CONTROL_METHODS = frozenset({
+    RETIRE_METHOD,
+    TERMINAL_METHOD,
+    SNAPSHOT_PAGE_METHOD,
+})
+
+
+def _carries_relay_metadata(message: dict[str, Any]) -> bool:
+    """Whether one inbound frame is a relay presentation frame.
+
+    Relay streams stamp every frame with the reserved ``relay_incarnation``
+    generation; the relay's own control methods are recognized even without
+    the stamp so they are never mistaken for protocol notifications.
+    """
+    return (
+        RELAY_INCARNATION_FIELD in message
+        or message.get("method") in _RELAY_CONTROL_METHODS
+    )
+
+
 class AppServerClient:
     def __init__(
         self,
@@ -74,12 +103,16 @@ class AppServerClient:
         *,
         run_peer: Callable[[], Coroutine[Any, Any, None]] | None = None,
         request_timeout: float = _DEFAULT_REQUEST_TIMEOUT,
+        presentation_handler: PresentationFrameHandler | None = None,
+        presentation_stream_id: str = DEFAULT_PRESENTATION_STREAM_ID,
     ) -> None:
         self._transport = transport
         self._run_peer = run_peer
         self._request_timeout = _validated_timeout(
             request_timeout, name="request_timeout"
         )
+        self._presentation_handler = presentation_handler
+        self._presentation_stream_id = presentation_stream_id
         self._peer_task: asyncio.Task[None] | None = None
         self._reader_task: asyncio.Task[None] | None = None
         self._next_request_id = 1
@@ -93,6 +126,22 @@ class AppServerClient:
         self._processed_sequence = 0
         self._processed = asyncio.Condition()
         self._closed = False
+
+    def attach_presentation(
+        self,
+        handler: PresentationFrameHandler,
+        *,
+        stream_id: str = DEFAULT_PRESENTATION_STREAM_ID,
+    ) -> None:
+        """Route relay presentation frames to ``handler`` from now on.
+
+        The handler receives ``(stream_id, incarnation, message)`` with the
+        reserved ``relay_incarnation`` field already stripped, and reports
+        whether it consumed the frame; unconsumed frames continue through
+        the ordinary envelope validation and incoming stream.
+        """
+        self._presentation_handler = handler
+        self._presentation_stream_id = stream_id
 
     async def start(self) -> None:
         self._ensure_open()
@@ -267,6 +316,29 @@ class AppServerClient:
         self._response_boundaries.clear()
 
     async def _dispatch(self, message: dict[str, Any]) -> None:
+        if _carries_relay_metadata(message):
+            # The reserved incarnation stamp is relay metadata, not part of
+            # the JSON-RPC envelope schema (which forbids extra fields), so
+            # it is lifted off before validation and offered to the
+            # presentation consumer with the stripped frame.
+            incarnation = message.get(RELAY_INCARNATION_FIELD)
+            if incarnation is not None and (
+                type(incarnation) is not int or incarnation < 0
+            ):
+                raise JsonRpcProtocolError(
+                    "relay_incarnation must be a non-negative integer"
+                )
+            stripped = {
+                key: value
+                for key, value in message.items()
+                if key != RELAY_INCARNATION_FIELD
+            }
+            handler = self._presentation_handler
+            if handler is not None and handler(
+                self._presentation_stream_id, incarnation, stripped
+            ):
+                return
+            message = stripped
         envelope = validate_json_rpc_envelope(message)
         if isinstance(envelope, ServerRequest | Notification):
             await self._put_incoming(envelope)

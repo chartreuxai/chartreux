@@ -4,11 +4,14 @@ from __future__ import annotations
 
 import asyncio
 from typing import Any
+from unittest.mock import AsyncMock
 
 import pytest
 
 from chartreux.app_server._sessions import SessionRuntimeRegistry
-from chartreux.core.subagents import RetentionPolicy
+from chartreux.app_server.subagent_ports import SubagentAdmissionClosedError
+from chartreux.core.subagents import RetentionPolicy, TaskArgs
+from chartreux.core.tools.base import InvokeContext
 from tests.app_server._subagent_test_support import (
     _GatedWakeup,
     _ManualClock,
@@ -345,3 +348,60 @@ async def test_drain_owns_the_reaper_displaced_by_an_ordinary_rearm() -> None:
     # has settled; the drain-owned set is empty again.
     assert reaper.done()
     assert not registry._detached_reaper_tasks
+
+
+# ---------------------------------------------------------------------------
+# 28. Quiescence: no child work starts while a drain is in progress
+# ---------------------------------------------------------------------------
+
+
+def _late_args() -> TaskArgs:
+    return TaskArgs(task="late work", identity="coder", background=True)
+
+
+@pytest.mark.asyncio
+async def test_launch_during_a_drain_is_denied_typed() -> None:
+    # The drain owns the registry's admission for its whole run: a launch
+    # arriving mid-drain is denied with the typed closed denial instead of
+    # starting new child work, and it holds no capacity slot.
+    clock = _ManualClock(0)
+    wakeup = _GatedWakeup()
+    registry, _root = _reaper_registry(clock, ttl=10, wakeup=wakeup)
+    record = _record("agent-1", clock=clock)
+    registry._agent_records[record.agent_id] = record
+    registry._children[record.session_id] = record.runtime
+    entered = asyncio.Event()
+    gate = asyncio.Event()
+
+    async def gated_close() -> None:
+        entered.set()
+        await gate.wait()
+
+    record.runtime.close = AsyncMock(side_effect=gated_close)
+    drain = asyncio.create_task(registry.drain_children())
+    try:
+        # The drain owns the final inventory phase; admission is closed.
+        await asyncio.wait_for(entered.wait(), timeout=1)
+        with pytest.raises(SubagentAdmissionClosedError, match="closed for shutdown"):
+            registry._reserve_admission(
+                _late_args(), InvokeContext(tool_call_id="late", session_id="root")
+            )
+        assert not registry._active_work_slots
+    finally:
+        gate.set()
+        await asyncio.wait_for(drain, timeout=1)
+    report = drain.result()
+    assert not report.timed_out
+    assert not registry._active_work_slots
+
+
+@pytest.mark.asyncio
+async def test_launch_after_admission_closed_is_denied_typed() -> None:
+    registry, _root = _reaper_registry(_ManualClock(0))
+    registry._admission_closed = True
+    with pytest.raises(SubagentAdmissionClosedError):
+        registry._reserve_admission(
+            _late_args(), InvokeContext(tool_call_id="late", session_id="root")
+        )
+    assert not registry._active_work_slots
+    await registry.close()

@@ -6,6 +6,7 @@ from datetime import UTC, datetime
 import json
 import os
 from pathlib import Path
+import stat
 import tempfile
 import threading
 from typing import TYPE_CHECKING, Any, TypedDict
@@ -137,6 +138,25 @@ def _entry_from_payload(payload: Any) -> _Entry | None:
     )
 
 
+def _session_stats(
+    session_dir: Path, *, strict_io: bool
+) -> tuple[os.stat_result, os.stat_result] | None:
+    if session_dir.name.endswith(".registry.json"):
+        return None
+    try:
+        if not stat.S_ISDIR(session_dir.stat().st_mode):
+            return None
+        try:
+            meta_stat = (session_dir / METADATA_FILENAME).stat()
+        except FileNotFoundError:
+            return None
+        return meta_stat, (session_dir / MESSAGES_FILENAME).stat()
+    except OSError:
+        if strict_io:
+            raise
+        return None
+
+
 class SessionIndex:
     """In-memory, disk-persisted cache of session listing metadata.
 
@@ -204,15 +224,10 @@ class SessionIndex:
         dirty = False
         seen: set[str] = set()
         for session_dir in self._save_dir.glob(self._pattern):
-            meta_path = session_dir / METADATA_FILENAME
-            messages_path = session_dir / MESSAGES_FILENAME
-            try:
-                meta_stat = meta_path.stat()
-                messages_stat = messages_path.stat()
-            except OSError:
-                if strict_io:
-                    raise
+            stats = _session_stats(session_dir, strict_io=strict_io)
+            if stats is None:
                 continue
+            meta_stat, messages_stat = stats
             seen.add(session_dir.name)
 
             cached = self._entries.get(session_dir.name)
@@ -267,6 +282,8 @@ class SessionIndex:
                 raise
             return None
         except json.JSONDecodeError:
+            if strict_io:
+                raise
             return None
         if not isinstance(metadata, dict):
             return None

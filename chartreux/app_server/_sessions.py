@@ -8,6 +8,7 @@ from collections.abc import (
     Callable,
     Coroutine,
     Iterator,
+    Mapping,
     Sequence,
 )
 from contextlib import ExitStack, asynccontextmanager, contextmanager
@@ -19,7 +20,12 @@ from uuid import uuid4
 
 from chartreux.app_server._child_runtime_lifecycle import (
     ChildDrain,
+    ChildDrainReport,
     ChildRuntimeAssembler,
+    OrphanReaper,
+    OrphanReapReport,
+    TreeShutdown,
+    TreeShutdownReport,
 )
 from chartreux.app_server._execution import (
     SessionExecution,
@@ -52,6 +58,7 @@ from chartreux.app_server._subagent_execution import (
     finalize_run_with_drain,
     freeze_run_admission,
     operative_completion_claim,
+    publish_child_terminal,
 )
 from chartreux.app_server._subagent_finalization import _check_runner as _check_runner
 from chartreux.app_server._subagent_launch import (
@@ -82,6 +89,8 @@ from chartreux.app_server._subagent_records import (
     _ReplacementClaim as _ReplacementClaim,
 )
 from chartreux.app_server._subagent_recovery import (
+    ChildTranscriptReconciler,
+    ChildTranscriptReconciliation,
     SubagentRecovery,
     _recovery_config as _recovery_config,
 )
@@ -99,6 +108,11 @@ from chartreux.app_server._subagent_retention import AgentRetention, EvictionNot
 from chartreux.app_server._subagent_transcript import TranscriptReads
 from chartreux.app_server._suspension_lifecycle import SuspensionLifecycle
 from chartreux.app_server._turns import DeliverCallback, TurnController, TurnStartAction
+from chartreux.app_server.agent_wire import (
+    TURN_OUTCOME_COMPLETED,
+    TURN_OUTCOME_FAILED,
+    TURN_OUTCOME_INTERRUPTED,
+)
 from chartreux.app_server.models import (
     CallbackOutput,
     OpenCallbackState,
@@ -119,6 +133,14 @@ from chartreux.app_server.protocol import (
     CallbackResultError,
     RunStopReason as PublicRunStopReason,
     TurnStartParams,
+)
+from chartreux.app_server.subagent_ports import (
+    MAX_SUBAGENT_DEPTH,
+    SubagentAdmission,
+    SubagentAdmissionClosedError,
+    SubagentCompletion,
+    SubagentDepthDeniedError,
+    SubagentEventFeed,
 )
 from chartreux.core.agent_loop import AgentLoop
 from chartreux.core.agent_loop._loop import _PreparedPolicyReplacement
@@ -179,8 +201,14 @@ type NotifyAgents = Callable[
 type Wakeup = Callable[[float], Awaitable[None]]
 type EventWatermark = Callable[[str], int]
 
-# Per root-session registry; retained idle agents do not consume active-work slots.
+# Per root-session registry. WP5 [5B] / design.md:448-456: retained idle agents
+# COUNT against the active-work cap — over-cap is a typed denial and closure is
+# an explicit user action only, never an automatic eviction.
 _DEFAULT_MAX_RUNNING_SUBAGENTS = 16
+
+# Coordinator event-feed sink for relayed subagent frames (WP5 [5B]): called
+# as ``sink(agent_id, frame)`` with each incarnation-stamped relay frame.
+type SubagentEventSink = Callable[[str, Mapping[str, Any]], Awaitable[None]]
 
 
 def _public_failure_envelope(
@@ -296,7 +324,7 @@ class QuiescenceSnapshot:
 
 
 class SessionRuntimeRegistry(SubagentRunnerPort):  # noqa: PLR0904
-    def __init__(  # noqa: PLR0915
+    def __init__(  # noqa: PLR0913, PLR0915
         self,
         notify_child: Notify,
         deliver_callback: DeliverCallback,
@@ -307,6 +335,9 @@ class SessionRuntimeRegistry(SubagentRunnerPort):  # noqa: PLR0904
         clock: Callable[[], float] = time.monotonic,
         wakeup: Wakeup = asyncio.sleep,
         max_running_subagents: int | None = None,
+        subagent_event_sink: SubagentEventSink | None = None,
+        *,
+        shutdown_timeout: float = 10.0,
     ) -> None:
         if max_running_subagents is not None and (
             isinstance(max_running_subagents, bool)
@@ -314,8 +345,27 @@ class SessionRuntimeRegistry(SubagentRunnerPort):  # noqa: PLR0904
             or max_running_subagents < 1
         ):
             raise ValueError("max_running_subagents must be a positive integer")
+        if (
+            isinstance(shutdown_timeout, bool)
+            or not isinstance(shutdown_timeout, (int, float))
+            or shutdown_timeout <= 0
+        ):
+            raise ValueError("shutdown_timeout must be a positive number of seconds")
+        self._shutdown_timeout = float(shutdown_timeout)
         self._max_running_subagents = max_running_subagents
         self._active_work_slots: set[_ActiveWorkSlot] = set()
+        # WP5 [5B]: one admission owns the registry's active-work slot set —
+        # capacity + depth checks with an atomic reservation and typed
+        # denials; retained idle agents count against the cap.
+        self._admission = SubagentAdmission(
+            self._active_work_slots, max_depth=MAX_SUBAGENT_DEPTH
+        )
+        # WP5 [5B] event feed: incarnation-stamped relay frames of each child
+        # run stream into the coordinator event feed through this sink (None
+        # disables relaying — zero behavior change).
+        self._subagent_event_sink = subagent_event_sink
+        self._subagent_feeds: dict[str, SubagentEventFeed] = {}
+        self._subagent_incarnation_seq = 0
         self._notify_child = notify_child
         self._notify_agents = notify_agents
         self._deliver_callback = deliver_callback
@@ -339,6 +389,10 @@ class SessionRuntimeRegistry(SubagentRunnerPort):  # noqa: PLR0904
         # a TaskResult. Ephemeral bookkeeping only — it records an existing
         # runtime event and never extends a result's lifetime.
         self._collected_results: set[tuple[str, str]] = set()
+        # WP5 [5C]: child result ids the root already adopted from a
+        # coordinator reconciliation message. The receipt makes the handoff
+        # idempotent: a repeated message never re-delivers and never replays.
+        self._child_result_receipts: dict[str, set[str]] = {}
         self._latest_run_ids: dict[str, str] = {}
         self._wait_leases: dict[tuple[str, str], int] = {}
         self._pending_notifications: set[tuple[str, str]] = set()
@@ -418,6 +472,12 @@ class SessionRuntimeRegistry(SubagentRunnerPort):  # noqa: PLR0904
         self._execution = SubagentExecution(self)
         self._child_runtime = ChildRuntimeAssembler(self)
         self._child_drain = ChildDrain(self)
+        # WP7 [7B]: the ordered session-tree shutdown (admission stop →
+        # interrupt → drain saves → terminate/kill → close IPC → reap).
+        self._tree_shutdown = TreeShutdown(self)
+        # WP7 [7C]: children whose parent session is gone are reaped, never
+        # replayed.
+        self._orphan_reaper = OrphanReaper(self)
         self._recovery = SubagentRecovery(self)
         self._suspension = SuspensionLifecycle(self)
         # WP4: the bounded automatic recovery controller. INERT unless
@@ -436,10 +496,21 @@ class SessionRuntimeRegistry(SubagentRunnerPort):  # noqa: PLR0904
             drain = ChildDrain(self)
             self._child_drain = drain
             return drain
+        if name == "_orphan_reaper":
+            reaper = OrphanReaper(self)
+            self._orphan_reaper = reaper
+            return reaper
         if name == "_recovery_controller":
             controller = RecoveryController(self)
             self._recovery_controller = controller
             return controller
+        if name == "_admission":
+            # WP5 [5B]: lazily wire the admission onto the bare registry's slot
+            # set so the reserve/close facade works on object.__new__ builds.
+            admission = SubagentAdmission(max_depth=MAX_SUBAGENT_DEPTH)
+            self._admission = admission
+            self.__dict__.setdefault("_active_work_slots", admission.slots)
+            return admission
         raise AttributeError(f"SessionRuntimeRegistry has no attribute {name!r}")
 
     @asynccontextmanager
@@ -850,6 +921,7 @@ class SessionRuntimeRegistry(SubagentRunnerPort):  # noqa: PLR0904
                     candidate.owner._validate_policy_replacement(candidate)
                 for candidate in prepared:
                     candidate.owner._commit_policy_replacement(candidate, retire=False)
+                    candidate.owner.advance_dangerous_command_policy_revision()
                 for candidate in prepared:
                     candidate.previous_manager._retire_authority()
                 return self.policy_revision
@@ -907,6 +979,18 @@ class SessionRuntimeRegistry(SubagentRunnerPort):  # noqa: PLR0904
         self._require_policy_unreserved()
         if self._root is not None:
             raise RuntimeError("A root session runtime is already registered")
+        session_logger = runtime.agent_loop.session_logger
+        if session_logger.session_dir is not None:
+            self._runtime_factory.initialize_registry_manifest(
+                runtime.agent_loop, session_logger.session_dir
+            )
+            # WP3 [3D]: the bound root is the session dir's sole writer —
+            # take the write fence (flock) for the writer's lifetime. A
+            # second writer, in this or any other process, is refused with
+            # the typed SessionBusyError before the root is registered.
+            self._runtime_factory.ensure_writer_fence(
+                runtime.agent_loop, session_logger.session_dir
+            )
         self._root = runtime
         self.begin_root_generation()
         runtime.agent_loop.bind_root_grant_port(
@@ -1067,6 +1151,9 @@ class SessionRuntimeRegistry(SubagentRunnerPort):  # noqa: PLR0904
     def release_root(self, runtime: SessionRuntime) -> None:
         self._require_policy_unreserved()
         if self._root is runtime:
+            # WP3 [3D]: root close releases the session-dir write fence; the
+            # lockfile itself is kept, never unlinked while in scope.
+            self._runtime_factory.release_writer_fence(runtime.agent_loop)
             self._root = None
             self._generation_identity = None
 
@@ -1119,6 +1206,51 @@ class SessionRuntimeRegistry(SubagentRunnerPort):  # noqa: PLR0904
     def references_child(self, session_id: str) -> bool:
         """Delegate to the transcript reads collaborator."""
         return self._transcript_reads.references_child(session_id)
+
+    # --- WP5 [5C]: child transcript reconciliation and idempotent receipts ---
+
+    async def reconcile_child_transcript(
+        self, agent_id: str, child_dir: Path
+    ) -> ChildTranscriptReconciliation:
+        """Adjudicate one dead child's transcript markers (coordinator side).
+
+        The coordinator owns physical child lifecycle, so it reads the child's
+        durable markers and classifies the run — never executed, started with
+        an unknown outcome, completed, or unreadable. It never writes the
+        child's transcript and never returns a replay instruction.
+        """
+        reconciler = ChildTranscriptReconciler(self._root_session_dir())
+        return await asyncio.to_thread(
+            reconciler.reconcile, child_dir, agent_id=agent_id
+        )
+
+    async def scan_child_transcripts(self) -> list[ChildTranscriptReconciliation]:
+        """Reconcile every child transcript under the root session's ``agents/``.
+
+        Result ids the root already recorded are reported as consumed, so a
+        repeated scan hands nothing to the root twice. Unreadable transcripts
+        are surfaced, not concealed.
+        """
+        async with self._registry_lock:
+            consumed = self._run_results.child_result_receipt_ids_locked()
+        reconciler = ChildTranscriptReconciler(self._root_session_dir())
+        return await asyncio.to_thread(reconciler.scan, consumed_result_ids=consumed)
+
+    async def record_child_result_receipt(self, agent_id: str, result_id: str) -> bool:
+        """Record one child result receipt idempotently; True when it is new."""
+        async with self._registry_lock:
+            return self._run_results.record_child_result_receipt_locked(
+                agent_id, result_id
+            )
+
+    def _root_session_dir(self) -> Path:
+        root = self._root
+        if root is None:
+            raise RuntimeError("No root session runtime is registered")
+        session_dir = root.agent_loop.session_logger.session_dir
+        if session_dir is None:
+            raise RuntimeError("The root session has no transcript directory")
+        return session_dir
 
     def _track_child_close(
         self,
@@ -1418,7 +1550,8 @@ class SessionRuntimeRegistry(SubagentRunnerPort):  # noqa: PLR0904
         )
 
     async def close(self) -> None:
-        await self.close_children()
+        """Shut the session tree down in design order (WP7 [7B])."""
+        await self._tree_shutdown.shutdown()
 
     @contextmanager
     def _child_creation(self) -> Iterator[None]:
@@ -1607,27 +1740,13 @@ class SessionRuntimeRegistry(SubagentRunnerPort):  # noqa: PLR0904
                 raise AgentBusyError("Agent is already running a task")
             if record is not None:
                 self._require_retained_identity_match(record, args)
-        # Check and reserve without awaiting: concurrent creation/reuse attempts
-        # consume capacity before they can allocate runtimes or call providers.
-        if not hasattr(self, "_active_work_slots"):
-            self._active_work_slots = set()
-        running = len(self._active_work_slots)
-        cap = getattr(self, "_max_running_subagents", None)
-        if cap is None:
-            root = getattr(self, "_root", None)
-            cap = (
-                root.agent_loop.config.subagents.max_running_subagents
-                if root is not None
-                else _DEFAULT_MAX_RUNNING_SUBAGENTS
-            )
-        if running >= cap:
-            raise RuntimeError(
-                f"Subagent launch rejected: {running} agents already running "
-                f"(cap {cap}); "
-                "wait for completion or release agents before launching more"
-            )
-        slot = _ActiveWorkSlot()
-        self._active_work_slots.add(slot)
+        # WP5 [5B]: capacity + depth admission reserves the slot ATOMICALLY
+        # (synchronous check-and-insert, visible to concurrent requests before
+        # any runtime allocation or provider call); over-cap/over-depth raises
+        # a typed denial, never silent queueing. Retained idle agents count
+        # against the cap (design.md:448-456). Called through the class like
+        # _run_admitted so spec'd mock registries run the real admission.
+        slot = SessionRuntimeRegistry._reserve_admission(self, args, ctx)
         launch = SessionRuntimeRegistry._run_admitted(
             self, args, ctx, slot, defer_launch_agents_update=defer_launch_agents_update
         )
@@ -1641,6 +1760,99 @@ class SessionRuntimeRegistry(SubagentRunnerPort):  # noqa: PLR0904
                 if not slot.transferred:
                     self._active_work_slots.discard(slot)
 
+    def _reserve_admission(self, args: TaskArgs, ctx: InvokeContext) -> _ActiveWorkSlot:
+        """Reserve one capacity slot atomically (WP5 [5B]).
+
+        Synchronous on purpose: no ``await`` between the occupancy check and
+        the slot insertion, so concurrent admission requests observe each
+        other's reservations under the loop — the reservation is atomic and
+        visible to concurrent requests before any runtime is allocated.
+        Retained idle agents (IDLE records) COUNT against the cap
+        (design.md:448-456); a reuse of an idle retained agent by agent_id
+        converts its retained occupancy into the new run's slot instead of
+        double-counting. Over-cap/over-depth raises the typed wire-visible
+        denial; nothing is queued. The slot is released by ``run``'s finally
+        on spawn failure or completion.
+        """
+        cap = getattr(self, "_max_running_subagents", None)
+        # WP5 [5E] quiescence: no child work starts while a drain is in
+        # progress (or after admission closed for shutdown). The check is
+        # synchronous with the reservation below, so a concurrent launch
+        # cannot slip in after the drain flag was set.
+        if getattr(self, "_admission_closed", False) or getattr(
+            self, "_draining_children", False
+        ):
+            raise SubagentAdmissionClosedError()
+        if cap is None:
+            root = getattr(self, "_root", None)
+            cap = (
+                root.agent_loop.config.subagents.max_running_subagents
+                if root is not None
+                else _DEFAULT_MAX_RUNNING_SUBAGENTS
+            )
+        records = getattr(self, "_agent_records", {})
+        retained_idle = [
+            record.agent_id
+            for record in records.values()
+            if record.state is _AgentState.IDLE
+        ]
+        # Spec'd/bare registries (tests drive the real run() over a mock) carry
+        # no _admission: fall back to one wrapping the slot set directly.
+        admission = getattr(self, "_admission", None)
+        if admission is None:
+            slots = getattr(self, "_active_work_slots", None)
+            if slots is None:
+                slots = self._active_work_slots = set()
+            admission = SubagentAdmission(slots, max_depth=MAX_SUBAGENT_DEPTH)
+        return admission.reserve(
+            cap=cap,
+            depth=1 if ctx.is_subagent else 0,
+            reuse_agent_id=args.agent_id,
+            retained_idle=retained_idle,
+        )
+
+    def _next_subagent_incarnation(self) -> int:
+        """Hand out a fresh relay incarnation generation per child run ([2A])."""
+        seq = getattr(self, "_subagent_incarnation_seq", 0)
+        self._subagent_incarnation_seq = seq + 1
+        return seq
+
+    def _child_event_feed(self, agent_id: str) -> SubagentEventFeed | None:
+        """One incarnation-stamped feed per child run, or None when no sink."""
+        sink = getattr(self, "_subagent_event_sink", None)
+        if sink is None:
+            return None
+        feed = SubagentEventFeed(
+            agent_id,
+            lambda frame: sink(agent_id, frame),
+            incarnation=self._next_subagent_incarnation(),
+        )
+        feeds = getattr(self, "_subagent_feeds", None)
+        if feeds is not None:
+            feeds[agent_id] = feed
+        return feed
+
+    @staticmethod
+    def _install_child_event_sink(
+        consume: Callable[[BaseEvent], Awaitable[None]], feed: SubagentEventFeed | None
+    ) -> Callable[[BaseEvent], Awaitable[None]]:
+        """Wrap a child event consumer with incarnation-stamped relay ([5B]).
+
+        The relay never breaks the run: a feed failure is logged and the
+        child's own event consumption continues in production order.
+        """
+        if feed is None:
+            return consume
+
+        async def relaying(event: BaseEvent) -> None:
+            try:
+                await feed.relay_event(event)
+            except Exception:
+                logger.warning("subagent event relay failed", exc_info=True)
+            await consume(event)
+
+        return relaying
+
     async def _run_admitted(  # noqa: PLR0912, PLR0914, PLR0915
         self,
         args: TaskArgs,
@@ -1652,7 +1864,8 @@ class SessionRuntimeRegistry(SubagentRunnerPort):  # noqa: PLR0904
         summary_task: str | None = None,
     ) -> AsyncGenerator[ToolStreamEvent | TaskResult, None]:
         if ctx.is_subagent:
-            raise RuntimeError("Agent depth limit of 1 reached")
+            # WP5 [5B]: typed depth denial (wire-visible, never a silent drop).
+            raise SubagentDepthDeniedError(depth=1, max_depth=MAX_SUBAGENT_DEPTH)
         parent = self._runtime(ctx.session_id)
         parent_identity = (
             parent.agent_loop.session_id,
@@ -1691,7 +1904,18 @@ class SessionRuntimeRegistry(SubagentRunnerPort):  # noqa: PLR0904
             )
 
             try:
-                context.runtime.turns._event_sink = context.consume_event
+                # WP5 [5B] event feed: child events relay into the coordinator
+                # event feed as incarnation-stamped frames, then consume.
+                # (Class-qualified calls keep spec'd mock registries on the
+                # real helpers.)
+                context.feed = SessionRuntimeRegistry._child_event_feed(
+                    self, context.record.agent_id
+                )
+                context.runtime.turns._event_sink = (
+                    SessionRuntimeRegistry._install_child_event_sink(
+                        context.consume_event, context.feed
+                    )
+                )
                 turn_id, action = SessionRuntimeRegistry._start_child_turn(
                     context.runtime,
                     args,
@@ -1788,7 +2012,15 @@ class SessionRuntimeRegistry(SubagentRunnerPort):  # noqa: PLR0904
         completion_evidence_sink = context.accumulator.completion_evidence_sink()
         child._completion_evidence_sink = completion_evidence_sink
         context.completion_evidence_sink = completion_evidence_sink
-        runtime.turns._event_sink = context.consume_event
+        # WP5 [5B] event feed: child events relay into the coordinator event
+        # feed as incarnation-stamped frames, then consume. (Class-qualified
+        # calls keep spec'd mock registries on the real helpers.)
+        context.feed = SessionRuntimeRegistry._child_event_feed(
+            self, args.agent_id or child.session_id
+        )
+        runtime.turns._event_sink = SessionRuntimeRegistry._install_child_event_sink(
+            context.consume_event, context.feed
+        )
         try:
             turn_id, start = SessionRuntimeRegistry._start_child_turn(
                 runtime,
@@ -1932,7 +2164,30 @@ class SessionRuntimeRegistry(SubagentRunnerPort):  # noqa: PLR0904
             # P6b: the capacity slot stays accounted while the finalization
             # verification runs and is released only here — the former
             # completion done-callback released it before the checks ran.
-            context.discard_work_slot(self, completion)
+            # WP5 [5E]: the run's terminal completion frame is published
+            # durably (save-before-emit) BEFORE that release, so no admission
+            # observes free capacity while the publication is outstanding.
+            try:
+                result = context.result
+                if result is not None and result.completed:
+                    outcome = TURN_OUTCOME_COMPLETED
+                elif result is not None and result.stop_reason is not None:
+                    outcome = TURN_OUTCOME_INTERRUPTED
+                else:
+                    outcome = TURN_OUTCOME_FAILED
+                await publish_child_terminal(
+                    child_loop=child,
+                    agent_id=(
+                        context.feed.agent_id
+                        if context.feed is not None
+                        else child.session_id
+                    ),
+                    run_id=context.turn_id,
+                    completion=SubagentCompletion(outcome=outcome),
+                    feed=context.feed,
+                )
+            finally:
+                context.discard_work_slot(self, completion)
             runtime.turns._event_sink = context.previous_event_sink
             # P2/P3 run-end hygiene: the run's receipt sink is spent.
             if child._completion_evidence_sink is context.completion_evidence_sink:
@@ -2881,18 +3136,55 @@ class SessionRuntimeRegistry(SubagentRunnerPort):  # noqa: PLR0904
         self._recovery_controller.cancel_all()
         await self._child_drain.reserve_resume(root)
 
-    async def close_children(self) -> None:
+    async def close_children(self) -> ChildDrainReport:
         """Delegate to the child drain collaborator."""
-        await self._child_drain.close_children()
+        return await self._child_drain.close_children()
 
-    async def drain_children(self) -> None:
+    async def close_admission(self) -> None:
+        """Stop new child admission without starting the drain (WP7 [7B])."""
+        await self._child_drain.close_admission()
+
+    async def shutdown_tree(self) -> TreeShutdownReport:
+        """Run the ordered session-tree shutdown (WP7 [7B]).
+
+        Stop admission → interrupt in-flight → drain saves → terminate/kill →
+        close IPC → reap, under the registry's one shutdown bound. The typed
+        report never claims a successful drain after the bound expired.
+        """
+        return await self._tree_shutdown.shutdown()
+
+    async def close_tree_for_switch(self) -> TreeShutdownReport:
+        """Fully close the old session tree before the new one opens (WP7 [7C]).
+
+        A session switch runs the [7B] ordered shutdown to completion before
+        the caller opens the new session; a tree that could not be reaped
+        raises the typed refusal, so the two trees never overlap.
+        """
+        return await self._tree_shutdown.reap_before_restart()
+
+    async def dispose_tree_after_root_death(self) -> TreeShutdownReport:
+        """No child outlives its root (WP7 [7C], design R2-F1).
+
+        The coordinator disposes of the whole child tree once the root agent
+        process is gone, and the tree must be fully reaped before any respawn
+        or resume — the same rule as a session switch.
+        """
+        return await self._tree_shutdown.reap_before_restart()
+
+    async def reap_orphaned_children(self) -> OrphanReapReport:
+        """Reap children whose parent session is gone; never replay (WP7 [7C])."""
+        return await self._orphan_reaper.reap()
+
+    async def drain_children(self) -> ChildDrainReport:
         """Delegate to the child drain collaborator (WP4 prelude).
 
         Shutdown cancels every pending automatic-recovery schedule (rollback:
-        cancel timers, retain counters/results).
+        cancel timers, retain counters/results). The returned typed report
+        distinguishes a completed drain from one bounded out by the shutdown
+        timeout — a timed-out drain is never a successful one.
         """
         self._recovery_controller.cancel_all()
-        await self._child_drain.drain_children()
+        return await self._child_drain.drain_children()
 
     @staticmethod
     async def _discard_child(child: AgentLoop) -> None:

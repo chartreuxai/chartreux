@@ -31,10 +31,12 @@ from chartreux.core.agent_loop._context_injection import ContextInjector
 from chartreux.core.agent_loop._dangerous_command_grants import (
     DangerousCommandGrantStore,
 )
+from chartreux.core.agent_loop._execution_port import TurnExecutionPort
 from chartreux.core.agent_loop._file_state_context import (
     FileStateContext,
     RevisionRegistryPort,
 )
+from chartreux.core.agent_loop._in_process_execution import InProcessTurnExecution
 from chartreux.core.agent_loop._loop_types import (
     AgentRuntimePolicy,
     AgentTurnOptions,
@@ -56,6 +58,7 @@ from chartreux.core.agent_loop._tool_batch_runner import (
     _ToolInvocation,
 )
 from chartreux.core.agent_loop._tool_decisions import (
+    LoopUserInputAdmission,
     ToolDecisionCoordinator,
     _dangerous_command_denial as _dangerous_command_denial,
     _declined_dangerous_command_decision as _declined_dangerous_command_decision,
@@ -773,6 +776,11 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
             ),
         )
         self._request_broker = InteractionRequestBroker()
+        # Agent-side execution port: the surface a host drives a turn through.
+        # The in-process adapter runs this loop's own turn stream, so the
+        # escape path and the coordinator path exercise the same components;
+        # a process-backed adapter replaces it without moving agent logic.
+        self._execution_port = InProcessTurnExecution(self)
         # Tool decisions: the approval workflows (dangerous-command and
         # out-of-root denial formatting, prompts, resume, persistence) and
         # the shared root-prompt asker lifecycle live on the coordinator.
@@ -801,6 +809,20 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
             apply_approved_root_grant=lambda root: self._apply_approved_root_grant(
                 root
             ),
+        )
+        # User-input admission (child-question refusal, unattended expiry)
+        # runs in this process: the broker owns the request records and asks
+        # this policy at admission, so a host only relays requests/answers.
+        self._request_broker.bind_admission(
+            LoopUserInputAdmission(
+                is_subagent_getter=lambda: self._is_subagent,
+                user_input_capability_getter=lambda: self._user_input_capability,
+                config_getter=lambda: self.config,
+                session_id_getter=lambda: self.session_id,
+                session_generation_getter=lambda: self._session_generation,
+                active_turn_id_getter=lambda: self._turn.turn_id,
+                deferred_questions=self.deferred_questions,
+            )
         )
         # Batch runner: the wait registry, the batch queue, the tool tasks
         # and their completion monitor, the batch teardown, and the
@@ -1468,6 +1490,16 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
 
     def reject_request(self, request_id: str, error: BaseException) -> None:
         self._request_broker.reject(request_id, error)
+
+    @property
+    def request_broker(self) -> InteractionRequestBroker:
+        """The agent-side user-input broker owning the open-request records."""
+        return self._request_broker
+
+    @property
+    def execution_port(self) -> TurnExecutionPort:
+        """The agent-side execution port this loop serves (in-process today)."""
+        return self._execution_port
 
     def bind_root_grant_port(self, port: RootGrantPort) -> None:
         """Bind the runtime-owned port that applies approved session root grants."""
@@ -3553,6 +3585,19 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
 
     def _require_policy_idle(self) -> None:
         _config_transactions._require_policy_idle(self)
+
+    def advance_dangerous_command_policy_revision(self) -> None:
+        """Invalidate every admission decided under the current policy.
+
+        A policy replacement changes the accepted restrictions each
+        outstanding dangerous-command grant was decided under, so the store's
+        monotonic policy revision advances and the cached authority is
+        dropped. An admission decided before the change then fails closed at
+        the execution gate instead of running on authority the replacement
+        removed.
+        """
+        self._dangerous_command_grants.bump_policy_revision()
+        self.tool_manager._invalidate_dangerous_command_authority()
 
     async def _prepare_policy_refresh(
         self,

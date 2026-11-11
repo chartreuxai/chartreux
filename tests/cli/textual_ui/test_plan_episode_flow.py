@@ -217,12 +217,13 @@ async def _session_with_plan(
     return session_id, logging
 
 
-def _resumed_app(
+async def _resumed_app(
     logging: SessionLoggingConfig, tmp_path: Path
 ) -> tuple[ChartreuxApp, Any]:
     loop = build_test_agent_loop(
         config=build_test_vibe_config(session_logging=logging), cwd=tmp_path
     )
+    await loop.persist_empty_session()
     return build_test_chartreux_app(agent_loop=loop), loop
 
 
@@ -338,7 +339,7 @@ class TestResumeSurfaces:
         session_id, logging = await _session_with_plan(
             tmp_path, lambda _sid: _record(directory, state=STATE_DRAFT)
         )
-        app, _ = _resumed_app(logging, tmp_path)
+        app, _ = await _resumed_app(logging, tmp_path)
         async with app.run_test():
             with _Harness(app, fields=_fields(tmp_path)) as harness:
                 await app._resume_local_session(session_id)
@@ -363,7 +364,7 @@ class TestResumeSurfaces:
             return _record(directory, state=STATE_ACCEPTING)
 
         session_id, logging = await _session_with_plan(tmp_path, _build)
-        app, _ = _resumed_app(logging, tmp_path)
+        app, _ = await _resumed_app(logging, tmp_path)
         async with app.run_test():
             with _Harness(app, fields=_fields(tmp_path)) as harness:
                 await app._resume_local_session(session_id)
@@ -394,7 +395,7 @@ class TestResumeSurfaces:
             return _record(directory, state=STATE_ACCEPTING)
 
         session_id, logging = await _session_with_plan(tmp_path, _build)
-        app, _ = _resumed_app(logging, tmp_path)
+        app, _ = await _resumed_app(logging, tmp_path)
         async with app.run_test():
             with _Harness(app, fields=_fields(tmp_path)) as harness:
                 await app._resume_local_session(session_id)
@@ -415,7 +416,7 @@ class TestResumeSurfaces:
             return _record(directory, state=STATE_ACCEPTING)
 
         session_id, logging = await _session_with_plan(tmp_path, _build)
-        app, _ = _resumed_app(logging, tmp_path)
+        app, _ = await _resumed_app(logging, tmp_path)
         async with app.run_test():
             with _Harness(app, fields=_fields(tmp_path)) as harness:
                 await app._resume_local_session(session_id)
@@ -440,7 +441,7 @@ class TestResumeSurfaces:
         session_id, logging = await _session_with_plan(
             tmp_path, lambda _sid: _record(directory, state=state)
         )
-        app, _ = _resumed_app(logging, tmp_path)
+        app, _ = await _resumed_app(logging, tmp_path)
         async with app.run_test():
             with _Harness(app, fields=_fields(tmp_path)) as harness:
                 await app._resume_local_session(session_id)
@@ -462,7 +463,7 @@ class TestResumeSurfaces:
             tmp_path,
             lambda _sid: _record(directory, state=STATE_DRAFT, episode_id=None),
         )
-        app, _ = _resumed_app(logging, tmp_path)
+        app, _ = await _resumed_app(logging, tmp_path)
         async with app.run_test():
             with _Harness(app, fields=_fields(tmp_path)) as harness:
                 await app._resume_local_session(session_id)
@@ -485,7 +486,7 @@ class TestResumeSurfaces:
                 directory, state=STATE_DRAFT, scan_domain=_scan_domain(tmp_path)
             ),
         )
-        app, _ = _resumed_app(logging, tmp_path)
+        app, _ = await _resumed_app(logging, tmp_path)
         async with app.run_test():
             with _Harness(app, fields=_fields(tmp_path)) as harness:
                 await app._resume_local_session(session_id)
@@ -511,7 +512,7 @@ class TestResumeSurfaces:
 
         session_id, logging = await _session_with_plan(tmp_path, _build)
         _executor_marker(tmp_path)
-        app, _ = _resumed_app(logging, tmp_path)
+        app, _ = await _resumed_app(logging, tmp_path)
         async with app.run_test():
             with _Harness(app, fields=_fields(tmp_path)) as harness:
                 await app._resume_local_session(session_id)
@@ -544,7 +545,7 @@ class TestResumeSurfaces:
 
         session_id, logging = await _session_with_plan(tmp_path, _build)
         _executor_marker(tmp_path)
-        app, _ = _resumed_app(logging, tmp_path)
+        app, _ = await _resumed_app(logging, tmp_path)
         async with app.run_test():
             with _Harness(app, fields=_fields(tmp_path)) as harness:
                 await app._resume_local_session(session_id)
@@ -569,7 +570,7 @@ class TestNeverRearmedPinRestore:
         session_id, logging = await _session_with_plan(
             tmp_path, lambda _sid: _record(directory, state=STATE_ACCEPTED)
         )
-        app, _ = _resumed_app(logging, tmp_path)
+        app, _ = await _resumed_app(logging, tmp_path)
         async with app.run_test():
             with _Harness(app, fields=_fields(tmp_path)) as harness:
                 await app._resume_local_session(session_id)
@@ -595,7 +596,7 @@ class TestNeverRearmedPinRestore:
                 pre_entry_planner_thinking=None,
             ),
         )
-        app, _ = _resumed_app(logging, tmp_path)
+        app, _ = await _resumed_app(logging, tmp_path)
         async with app.run_test():
             with _Harness(app, fields=_fields(tmp_path)) as harness:
                 await app._resume_local_session(session_id)
@@ -613,7 +614,7 @@ class TestNeverRearmedPinRestore:
             tmp_path,
             lambda _sid: _record(directory, state=STATE_DRAFT, episode_id=None),
         )
-        app, _ = _resumed_app(logging, tmp_path)
+        app, _ = await _resumed_app(logging, tmp_path)
         async with app.run_test():
             with _Harness(app, fields=_fields(tmp_path)) as harness:
                 await app._resume_local_session(session_id)
@@ -637,7 +638,7 @@ class TestNeverRearmedPinRestore:
 
         session_id, logging = await _session_with_plan(tmp_path, _build)
         _executor_marker(tmp_path)
-        app, loop = _resumed_app(logging, tmp_path)
+        app, loop = await _resumed_app(logging, tmp_path)
         async with app.run_test():
             with _Harness(app, fields=_fields(tmp_path)) as harness:
                 await app._resume_local_session(session_id)
@@ -676,7 +677,7 @@ class TestNeverRearmedPinRestore:
 
         session_id, logging = await _session_with_plan(tmp_path, _build)
         _executor_marker(tmp_path)
-        app, _ = _resumed_app(logging, tmp_path)
+        app, _ = await _resumed_app(logging, tmp_path)
         async with app.run_test():
             with _Harness(app, fields=_fields(tmp_path)) as harness:
                 await app._resume_local_session(session_id)
@@ -701,7 +702,7 @@ class TestNeverRearmedPinRestore:
         session_id, logging = await _session_with_plan(
             tmp_path, lambda _sid: _record(directory, state=STATE_ACCEPTED)
         )
-        app, loop = _resumed_app(logging, tmp_path)
+        app, loop = await _resumed_app(logging, tmp_path)
         async with app.run_test():
             with _Harness(app, fields=_fields(tmp_path)) as harness:
                 await app._resume_local_session(session_id)
@@ -755,7 +756,7 @@ class TestRebindAndAuthorizedRoots:
         paths = _armed_episode(tmp_path)
         target = tmp_path / "PLAN.md"
         target.write_text(PLAN_TEXT, encoding="utf-8")
-        app, _ = _resumed_app(
+        app, _ = await _resumed_app(
             SessionLoggingConfig(enabled=True, save_dir=str(tmp_path / "sessions")),
             tmp_path,
         )
@@ -779,7 +780,7 @@ class TestRebindAndAuthorizedRoots:
         outside = tmp_path.parent / "chartreux-outside-roots" / "PLAN.md"
         outside.parent.mkdir(exist_ok=True)
         outside.write_text(PLAN_TEXT, encoding="utf-8")
-        app, _ = _resumed_app(
+        app, _ = await _resumed_app(
             SessionLoggingConfig(enabled=True, save_dir=str(tmp_path / "sessions")),
             tmp_path,
         )
@@ -808,7 +809,7 @@ class TestRebindAndAuthorizedRoots:
         inside_link.symlink_to(paths.document_path)
         paths.document_path.write_text(PLAN_TEXT, encoding="utf-8")
 
-        app, _ = _resumed_app(
+        app, _ = await _resumed_app(
             SessionLoggingConfig(enabled=True, save_dir=str(tmp_path / "sessions")),
             tmp_path,
         )
@@ -840,7 +841,7 @@ class TestRebindAndAuthorizedRoots:
             tmp_path,
             lambda _sid: _record(legacy_dir, state=STATE_DRAFT, episode_id=None),
         )
-        app, _ = _resumed_app(logging, tmp_path)
+        app, _ = await _resumed_app(logging, tmp_path)
         with patch(
             "chartreux.core.plan_mode.allocate_plan_workspace",
             MagicMock(
@@ -873,7 +874,7 @@ class TestRebindAndAuthorizedRoots:
         self, tmp_path: Path
     ) -> None:
         paths = _armed_episode(tmp_path)
-        app, _ = _resumed_app(
+        app, _ = await _resumed_app(
             SessionLoggingConfig(enabled=True, save_dir=str(tmp_path / "sessions")),
             tmp_path,
         )
@@ -898,7 +899,7 @@ class TestRebindAndAuthorizedRoots:
         target.write_text(
             "# Bound\n\n## Summary\n\nThe re-bound document.\n", encoding="utf-8"
         )
-        app, _ = _resumed_app(
+        app, _ = await _resumed_app(
             SessionLoggingConfig(enabled=True, save_dir=str(tmp_path / "sessions")),
             tmp_path,
         )
@@ -952,7 +953,7 @@ class TestClearDuringClaimIntegration:
 
         session_id, logging = await _session_with_plan(tmp_path, _build)
         snapshot = accepted_snapshot_path(directory, EPISODE_ID)
-        app, _ = _resumed_app(logging, tmp_path)
+        app, _ = await _resumed_app(logging, tmp_path)
         async with app.run_test():
             app.app_server.clear_history = AsyncMock()
             record_clear = AsyncMock(side_effect=lambda: order.append("record"))
@@ -989,7 +990,7 @@ class TestClearDuringClaimIntegration:
             return _record(directory, state=STATE_ACCEPTING)
 
         session_id, logging = await _session_with_plan(tmp_path, _build)
-        app, _ = _resumed_app(logging, tmp_path)
+        app, _ = await _resumed_app(logging, tmp_path)
         async with app.run_test():
             clear = AsyncMock()
             app.app_server.clear_history = clear
@@ -1019,7 +1020,7 @@ class TestClearDuringClaimIntegration:
 
         session_id, logging = await _session_with_plan(tmp_path, _build)
         _executor_marker(tmp_path)
-        app, _ = _resumed_app(logging, tmp_path)
+        app, _ = await _resumed_app(logging, tmp_path)
         async with app.run_test():
             clear = AsyncMock()
             app.app_server.clear_history = clear
@@ -1046,7 +1047,7 @@ class TestClearDuringClaimIntegration:
             return _record(directory, state=STATE_ACCEPTING)
 
         session_id, logging = await _session_with_plan(tmp_path, _build)
-        app, loop = _resumed_app(logging, tmp_path)
+        app, loop = await _resumed_app(logging, tmp_path)
         async with app.run_test():
             app.app_server.clear_history = AsyncMock()
             with _Harness(app, fields=_fields(tmp_path)):
@@ -1173,7 +1174,7 @@ class TestEpisodeStatusLines:
         session_id, logging = await _session_with_plan(
             tmp_path, lambda _sid: _record(directory, state=STATE_ACCEPTED)
         )
-        app, _ = _resumed_app(logging, tmp_path)
+        app, _ = await _resumed_app(logging, tmp_path)
         async with app.run_test():
             with _Harness(app, fields=_fields(tmp_path)) as harness:
                 await app._resume_local_session(session_id)
@@ -1220,7 +1221,7 @@ class TestTerminalCancelSurface:
             states_at_cleanup.append("gone" if sidecar is None else sidecar.state)
             return real_release(workspace)
 
-        app, loop = _resumed_app(logging, tmp_path)
+        app, loop = await _resumed_app(logging, tmp_path)
         async with app.run_test():
             with _Harness(app, fields=_fields(tmp_path)) as harness:
                 with patch("chartreux.cli.textual_ui.app.release_workspace", _release):
@@ -1258,7 +1259,7 @@ class TestTerminalCancelSurface:
         session_id, logging = await _session_with_plan(
             tmp_path, lambda _sid: _record(directory, state=STATE_DRAFT)
         )
-        app, loop = _resumed_app(logging, tmp_path)
+        app, loop = await _resumed_app(logging, tmp_path)
         async with app.run_test():
             with _Harness(app, fields=_fields(tmp_path)) as harness:
                 await app._resume_local_session(session_id)
@@ -1302,7 +1303,7 @@ class TestTerminalCancelSurface:
         session_id, logging = await _session_with_plan(
             tmp_path, lambda _sid: _record(directory, state=STATE_CANCELLED)
         )
-        app, _ = _resumed_app(logging, tmp_path)
+        app, _ = await _resumed_app(logging, tmp_path)
         async with app.run_test():
             with _Harness(app, fields=_fields(tmp_path)) as harness:
                 await app._resume_local_session(session_id)
@@ -1324,7 +1325,7 @@ class TestTerminalCancelSurface:
         session_id, logging = await _session_with_plan(
             tmp_path, lambda _sid: _record(directory, state=STATE_DRAFT)
         )
-        app, loop = _resumed_app(logging, tmp_path)
+        app, loop = await _resumed_app(logging, tmp_path)
         async with app.run_test():
             app.app_server.clear_history = AsyncMock()
             with _Harness(app, fields=_fields(tmp_path)):
@@ -1349,7 +1350,7 @@ class TestTerminalCancelSurface:
             return _record(directory, state=STATE_ACCEPTING)
 
         session_id, logging = await _session_with_plan(tmp_path, _build)
-        app, loop = _resumed_app(logging, tmp_path)
+        app, loop = await _resumed_app(logging, tmp_path)
         async with app.run_test():
             with _Harness(app, fields=_fields(tmp_path)) as harness:
                 await app._resume_local_session(session_id)
@@ -1413,7 +1414,7 @@ class TestRecoveryReOfferContinuation:
         (directory / "plan.md").write_text(
             "# Plan\n\n## Summary\n\nA completely different plan.\n", encoding="utf-8"
         )
-        app, _ = _resumed_app(logging, tmp_path)
+        app, _ = await _resumed_app(logging, tmp_path)
         async with app.run_test():
             with _Harness(
                 app, fields=_fields(tmp_path), confirmed=_snapshot_plan()
@@ -1455,7 +1456,7 @@ class TestRecoveryReOfferContinuation:
         draft = directory / "plan.md"
         draft.write_bytes(SNAPSHOT_BYTES)
         draft.unlink()
-        app, _ = _resumed_app(logging, tmp_path)
+        app, _ = await _resumed_app(logging, tmp_path)
         async with app.run_test():
             with _Harness(
                 app, fields=_fields(tmp_path), confirmed=_snapshot_plan()
@@ -1485,7 +1486,7 @@ class TestRecoveryReOfferContinuation:
 
         session_id, logging = await _session_with_plan(tmp_path, _build)
         directory = built["directory"]
-        app, _ = _resumed_app(logging, tmp_path)
+        app, _ = await _resumed_app(logging, tmp_path)
         async with app.run_test():
             with _Harness(
                 app, fields=_fields(tmp_path), confirmed=_snapshot_plan()
@@ -1515,7 +1516,7 @@ class TestRecoveryReOfferContinuation:
 
         session_id, logging = await _session_with_plan(tmp_path, _build)
         directory = built["directory"]
-        app, _ = _resumed_app(logging, tmp_path)
+        app, _ = await _resumed_app(logging, tmp_path)
         async with app.run_test():
             with _Harness(app, fields=_fields(tmp_path), confirmed=None) as harness:
                 await app._resume_local_session(session_id)
@@ -1557,7 +1558,7 @@ class TestReboundResumeDirectory:
             sha256=digest_bytes(content),
             summary="Do the thing carefully.",
         )
-        app, _ = _resumed_app(logging, tmp_path)
+        app, _ = await _resumed_app(logging, tmp_path)
         async with app.run_test():
             with _Harness(
                 app, fields=_fields(tmp_path), confirmed=confirmed

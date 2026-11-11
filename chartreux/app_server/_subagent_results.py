@@ -103,6 +103,7 @@ class ResultsStateView(Protocol):
     _wait_leases: dict[tuple[str, str], int]
     _pending_notifications: set[tuple[str, str]]
     _result_write_tokens: dict[tuple[str, str], object]
+    _child_result_receipts: dict[str, set[str]]
     _evicted_agents: dict[str, _AgentTombstone]
     _children: dict[str, SessionRuntime]
     _admission_closed: bool
@@ -431,7 +432,44 @@ class RunResults:
             self._view._result_write_tokens.pop(key, None)
             self._delivery_markings_locked().pop(key, None)
         self._view._latest_run_ids.pop(agent_id, None)
+        self._child_result_receipts_locked().pop(agent_id, None)
         return keys
+
+    def _child_result_receipts_locked(self) -> dict[str, set[str]]:
+        """The registry-owned child result receipt ledger (locked).
+
+        Installed lazily on the view: a bare registry built with
+        ``object.__new__`` never ran ``__init__``, and its ``__getattr__``
+        raises for unknown names, so the first locked access creates the
+        ledger.
+        """
+        receipts = getattr(self._view, "_child_result_receipts", None)
+        if receipts is None:
+            receipts = {}
+            self._view._child_result_receipts = receipts
+        return receipts
+
+    def record_child_result_receipt_locked(self, agent_id: str, result_id: str) -> bool:
+        """Record one child result receipt idempotently (locked).
+
+        Returns True when the receipt is new — the root now adopts the child's
+        terminal result — and False when it was already recorded, so a repeated
+        coordinator reconciliation message never re-delivers and never replays
+        the run. The caller must hold the registry lock.
+        """
+        receipts = self._child_result_receipts_locked().setdefault(agent_id, set())
+        if result_id in receipts:
+            return False
+        receipts.add(result_id)
+        return True
+
+    def child_result_receipt_ids_locked(self) -> set[str]:
+        """Every child result id the root already recorded (locked)."""
+        return {
+            result_id
+            for receipts in self._child_result_receipts_locked().values()
+            for result_id in receipts
+        }
 
     # ------------------------------------------------------------------
     # P2d delivery states: the marking, the refusal predicate, telemetry.

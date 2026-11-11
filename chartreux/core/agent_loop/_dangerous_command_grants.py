@@ -128,6 +128,14 @@ class DangerousCommandGrantStore:
         self._remote_exec_once: list[RemoteExecOncePermit] = []
         self._refusals: set[DangerousCommandCallIdentity] = set()
         self._authority_generation = 0
+        self._policy_revision = 0
+
+    @property
+    def current_policy_revision(self) -> int:
+        return self._policy_revision
+
+    def bump_policy_revision(self) -> None:
+        self._policy_revision += 1
 
     @property
     def authority_generation(self) -> int:
@@ -216,8 +224,11 @@ class DangerousCommandGrantStore:
         grant in that scope: a destination grant is authority for the one
         operation, so there is no finer live unit to revoke by scope alone.
         """
+        wanted = tuple(requirements)
+        if wanted:
+            self.bump_policy_revision()
         changed = False
-        for operation_id, scope in requirements:
+        for operation_id, scope in wanted:
             if operation_id == REMOTE_EXEC_OPERATION_ID:
                 if self._remote_exec_session.pop(scope, None) is not None:
                     changed = True
@@ -251,8 +262,11 @@ class DangerousCommandGrantStore:
         self, requirements: Iterable[RemoteExecGrantRequirement]
     ) -> bool:
         """Remove live destination authority; True when anything was removed."""
+        wanted = tuple(requirements)
+        if wanted:
+            self.bump_policy_revision()
         changed = False
-        for requirement in requirements:
+        for requirement in wanted:
             destinations = self._remote_exec_session.get(requirement.scope)
             if destinations is not None and requirement.destination in destinations:
                 destinations.discard(requirement.destination)
@@ -277,6 +291,36 @@ class DangerousCommandGrantStore:
                 key=_scope_sort_key,
             )
         )
+
+    def revoke_live_authority(
+        self, operation_id: str, destination: RemoteDestination | None
+    ) -> bool:
+        """Remove one operation's — or one destination's — live authority.
+
+        The single revision-locked revocation entry point: the removal and
+        the policy-revision advance are one operation, so live authority is
+        never dropped without invalidating the admissions decided under it.
+        A ``network.remote-exec`` operation at a scope drops every
+        destination grant in that scope; with *destination*, only that
+        destination's grants go and every pending once permit containing it
+        is invalidated whole. Returns True when anything was removed.
+        """
+        self.bump_policy_revision()
+        if destination is not None:
+            changed = self.revoke_remote_exec_session(
+                RemoteExecGrantRequirement(scope=scope, destination=destination)
+                for scope in self.remote_exec_scopes_for_destination(destination)
+            )
+            self.invalidate_pending_destinations({destination})
+            return changed
+        requirements = {
+            (operation_id, authority.scope)
+            for authority in self.dangerous_command_authorities()
+            if operation_id in authority.operations
+        }
+        changed = self.revoke_session(requirements)
+        self.invalidate_pending(requirements)
+        return changed
 
     def install_remote_exec_once(
         self, requirements: frozenset[RemoteExecGrantRequirement]
@@ -322,6 +366,8 @@ class DangerousCommandGrantStore:
         revocation rule.
         """
         wanted = set(requirements)
+        if wanted:
+            self.bump_policy_revision()
         kept = [permit for permit in self._once if not (permit.requirements & wanted)]
         invalidated = len(self._once) - len(kept)
         self._once = kept
@@ -356,6 +402,8 @@ class DangerousCommandGrantStore:
         mirroring the whole-permit invalidation of the scope-level rule.
         """
         wanted = set(destinations)
+        if wanted:
+            self.bump_policy_revision()
         kept = [
             permit
             for permit in self._remote_exec_once
@@ -394,6 +442,7 @@ class DangerousCommandGrantStore:
         self._remote_exec_once = []
         self._refusals = set()
         self._bump_authority_generation()
+        self.bump_policy_revision()
         return cleared
 
 

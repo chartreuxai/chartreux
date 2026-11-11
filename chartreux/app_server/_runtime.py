@@ -6,7 +6,8 @@ from contextlib import suppress
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 import threading
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, Any, Literal
+from weakref import WeakKeyDictionary
 
 from pydantic import ValidationError
 
@@ -47,6 +48,7 @@ from chartreux.app_server.protocol import (
     SessionOptions,
     TransportKind,
 )
+from chartreux.app_server.registry_manifest import RegistryManifest, SessionWriterFence
 from chartreux.app_server.transport import JsonRpcTransport, memory_transport_pair
 from chartreux.core._usage_startup import (
     StartupAccountingContext,
@@ -281,6 +283,12 @@ class RootOpenRequest:
     startup_accounting: StartupAccountingContext | None = None
     # Controllers claim before naming; direct callers claim in open_root.
     startup_accounting_claimed: bool = False
+    # WP5 [5C]: a child agent process opens a fresh loop whose transcript it
+    # owns under the root session's agents/ subtree. A child is never resumed
+    # as a session, so the logging override applies to a NEW session only.
+    session_logging: SessionLoggingConfig | None = None
+    is_subagent: bool = False
+    parent_session_id: str | None = None
 
     def __post_init__(self) -> None:
         if self.startup_accounting is not None and (
@@ -289,6 +297,8 @@ class RootOpenRequest:
             raise ValueError("Startup accounting requires a new root session")
         if self.session_id is not None and self.continue_latest:
             raise ValueError("Cannot resume a session and continue the latest")
+        if self.is_subagent and (self.session_id is not None or self.continue_latest):
+            raise ValueError("A child agent session is always fresh, never resumed")
 
     def claim_startup_accounting(self) -> None:
         context = self.startup_accounting
@@ -426,6 +436,7 @@ class _RootRuntimeBlueprint:
         committed_model: CommittedModelIdentity | None = None,
         bound_policy: ActivatedPolicy | None = None,
         accounting_owner: RootAccountingOwner | None = None,
+        is_subagent: bool = False,
     ) -> AgentLoop:
         policy = AgentRuntimePolicy(
             max_turns=self.options.max_turns,
@@ -434,7 +445,7 @@ class _RootRuntimeBlueprint:
             max_session_tokens=self.options.max_session_tokens,
             run_max_price=self.options.run_max_price,
             run_max_session_tokens=self.options.run_max_session_tokens,
-            enable_streaming=True,
+            enable_streaming=not is_subagent,
             launch_context={
                 "agent_entrypoint": self.client_info.entrypoint,
                 "agent_version": __version__,
@@ -460,6 +471,7 @@ class _RootRuntimeBlueprint:
         return _AgentLoopBlueprint(
             config_orchestrator=self.config_orchestrator.copy(),
             policy=policy,
+            is_subagent=is_subagent,
             parent_session_id=parent_session_id,
             cwd=self.cwd,
             harness_files=self.harness_files,
@@ -518,9 +530,88 @@ class HarnessServer:
         )
 
 
+# WP3 [3D]: the session-dir write fences held by live root writers, keyed by
+# the owning loop. The flock is the cross-process writer-exclusion gate
+# (design R2-F8): acquired when a root is bound/opened for writing, held for
+# the writer's lifetime, released on root close. The lockfile itself is
+# created once per session dir and never unlinked while the fence is in scope.
+_writer_fences: WeakKeyDictionary[AgentLoop, SessionWriterFence] = WeakKeyDictionary()
+
+
 class AgentRuntimeFactory:
     def __init__(self, process: HarnessProcess | None = None) -> None:
         self._process = process
+        self.registry_manifests: WeakKeyDictionary[AgentLoop, RegistryManifest] = (
+            WeakKeyDictionary()
+        )
+
+    def initialize_registry_manifest(
+        self, source: AgentLoop, session_dir: Path
+    ) -> None:
+        session_dir.mkdir(parents=True, mode=0o700, exist_ok=True)
+        registry = self.registry_manifests.get(source)
+        if registry is None or registry.fence_path.parent != session_dir:
+            registry = RegistryManifest(session_dir)
+        registry.initialize()
+        self.registry_manifests[source] = registry
+
+    def registry_manifest(self, source: AgentLoop) -> RegistryManifest | None:
+        """The registry manifest registered for a root loop, when it has one."""
+        return self.registry_manifests.get(source)
+
+    def writer_fence(self, source: AgentLoop) -> SessionWriterFence | None:
+        """The session-dir write fence held for a root loop, when it has one."""
+        return _writer_fences.get(source)
+
+    def acquire_writer_fence(
+        self, source: AgentLoop, session_dir: Path
+    ) -> SessionWriterFence:
+        """Take the session-dir write fence for a root writer, fail-closed.
+
+        Reuses the held fence when the loop already fences this directory (an
+        in-place re-resume of the same session); otherwise acquires a fresh
+        flock — a second writer, in this or any other process, gets the typed
+        ``SessionBusyError``, and a missing session dir the typed
+        ``SessionDeletedError``. The lockfile is created once per session dir
+        and never unlinked while the fence is in scope.
+        """
+        held = _writer_fences.get(source)
+        if held is not None and held.path.parent == session_dir:
+            return held
+        # A fence held by ANOTHER loop for this directory is stale once that
+        # loop is closing/closed (a bare ``aclose`` does not run
+        # ``close_agent_loop``): release it so the new writer can take over.
+        # A still-live holder is refused by the flock itself, fail-closed.
+        for other, other_fence in list(_writer_fences.items()):
+            if other is not source and other_fence.path.parent == session_dir:
+                if getattr(other, "_closing", False):
+                    if _writer_fences.get(other) is other_fence:
+                        _writer_fences.pop(other, None)
+                    other_fence.release()
+        return SessionWriterFence(session_dir, source.session_id).acquire()
+
+    def install_writer_fence(
+        self, source: AgentLoop, fence: SessionWriterFence
+    ) -> None:
+        """Hold *fence* for the writer's lifetime, releasing any previous one."""
+        previous = _writer_fences.get(source)
+        if previous is not None and previous is not fence:
+            previous.release()
+        _writer_fences[source] = fence
+
+    def ensure_writer_fence(
+        self, source: AgentLoop, session_dir: Path
+    ) -> SessionWriterFence:
+        """Acquire and hold the fence (the root bind / open-for-writing path)."""
+        fence = self.acquire_writer_fence(source, session_dir)
+        self.install_writer_fence(source, fence)
+        return fence
+
+    def release_writer_fence(self, source: AgentLoop) -> None:
+        """Release the writer's fence on root close; the lockfile is kept."""
+        fence = _writer_fences.pop(source, None)
+        if fence is not None:
+            fence.release()
 
     async def retire_root_accounting(self, source: AgentLoop) -> None:
         """Release all accounting bindings retained by a finalized root runtime."""
@@ -558,7 +649,7 @@ class AgentRuntimeFactory:
         _require_session_logging(source.config)
         return _find_session_to_continue(source.config, cwd=cwd)
 
-    async def resume_root(  # noqa: PLR0914 - resume lifecycle boundary
+    async def resume_root(  # noqa: PLR0914, PLR0915 - resume lifecycle boundary
         self, source: AgentLoop, session_id: str
     ) -> None:
         """Resume a stored session by rebinding the existing loop in place.
@@ -584,10 +675,20 @@ class AgentRuntimeFactory:
         previous_session_pinned = source.session_logger.active_model is not None
         prepared_scratchpad: Path | None = None
         target_model_applied = False
+        held_fence: SessionWriterFence | None = None
+        writer_fence: SessionWriterFence | None = None
         try:
             session_path, loaded_messages, metadata = await asyncio.to_thread(
                 _load_session, source.config, session_id
             )
+            # WP3 [3D]: take the session-dir write fence before any write to
+            # the resumed session (the repair install below may migrate the
+            # transcript). A second writer gets the typed SessionBusyError.
+            held_fence = _writer_fences.get(source)
+            writer_fence = await asyncio.to_thread(
+                self.acquire_writer_fence, source, session_path
+            )
+            self.initialize_registry_manifest(source, session_path)
             # PI1/T (S4 resume install): under the held lease, fail closed on an
             # unrepairable transcript and durably migrate a repaired one BEFORE
             # the loop is rebound to the repaired messages.
@@ -669,6 +770,8 @@ class AgentRuntimeFactory:
                 bound_policy=activated_policy,
             )
             source.replace_session_lease(lease)
+            if writer_fence is not None:
+                self.install_writer_fence(source, writer_fence)
             # T2b warm-resume clear-and-reseal: the rebind above retained a
             # matching archive descriptor (the old warm-continuation rule);
             # the resume transaction now proves the rebound list hydrated
@@ -696,6 +799,10 @@ class AgentRuntimeFactory:
                 )
             if lease is not None:
                 await asyncio.to_thread(lease.release)
+            if writer_fence is not None and writer_fence is not held_fence:
+                if _writer_fences.get(source) is writer_fence:
+                    _writer_fences.pop(source, None)
+                writer_fence.release()
             raise
 
     async def finish_resume_root(self, source: AgentLoop, session_id: str) -> None:
@@ -726,9 +833,41 @@ class AgentRuntimeFactory:
         session_path, loaded_messages, metadata = await asyncio.to_thread(
             _load_session, blueprint.config, session_id
         )
-        # PI1/T (S4 resume install): under the held lease, fail closed on an
-        # unrepairable transcript and durably migrate a repaired one BEFORE the
-        # loop is built around the repaired messages.
+        # WP3 [3D]: take the session-dir write fence before any write to the
+        # resumed session (the repair install below may migrate the
+        # transcript). A second writer gets the typed SessionBusyError.
+        writer_fence = await asyncio.to_thread(
+            SessionWriterFence(session_path, session_id).acquire
+        )
+        try:
+            return await self._resume_blueprint_fenced(
+                blueprint,
+                session_id,
+                session_lease,
+                session_path,
+                loaded_messages,
+                metadata,
+                writer_fence,
+            )
+        except BaseException:
+            # Idempotent: no-op when the fence was already installed onto the
+            # built loop and released with it.
+            writer_fence.release()
+            raise
+
+    async def _resume_blueprint_fenced(
+        self,
+        blueprint: _RootRuntimeBlueprint,
+        session_id: str,
+        session_lease: SessionLease | None,
+        session_path: Path,
+        loaded_messages: list[LLMMessage],
+        metadata: dict[str, object],
+        writer_fence: SessionWriterFence,
+    ) -> AgentLoop:
+        # PI1/T (S4 resume install): under the held lease and fence, fail
+        # closed on an unrepairable transcript and durably migrate a repaired
+        # one BEFORE the loop is built around the repaired messages.
         loaded_messages, repair_pending = await asyncio.to_thread(
             _install_transcript_repair, session_path, loaded_messages, metadata
         )
@@ -771,6 +910,9 @@ class AgentRuntimeFactory:
             bound_policy=activated_policy,
             accounting_owner=accounting_owner,
         )
+        # The built loop becomes the session dir's sole writer: hold the fence
+        # for its lifetime (released on root close).
+        self.install_writer_fence(replacement, writer_fence)
         # Set messages and stats immediately so the UI can render the stored
         # transcript while the runtime (git, MCP) warms up in the background.
         # MessageList.update_system_prompt() inserts at position 0 when the
@@ -795,6 +937,7 @@ class AgentRuntimeFactory:
                 repair_messages=loaded_messages if repair_pending else None,
             )
         except BaseException:
+            self.release_writer_fence(replacement)
             await close_agent_loop(replacement)
             raise
         return replacement
@@ -849,48 +992,7 @@ class AgentRuntimeFactory:
             enabled=parent_session_dir is not None,
         )
         logging_dump = session_logging.model_dump(mode="json")
-        try:
-            overrides = orchestrator.get_layer(OverridesLayer.NAME)
-        except KeyError as exc:
-            raise RuntimeConfigurationError(
-                "Failed to configure child session logging"
-            ) from exc
-        except AttributeError:
-            # A layer stack without a builder (the test double) resolves
-            # through the public layers view.
-            overrides = next(
-                (
-                    layer
-                    for layer in orchestrator.layers
-                    if layer.name == OverridesLayer.NAME
-                ),
-                None,
-            )
-        if overrides is None:
-            orchestrator.replace_or_append_layer(
-                OverridesLayer.NAME,
-                OverridesLayer(data={"session_logging": logging_dump}),
-            )
-        else:
-            if overrides.cached_data is None or overrides.fingerprint is None:
-                await overrides.load()
-            fingerprint = overrides.fingerprint
-            if fingerprint is None:
-                raise RuntimeConfigurationError(
-                    "Failed to configure child session logging"
-                ) from None
-            # Patch the installed layer in place: copy() binds the
-            # default-layer resolver to this exact object, so replacing the
-            # object would orphan the resolver and break later name-based
-            # default-layer resolution.
-            await overrides.apply(
-                ConfigPatch(
-                    AddOperationPatch(path="/session_logging", value=logging_dump),
-                    fingerprint=fingerprint,
-                    reason="configure child session logging",
-                )
-            )
-        orchestrator.rebuild()
+        await _configure_session_logging(orchestrator, logging_dump)
         child_session_id = session_id or generate_session_id()
         lease = await asyncio.to_thread(
             _acquire_session_lease, parent.config, child_session_id
@@ -1729,6 +1831,14 @@ class HarnessProcess:
                 if context is not None
                 else generate_session_id()
             )
+            if request.session_logging is not None:
+                # A child agent process owns its transcript: bind the loop it
+                # is about to open to its own <root>/agents/<agent>_<ts>_<id>
+                # directory before the SessionLogger is constructed.
+                await _configure_session_logging(
+                    blueprint.config_orchestrator,
+                    request.session_logging.model_dump(mode="json"),
+                )
             lease = await asyncio.to_thread(
                 _acquire_session_lease, blueprint.config, session_id
             )
@@ -1739,7 +1849,11 @@ class HarnessProcess:
                     else await self.create_accounting_owner(session_id, blueprint.cwd)
                 )
                 root = blueprint.build(
-                    session_id=session_id, session_lease=lease, accounting_owner=owner
+                    parent_session_id=request.parent_session_id,
+                    session_id=session_id,
+                    session_lease=lease,
+                    accounting_owner=owner,
+                    is_subagent=request.is_subagent,
                 )
                 if context is not None:
                     # Replay content-free outcomes, not just bytes: a cold scan
@@ -1914,6 +2028,54 @@ def _project_session_mcp_server(server: SessionMCPServer) -> MCPServer:
             )
         case _:
             raise TypeError(f"Unsupported session MCP server: {type(server).__name__}")
+
+
+async def _configure_session_logging(
+    orchestrator: ConfigOrchestrator[ChartreuxConfigSchema],
+    logging_dump: dict[str, Any],
+) -> None:
+    """Bind a session's logging config to the loop it is about to build."""
+    try:
+        overrides = orchestrator.get_layer(OverridesLayer.NAME)
+    except KeyError as exc:
+        raise RuntimeConfigurationError(
+            "Failed to configure child session logging"
+        ) from exc
+    except AttributeError:
+        # A layer stack without a builder (the test double) resolves
+        # through the public layers view.
+        overrides = next(
+            (
+                layer
+                for layer in orchestrator.layers
+                if layer.name == OverridesLayer.NAME
+            ),
+            None,
+        )
+    if overrides is None:
+        orchestrator.replace_or_append_layer(
+            OverridesLayer.NAME, OverridesLayer(data={"session_logging": logging_dump})
+        )
+    else:
+        if overrides.cached_data is None or overrides.fingerprint is None:
+            await overrides.load()
+        fingerprint = overrides.fingerprint
+        if fingerprint is None:
+            raise RuntimeConfigurationError(
+                "Failed to configure child session logging"
+            ) from None
+        # Patch the installed layer in place: copy() binds the
+        # default-layer resolver to this exact object, so replacing the
+        # object would orphan the resolver and break later name-based
+        # default-layer resolution.
+        await overrides.apply(
+            ConfigPatch(
+                AddOperationPatch(path="/session_logging", value=logging_dump),
+                fingerprint=fingerprint,
+                reason="configure child session logging",
+            )
+        )
+    orchestrator.rebuild()
 
 
 def _session_config_overrides(options: SessionOptions) -> dict[str, object]:
@@ -2283,6 +2445,11 @@ async def _settle_detached_accounting_producers(
 
 
 async def close_agent_loop(agent_loop: AgentLoop) -> None:
+    # WP3 [3D]: the root writer's session-dir fence ends with the writer (the
+    # lockfile itself is kept, never unlinked while in scope).
+    fence = _writer_fences.pop(agent_loop, None)
+    if fence is not None:
+        fence.release()
     title_task = agent_loop._auto_title_task
     if title_task is not None and not title_task.done():
         agent_loop._detached_accounting_producers.add(title_task)

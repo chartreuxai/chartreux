@@ -13,6 +13,7 @@ from chartreux.app_server._model import ProtocolModel
 from chartreux.app_server.events import AppServerEvent
 from chartreux.app_server.models import PublicCallbackEntry
 from chartreux.app_server.protocol import (
+    AgentTranscriptGetResponse,
     CallbackResultError,
     CallbackResultParams,
     CallbackResultResponse,
@@ -75,6 +76,8 @@ from chartreux.app_server.protocol import (
 )
 
 type MCPAuthorizationReason = Literal["missing", "expired", "rejected", "invalid"]
+
+type AgentTranscriptReadSource = Literal["live", "disk"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -184,6 +187,46 @@ class SessionBackendError(Exception):
         self.after_response = after_response
         self.on_response_abandoned = on_response_abandoned
         super().__init__(message)
+
+
+type LiveTranscriptRefusalReason = Literal[
+    "disk_read_for_live_agent", "live_agent_unavailable"
+]
+
+
+class LiveTranscriptSourceRefused(SessionBackendError):
+    """A transcript page cannot be served from the requested source.
+
+    A live agent's transcript is paged from its registered live reader, so a
+    disk request for that agent is refused instead of silently falling back
+    to an interactive disk read.  An agent without a live page has no live
+    view at all, which is refused the same way rather than substituted.
+    """
+
+    def __init__(self, agent_id: str, *, reason: LiveTranscriptRefusalReason) -> None:
+        self.agent_id = agent_id
+        self.reason = reason
+        message = (
+            "A live agent transcript is served from its live page"
+            if reason == "disk_read_for_live_agent"
+            else "No live transcript page is available"
+        )
+        super().__init__(ProtocolErrorCode.CONFLICT, message, {"reason": reason})
+
+
+class LiveTranscriptPages(Protocol):
+    """Paged reads of live-agent transcripts, served from in-memory state."""
+
+    def is_live(self, agent_id: str) -> bool: ...
+
+    async def read_page(
+        self,
+        agent_id: str,
+        *,
+        source: AgentTranscriptReadSource,
+        before: str | None = None,
+        limit: int = 50,
+    ) -> AgentTranscriptGetResponse: ...
 
 
 @dataclass(frozen=True, slots=True)

@@ -27,8 +27,20 @@ from chartreux.app_server._subagent_records import (
     _ReplacementClaim,
     _ResumeAdmission,
 )
+from chartreux.app_server.agent_wire import (
+    TURN_OUTCOME_COMPLETED,
+    TURN_OUTCOME_FAILED,
+    TURN_OUTCOME_INTERRUPTED,
+)
 from chartreux.app_server.models import PublicTurn, PublicTurnStatus, TextContentBlock
 from chartreux.app_server.protocol import TurnInterruptParams, TurnStartParams
+from chartreux.app_server.subagent_ports import (
+    SubagentCompletion,
+    SubagentEventFeed,
+    child_result_store,
+    child_terminal_record,
+    record_child_terminal,
+)
 from chartreux.core import completion_checks
 from chartreux.core.agent_loop import AgentLoop
 from chartreux.core.agent_loop.resume_progress import (
@@ -391,6 +403,50 @@ async def finalize_run_with_drain(
     finally:
         if completion_checks.spawn_shell_command is tracking_spawn:
             completion_checks.spawn_shell_command = original_spawn
+
+
+async def publish_child_terminal(
+    *,
+    child_loop: AgentLoop,
+    agent_id: str,
+    run_id: str | None,
+    completion: SubagentCompletion,
+    feed: SubagentEventFeed | None,
+) -> None:
+    """Publish one child's terminal state: durable record first, frame second.
+
+    Save-before-emit ([5E]): the child's terminal result record ([5C]) is
+    written atomically before the terminal completion frame is relayed, so a
+    crash right after the publication reconciles as the run's terminal
+    outcome instead of an unknown one. The frame half is the [5B] feed's
+    exactly-once terminal publication; a run without a feed (relaying
+    disabled) still writes its durable record. A publication failure is
+    logged and never concealed as a successful publication.
+    """
+    if run_id is not None:
+        session_id = getattr(child_loop, "session_id", None)
+        store = child_result_store(child_loop)
+        if store is not None and isinstance(session_id, str):
+            written = await record_child_terminal(
+                store,
+                child_terminal_record(
+                    agent_id=agent_id,
+                    session_id=session_id,
+                    run_id=run_id,
+                    outcome=completion.outcome,
+                    error=completion.error,
+                ),
+            )
+            if not written:
+                logger.warning(
+                    "Failed to record the child terminal result for %s", agent_id
+                )
+    if feed is None or run_id is None:
+        return
+    try:
+        await feed.publish_terminal(completion)
+    except Exception:
+        logger.warning("subagent completion relay failed", exc_info=True)
 
 
 def _tool_call_effect_sets(messages: Sequence[LLMMessage]) -> tuple[set[str], set[str]]:
@@ -762,6 +818,9 @@ class ForegroundExecutionContext:
     # P2/P3: the receipt sink installed on the child loop at admission (the
     # run accumulator's side-channel callback); cleared at run teardown.
     completion_evidence_sink: Callable[[CompletionEvidenceReceipt], None] | None = None
+    # WP5 [5B]: the run's incarnation-stamped event feed into the coordinator
+    # event feed; None disables relaying (zero behavior change).
+    feed: SubagentEventFeed | None = None
 
     async def consume_event(self, event: BaseEvent) -> None:
         """Feed one child event into the bounded progress queue.
@@ -853,6 +912,9 @@ class BackgroundExecutionContext:
     # override_cooldown launch, taken pre-start (the child's first model
     # call consumes the coordinator binding); None for ordinary launches.
     override_diagnostics: dict[str, object] | None = None
+    # WP5 [5B]: the run's incarnation-stamped event feed into the coordinator
+    # event feed; None disables relaying (zero behavior change).
+    feed: SubagentEventFeed | None = None
 
     async def consume_event(self, event: BaseEvent) -> None:
         """Feed one child event into the run record's progress summaries.
@@ -1856,19 +1918,17 @@ class SubagentExecution:
                 context.run_record.result = context.run_record.result.model_copy(
                     update={"stop_reason": context.run_record.stop_reason}
                 )
-            active_task = context.runtime.turns._active_task
-            if context.record.reserved_for_replacement:
-                # The old execution is joined, but its allocation now
-                # belongs to the handoff, including notification awaits.
-                pass
-            elif active_task is not None and not active_task.done():
-                # Release/drain may cancel the monitor before provider
-                # cancellation finishes; keep counting the actual work.
-                active_task.add_done_callback(
-                    lambda _: self._view._active_work_slots.discard(slot)
-                )
-            else:
-                self._view._active_work_slots.discard(slot)
+            # WP5 [5E]: the run's single terminal completion frame is published
+            # durably BEFORE its capacity slot is released — save-before-emit:
+            # the child's terminal result record ([5C]) exists first, so a
+            # coordinator reconciliation can always adjudicate the run, and no
+            # admission observes free capacity while the publication is still
+            # outstanding. A cancellation landing inside the publication still
+            # releases the slot (the inner finally) and then propagates.
+            try:
+                await self._publish_terminal(context)
+            finally:
+                self._release_work_slot(context, slot)
             context.runtime.turns._event_sink = context.previous_event_sink
             if context.runtime.agent_loop.run_identity == context.run_id:
                 context.runtime.agent_loop.run_identity = None
@@ -2092,6 +2152,67 @@ class SubagentExecution:
     # ------------------------------------------------------------------
     # P2b: the reconciliation sweep (the guaranteed notification backstop).
     # ------------------------------------------------------------------
+
+    def _release_work_slot(
+        self, context: BackgroundExecutionContext, slot: _ActiveWorkSlot
+    ) -> None:
+        """Release the run's capacity slot after its terminal publication."""
+        active_task = context.runtime.turns._active_task
+        if context.record.reserved_for_replacement:
+            # The old execution is joined, but its allocation now
+            # belongs to the handoff, including notification awaits.
+            pass
+        elif active_task is not None and not active_task.done():
+            # Release/drain may cancel the monitor before provider
+            # cancellation finishes; keep counting the actual work.
+            active_task.add_done_callback(
+                lambda _: self._view._active_work_slots.discard(slot)
+            )
+        else:
+            self._view._active_work_slots.discard(slot)
+
+    @staticmethod
+    def _terminal_completion(context: BackgroundExecutionContext) -> SubagentCompletion:
+        """The run record's terminal state mapped to its completion frame."""
+        status = context.run_record.status
+        if status is RunStatus.COMPLETED:
+            outcome = TURN_OUTCOME_COMPLETED
+        elif status is RunStatus.CANCELLED or (
+            status is RunStatus.FAILED
+            and context.run_record.stop_reason is RunStopReason.USER_CANCELLED
+        ):
+            outcome = TURN_OUTCOME_INTERRUPTED
+        else:
+            outcome = TURN_OUTCOME_FAILED
+        failure = context.run_record.failure
+        return SubagentCompletion(
+            outcome=outcome,
+            error=(
+                f"{failure.failure.failure_class}: {failure.failure.message}"
+                if failure is not None
+                else None
+            ),
+        )
+
+    async def _publish_terminal(self, context: BackgroundExecutionContext) -> None:
+        """Publish the run's terminal frame durably, exactly once ([5E]).
+
+        The durable half is the child-owned terminal result record ([5C]):
+        for a child that owns a transcript directory the record is written
+        save-before-emit, so a crash right after the publication reconciles
+        as completed (or as the run's terminal outcome) instead of an unknown
+        outcome. The frame half is the [5B] feed's exactly-once terminal
+        publication. A publication failure is logged and never concealed as
+        a successful drain.
+        """
+        completion = self._terminal_completion(context)
+        await publish_child_terminal(
+            child_loop=context.runtime.agent_loop,
+            agent_id=context.agent_id,
+            run_id=context.run_id,
+            completion=completion,
+            feed=context.feed,
+        )
 
     def _find_run_record(self, agent_id: str, run_id: str) -> RunRecord | None:
         """Locate a terminal run record for the notification payload (view read)."""
