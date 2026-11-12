@@ -45,7 +45,8 @@ def test_recursive_rm_original_option_is_a_hard_guard_without_alternative(
     assert result is not None and result.permission == ToolPermission.NEVER
     assert result.reason == (
         f"Command denied: recursive rm option '{token}' in 'rm {token} file'. "
-        "This is a hard guard regardless of target."
+        "This is a hard guard outside the clean-tree and session scratchpad "
+        "carve-outs."
     )
     assert not any(marker in (result.reason or "") for marker in _ALTERNATIVE_MARKERS)
 
@@ -202,7 +203,7 @@ def test_recursive_rm_option_cluster_is_escaped(tmp_path: Path, suffix: str) -> 
     assert result is not None and result.permission == ToolPermission.NEVER
     assert result.reason and "recursive rm option '-rf" in result.reason
     assert suffix not in result.reason
-    assert "hard guard regardless of target" in result.reason
+    assert "hard guard outside the clean-tree" in result.reason
 
 
 @pytest.mark.parametrize(
@@ -433,7 +434,7 @@ def test_syntax_aggregate_joins_related_alternatives() -> None:
         ("denylist", "matches denylist pattern"),
         ("standalone", "is not allowed as a standalone command"),
         ("dangerous_command", "requires approval for a dangerous git operation"),
-        ("recursive_rm", "This is a hard guard regardless of target."),
+        ("recursive_rm", "This is a hard guard outside the clean-tree"),
         ("path_glob", "cannot be safely inspected"),
         ("eval_exec", "eval and exec cannot be safely inspected"),
         ("protected_env", "unsetting a protected shell environment variable"),
@@ -519,10 +520,10 @@ def test_syntax_alternative_survives_redaction_and_bounds() -> None:
             "use the edit tool to modify files",
         ),
         (
-            "python3 << 'EOF'\nprint(42)\nEOF",
-            "heredocs are unsupported in v0.1",
-            "use write_file to create the content, or use read_file with "
-            "offset and limit, grep, and the edit tool for existing files",
+            "python3 - <<EOF\nprint(42)\nEOF",
+            "unquoted heredoc delimiter",
+            "quote the delimiter (`<<'EOF'`) so the body stays literal, or use "
+            "write_file to create the content",
         ),
         (
             "for i in 1 2; do echo $i; done",
@@ -549,7 +550,7 @@ def test_syntax_alternative_survives_redaction_and_bounds() -> None:
     ],
 )
 def test_syntax_denials_name_alternative_end_to_end(
-    tmp_path: Path, command: str, requirement: str, alternative: str
+    tmp_path: Path, command: str, requirement: str, alternative: str, zsh_executor
 ) -> None:
     tool = Bash(config_getter=BashToolConfig, state=BaseToolState(), cwd=tmp_path)
     result = tool.resolve_permission(BashArgs(command=command))
@@ -564,20 +565,12 @@ def test_syntax_denials_name_alternative_end_to_end(
 @pytest.mark.parametrize(
     ("command", "requirements"),
     [
-        ("rm -r build", ("This is a hard guard regardless of target.",)),
+        ("rm -r build", ("This is a hard guard outside the clean-tree",)),
         ("python3", ("is not allowed as a standalone command",)),
         ("vim file.txt", ("matches denylist pattern 'vim'",)),
         ("eval 'echo hi'", ("eval and exec cannot be safely inspected",)),
-        (
-            "PYTHONPATH=/abs python x",
-            ("dangerous environment assignment", "PYTHONPATH"),
-        ),
+        ("PYTHONPATH=.. python x", ("dangerous environment assignment", "PYTHONPATH")),
         ("LD_PRELOAD=x ls", ("dangerous environment assignment", "PRELOAD")),
-        ("foo=bar ls", ("an environment assignment with a non-uppercase name",)),
-        (
-            "unset PATH",
-            ("unsetting shell environment variables cannot be safely inspected",),
-        ),
         (
             "hash -p /usr/bin/curl harmless",
             ("unsupported command lookup modification", "hash"),
@@ -606,9 +599,9 @@ def test_policy_denials_suggest_nothing_end_to_end(
     "command",
     [
         # Unmodeled syntax plus a policy violation in one command.
-        "PYTHONPATH=/abs cat $(ls)",
-        # A non-literal redirect target expands a variable.
-        "echo hi > $TMP/x",
+        "PYTHONPATH=.. cat $(ls)",
+        # Unmodeled syntax plus a dangerous environment assignment.
+        "PYTHONPATH=.. echo hi > $TMP/x",
         # A herestring leaves an unrecognized node in the command.
         "cat <<<x",
     ],
@@ -655,21 +648,23 @@ def test_mixed_syntax_and_dangerous_authority_renders_as_policy(tmp_path: Path) 
     assert "Instead," in (result.reason or "")
 
 
-def test_authorization_outcomes_are_unchanged(tmp_path: Path) -> None:
+def test_authorization_outcomes_are_unchanged(tmp_path: Path, zsh_executor) -> None:
     # The class-aware messages change denial text and typing only: no
-    # currently-denied command becomes allowed and vice versa.
+    # currently-denied command becomes allowed and vice versa. The equals row
+    # is the zsh equals-expansion family (pinned: the shipped bash default
+    # does not expand the marker).
     tool = Bash(config_getter=BashToolConfig, state=BaseToolState(), cwd=tmp_path)
     denied = [
         "rm -r build",
         "cat $(locate chartreux)",
-        "python3 << 'EOF'\nprint(42)\nEOF",
+        "python3 <<EOF\nprint(42)\nEOF",
         "for i in 1 2; do echo $i; done",
         "echo =ls",
         "echo $HOME",
         "python3",
         "vim file.txt",
         "eval 'echo hi'",
-        "PYTHONPATH=/abs python x",
+        "PYTHONPATH=.. python x",
         "unset PATH",
         "echo hi > .git/config",
         "cd / && pwd",
@@ -685,6 +680,8 @@ def test_authorization_outcomes_are_unchanged(tmp_path: Path) -> None:
         "echo hi > out.txt",
         "echo hi 2>&1",
         "echo hi > /dev/null",
+        # A quoted-delimiter heredoc is admitted: the body stays literal.
+        "python3 - <<'EOF'\nprint(42)\nEOF",
     ]
     for command in denied:
         result = tool.resolve_permission(BashArgs(command=command))

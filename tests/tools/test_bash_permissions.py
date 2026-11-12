@@ -566,8 +566,9 @@ def test_s3_local_reads_and_writes_are_collected_before_egress_authority(
 
     assert isinstance(permission, PermissionContext)
     assert permission.permission is ToolPermission.NEVER
-    # The path denial, not an egress classification: no operation to grant.
-    assert permission.denial_kind is None
+    # The path denial, not an egress classification: the path layer's own
+    # out-of-root kind, with no dangerous operation to grant.
+    assert permission.denial_kind == "out_of_root"
     assert permission.dangerous_command_proposal is None
     assert "outside the authorized workspace" in (permission.reason or "")
 
@@ -2096,7 +2097,6 @@ def test_dangerous_git_forms_require_dangerous_command_approval_by_default(
     ("command", "operation_ids"),
     [
         ("git checkout main", ("git.checkout",)),
-        ("git checkout -b feature", ("git.checkout",)),
         ("git --no-pager checkout main", ("git.checkout",)),
     ],
 )
@@ -2104,9 +2104,9 @@ def test_dangerous_git_checkout_forms_require_approval_outside_the_exemption(
     command, operation_ids, tmp_path
 ):
     # A2 re-pin: the clean-tree checkout exemption is state-aware, so the
-    # checkout forms keep requiring dangerous-command approval when the
-    # process cwd is not an exempt clean repository. The re-pin context is
-    # an unborn-branch repository with an untracked file: no local branch
+    # switch forms keep requiring dangerous-command approval when the process
+    # cwd is not an exempt clean repository. The re-pin context is an
+    # unborn-branch repository with an untracked file: no local branch
     # exists and the tree is dirty, so the guardrails fail closed and the
     # denial keeps its original whole-call proposal shape.
     repo = tmp_path / "repo"
@@ -2132,6 +2132,29 @@ def test_dangerous_git_checkout_forms_require_approval_outside_the_exemption(
     assert proposal.operations == operation_ids
     assert proposal.command == tuple(shlex.split(command))
     assert proposal.consequence
+
+
+@pytest.mark.parametrize(
+    "command", ["git checkout -b feature", "git checkout -b feature main"]
+)
+def test_routine_branch_creation_passes_the_dirty_unborn_repository(command, tmp_path):
+    # P3 flip of the A2 re-pin: the same unborn-branch repository with an
+    # untracked file leaves the creation form routine — it carries no
+    # dangerous operation and no state guardrail gates it.
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(
+        ["git", "init", "-q", "-b", "main", str(repo)], check=True, capture_output=True
+    )
+    (repo / "untracked.txt").write_text("untracked\n", encoding="utf-8")
+    bash_tool = Bash(
+        config_getter=lambda: BashToolConfig(), state=BaseToolState(), cwd=repo
+    )
+
+    permission = bash_tool.resolve_permission(BashArgs(command=command))
+
+    assert permission is None or permission.permission is ToolPermission.ALWAYS, command
+    assert permission is None or permission.dangerous_command_proposal is None, command
 
 
 @pytest.mark.parametrize(
@@ -2493,7 +2516,7 @@ def test_eval_and_exec_are_denied(command):
 @pytest.mark.parametrize(
     "command",
     [
-        "cat <<'EOF'\nhi\nEOF",
+        "cat <<EOF\nhi\nEOF",
         "FOO=bar",
         "echo $(id)",
         "&&",
@@ -2502,7 +2525,9 @@ def test_eval_and_exec_are_denied(command):
         "echo ${(e)payload}",
     ],
 )
-def test_unmodeled_shell_syntax_is_denied(command):
+def test_unmodeled_shell_syntax_is_denied(command, zsh_executor):
+    # The equals row is the zsh equals-expansion family: the shipped bash
+    # default does not expand the marker, so the family is pinned here.
     tool = Bash(config_getter=lambda: BashToolConfig(), state=BaseToolState())
     result = tool.resolve_permission(BashArgs(command=command))
     assert result is not None and result.permission is ToolPermission.NEVER
@@ -2569,6 +2594,18 @@ def test_shell_analysis_failures_are_denied(command):
         "CI=1 npm test",
         "PYTHONPATH=. python -m pytest",
         "PYTHONPATH=./lib python -m pytest",
+        # P1d: absolute PYTHONPATH entries are the documented worktree
+        # recipe; assignment name case no longer decides admission.
+        "PYTHONPATH=/tmp python3 -m pytest",
+        "PYTHONPATH=.:/tmp python3 -m pytest",
+        "PYTHONPATH=/tmp/worktree uv run --project . --no-sync pytest",
+        "UV_CACHE_DIR=/tmp/uv-cache uv run pytest",
+        "UV_PROJECT_ENVIRONMENT=/tmp/env uv run pytest",
+        "TMPDIR=/tmp/x uv run pytest",
+        "lower=value cmd",
+        "env lower=value git status",
+        "export PYTHONPATH=/tmp; python3 -m pytest",
+        "declare -x PYTHONPATH=/tmp; python3 -m pytest",
     ],
 )
 def test_safe_literal_environment_prefixes_are_allowed(command, tmp_path):
@@ -2585,15 +2622,16 @@ def test_safe_literal_environment_prefixes_are_allowed(command, tmp_path):
         "PATH=/tmp git status",
         "LESS=-o/tmp/output less README.md",
         "HOME=/tmp git status",
-        "PYTHONPATH=/tmp python3 -m pytest",
         "PYTHONPATH=../lib python3 -m pytest",
         "PYTHONPATH=~/lib python3 -m pytest",
-        "PYTHONPATH=.:/tmp python3 -m pytest",
+        "PYTHONPATH=/tmp:.. python3 -m pytest",
         "GIT_EXTERNAL_DIFF=cat git diff",
         "LD_PRELOAD=plugin.so cmd",
         "NODE_OPTIONS=--inspect node",
+        "PYTHONINSPECT=1 python3 -m pytest",
         "CI=$X cmd",
-        "lower=value cmd",
+        "env HOME=/tmp git status",
+        "export HOME=/tmp; git status",
     ],
 )
 def test_unsafe_environment_prefixes_are_denied(command, tmp_path):
@@ -3279,6 +3317,82 @@ def test_benign_file_operands_remain_allowed(tmp_path: Path, command: str) -> No
     assert _w11_permission(command, tmp_path).permission is ToolPermission.ALWAYS
 
 
+@pytest.mark.parametrize(
+    "command",
+    [
+        "wc -l okay.txt",
+        "cat -n okay.txt",
+        "head -n 2 okay.txt",
+        "sort okay.txt",
+        "uniq okay.txt",
+        "wc -l",
+    ],
+)
+def test_non_glob_option_calls_take_the_ordinary_path(
+    tmp_path: Path, command: str
+) -> None:
+    # P2: an option word in a call with no glob operand is not a path-glob
+    # candidate, so the ordinary path inspection decides the call.
+    (tmp_path / "okay.txt").write_text("x\n", encoding="utf-8")
+
+    assert _w11_permission(command, tmp_path).permission is ToolPermission.ALWAYS
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        # A glob-bearing option call cannot bind a literal plan: the option
+        # word never becomes a plan operand.
+        "wc -l *.okay",
+        "cat -n *.okay",
+        # The read-modal transport refuses the table-classified write
+        # position: a second match would be uniq's OUTPUT file.
+        "uniq *.okay",
+    ],
+)
+def test_glob_calls_beyond_the_read_transport_stay_denied(
+    tmp_path: Path, command: str
+) -> None:
+    (tmp_path / "alpha.okay").write_text("a\n", encoding="utf-8")
+    (tmp_path / "beta.okay").write_text("b\n", encoding="utf-8")
+
+    result = _w11_permission(command, tmp_path)
+
+    assert result.permission is ToolPermission.NEVER
+    assert "path glob candidate" in (result.reason or "")
+
+
+def test_single_match_read_glob_binds_the_literal_plan(tmp_path: Path) -> None:
+    (tmp_path / "only.okay").write_text("a\n", encoding="utf-8")
+
+    assert _w11_permission("sort *.okay", tmp_path).permission is ToolPermission.ALWAYS
+    assert _w11_permission("uniq *.okay", tmp_path).permission is ToolPermission.ALWAYS
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "cat <<'EOF'\nhi\nEOF",
+        "sort <<'EOF'\nb\na\nEOF",
+        "python3 - <<'EOF'\nprint(1)\nEOF",
+    ],
+)
+def test_quoted_heredoc_feeding_a_stdin_consumer_is_routine(
+    tmp_path: Path, command: str
+) -> None:
+    assert _w11_permission(command, tmp_path).permission is ToolPermission.ALWAYS
+
+
+def test_unquoted_heredoc_stays_denied_but_names_the_quoted_form(
+    tmp_path: Path,
+) -> None:
+    result = _w11_permission("python3 - <<EOF\nprint(1)\nEOF", tmp_path)
+
+    assert result.permission is ToolPermission.NEVER
+    assert "unquoted heredoc delimiter" in (result.reason or "")
+    assert "quote the delimiter" in (result.reason or "")
+
+
 def test_rsync_local_copy_without_a_remote_operand_is_routine(tmp_path: Path) -> None:
     # v0.7.1 S4b2c: rsync left the shipped denylist once the bounded
     # transfer grammar was modeled; with no remote operand the path layer
@@ -3416,7 +3530,8 @@ def test_executor_inner_commands_reenter_hard_policy(
     # alternative deletion method is suggested.
     assert result.reason == (
         "Command denied: recursive rm option '-r' in 'rm -r build'. "
-        "This is a hard guard regardless of target."
+        "This is a hard guard outside the clean-tree and session scratchpad "
+        "carve-outs."
     )
 
 
@@ -3615,10 +3730,10 @@ def test_non_run_uv_package_policy_stays_pinned(
             "use the edit tool to modify files",
         ),
         (
-            "python3 << 'EOF'\nprint(42)\nEOF",
-            "heredocs are unsupported in v0.1",
-            "use write_file to create the content, or use read_file with "
-            "offset and limit, grep, and the edit tool for existing files",
+            "python3 <<EOF\nprint(42)\nEOF",
+            "unquoted heredoc delimiter",
+            "quote the delimiter (`<<'EOF'`) so the body stays literal, or use "
+            "write_file to create the content",
         ),
         (
             "for i in 1 2; do echo $i; done",
@@ -3645,7 +3760,7 @@ def test_non_run_uv_package_policy_stays_pinned(
     ],
 )
 def test_syntax_denials_name_the_compliant_alternative(
-    bash, command: str, requirement: str, alternative: str
+    bash, command: str, requirement: str, alternative: str, zsh_executor
 ) -> None:
     # A SYNTAX denial (unmodeled v0.1 construct) names the compliant
     # alternative concretely.
@@ -3660,18 +3775,11 @@ def test_syntax_denials_name_the_compliant_alternative(
 @pytest.mark.parametrize(
     ("command", "requirements"),
     [
-        ("rm -r build", ("This is a hard guard regardless of target.",)),
+        ("rm -r build", ("This is a hard guard outside the clean-tree",)),
         ("python3", ("is not allowed as a standalone command",)),
         ("vim file.txt", ("matches denylist pattern 'vim'",)),
         ("eval 'echo hi'", ("eval and exec cannot be safely inspected",)),
-        (
-            "PYTHONPATH=/abs python x",
-            ("dangerous environment assignment", "PYTHONPATH"),
-        ),
-        (
-            "unset PATH",
-            ("unsetting shell environment variables cannot be safely inspected",),
-        ),
+        ("PYTHONPATH=.. python x", ("dangerous environment assignment", "PYTHONPATH")),
         ("echo hi > .git/config", ("redirection to protected Git metadata",)),
         ("find . -exec id \\;", ("find execution predicates are not permitted",)),
     ],
@@ -3700,7 +3808,7 @@ def test_policy_denials_state_the_requirement_and_suggest_nothing(
     "command",
     [
         # Unmodeled syntax plus a policy violation in one command.
-        "PYTHONPATH=/abs cat $(ls)",
+        "PYTHONPATH=.. cat $(ls)",
         # A herestring leaves an unrecognized node in the command.
         "cat <<<x",
     ],
@@ -3775,7 +3883,9 @@ def test_equals_expansion_authorizes_the_resolved_command(bash) -> None:
     assert "matches denylist pattern 'vim'" in (context.reason or "")
 
 
-def test_equals_unresolvable_denies_with_the_established_message(bash) -> None:
+def test_equals_unresolvable_denies_with_the_established_message(
+    bash, zsh_executor
+) -> None:
     context = bash.resolve_permission(BashArgs(command="=notacommand-xyz -la"))
     assert context is not None and context.permission is ToolPermission.NEVER
     reason = context.reason or ""
@@ -3796,7 +3906,7 @@ def test_dangerous_environment_still_denies_with_expansion_present(
     bash, locate_file: str
 ) -> None:
     context = bash.resolve_permission(
-        BashArgs(command="X=5; PYTHONPATH=/abs grep -m $X lit lines.txt")
+        BashArgs(command="X=5; PYTHONPATH=.. grep -m $X lit lines.txt")
     )
     assert context is not None and context.permission is ToolPermission.NEVER
     reason = context.reason or ""

@@ -195,7 +195,6 @@ def test_benign_shell_forms(bash_tool: Bash, command: str) -> None:
         "env PATH=/tmp npm test",
         "env GIT_CONFIG_GLOBAL=fixture git status",
         "env PYTHONPATH=../outside pytest",
-        "env ci=1 npm test",
         "env CI=1 rm -rf src",
     ],
 )
@@ -297,6 +296,14 @@ def test_executable_configuring_environment_is_denied(
         "NO_COLOR",
         "PIP_DISABLE_PIP_VERSION_CHECK",
         "UV_NO_SYNC",
+        # Lowercase and mixed-case names are admitted: the name case no
+        # longer decides, only the protected-name tables and the value.
+        "ci",
+        "lower_name",
+        "Mixed_Case",
+        "TMPDIR",
+        "UV_CACHE_DIR",
+        "UV_PROJECT_ENVIRONMENT",
     ],
 )
 def test_benign_environment_controls(bash_tool: Bash, prefix: str, name: str) -> None:
@@ -931,8 +938,82 @@ def test_find_leading_option_tokens_are_skipped() -> None:
     ]).requires_approval
 
 
-def test_xargs_always_requires_approval() -> None:
+def test_xargs_dispatches_only_a_modeled_read_subcommand() -> None:
+    """xargs is modeled only as a closed-grammar read dispatch (v0.7.8 P5)."""
+    # An unmodeled subcommand keeps the shipped blanket denial.
     assert analyze_shell_command_policy(["xargs", "echo"]).requires_approval
+    assert analyze_shell_command_policy(["xargs", "git", "push"]).requires_approval
+    assert analyze_shell_command_policy(["xargs"]).requires_approval
+    # The modeled read subcommands are admitted, with their operands surfaced
+    # for path inspection and their own option values carried through.
+    for tokens in (
+        ["xargs", "-0", "grep", "pat"],
+        ["xargs", "-0", "cat"],
+        ["xargs", "wc", "-l", "f"],
+        ["xargs", "sort", "-r"],
+        ["xargs", "-a", "list", "cat"],
+        ["xargs", "--null", "--max-args=2", "cat"],
+        # -I substitutes one input word per placed operand, so an explicit
+        # replacement spelling cannot word-split or add arguments.
+        ["xargs", "-I", "R", "cat", "R"],
+    ):
+        policy = analyze_shell_command_policy(tokens)
+        assert not policy.requires_approval, tokens
+        assert policy.inspect_positional_paths, tokens
+    assert analyze_shell_command_policy([
+        "xargs",
+        "-a",
+        "list",
+        "cat",
+    ]).option_path_values == ("list",)
+    assert analyze_shell_command_policy([
+        "xargs",
+        "grep",
+        "-f",
+        "pats",
+    ]).option_path_values == ("pats",)
+
+
+@pytest.mark.parametrize(
+    "tokens",
+    [
+        # uniq's second positional is its output file, and xargs appends an
+        # unbounded number of words, so the write position is always reachable.
+        ["xargs", "uniq"],
+        ["xargs", "uniq", "in"],
+        # The dispatched command's own write surface stays denied.
+        ["xargs", "sort", "-o", "out", "in"],
+        ["xargs", "sort", "--output=out", "in"],
+        ["xargs", "sort", "--files0-from", "list"],
+        ["xargs", "wc", "--files0-from", "list"],
+        # Unmodeled options, including the interactive prompt.
+        ["xargs", "-p", "cat"],
+        ["xargs", "--interactive", "cat"],
+        ["xargs", "-n"],
+        ["xargs", "--show-limits", "cat"],
+        # Unmodeled and path-spelled subcommands.
+        ["xargs", "rm", "-rf", "build"],
+        ["xargs", "/bin/cat"],
+        ["xargs", "--", "sed", "cat"],
+    ],
+)
+def test_xargs_write_positions_and_unmodeled_forms_require_approval(
+    tokens: list[str],
+) -> None:
+    assert analyze_shell_command_policy(tokens).requires_approval
+
+
+def test_xargs_short_clusters_and_attached_values() -> None:
+    # Boolean flags cluster; a value-taking flag ends the cluster.
+    assert not analyze_shell_command_policy(["xargs", "-0rt", "cat"]).requires_approval
+    assert not analyze_shell_command_policy(["xargs", "-n1", "cat"]).requires_approval
+    assert analyze_shell_command_policy(["xargs", "-0q", "cat"]).requires_approval
+    # An attached -a value is still a path value.
+    assert analyze_shell_command_policy([
+        "xargs",
+        "-alist",
+        "cat",
+    ]).option_path_values == ("list",)
 
 
 @pytest.mark.parametrize(
@@ -1264,8 +1345,6 @@ def test_less_option_resume_has_bounded_depth() -> None:
         "PIP_TARGET=/etc pip install pkg",
         "PIP_PREFIX=/etc pip install pkg",
         "PIP_CACHE_DIR=/tmp/pip-cache pip install pkg",
-        "UV_PROJECT_ENVIRONMENT=/etc uv sync",
-        "UV_CACHE_DIR=/tmp/uv-cache uv sync",
         "PIP_CONFIG_FILE=config pip install pkg",
         "UV_CONFIG_FILE=config uv pip install pkg",
         "UV_TARGET=/etc uv pip install pkg",
@@ -1615,8 +1694,8 @@ def test_cd_chains_with_redirects_are_allowed(workspace: Path, command: str) -> 
         # closed on the unknown working directory.
         ("popd +1 && grep x file.txt > out.log", "not statically known"),
         ("cd - && grep x file.txt > out.log", "not statically known"),
-        # Heredocs stay fail-closed (documented residual).
-        ("cd sub && cat <<EOF > out.log\nhi\nEOF", "heredocs are unsupported"),
+        # Unquoted heredocs stay fail-closed (documented residual).
+        ("cd sub && cat <<EOF > out.log\nhi\nEOF", "unquoted heredoc delimiter"),
     ],
 )
 def test_cd_chains_with_redirects_still_fail_closed(

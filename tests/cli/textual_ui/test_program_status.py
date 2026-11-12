@@ -1423,13 +1423,18 @@ class TestBashSettlementOrdering:
             await app._dispatch_idle_input("!sleep 30")
             assert app._is_busy() is True
             await _wait_until(lambda: _emitted_calls(emitter) == [("working", None)])
-            # A prompt submitted now takes the busy branch: no turn start, no
-            # second bump, no report from the turn path.
+            # Item-5 A.4: a prompt submitted now is user input like any other —
+            # accepted and queued, never refused for the running shell command.
+            # No turn start, no second bump, no report from the turn path.
             await app._dispatch_submitted_value("hello")
             turn_start.assert_not_called()
             assert app._record_epoch == epoch + 1
             assert app.turn_epoch_map == {}
             assert app._pending_start_epoch is None
+            assert not any(
+                "cannot be queued" in notification.message
+                for notification in app._notifications
+            )
             task = app._bash_task
             assert task is not None
             task.cancel()

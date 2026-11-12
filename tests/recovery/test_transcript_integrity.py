@@ -53,7 +53,10 @@ from chartreux.app_server._sessions import SessionRuntimeRegistry
 from chartreux.app_server._turns import TurnConflictError
 from chartreux.app_server._utils import public_error
 from chartreux.app_server.models import (
+    FailedEffectState,
+    PublicEffectEntry,
     PublicError,
+    PublicTurnStatus,
     RootRecoveryNoticeDetail,
     TextContentBlock,
     TurnErrorCode,
@@ -149,18 +152,19 @@ from chartreux.core.session.session_loader import (
 from chartreux.core.session.session_logger import SessionLogger
 from chartreux.core.session_types import AgentStats
 from chartreux.core.skills.models import ParsedSkillCommand, SkillInfo
-from chartreux.core.subagents import SubagentRunnerPort
+from chartreux.core.subagents import SubagentRunnerPort, TaskResult
 from chartreux.core.tools.manager import ToolManager
 from chartreux.core.tools.secret_redaction import ScrubPolicy
 from chartreux.core.utils.tags import CancellationReason, get_user_cancellation_message
 from chartreux.questions import UserAnswer, UserQuestionResult
+from chartreux.utils.retry_prompt import build_retry_prompt
 from tests.agent_loop.test_agent_steer_tool_call import (
     _assert_tool_calls_immediately_paired,
 )
 from tests.agent_loop.test_agent_wait_steering import WaitManager, make_loop, wait_call
 from tests.conftest import build_test_agent_loop, build_test_vibe_config
 from tests.mock.utils import mock_llm_chunk
-from tests.recovery.conftest import FakeClock
+from tests.recovery.conftest import ControlledTransport, FakeClock
 from tests.recovery.test_root_recovery import _failure, _payload_summary, _timeout_error
 from tests.stubs.fake_backend import FakeBackend
 
@@ -4658,3 +4662,221 @@ class TestRequestPrepMemoTypedFailures:
         prep = gateway._prepare_backend_messages(inputs_ok)
         assert gateway._prepare_backend_messages(inputs_ok) is prep
         assert calls == [1, 1, 1]
+
+
+# ---------------------------------------------------------------------------
+# Item 2 B.1 — a stream truncation settles its in-flight tool effect
+# ---------------------------------------------------------------------------
+
+_RETRY_WARNING_TEXT = "recent actions may repeat"
+_CHILD_RESULT = "child result"
+
+
+def _settled_child(manager: WaitManager) -> None:
+    """Resolve the first child wait so its tool result is recorded."""
+    future: asyncio.Future[TaskResult] = asyncio.get_running_loop().create_future()
+    future.set_result(TaskResult(response=_CHILD_RESULT, turns_used=1, completed=True))
+    manager.results["child_done"] = future
+
+
+def _truncating_loop() -> tuple[AgentLoop, FakeBackend]:
+    """A root loop whose second model step truncates with a call in flight.
+
+    Step one requests a tool call and settles it; step two streams a second
+    call and ends without a finish reason — the incident's shape (the in-flight
+    effect is the streamed call the truncation never executed).
+    """
+    backend = FakeBackend([
+        [
+            mock_llm_chunk(
+                content="",
+                tool_calls=[wait_call("child_done")],
+                stop_reason="tool_calls",
+            )
+        ],
+        [
+            mock_llm_chunk(
+                content="",
+                tool_calls=[wait_call("child_in_flight", 1)],
+                stop_reason=None,
+            )
+        ],
+        [mock_llm_chunk(content="recovered")],
+    ])
+    loop = build_test_agent_loop(
+        config=build_test_vibe_config(enabled_tools=["wait_for_agent"]),
+        backend=backend,
+        enable_streaming=True,
+    )
+    return loop, backend
+
+
+async def _truncating_runtime() -> tuple[AgentLoop, FakeBackend, WaitManager, Any]:
+    """One root runtime whose first turn truncates mid-stream."""
+    loop, backend = _truncating_loop()
+    manager = WaitManager()
+    _settled_child(manager)
+    registry = SessionRuntimeRegistry(AsyncMock(), AsyncMock(), lambda _: 0)
+    root = registry._build_child_runtime(loop)
+    root.turns._subagent_runner = cast(SubagentRunnerPort, manager)
+    return loop, backend, manager, root
+
+
+@pytest.mark.asyncio
+async def test_truncation_settles_the_in_flight_effect_and_admits_the_retry() -> None:
+    """Item 2 B.1 / criterion 5: the truncation's in-flight tool effect settles
+    within the bounded grace — the recorded "Turn ended" failure of a call the
+    truncation never executed — so the root gate admits the automatic retry,
+    which keeps the completed tool result and carries the shipped warning.
+    """
+    loop, backend, _manager, root = await _truncating_runtime()
+    try:
+        response, action = root.turns.start(
+            TurnStartParams(
+                session_id=loop.session_id, message=[TextContentBlock(text="start")]
+            )
+        )
+        action()
+        failed = await root.turns.wait_for_turn(response.turn.id)
+
+        assert failed.status is PublicTurnStatus.FAILED
+        projection = root.turns.root_recovery._projections[failed.id]
+        assert projection.failure_class is FailureClass.INCOMPLETE_STREAM
+        assert projection.transient_cause_confirmed is True
+        assert projection.effects_settled is True
+
+        # The in-flight effect settled as the recorded terminalization failure.
+        effects = {
+            entry.id: entry
+            for entry in root.turns.history
+            if isinstance(entry, PublicEffectEntry)
+        }
+        in_flight = effects["child_in_flight"]
+        assert isinstance(in_flight.state, FailedEffectState)
+        assert in_flight.state.error is not None
+        assert in_flight.state.error.message == "Turn ended"
+
+        gate = root.turns.root_recovery
+        scheduled = await gate.schedule(
+            RootRecoveryScheduleParams(
+                session_id=loop.session_id,
+                terminal_turn_id=failed.id,
+                solicited=True,
+                input_generation=0,
+            )
+        )
+        assert scheduled.decision == "scheduled"
+        assert scheduled.eligible_class == "incomplete_stream"
+        assert scheduled.idempotency_key is not None
+        admitted = await gate.admit(
+            RootRecoveryAdmitParams(
+                session_id=loop.session_id,
+                episode_id=scheduled.episode_id or "",
+                idempotency_key=scheduled.idempotency_key,
+                terminal_turn_id=failed.id,
+                input_generation=0,
+            )
+        )
+        assert admitted.decision == "admitted"
+
+        # The retry turn runs with the kept tool result and the shipped copy.
+        retry, retry_action = root.turns.start(
+            TurnStartParams(
+                session_id=loop.session_id,
+                message=[TextContentBlock(text=build_retry_prompt(""))],
+                idempotency_key=scheduled.idempotency_key,
+            )
+        )
+        retry_action()
+        recovered = await root.turns.wait_for_turn(retry.turn.id)
+        assert recovered.status is PublicTurnStatus.COMPLETED
+
+        retry_request = backend.requests_messages[-1]
+        kept = [
+            message
+            for message in retry_request
+            if message.role is Role.tool and message.tool_call_id == "child_done"
+        ]
+        assert kept and kept[0].content
+        assert any(
+            message.role is Role.user and _RETRY_WARNING_TEXT in (message.content or "")
+            for message in retry_request
+        )
+        # The completed result stayed in the conversation across the failure.
+        assert [
+            message
+            for message in loop.messages
+            if message.role is Role.tool and message.tool_call_id == "child_done"
+        ]
+    finally:
+        await root.close()
+        await loop.aclose()
+
+
+@pytest.mark.asyncio
+async def test_other_failure_classes_keep_the_unsettled_effects_decline(
+    controlled_transport: Callable[..., ControlledTransport],
+) -> None:
+    """Criterion 5 (contrast): a mid-stream transient fault of ANOTHER class
+    leaves the streamed call's effect unsettled, so the gate keeps its
+    ``effects_unsettled`` decline — the settlement is truncation-only.
+    """
+    backend = controlled_transport([
+        [
+            mock_llm_chunk(
+                content="",
+                tool_calls=[wait_call("child_in_flight")],
+                stop_reason="tool_calls",
+            ),
+            _server_error(),
+        ]
+    ])
+    loop = build_test_agent_loop(
+        config=build_test_vibe_config(enabled_tools=["wait_for_agent"]),
+        backend=backend,
+        enable_streaming=True,
+    )
+    registry = SessionRuntimeRegistry(AsyncMock(), AsyncMock(), lambda _: 0)
+    root = registry._build_child_runtime(loop)
+    try:
+        response, action = root.turns.start(
+            TurnStartParams(
+                session_id=loop.session_id, message=[TextContentBlock(text="start")]
+            )
+        )
+        action()
+        failed = await root.turns.wait_for_turn(response.turn.id)
+
+        assert failed.status is PublicTurnStatus.FAILED
+        projection = root.turns.root_recovery._projections[failed.id]
+        assert projection.failure_class is FailureClass.PROVIDER_STALL
+        assert projection.effects_settled is False
+
+        declined = await root.turns.root_recovery.schedule(
+            RootRecoveryScheduleParams(
+                session_id=loop.session_id,
+                terminal_turn_id=failed.id,
+                solicited=True,
+                input_generation=0,
+            )
+        )
+        assert declined.decision == "declined"
+        assert declined.reason == "effects_unsettled"
+    finally:
+        await root.close()
+        await loop.aclose()
+
+
+def _server_error() -> BackendError:
+    """A retryable provider 5xx (PROVIDER_STALL), distinct from a truncation."""
+    return BackendError(
+        provider="mistral",
+        endpoint="https://api.mistral.ai/v1/chat/completions",
+        status=500,
+        reason="server boom",
+        headers=None,
+        body_text=None,
+        parsed_error="Server error",
+        model="mistral-medium-latest",
+        payload_summary=_payload_summary(),
+    )

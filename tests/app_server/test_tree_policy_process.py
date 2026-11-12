@@ -8,12 +8,17 @@ fresh transaction object adjudicate the journal.
 
 from __future__ import annotations
 
+import inspect
+import logging
 import os
 from pathlib import Path
 import sys
+from typing import Any
+from unittest.mock import AsyncMock
 
 import pytest
 
+from chartreux.app_server._execution import SessionExecutionConflict
 from chartreux.app_server._policy_tree import (
     FilePolicyTreeJournal,
     InProcessPolicyNode,
@@ -21,6 +26,7 @@ from chartreux.app_server._policy_tree import (
     ManifestPolicyTreeJournal,
     PolicyChange,
     PolicyNodeRevision,
+    PolicyNodeService,
     PolicyRevisionStaleError,
     PolicyTreePhase,
     PolicyTreeRecoveryDecision,
@@ -30,11 +36,25 @@ from chartreux.app_server._policy_tree import (
     ProcessPolicyTree,
     policy_tree_transport,
 )
+from chartreux.app_server._sessions import SessionRuntime, SessionRuntimeRegistry
+from chartreux.app_server._subagent_launch import ProcessChildSession
+from chartreux.app_server.agent_wire import (
+    POLICY_COMMIT_METHOD,
+    POLICY_PREPARE_METHOD,
+    POLICY_RESERVE_METHOD,
+    POLICY_RETIRE_METHOD,
+    POLICY_REVISION_METHOD,
+)
 from chartreux.app_server.child_agent_process import ChildAgentProcess
 from chartreux.app_server.process_bootstrap import spawn_process
 from chartreux.app_server.registry_manifest import RegistryManifest
 from chartreux.app_server.subagent_ports import SubagentSpawnSpec
-from chartreux.app_server.transport import TRANSPORT_ENV_VAR
+from chartreux.app_server.transport import (
+    IN_PROCESS_TRANSPORT,
+    STDIO_TRANSPORT,
+    TRANSPORT_ENV_VAR,
+    TransportSelection,
+)
 from chartreux.core.agent_loop import AgentLoop
 from tests.agent_loop.test_policy_replacement import make_loop
 from tests.differential import egress
@@ -42,6 +62,13 @@ from tests.differential import egress
 pytestmark = pytest.mark.asyncio
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
+
+_STDIO_SELECTION = TransportSelection(
+    kind=STDIO_TRANSPORT, selector=STDIO_TRANSPORT, source="environment"
+)
+_IN_PROCESS_SELECTION = TransportSelection(
+    kind=IN_PROCESS_TRANSPORT, selector=IN_PROCESS_TRANSPORT, source="default"
+)
 
 
 def change(*patterns: str) -> PolicyChange:
@@ -441,3 +468,178 @@ async def test_process_node_refuses_a_stale_commit_typed(tmp_path: Path) -> None
             await transaction.abort()
         finally:
             await process.close()
+
+
+# ---------------------------------------------------------------------------
+# Package 20b: the production call site — a stdio session's replacement drives
+# each process-backed descendant through its own wire.
+# ---------------------------------------------------------------------------
+
+
+async def _ignore(*_args: Any, **_kwargs: Any) -> None:
+    return None
+
+
+class _WirePolicyClient:
+    """The coordinator-side client of one child's own policy authority.
+
+    The child's ``PolicyNodeService`` answers every frame, so this double
+    reproduces the process boundary without a second interpreter: the phases
+    and their refusals are the shipped ones.
+    """
+
+    def __init__(self, loop: AgentLoop) -> None:
+        self.service = PolicyNodeService(loop)
+        self.methods: list[str] = []
+
+    async def policy_request(
+        self, method: str, params: dict[str, Any]
+    ) -> dict[str, Any]:
+        self.methods.append(method)
+        return await self.service.handle(method, params)
+
+
+class _ProcessSpawnedChild:
+    """A spawned child handle whose process the test declares reachable or not."""
+
+    def __init__(self, wire: _WirePolicyClient, *, alive: bool) -> None:
+        self.agent_id = "coder-process"
+        self.session_id = "child-process-session"
+        self.child_session_dir = None
+        self.root_session_dir = None
+        self.completion_source: Any = None
+        self.wire_client = wire
+        self._alive = alive
+
+    @property
+    def alive(self) -> bool:
+        return self._alive
+
+    async def close(self) -> None:
+        self._alive = False
+
+    def reconcile_death(self) -> Any:
+        return None
+
+
+async def _stdio_tree(
+    tmp_path: Path, *, child_alive: bool = True
+) -> tuple[SessionRuntimeRegistry, SessionRuntime, _WirePolicyClient, list[AgentLoop]]:
+    """A stdio-selected registry whose child lives behind its own wire."""
+    root_dir = tmp_path / "root"
+    child_dir = tmp_path / "child"
+    root_dir.mkdir()
+    child_dir.mkdir()
+    root_loop = await make_loop(root_dir)
+    child_loop = await make_loop(child_dir)
+    manifest_dir = tmp_path / "manifest"
+    manifest_dir.mkdir()
+    manifest = RegistryManifest(manifest_dir)
+    manifest.initialize()
+    registry = SessionRuntimeRegistry(
+        _ignore, _ignore, lambda _session_id: 0, transport_selection=_STDIO_SELECTION
+    )
+    root = registry._build_child_runtime(root_loop)
+    registry.bind_root(root)
+    registry._runtime_factory.registry_manifests[root_loop] = manifest
+    wire = _WirePolicyClient(child_loop)
+    spawned = _ProcessSpawnedChild(wire, alive=child_alive)
+    registry._process_children[spawned.session_id] = ProcessChildSession(
+        agent_id=spawned.agent_id,
+        identity="coder",
+        session_id=spawned.session_id,
+        attempt_id="attempt-policy-1",
+        spawned=spawned,
+    )
+    return registry, root, wire, [root_loop, child_loop]
+
+
+async def _replace(registry: SessionRuntimeRegistry, root: SessionRuntime) -> str:
+    return await registry.replace_policy(
+        session_id=root.agent_loop.session_id,
+        source="user-toml",
+        tools={"read_file": {"denylist": ["B"]}},
+        expected_revision=registry.policy_revision,
+    )
+
+
+async def test_policy_tree_transport_requires_the_resolved_selection() -> None:
+    process_topology = policy_tree_transport(_STDIO_SELECTION)
+    in_process_topology = policy_tree_transport(_IN_PROCESS_SELECTION)
+    assert isinstance(process_topology, ProcessPolicyTree)
+    assert isinstance(in_process_topology, InProcessPolicyTree)
+    # No environment default: the topology is the session's resolved choice,
+    # and an uninjected call must fail rather than answer from an empty environ.
+    parameter = inspect.signature(policy_tree_transport).parameters["selection"]
+    assert parameter.default is inspect.Parameter.empty
+
+
+async def test_a_registry_without_a_selection_keeps_the_in_process_topology(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # An ambient selector must not claim a topology this session never chose:
+    # only the explicit session selection reaches the seam.
+    monkeypatch.setenv(TRANSPORT_ENV_VAR, STDIO_TRANSPORT)
+    registry = SessionRuntimeRegistry(AsyncMock(), AsyncMock(), lambda _session_id: 0)
+    assert isinstance(registry.policy_transport(), InProcessPolicyTree)
+
+
+async def test_replace_policy_drives_a_process_child_through_its_wire(
+    tmp_path: Path,
+) -> None:
+    registry, root, wire, loops = await _stdio_tree(tmp_path)
+    try:
+        await _replace(registry, root)
+        # The change is published in the process that owns each authority.
+        assert "B" in denylist(root.agent_loop)
+        assert "B" in denylist(loops[1])
+        assert loops[1]._dangerous_command_grants.current_policy_revision == 1
+        # Every phase crossed the child's own wire, in transaction order.
+        assert wire.methods == [
+            POLICY_REVISION_METHOD,
+            POLICY_RESERVE_METHOD,
+            POLICY_PREPARE_METHOD,
+            POLICY_COMMIT_METHOD,
+            POLICY_RETIRE_METHOD,
+        ]
+    finally:
+        await close(*loops)
+
+
+async def test_replace_policy_refuses_an_unreachable_process_child(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    registry, root, wire, loops = await _stdio_tree(tmp_path, child_alive=False)
+    before = [denylist(loop) for loop in loops]
+    try:
+        with caplog.at_level(logging.WARNING):
+            with pytest.raises(SessionExecutionConflict, match="cannot reach"):
+                await _replace(registry, root)
+        # Refused BEFORE the first reserve: nothing was prepared, published or
+        # driven over the dead child's wire.
+        assert "unreachable" in caplog.text
+        assert wire.methods == []
+        assert [denylist(loop) for loop in loops] == before
+        assert all("B" not in patterns for patterns in before)
+    finally:
+        await close(*loops)
+
+
+async def test_replace_policy_refuses_a_roots_change_across_processes(
+    tmp_path: Path,
+) -> None:
+    registry, root, wire, loops = await _stdio_tree(tmp_path)
+    before = [denylist(loop) for loop in loops]
+    try:
+        with pytest.raises(SessionExecutionConflict, match="in-process"):
+            await registry.replace_policy(
+                session_id=root.agent_loop.session_id,
+                source="user-toml",
+                tools={"read_file": {"denylist": ["B"]}},
+                expected_revision=registry.policy_revision,
+                roots={},
+            )
+        assert wire.methods == []
+        assert [denylist(loop) for loop in loops] == before
+    finally:
+        await close(*loops)

@@ -1,6 +1,6 @@
 {
   "description": "Transport-level JSON-RPC exchange replayed over the in-process and process-pipe topologies.",
-  "protocolVersion": 1,
+  "protocolVersion": 2,
   "messages": [
     {
       "jsonrpc": "2.0",

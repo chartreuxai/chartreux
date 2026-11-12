@@ -20,11 +20,13 @@ identity are unchanged by the split.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 import re
 from typing import TYPE_CHECKING
 
 from chartreux.core.dangerous_commands import (
     DangerousCommandClassification,
+    GitRepositoryRelocation,
     GrantableGitCall,
     ModeledGitCall,
     operations_for_ids,
@@ -44,7 +46,6 @@ from chartreux.core.tools.builtins._shell_git_support import (
 )
 
 if TYPE_CHECKING:
-    from chartreux.core.dangerous_commands import GitRepositoryRelocation
     from chartreux.core.tools.builtins._shell_git_support import _GitGlobalScan
 
 
@@ -166,6 +167,78 @@ _GIT_RESTORE_TABLE = _OptionTable(
     frozenset({"--pathspec-from-file", "--source"}), frozenset("s")
 )
 _GIT_WORKTREE_TABLES = {"checkout": _GIT_CHECKOUT_TABLE, "restore": _GIT_RESTORE_TABLE}
+
+
+@dataclass(frozen=True)
+class _GitCheckoutShape:
+    """One modeled checkout invocation's shape.
+
+    ``switch`` is ``git checkout <branch>``; ``create`` is
+    ``git checkout -b <new> [<start>]``.
+    """
+
+    kind: str
+    branch: str
+    start: str | None
+
+
+def _scan_git_checkout_shape(  # noqa: PLR0911
+    tokens: list[str],
+) -> tuple[_GitCheckoutShape, int] | None:
+    """The modeled checkout shape of one git invocation, with the
+    subcommand's token index, or None when the invocation is neither shape.
+
+    Modeled only: ``git checkout <branch>`` — no options, exactly one
+    operand — and ``git checkout -b <new> [<start>]`` — the ``-b`` option
+    alone, at most one further operand. Every other shape is unmodeled:
+    pathspecs (a second operand or an end-of-options marker),
+    ``-f``/``--force``/``--discard-changes``/``--merge``,
+    ``--orphan``/``--conflict``/``--pathspec-from-file``/
+    ``--recurse-submodules``, ``-B``, and any other option. Global options
+    are restricted to the recognized grammar that neither overrides
+    configuration nor relocates the repository: an inline
+    ``-c``/``--config-env`` (which can alter the actual invocation's
+    behavior, e.g. core.hooksPath) and repository relocation
+    (``-C``/``--git-dir``/``--work-tree``) both fail closed.
+
+    The pure grammar is shared by the two consumers that must agree on it:
+    the classifier's routine branch-creation admission (``create``) and the
+    resolver's existing-branch exemption and executed-string injection
+    (``switch``, plus ``create`` for the injection site).
+    """
+    if not tokens or tokens[0] != "git":
+        # A bare git executable only: no path, no alias form.
+        return None
+    globals_scan = _scan_git_globals(tokens[1:])
+    if globals_scan.error is not None or globals_scan.end_of_options:
+        return None
+    if globals_scan.relocation != GitRepositoryRelocation():
+        return None
+    args = tokens[1:]
+    if globals_scan.index >= len(args) or args[globals_scan.index] != "checkout":
+        return None
+    scan = _scan_classified_git_options(
+        args[globals_scan.index + 1 :], _GIT_CHECKOUT_TABLE, strict=False
+    )
+    if scan.error is not None or scan.end_of_options:
+        return None
+    subcommand_index = 1 + globals_scan.index
+    if not scan.options and not scan.values and len(scan.operands) == 1:
+        return (_GitCheckoutShape("switch", scan.operands[0], None), subcommand_index)
+    if (
+        scan.options == ("-b",)
+        and len(scan.values) == 1
+        and scan.values[0][0] == "-b"
+        and len(scan.operands) <= 1
+    ):
+        return (
+            _GitCheckoutShape(
+                "create", scan.values[0][1], scan.operands[0] if scan.operands else None
+            ),
+            subcommand_index,
+        )
+    return None
+
 
 # stash's value-taking options must consume before the sub-subcommand is
 # read: `git stash -m drop` is a stash push with message "drop", not a drop.
@@ -339,7 +412,12 @@ def _classify_git_worktree_subcommand(
     args: list[str],
     globals_scan: _GitGlobalScan,
 ) -> DangerousCommandClassification:
-    """checkout/restore: every form is consequential, so all forms are grantable."""
+    """checkout/restore: every form is consequential, so all forms are grantable.
+
+    The one exception is admitted one level up, in
+    ``classify_dangerous_git_command``: the routine branch-creation shape
+    (``git checkout -b <new> [<start>]``).
+    """
     scan = _scan_classified_git_options(args, table, strict=False)
     if scan.error is not None:
         return _hard_denied(f"git {subcommand}: {scan.error}")
@@ -999,7 +1077,9 @@ def _dispatch_git_subcommand(
     return classification
 
 
-def classify_dangerous_git_command(tokens: list[str]) -> DangerousCommandClassification:
+def classify_dangerous_git_command(
+    tokens: list[str], *, admit_checkout_creation: bool = True
+) -> DangerousCommandClassification:
     """Classify one whole expanded call for the dangerous-command flow.
 
     Pure and typed: the call is ``routine`` (no dangerous-command
@@ -1037,6 +1117,16 @@ def classify_dangerous_git_command(tokens: list[str]) -> DangerousCommandClassif
         # classify.
         return _ROUTINE
     subcommand = args[globals_scan.index]
+    if subcommand == "checkout" and admit_checkout_creation:
+        # The routine branch-creation admission (P3): ``git checkout -b
+        # <new> [<start>]`` preserves work, so it carries no consequential
+        # operation. ``admit_checkout_creation=False`` is the resolver's
+        # gate for the state/configuration checks the pure classifier
+        # cannot make (a program-selecting repository config keeps the
+        # approval class); every other checkout form stays grantable.
+        shape = _scan_git_checkout_shape(tokens)
+        if shape is not None and shape[0].kind == "create":
+            return _ROUTINE
     return _dispatch_git_subcommand(
         subcommand, args[globals_scan.index + 1 :], globals_scan
     )

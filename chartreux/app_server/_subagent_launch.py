@@ -4,11 +4,25 @@ import asyncio
 from collections.abc import Awaitable, Iterator
 from contextlib import AbstractAsyncContextManager, contextmanager, suppress
 from dataclasses import dataclass, replace
+from datetime import UTC, datetime
+from enum import StrEnum
 import fnmatch
-from typing import TYPE_CHECKING, Protocol
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, Protocol, cast
+from uuid import uuid4
 
 from chartreux.app_server._subagent_records import AgentRecord
 from chartreux.app_server._subagent_recovery import _effective_eligibility
+from chartreux.app_server._subagent_transcript import ChildTombstoneRecord
+from chartreux.app_server.subagent_ports import (
+    CHILD_HANDOFF_PAYLOAD_KEY,
+    CHILD_TEARDOWN_REASON,
+    ChildTeardownOutcome,
+    SpawnedSubagent,
+    SubagentSpawnPort,
+    child_result_store,
+    child_spawn_spec,
+)
 from chartreux.core.agent_loop import AgentLoop
 from chartreux.core.agents.identity_launch import (
     parse_model_shorthand,
@@ -46,7 +60,7 @@ from chartreux.core.recovery_policy import (
     validate_replacement_selection,
 )
 from chartreux.core.session.saved_sessions import delete_saved_session
-from chartreux.core.session_types import CommittedModelIdentity
+from chartreux.core.session_types import ChildSessionLink, CommittedModelIdentity
 from chartreux.core.subagents import (
     InvalidLaunchModelError,
     LaunchConfig,
@@ -65,6 +79,67 @@ if TYPE_CHECKING:
     from chartreux.app_server._sessions import SessionRuntime
 
 _AGENT_ID_HIGH_WATER_MARK_KEY = "_app_server_agent_id_high_water_mark"
+
+PUBLICATION_ROLLBACK_REASON = "publication-rolled-back"
+"""Tombstone reason: the publication transaction rolled its own failure back."""
+
+PUBLICATION_REJECTED_REASON = "publication-rejected"
+"""Tombstone reason: a published child was rejected before it was accepted."""
+
+
+def new_publication_attempt_id() -> str:
+    """Mint the coordinator-side identity of one child publication attempt."""
+    return f"attempt-{uuid4().hex}"
+
+
+def retire_child_publication(
+    child: AgentLoop, *, attempt_id: str | None, reason: str
+) -> bool:
+    """Durably retract an abandoned child publication; True when written.
+
+    The tombstone is the retraction that outlives a lost delete: the child
+    transcript scan reports the attempt as retracted (and filters it out), so
+    its persisted records can never resurrect as an adoptable child. A child
+    with no durable transcript (logging disabled) has nothing to retract.
+    """
+    store = child_result_store(child)
+    if store is None:
+        return False
+    store.record_tombstone(
+        ChildTombstoneRecord(
+            session_id=child.session_id,
+            reason=reason,
+            created_at=datetime.now(UTC).isoformat(),
+            attempt_id=attempt_id,
+            agent_id=child.launch_identity,
+        )
+    )
+    return True
+
+
+def published_attempt_id(
+    child: AgentLoop, parent: SessionRuntime, tool_call_id: str
+) -> str | None:
+    """The attempt id a published child was recorded under, when known.
+
+    The child's own first write is the primary bridge; the parent link is the
+    fallback, so a rollback retracts even when only one of the two survived.
+    A pre-v0.7.8 record carries neither and retracts through its session id.
+    """
+    metadata = child.session_logger.session_metadata
+    if metadata is not None and metadata.attempt_id is not None:
+        return metadata.attempt_id
+    parent_metadata = parent.agent_loop.session_logger.session_metadata
+    if parent_metadata is None:
+        return None
+    return next(
+        (
+            link.attempt_id
+            for link in parent_metadata.child_sessions
+            if link.session_id == child.session_id and link.tool_call_id == tool_call_id
+        ),
+        None,
+    )
 
 
 class LaunchStateView(Protocol):
@@ -91,6 +166,11 @@ class LaunchStateView(Protocol):
     _agent_records: dict[str, AgentRecord]
     _package_replacements: dict[str, int]
     _registry_lock: asyncio.Lock
+    # Item 1 child seam: the process-backed spawn adapter this run selected
+    # (None keeps the in-process publication path byte for byte), and the
+    # coordinator-side handles of the children that live in their own process.
+    _subagent_spawn: SubagentSpawnPort | None
+    _process_children: dict[str, ProcessChildSession]
 
     def _require_policy_unreserved(self) -> None: ...
 
@@ -119,27 +199,33 @@ class ChildPublicationAttempt:
     """Per-invocation state for one child publication (ASC area 1).
 
     Holds the parent runtime and captured identity, the resolved launch
-    candidate and tool-call id, the constructed child/runtime once they
-    exist, and the two transaction flags the rollback region reads. The
-    registry-owned child maps stay canonical; the attempt carries only
-    the publication transaction's local state.
+    candidate and tool-call id, the coordinator-minted attempt id, the
+    constructed child/runtime once they exist, and the transaction flags the
+    rollback region reads. The registry-owned child maps stay canonical; the
+    attempt carries only the publication transaction's local state.
     """
 
     parent: SessionRuntime
     identity: tuple[str, int]
     candidate: LaunchCandidate
     tool_call_id: str
+    attempt_id: str
     child: AgentLoop | None = None
     runtime: SessionRuntime | None = None
     link_recorded: bool = False
     projection_started: bool = False
+    persisted: bool = False
 
     async def rollback(self, view: LaunchStateView) -> None:
         """Remove every durable/runtime trace of an unaccepted publication.
 
         Replaces the local transaction flags of the former registry method
         without widening the cleanup region or changing exception
-        suppression.
+        suppression. A publication whose first durable write landed is
+        retracted with a tombstone before removal: if the delete is lost or
+        the process dies mid-rollback, the retraction still gates the child
+        transcript scan. A publication that never persisted has nothing to
+        retract and is deleted.
         """
         child = self.child
         runtime = self.runtime
@@ -157,8 +243,343 @@ class ChildPublicationAttempt:
                 )
         with suppress(Exception):
             await runtime.close()
+        if self.persisted:
+            with suppress(Exception):
+                retire_child_publication(
+                    child,
+                    attempt_id=self.attempt_id,
+                    reason=PUBLICATION_ROLLBACK_REASON,
+                )
         with suppress(Exception):
             await delete_saved_session(session_id, child.config.session_logging)
+
+
+class ChildPublicationStage(StrEnum):
+    """The stage one aggregate child publication attempt reached.
+
+    The aggregate outcome names the stage that failed, so a caller never has
+    to infer it from a nested exception type. PERMIT is its own stage because
+    a process-backed child cannot consume a C4 permit binding in v0.7.8: the
+    request is refused there and the reservation is released, never stranded.
+    """
+
+    ADMISSION = "admission"
+    HANDOFF = "handoff"
+    PERMIT = "permit"
+    SPAWN = "spawn"
+    PERSISTENCE = "persistence"
+    LINKAGE = "linkage"
+    PROJECTION = "projection"
+
+
+class ChildPublicationError(RuntimeError):
+    """One process-backed child publication attempt's stage-named failure.
+
+    ``retraction`` reports what the conservative teardown established after the
+    failure: a reaped or tombstoned attempt, the typed INCONCLUSIVE class when
+    the attempt could not be settled inside the bounded rollback wait, or None
+    when nothing was spawned yet. A caller must never read this error as a
+    claimed rollback.
+    """
+
+    def __init__(
+        self,
+        stage: ChildPublicationStage,
+        attempt_id: str,
+        *,
+        retraction: ChildTeardownOutcome | None = None,
+        detail: str = "",
+    ) -> None:
+        self.stage = stage
+        self.attempt_id = attempt_id
+        self.retraction = retraction
+        message = (
+            f"Child publication attempt {attempt_id} failed at stage {stage.value}"
+        )
+        if detail:
+            message += f": {detail}"
+        if retraction is not None:
+            message += f" (teardown: {retraction.value})"
+        super().__init__(message)
+
+
+@dataclass(slots=True)
+class ProcessChildSession:
+    """A coordinator-side handle to a child whose loop lives in its own process.
+
+    A RETAINED child keeps this handle — and therefore its process — across
+    re-tasks; a non-retained child's handle is closed at its completion. The
+    registry owns the map, so the handle is never the source of child truth.
+    """
+
+    agent_id: str
+    identity: str
+    session_id: str
+    attempt_id: str
+    spawned: SpawnedSubagent
+    child_dir: str | None = None
+    retained: bool = False
+    closed: bool = False
+
+    @property
+    def alive(self) -> bool:
+        return not self.closed and bool(getattr(self.spawned, "alive", True))
+
+    async def close(self) -> None:
+        """Reap this child's process; a repeated close is a no-op."""
+        if self.closed:
+            return
+        self.closed = True
+        with suppress(Exception):
+            await self.spawned.close()
+
+
+async def record_process_child_link(
+    parent: AgentLoop,
+    *,
+    session_id: str,
+    session_dir: str | None,
+    tool_call_id: str,
+    agent: str,
+    attempt_id: str,
+) -> ChildSessionLink:
+    """Record the parent link of a child whose loop lives in another process.
+
+    The in-process linkage writes the parent's transcript as well; this path
+    changes no parent message, so it persists the link itself — the same
+    append/rollback shape, keyed on the tool call so a repeated link is
+    idempotent and a conflicting one fails loudly.
+    """
+    parent_dir = parent.session_logger.session_dir
+    relative_path = (
+        str(Path(session_dir).relative_to(parent_dir))
+        if parent_dir is not None and session_dir is not None
+        else None
+    )
+    link = ChildSessionLink(
+        session_id=session_id,
+        tool_call_id=tool_call_id,
+        agent=agent,
+        relative_path=relative_path,
+        attempt_id=attempt_id,
+    )
+    metadata = parent.session_logger.session_metadata
+    if metadata is None:
+        return link
+    existing = next(
+        (item for item in metadata.child_sessions if item.tool_call_id == tool_call_id),
+        None,
+    )
+    if existing is not None:
+        if existing != link:
+            raise RuntimeError(
+                f"Tool call {tool_call_id} is already linked to a child session"
+            )
+        return existing
+    metadata.child_sessions.append(link)
+    try:
+        await parent.session_logger.persist_child_sessions()
+    except BaseException:
+        metadata.child_sessions.remove(link)
+        raise
+    return link
+
+
+class ProcessChildPublication:
+    """The aggregate child publication transaction over the process boundary.
+
+    One attempt runs as a SINGLE typed outcome keyed by the coordinator-minted
+    attempt id: the admission fence, the working-set handoff, permit binding,
+    persistence, parent linkage and projection happen in order, and a failure
+    names the stage that failed. A failure after the spawn is settled
+    CONSERVATIVELY — the coordinator never claims a rollback it cannot observe:
+    the prepared child is cancelled, its atomic rollback gets a bounded wait,
+    and the durable records it left are retracted (or the typed INCONCLUSIVE
+    class is reported when the attempt cannot be settled inside that bound).
+
+    A RETAINED child is not respawned by a re-task: the existing handle is
+    reused, so its process survives across tasks; a non-retained child is
+    spawned on every launch and exits at completion.
+    """
+
+    def __init__(
+        self,
+        admission: ChildLaunchAdmission,
+        spawn: SubagentSpawnPort,
+        *,
+        rollback_wait: float,
+    ) -> None:
+        self._admission = admission
+        self._spawn = spawn
+        self._rollback_wait = rollback_wait
+
+    async def publish(
+        self,
+        attempt: ChildPublicationAttempt,
+        *,
+        retained: bool,
+        mint: OverrideMint | None = None,
+        reuse: ProcessChildSession | None = None,
+    ) -> ProcessChildSession:
+        """Run one aggregate publication attempt and answer its handle."""
+        stage = ChildPublicationStage.ADMISSION
+        spawned: SpawnedSubagent | None = None
+        try:
+            self._admission.validate_admission(attempt.parent, attempt.identity)
+            stage = ChildPublicationStage.HANDOFF
+            agent_name = attempt.candidate.identity.replace(":", "-")
+            if reuse is not None and reuse.alive:
+                # A retained child keeps its process: the re-task only links
+                # the new tool call to the process that already exists.
+                await self._link(attempt, reuse, agent_name)
+                return reuse
+            root_session_dir = attempt.parent.agent_loop.session_logger.session_dir
+            if root_session_dir is None:
+                raise RuntimeError(
+                    "a process-backed child needs the root session directory: "
+                    "its transcript belongs under <root>/agents"
+                )
+            payload = self._handoff_payload(attempt)
+            stage = ChildPublicationStage.PERMIT
+            if mint is not None:
+                raise RuntimeError(
+                    "a process-backed child cannot consume a cooldown-override "
+                    "permit in this release; the reservation was released"
+                )
+            spec = child_spawn_spec(
+                agent_id=f"{agent_name}-{attempt.attempt_id}",
+                parent_session_id=attempt.parent.agent_loop.session_id,
+                root_session_dir=root_session_dir,
+                agent_name=agent_name,
+                payload=payload,
+                attempt_id=attempt.attempt_id,
+            )
+            stage = ChildPublicationStage.SPAWN
+            spawned = await self._spawn.spawn(spec)
+            stage = ChildPublicationStage.PERSISTENCE
+            session_id = getattr(spawned, "session_id", None)
+            if not isinstance(session_id, str) or not session_id:
+                raise RuntimeError(
+                    "the spawned child announced no session id, so its first "
+                    "durable record cannot be attributed to this attempt"
+                )
+            handle = ProcessChildSession(
+                agent_id=getattr(spawned, "agent_id", spec.agent_id),
+                identity=attempt.candidate.identity,
+                session_id=session_id,
+                attempt_id=attempt.attempt_id,
+                spawned=spawned,
+                child_dir=getattr(spawned, "child_session_dir", None),
+                retained=retained,
+            )
+            attempt.persisted = True
+            stage = ChildPublicationStage.LINKAGE
+            await self._link(attempt, handle, agent_name)
+            return handle
+        except asyncio.CancelledError:
+            if spawned is not None:
+                await self._settle(attempt, spawned)
+            raise
+        except BaseException as exc:
+            # ``_link`` raises its own stage-named error; the aggregate reply
+            # must keep that stage instead of relabelling it as the caller's.
+            failed = exc.stage if isinstance(exc, ChildPublicationError) else stage
+            raise await self._fail(attempt, failed, exc, spawned=spawned) from exc
+
+    async def _link(
+        self, attempt: ChildPublicationAttempt, handle: ProcessChildSession, agent: str
+    ) -> None:
+        """Record the parent link and project it, naming the failing stage."""
+        try:
+            await record_process_child_link(
+                attempt.parent.agent_loop,
+                session_id=handle.session_id,
+                session_dir=handle.child_dir,
+                tool_call_id=attempt.tool_call_id,
+                agent=agent,
+                attempt_id=handle.attempt_id,
+            )
+            attempt.link_recorded = True
+        except BaseException as exc:
+            raise ChildPublicationError(
+                ChildPublicationStage.LINKAGE,
+                attempt.attempt_id,
+                detail=f"{type(exc).__name__}: {exc}",
+            ) from exc
+        try:
+            attempt.projection_started = True
+            if attempt.parent.turns._projector is not None:
+                await attempt.parent.turns.link_subagent(
+                    attempt.tool_call_id, handle.session_id
+                )
+        except BaseException as exc:
+            raise ChildPublicationError(
+                ChildPublicationStage.PROJECTION,
+                attempt.attempt_id,
+                detail=f"{type(exc).__name__}: {exc}",
+            ) from exc
+
+    def _handoff_payload(self, attempt: ChildPublicationAttempt) -> dict[str, Any]:
+        """The spawn handoff: the parent's rendered, redacted working set."""
+        message = attempt.parent.agent_loop.file_state_handoff_message()
+        if message is None or not message.content:
+            return {}
+        return {CHILD_HANDOFF_PAYLOAD_KEY: message.content}
+
+    async def _fail(
+        self,
+        attempt: ChildPublicationAttempt,
+        stage: ChildPublicationStage,
+        exc: BaseException,
+        *,
+        spawned: SpawnedSubagent | None,
+    ) -> ChildPublicationError:
+        """Settle a failed attempt and return its stage-named aggregate error."""
+        retraction = (
+            await self._settle(attempt, spawned) if spawned is not None else None
+        )
+        return ChildPublicationError(
+            stage,
+            attempt.attempt_id,
+            retraction=retraction,
+            detail=f"{type(exc).__name__}: {exc}",
+        )
+
+    async def _settle(
+        self, attempt: ChildPublicationAttempt, spawned: SpawnedSubagent
+    ) -> ChildTeardownOutcome:
+        """Retract this attempt's runtime and durable traces; never claim success.
+
+        The link and projection this attempt already published are dropped
+        first, so a retracted attempt leaves no adoptable parent-side trace;
+        then the child is cancelled, given the bounded wait for its own atomic
+        rollback, and its durable records are retracted.
+        """
+        session_id = getattr(spawned, "session_id", None)
+        if attempt.projection_started and session_id is not None:
+            with suppress(Exception):
+                await attempt.parent.turns.unlink_subagent(
+                    attempt.tool_call_id, session_id
+                )
+        if attempt.link_recorded and session_id is not None:
+            with suppress(Exception):
+                await attempt.parent.agent_loop.forget_child_session(
+                    session_id, attempt.tool_call_id
+                )
+        attempt.link_recorded = False
+        attempt.projection_started = False
+        from chartreux.app_server.child_agent_process import (
+            SpawnedAttempt,
+            teardown_spawned_attempt,
+        )
+
+        report = await teardown_spawned_attempt(
+            cast(SpawnedAttempt, spawned),
+            attempt_id=attempt.attempt_id,
+            reason=CHILD_TEARDOWN_REASON,
+            wait_seconds=self._rollback_wait,
+        )
+        return report.outcome
 
 
 @dataclass(frozen=True, slots=True)
@@ -1025,6 +1446,90 @@ class ChildLaunchAdmission:
                 mint.ledger.release(mint.permit)
             raise
 
+    async def create_process_registered(
+        self,
+        parent: SessionRuntime,
+        args: TaskArgs,
+        ctx: InvokeContext,
+        *,
+        attempt_id: str | None = None,
+        reuse: ProcessChildSession | None = None,
+        rollback_wait: float | None = None,
+    ) -> ProcessChildSession:
+        """Publish one child whose loop lives in its own process (item 1 seam 2).
+
+        The aggregate transaction runs here, in the process that owns the
+        children, while the child's loop lives behind its own pipe: admission
+        fencing, the working-set handoff, persistence (the child's own first
+        write, keyed by this attempt), parent linkage, and projection all
+        execute as ONE attempt keyed by the coordinator-minted attempt id, and
+        a failure answers a :class:`ChildPublicationError` naming the failed
+        stage. The attempt id is caller-supplyable so a coordinator that mints
+        it keeps the identity across a lost reply.
+
+        ``reuse`` names a retained child's existing handle: a re-task of that
+        child links the new tool call to the process it already has instead of
+        spawning a second one.
+        """
+        from chartreux.app_server.child_agent_process import DEFAULT_CHILD_ROLLBACK_WAIT
+
+        spawn = self._view._subagent_spawn
+        resolved_attempt_id = attempt_id or new_publication_attempt_id()
+        if spawn is None:
+            raise ChildPublicationError(
+                ChildPublicationStage.ADMISSION,
+                resolved_attempt_id,
+                detail="this run selects no process-backed spawn adapter",
+            )
+        mint = self.mint_override_permit(parent, args)
+        try:
+            candidate = (
+                self.resolve_candidate(
+                    parent,
+                    args,
+                    override_permit=mint.permit,
+                    override_ledger=mint.ledger,
+                )
+                if mint is not None
+                else self.resolve_candidate(parent, args)
+            )
+            self.require_identity_allowed(
+                parent, candidate.orchestrator.config.agent.identity
+            )
+            attempt = ChildPublicationAttempt(
+                parent=parent,
+                identity=(
+                    parent.agent_loop.session_id,
+                    parent.agent_loop._session_generation,
+                ),
+                candidate=candidate,
+                tool_call_id=ctx.tool_call_id,
+                attempt_id=resolved_attempt_id,
+            )
+            retained = (
+                bool(args.retain)
+                if args.retain is not None
+                else bool(reuse is not None and reuse.retained)
+            )
+            publisher = ProcessChildPublication(
+                self,
+                spawn,
+                rollback_wait=(
+                    DEFAULT_CHILD_ROLLBACK_WAIT
+                    if rollback_wait is None
+                    else rollback_wait
+                ),
+            )
+            return await publisher.publish(
+                attempt, retained=retained, mint=mint, reuse=reuse
+            )
+        except BaseException:
+            if mint is not None:
+                # Pretransport release: the run never started, so the
+                # reservation must not strand the endpoint's in-flight slot.
+                mint.ledger.release(mint.permit)
+            raise
+
     async def _create_registered_minted(
         self,
         parent: SessionRuntime,
@@ -1058,6 +1563,7 @@ class ChildLaunchAdmission:
             ),
             candidate=candidate,
             tool_call_id=ctx.tool_call_id,
+            attempt_id=new_publication_attempt_id(),
         )
         self.validate_admission(parent, attempt.identity)
         with self.creation_fence():
@@ -1090,10 +1596,16 @@ class ChildLaunchAdmission:
             self._view._children[child.session_id] = runtime
             self._view._child_links[child.session_id] = (parent, ctx.tool_call_id)
             try:
-                await child.persist_empty_session()
+                # The attempt id rides the FIRST durable write: a torn
+                # persist-to-link window stays attributable to its attempt.
+                await child.persist_empty_session(attempt_id=attempt.attempt_id)
+                attempt.persisted = True
                 self.validate_admission(parent, attempt.identity)
                 await parent.agent_loop.record_child_session(
-                    child, ctx.tool_call_id, candidate.identity
+                    child,
+                    ctx.tool_call_id,
+                    candidate.identity,
+                    attempt_id=attempt.attempt_id,
                 )
                 attempt.link_recorded = True
                 self.validate_admission(parent, attempt.identity)
@@ -1113,7 +1625,9 @@ class ChildLaunchAdmission:
         # C4: a rejected child never runs, so its bound override permit (if
         # any) is released pretransport — the in-flight slot must not strand.
         release_bound_override(runtime.agent_loop)
-        session_id = runtime.agent_loop.session_id
+        child = runtime.agent_loop
+        session_id = child.session_id
+        attempt_id = published_attempt_id(child, parent, tool_call_id)
         self._view._children.pop(session_id, None)
         self._view._child_links.pop(session_id, None)
         with suppress(Exception):
@@ -1122,7 +1636,11 @@ class ChildLaunchAdmission:
             await parent.agent_loop.forget_child_session(session_id, tool_call_id)
         with suppress(Exception):
             await runtime.close()
+        # The accepted-then-rejected child is retracted before its records are
+        # removed, so a lost delete cannot leave an adoptable transcript.
         with suppress(Exception):
-            await delete_saved_session(
-                session_id, runtime.agent_loop.config.session_logging
+            retire_child_publication(
+                child, attempt_id=attempt_id, reason=PUBLICATION_REJECTED_REASON
             )
+        with suppress(Exception):
+            await delete_saved_session(session_id, child.config.session_logging)

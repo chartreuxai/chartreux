@@ -39,6 +39,7 @@ from chartreux.app_server._subagent_transcript import (
     root_session_dir_from_spec,
 )
 from chartreux.app_server.agent_wire import (
+    AGENT_CHILD_TEARDOWN_METHOD,
     AGENT_TURN_ENDED_METHOD,
     AGENT_TURN_EVENT_METHOD,
     SUBAGENT_OPEN_METHOD,
@@ -55,7 +56,14 @@ from chartreux.app_server.process_bootstrap import (
     write_ready_frame,
 )
 from chartreux.app_server.root_agent import RootAgentServer, RootLoopFactory
-from chartreux.app_server.subagent_ports import spawn_spec_from_wire
+from chartreux.app_server.subagent_ports import (
+    CHILD_FAILURE_FRAME_KEY,
+    CHILD_HANDOFF_PAYLOAD_KEY,
+    ChildFailureEvidence,
+    child_failure_evidence,
+    encode_child_failure,
+    spawn_spec_from_wire,
+)
 from chartreux.app_server.transport import (
     BinaryLineReader,
     BinaryLineWriter,
@@ -65,7 +73,7 @@ from chartreux.app_server.transport import (
 from chartreux.core.agent_loop import AgentLoop
 from chartreux.core.agent_loop._loop_types import AgentTurnOptions
 from chartreux.core.config.harness_files import init_harness_files_manager
-from chartreux.core.llm_models import LLMMessage
+from chartreux.core.llm_models import LLMMessage, Role
 from chartreux.core.paths import LITERAL_LOG_FILE, LOG_FILE
 from chartreux.observability.logging import init_file_logging, logger
 
@@ -87,11 +95,12 @@ class ChildAgentServer(RootAgentServer):
     ) -> None:
         super().__init__(transport, factory=factory)
         self._agent_id: str | None = None
+        self._attempt_id: str | None = None
         self._root_session_dir: Path | None = None
         self._transcript_store: ChildTranscriptStore | None = None
 
     async def _handle_request(
-        self, method: str, params: Mapping[str, Any]
+        self, method: str, params: Mapping[str, Any], request_id: object = None
     ) -> dict[str, Any]:
         if method == SUBAGENT_OPEN_METHOD:
             if self._loop is not None:
@@ -101,6 +110,10 @@ class ChildAgentServer(RootAgentServer):
             spec = spawn_spec_from_wire(params)
             self._loop = await self._factory.open(params)
             self._agent_id = spec.agent_id
+            # The publication attempt this child was spawned under rides every
+            # durable record it writes, so a lost aggregate reply stays
+            # attributable to its attempt (item 1 child seam).
+            self._attempt_id = spec.attempt_id
             session_dir = self._loop.session_logger.session_dir
             self._root_session_dir = child_transcript_root_for(
                 session_dir, root_session_dir_from_spec(spec.payload)
@@ -111,7 +124,13 @@ class ChildAgentServer(RootAgentServer):
                 "session_id": self._loop.session_id,
                 "session_dir": str(session_dir) if session_dir is not None else None,
             }
-        return await super()._handle_request(method, params)
+        if method == AGENT_CHILD_TEARDOWN_METHOD:
+            # A child agent owns no publication attempts: its own attempt is
+            # settled by the process that spawned it, never by its own pipe.
+            raise UnsupportedAgentRequestError(
+                "this agent owns no child publication attempts to tear down"
+            )
+        return await super()._handle_request(method, params, request_id)
 
     def _open_transcript_store(self) -> ChildTranscriptStore | None:
         """The child-owned marker store for this transcript dir, when usable."""
@@ -133,12 +152,16 @@ class ChildAgentServer(RootAgentServer):
         self._record_start(turn_id)
         outcome = TURN_OUTCOME_COMPLETED
         error: str | None = None
+        failure: ChildFailureEvidence | None = None
         try:
             loop = self._require_loop()
             request = decode_turn_request(params)
+            runner, tool_io = self._host_ports_for(params)
             options = request.turn_options or AgentTurnOptions()
             request = replace(
                 request,
+                subagent_runner=runner,
+                tool_io=tool_io,
                 turn_options=replace(
                     options, turn_id=turn_id, retry_sink=self._retry_sink(turn_id)
                 ),
@@ -154,17 +177,54 @@ class ChildAgentServer(RootAgentServer):
         except BaseException as exc:
             outcome = TURN_OUTCOME_FAILED
             error = f"{type(exc).__name__}: {exc}"
+            failure = self._failure_evidence(turn_id, exc)
         finally:
             self._active_turn_id = None
             # Save-before-emit: the terminal result record is durable before
             # the completion frame is announced, so a crash right after this
-            # point reconciles as COMPLETED, not as an unknown outcome.
-            self._record_result(turn_id, outcome=outcome, error=error)
+            # point reconciles as COMPLETED, not as an unknown outcome. The
+            # failure block is part of the record: the measured evidence stays
+            # on disk even when the completion frame is lost with the pipe.
+            failure_block = (
+                encode_child_failure(failure) if failure is not None else None
+            )
+            self._record_result(
+                turn_id, outcome=outcome, error=error, failure=failure_block
+            )
+            ended: dict[str, Any] = {
+                "turn_id": turn_id,
+                "outcome": outcome,
+                "error": error,
+            }
+            if failure_block is not None:
+                ended[CHILD_FAILURE_FRAME_KEY] = failure_block
             with suppress(Exception):
-                await self._notify(
-                    AGENT_TURN_ENDED_METHOD,
-                    {"turn_id": turn_id, "outcome": outcome, "error": error},
-                )
+                await self._notify(AGENT_TURN_ENDED_METHOD, ended)
+
+    def _failure_evidence(
+        self, turn_id: str, exc: BaseException
+    ) -> ChildFailureEvidence | None:
+        """Derive the run's typed envelope here, where its evidence still lives.
+
+        Total by contract: a derivation failure is logged and reported as
+        ``None`` (no envelope), never masking the run's primary failure.
+        """
+        loop = self._loop
+        if loop is None:
+            return None
+        try:
+            return child_failure_evidence(
+                loop,
+                exc,
+                agent_id=self._agent_id or loop.session_id,
+                run_id=turn_id,
+                turn_id=turn_id,
+            )
+        except Exception as failure_exc:
+            logger.warning(
+                "Failed to derive the child failure envelope", exc_info=failure_exc
+            )
+            return None
 
     async def _read_page(self, params: Mapping[str, Any]) -> dict[str, Any]:
         """Serve a live page; the child answers to its agent id and session id."""
@@ -192,12 +252,24 @@ class ChildAgentServer(RootAgentServer):
                     session_id=loop.session_id,
                     run_id=turn_id,
                     started_at=datetime.now(UTC).isoformat(),
+                    # The run-time marker keeps its shipped semantics (written
+                    # immediately before the run, never at publication) and
+                    # carries the attempt id when the spawn named one, so the
+                    # marker bridges to the attempt that created this child.
+                    attempt_id=self._attempt_id,
                 )
             )
         except ChildTranscriptError as exc:
             logger.warning("Failed to record the child start marker: %s", exc)
 
-    def _record_result(self, turn_id: str, *, outcome: str, error: str | None) -> None:
+    def _record_result(
+        self,
+        turn_id: str,
+        *,
+        outcome: str,
+        error: str | None,
+        failure: dict[str, Any] | None = None,
+    ) -> None:
         store = self._transcript_store
         loop = self._loop
         if store is None or loop is None:
@@ -220,6 +292,7 @@ class ChildAgentServer(RootAgentServer):
                     outcome=outcome,
                     completed_at=datetime.now(UTC).isoformat(),
                     error=error,
+                    failure=failure,
                 )
             )
         except ChildTranscriptError as exc:
@@ -263,7 +336,7 @@ class HarnessChildLoopFactory:
             if isinstance(raw_name, str) and raw_name
             else spec.agent_id.replace(":", "-")
         )
-        return await self._process.open_root(
+        loop = await self._process.open_root(
             RootOpenRequest(
                 options=options,
                 client_info=client_info,
@@ -275,6 +348,18 @@ class HarnessChildLoopFactory:
                 parent_session_id=spec.parent_session_id,
             )
         )
+        # Publication-time bridge: the attempt id lands in the child's FIRST
+        # durable write, so a torn persist-to-link window (or a lost aggregate
+        # reply) is attributable to the attempt that produced it.
+        await loop.persist_empty_session(attempt_id=spec.attempt_id)
+        handoff = payload.get(CHILD_HANDOFF_PAYLOAD_KEY)
+        if isinstance(handoff, str) and handoff:
+            # Spawn handoff: the parent's working set arrives ahead of the
+            # task brief, redacted on the parent's side like every message.
+            loop.messages.append(
+                LLMMessage(role=Role.user, content=handoff, injected=True)
+            )
+        return loop
 
     async def close(self) -> None:
         await self._process.close()

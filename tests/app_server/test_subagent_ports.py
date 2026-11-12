@@ -2,18 +2,41 @@
 
 from __future__ import annotations
 
+import asyncio
+from collections.abc import AsyncIterator
 from contextlib import aclosing
 import os
 from pathlib import Path
+import subprocess
 import sys
-from typing import Any
+from typing import Any, cast
 
 import pytest
 
 from chartreux.app_server.agent_wire import (
+    AGENT_RECEIVING_NOTIFICATIONS,
+    AGENT_RECEIVING_REQUESTS,
+    AGENT_TURN_ENDED_METHOD,
+    HOST_SUBAGENT_ENDED_METHOD,
+    HOST_SUBAGENT_EVENT_METHOD,
+    HOST_TOOL_IO_METHOD,
     SUBAGENT_OPEN_METHOD,
     TURN_OUTCOME_COMPLETED,
     TURN_OUTCOME_FAILED,
+    ToolIOCapabilities,
+    agent_request_id,
+    decode_host_run_end,
+    decode_host_run_frame,
+    decode_host_service_offers,
+    decode_shell_command_request,
+    decode_tool_io_request,
+    decode_tool_io_result,
+    encode_host_run_end,
+    encode_host_run_frame,
+    encode_host_service_offers,
+    encode_shell_command_request,
+    encode_tool_io_request,
+    encode_tool_io_result,
 )
 from chartreux.app_server.child_agent import CHILD_AGENT_MODULE
 from chartreux.app_server.child_agent_process import (
@@ -22,21 +45,50 @@ from chartreux.app_server.child_agent_process import (
     child_agent_command,
     multi_process_child_selected,
 )
+from chartreux.app_server.process_bootstrap import (
+    PROCESS_PROTOCOL_VERSION,
+    ReadyFrame,
+    SpawnedProcess,
+)
+from chartreux.app_server.root_agent_process import RootAgentProcess
 from chartreux.app_server.subagent_ports import (
+    CHILD_FAILURE_FRAME_KEY,
+    ChildFailureEvidence,
+    ChildTeardownOutcome,
+    ChildTeardownReport,
+    ChildTeardownRequest,
     InProcessSubagentSpawn,
     SubagentCompletion,
     SubagentFrame,
     SubagentSpawnDeniedError,
     SubagentSpawnSpec,
+    decode_child_failure,
+    failure_decision,
     spawn_spec_from_wire,
     spawn_spec_to_wire,
+    subagent_completion_frame,
     subagent_spawn_port,
 )
 from chartreux.app_server.transport import TRANSPORT_ENV_VAR
 from chartreux.core.agent_loop._execution_port import ExecutionTurnRequest
 from chartreux.core.agent_loop._loop_types import AgentTurnOptions
 from chartreux.core.config.models import SessionLoggingConfig
-from chartreux.core.events import AssistantEvent, BaseEvent, UserMessageEvent
+from chartreux.core.events import (
+    AssistantEvent,
+    BaseEvent,
+    ToolStreamEvent,
+    UserMessageEvent,
+)
+from chartreux.core.llm.exceptions import IncompleteStreamError
+from chartreux.core.recovery_models import (
+    CallEvidence,
+    attach_call_evidence,
+    build_failure_envelope,
+)
+from chartreux.core.recovery_observation import observe_exception
+from chartreux.core.subagents import TaskResult
+from chartreux.core.tools.io_port import ShellCommandRequest, ShellCommandResult
+from chartreux.utils.io import BoundedReadResult, ReadSafeResult
 from tests.conftest import build_test_agent_loop, build_test_vibe_config
 from tests.differential import egress
 from tests.mock.utils import mock_llm_chunk
@@ -184,6 +236,63 @@ def test_spawn_spec_wire_roundtrip() -> None:
         spawn_spec_from_wire({"agent_id": ""})
 
 
+def test_spawn_spec_carries_the_publication_attempt_across_the_wire() -> None:
+    spec = SubagentSpawnSpec(agent_id="agent-3", attempt_id="attempt-child-9")
+    wire = spawn_spec_to_wire(spec)
+    assert wire["attempt_id"] == "attempt-child-9"
+    assert spawn_spec_from_wire(wire) == spec
+    # A spawn minted without an attempt keeps the field absent, so a child
+    # created outside a publication attempt records none.
+    assert spawn_spec_from_wire({"agent_id": "agent-2"}).attempt_id is None
+
+
+def test_child_teardown_request_and_report_round_trip() -> None:
+    request = ChildTeardownRequest(
+        attempt_id="attempt-child-9", agent_id="coder", wait_seconds=0.5
+    )
+    assert ChildTeardownRequest.from_wire(request.to_wire()) == request
+    assert (
+        ChildTeardownRequest.from_wire({"attempt_id": "attempt-child-9"}).reason
+        == "publication-teardown"
+    )
+
+    report = ChildTeardownReport(
+        attempt_id="attempt-child-9",
+        outcome=ChildTeardownOutcome.TOMBSTONED,
+        agent_id="coder",
+        session_id="child-session-9",
+        child_dir="sessions/root-session-1/agents/coder_1",
+        retracted=True,
+        detail="the persisted records were retracted",
+    )
+    assert ChildTeardownReport.from_wire(report.to_wire()) == report
+    assert report.settled is True
+
+
+def test_child_teardown_wire_rejects_malformed_payloads() -> None:
+    with pytest.raises(ValueError, match="no attempt id"):
+        ChildTeardownRequest.from_wire({})
+    with pytest.raises(ValueError, match="no known outcome"):
+        # A peer cannot report an outcome this end does not know: a claimed
+        # rollback outside the four established classes never parses.
+        ChildTeardownReport.from_wire({
+            "attempt_id": "attempt-child-9",
+            "outcome": "rolled-back",
+        })
+    with pytest.raises(ValueError, match="no attempt id"):
+        ChildTeardownReport.from_wire({"outcome": ChildTeardownOutcome.REAPED.value})
+    inconclusive = ChildTeardownReport(
+        attempt_id="attempt-child-9", outcome=ChildTeardownOutcome.INCONCLUSIVE
+    )
+    assert inconclusive.settled is False
+    assert (
+        ChildTeardownReport(
+            attempt_id="attempt-child-9", outcome=ChildTeardownOutcome.ATTEMPT_UNKNOWN
+        ).settled
+        is False
+    )
+
+
 @pytest.mark.asyncio
 async def test_in_process_adapter_streams_events_then_completion(
     tmp_path: Path,
@@ -308,3 +417,234 @@ async def test_child_entrypoint_speaks_the_subagent_open_frame(tmp_path: Path) -
             assert isinstance(result.get("session_id"), str)
         finally:
             await spawned.transport.close()
+
+
+# ---------------------------------------------------------------------------
+# op-9: the host-service channel's wire surface (the pre-rider subset).
+#
+# These assert what travels when the agent asks the coordinator for the two
+# host REQUEST ports a turn needs. The spawned end-to-end turn lives in
+# test_root_process.py; here the codecs and the coordinator-end refusal are
+# pinned without a process.
+# ---------------------------------------------------------------------------
+
+
+class _HostToolIO:
+    """A minimal host tool I/O port: the capability flags are all it advertises."""
+
+    supports_read = True
+    supports_write = False
+    supports_terminal = True
+
+
+def test_host_service_offers_announce_the_ports_a_turn_may_call() -> None:
+    offers = decode_host_service_offers({})
+    assert offers.subagent_runner is False
+    assert offers.tool_io is None
+
+    payload = encode_host_service_offers(
+        subagent_runner=object(), tool_io=_HostToolIO()
+    )
+    offers = decode_host_service_offers({"host_services": payload})
+    assert offers.subagent_runner is True
+    assert offers.tool_io == ToolIOCapabilities(
+        supports_read=True, supports_write=False, supports_terminal=True
+    )
+
+
+def test_tool_io_requests_and_results_round_trip() -> None:
+    request = encode_tool_io_request(
+        "read_lines", {"path": "a.txt", "start_line": 2, "limit": 3, "max_bytes": 64}
+    )
+    op, arguments = decode_tool_io_request(request)
+    assert op == "read_lines"
+    assert arguments["path"] == "a.txt"
+
+    bounded = BoundedReadResult(
+        lines=["two", "three"], total_lines=9, was_truncated=True
+    )
+    assert decode_tool_io_result(op, encode_tool_io_result(op, bounded)) == bounded
+
+    text = ReadSafeResult(text="hello", encoding="utf-8", newline="\n")
+    assert (
+        decode_tool_io_result("read_text", encode_tool_io_result("read_text", text))
+        == text
+    )
+
+    shell = ShellCommandResult(stdout="out", stderr="err", returncode=2)
+    assert (
+        decode_tool_io_result("run_shell", encode_tool_io_result("run_shell", shell))
+        == shell
+    )
+    assert (
+        decode_tool_io_result("write_text", encode_tool_io_result("write_text", None))
+        is None
+    )
+
+    shell_request = ShellCommandRequest(
+        session_id="session-1",
+        tool_call_id="call-1",
+        command="ls",
+        cwd=Path("/tmp"),
+        timeout=5.0,
+        max_output_bytes=128,
+        args=["-l"],
+        env={"LANG": "C"},
+    )
+    decoded = decode_shell_command_request(encode_shell_command_request(shell_request))
+    assert decoded.command == "ls"
+    assert decoded.args == ["-l"]
+    assert decoded.env == {"LANG": "C"}
+    assert str(decoded.cwd) == "/tmp"
+
+
+def test_host_subagent_run_frames_round_trip() -> None:
+    event = ToolStreamEvent(tool_name="task", message="working", tool_call_id="call-1")
+    assert decode_host_run_frame(encode_host_run_frame(event)) == event
+
+    result = TaskResult(response="done", turns_used=2, completed=True)
+    assert decode_host_run_frame(encode_host_run_frame(result)) == result
+
+    assert decode_host_run_end(encode_host_run_end(result=result)) == (result, None)
+    assert decode_host_run_end(encode_host_run_end()) == (None, None)
+    assert decode_host_run_end(encode_host_run_end(error="boom")) == (None, "boom")
+
+
+class _FramePipe:
+    """A transport double: the test feeds frames and reads what the end sent."""
+
+    def __init__(self) -> None:
+        self.sent: list[dict[str, Any]] = []
+        self._incoming: asyncio.Queue[dict[str, Any] | None] = asyncio.Queue()
+
+    async def send(self, message: dict[str, Any]) -> None:
+        self.sent.append(message)
+
+    async def messages(self) -> AsyncIterator[dict[str, Any]]:
+        while True:
+            frame = await self._incoming.get()
+            if frame is None:
+                return
+            yield frame
+
+    def feed(self, frame: dict[str, Any]) -> None:
+        self._incoming.put_nowait(frame)
+
+    async def close(self) -> None:
+        self._incoming.put_nowait(None)
+
+
+class _ProcessDouble:
+    def poll(self) -> int | None:
+        return None
+
+    def terminate(self) -> None:
+        pass
+
+    def kill(self) -> None:
+        pass
+
+
+async def _until(predicate: Any, timeout: float = 5.0) -> None:
+    async with asyncio.timeout(timeout):
+        while not predicate():
+            await asyncio.sleep(0.01)
+
+
+@pytest.mark.asyncio
+async def test_a_host_tool_io_request_needs_a_port_offered_with_the_turn() -> None:
+    pipe = _FramePipe()
+    process = RootAgentProcess(
+        SpawnedProcess(
+            process=cast("subprocess.Popen[bytes]", _ProcessDouble()),
+            transport=cast("Any", pipe),
+            ready=ReadyFrame(protocol_version=PROCESS_PROTOCOL_VERSION),
+        ),
+        heartbeat_interval=30.0,
+    )
+    try:
+        pipe.feed({
+            "jsonrpc": "2.0",
+            "id": agent_request_id(1),
+            "method": HOST_TOOL_IO_METHOD,
+            "params": {"op": "read_text", "path": "a.txt"},
+        })
+        await _until(lambda: pipe.sent)
+
+        reply = pipe.sent[0]
+        assert reply["id"] == agent_request_id(1)
+        # No turn is in flight, so there is no port to serve: typed, not a hang.
+        assert "UnsupportedProcessTurnRequest" in reply["error"]["code"]
+        assert "no host tool I/O port" in reply["error"]["message"]
+        assert process.death is None
+    finally:
+        await process.close()
+
+
+def test_the_host_run_answers_are_notifications_never_requests() -> None:
+    # A host subagent run's frames answer the agent's request: they carry no id
+    # and live in the notification table, never in the request table.
+    assert HOST_SUBAGENT_EVENT_METHOD in AGENT_RECEIVING_NOTIFICATIONS
+    assert HOST_SUBAGENT_ENDED_METHOD in AGENT_RECEIVING_NOTIFICATIONS
+    assert HOST_SUBAGENT_EVENT_METHOD not in AGENT_RECEIVING_REQUESTS
+    assert HOST_SUBAGENT_ENDED_METHOD not in AGENT_RECEIVING_REQUESTS
+
+
+def _child_failure_evidence() -> ChildFailureEvidence:
+    """A derived envelope plus its inputs: the terminal frame's failure block."""
+    error = IncompleteStreamError("prov", "wire")
+    attach_call_evidence(
+        error,
+        CallEvidence(
+            logical_call_id="call-1",
+            started_at=0.0,
+            budget_seconds=60.0,
+            response_started=True,
+            semantic_output_published=False,
+            transport_attempts=1,
+            elapsed_seconds=0.5,
+            budget_exhausted=False,
+        ),
+    )
+    observation = observe_exception(error, phase="turn", turn_id="turn-1")
+    envelope = build_failure_envelope(
+        observation=observation,
+        agent_id="agent-1",
+        run_id="turn-1",
+        turn_id="turn-1",
+        tool_calls_present=True,
+    )
+    return ChildFailureEvidence(
+        envelope=envelope,
+        derivation_inputs={
+            "agent_id": "agent-1",
+            "run_id": "turn-1",
+            "tool_calls_present": True,
+            "tool_calls_pending": False,
+            "stop_reason": None,
+            "observation": {"phase": "turn", "call_evidence": None},
+        },
+    )
+
+
+def test_the_completion_frame_carries_the_child_failure_evidence() -> None:
+    evidence = _child_failure_evidence()
+    frame = subagent_completion_frame(
+        "agent-1",
+        4,
+        SubagentCompletion(outcome=TURN_OUTCOME_FAILED, error="boom", failure=evidence),
+    )
+
+    assert frame["method"] == AGENT_TURN_ENDED_METHOD
+    block = frame["params"][CHILD_FAILURE_FRAME_KEY]
+    assert block["derivation_inputs"]["tool_calls_present"] is True
+    decoded = decode_child_failure(block)
+    assert decoded is not None
+    assert failure_decision(decoded.envelope) == failure_decision(evidence.envelope)
+    assert "tool_effects_settled" in decoded.envelope.recovery.reason_codes
+
+    # A completed run's terminal frame carries no failure block at all.
+    completed = subagent_completion_frame(
+        "agent-1", 4, SubagentCompletion(outcome=TURN_OUTCOME_COMPLETED)
+    )
+    assert CHILD_FAILURE_FRAME_KEY not in completed["params"]

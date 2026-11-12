@@ -2,9 +2,9 @@
 
 ## Decision
 
-The app server queue contains structured user turns only. The Textual client
-does not keep a second queue for slash commands, shell commands, or deferred
-settings writes.
+The app server queue contains structured user input: user turns and manual
+`!` shell inputs. The Textual client does not keep a second queue for slash
+commands, shell commands, or deferred settings writes.
 
 Slash commands have two execution policies:
 
@@ -14,8 +14,13 @@ Slash commands have two execution policies:
 - All other slash commands require an idle session. If the user submits one
   while busy, the client keeps the text in the input and shows a warning.
 
-Shell commands also require an idle session. They are rejected while an agent
-turn, another shell command, or accepted queued prompt is active.
+A shell command is user input, so it behaves like one: submitting `!` while a
+turn or another shell command is active queues it in the same FIFO queue,
+beside any queued prompt, instead of rejecting it. At idle the session runs
+the command once and promotes its result record as an ordinary user turn; an
+interrupt before it starts removes the queued command unexecuted. A shell
+queued behind other work is therefore deferred user input, never work the
+server refuses.
 
 Settings commands such as `/model`, `/thinking`, `/theme`, and `/proxy-setup`
 open their picker only while idle. Once the user confirms a
@@ -32,6 +37,13 @@ Rejecting non-side-channel commands while busy makes the behavior explicit and
 keeps the client small. It also avoids ordering ambiguities such as whether a
 queued `/clear` should discard prompts that the app server has already
 accepted.
+
+A shell input is different from a slash command: it mutates nothing the client
+coordinates, and it is the user's own typing rather than a scheduling
+decision. Queueing it costs one queue entry kind and buys the user's stated
+expectation — a `!` command is like any other user input and behaves as such.
+Because the queue owns effect-then-turn, no concurrent inject path exists, so
+the record can never be lost to a turn-start race.
 
 Settings writes require the session to be idle because they can rebuild model,
 tool, skill, and prompt state. Since their commands cannot open while busy,
@@ -55,10 +67,12 @@ queued-message UI.
   and `/retry` on the idle-only path.
 - Keep settings commands on the idle-only path and write config directly after
   the user confirms the picker.
-- Do not add command, shell, callback, or barrier variants to the prompt queue.
-  New queued work belongs in an explicit app-server API.
+- Do not add command, callback, or barrier variants to the prompt queue. A
+  manual `!` shell input is the one admitted entry kind: it is user input, and
+  the shell command request is the only thing that mints it.
 - Preserve the submitted input when rejecting a busy command so the user can
-  retry it after the active work finishes.
+  retry it after the active work finishes. A shell command is never rejected
+  for being busy; it queues.
 
 ## Flag To User When
 

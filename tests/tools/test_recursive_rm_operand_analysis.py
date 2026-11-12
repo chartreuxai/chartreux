@@ -298,6 +298,18 @@ def resolve(cwd: Path, command: str) -> PermissionContext | None:
     return tool.resolve_permission(BashArgs(command=command))
 
 
+def resolve_with_scratchpad(
+    cwd: Path, scratchpad: Path, command: str
+) -> PermissionContext | None:
+    tool = Bash(
+        config_getter=lambda: BashToolConfig(),
+        state=BaseToolState(),
+        cwd=cwd,
+        scratchpad_dir=scratchpad,
+    )
+    return tool.resolve_permission(BashArgs(command=command))
+
+
 def assert_handoff(context: PermissionContext | None) -> None:
     """The command resolves handoff: the shipped blanket recursive-rm denial."""
     assert context is not None
@@ -689,6 +701,77 @@ class TestRecursiveRmPins:
             ShellPermissionResolver, "_segment_write_paths", return_value=None
         ):
             assert_handoff(resolve(repo, "rm -rf vendor; echo x > after.txt"))
+
+
+class TestScratchpadRmCarveOut:
+    """v0.7.8 P4: containment-only admission for the session scratchpad.
+
+    The scratchpad family skips the git-tree analysis (clean-tree state,
+    metadata overlap, repository recovery) but keeps the call-footprint
+    analysis, the canonical-path containment rule, and the root exclusion.
+    """
+
+    def test_contained_operands_resolve_run_class(self, tmp_path: Path) -> None:
+        repo = make_clean_repo(tmp_path / "repo")
+        scratch = tmp_path / "scratch"
+        (scratch / "work").mkdir(parents=True)
+        (scratch / "work" / "draft.txt").write_text("draft\n", encoding="utf-8")
+        for command in (
+            f"rm -r {scratch}/work",
+            f"rm -rf {scratch}/work/draft.txt",
+            f"rm -r {scratch}/work {scratch}/missing",
+            f"rm -r -- {scratch}/work",
+        ):
+            assert_run_class(resolve_with_scratchpad(repo, scratch, command))
+
+    def test_scratchpad_root_is_not_a_deletable_operand(self, tmp_path: Path) -> None:
+        repo = make_clean_repo(tmp_path / "repo")
+        scratch = tmp_path / "scratch"
+        scratch.mkdir()
+        assert_handoff(resolve_with_scratchpad(repo, scratch, f"rm -r {scratch}"))
+        assert_handoff(resolve_with_scratchpad(repo, scratch, f"rm -rf {scratch}/"))
+
+    def test_symlink_escaping_the_root_resolves_handoff(self, tmp_path: Path) -> None:
+        # Containment is decided on the resolved path, never the spelling.
+        repo = make_clean_repo(tmp_path / "repo")
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        (outside / "keep.txt").write_text("keep\n", encoding="utf-8")
+        scratch = tmp_path / "scratch"
+        scratch.mkdir()
+        (scratch / "escape").symlink_to(outside, target_is_directory=True)
+        assert_handoff(
+            resolve_with_scratchpad(repo, scratch, f"rm -r {scratch}/escape")
+        )
+        assert_handoff(
+            resolve_with_scratchpad(repo, scratch, f"rm -r {scratch}/escape/keep.txt")
+        )
+
+    def test_mixed_operand_with_a_repository_target_resolves_handoff(
+        self, tmp_path: Path
+    ) -> None:
+        repo = make_clean_repo(tmp_path / "repo")
+        scratch = tmp_path / "scratch"
+        (scratch / "work").mkdir(parents=True)
+        # The repository operand is eligible on its own (a clean tree), but the
+        # whole command fails: one operand is not scratchpad-contained.
+        assert_run_class(resolve(repo, "rm -rf build"))
+        assert_handoff(
+            resolve_with_scratchpad(repo, scratch, f"rm -r {scratch}/work build")
+        )
+
+    def test_unestablishable_call_footprint_resolves_handoff(
+        self, tmp_path: Path
+    ) -> None:
+        repo = make_clean_repo(tmp_path / "repo")
+        scratch = tmp_path / "scratch"
+        (scratch / "work").mkdir(parents=True)
+        with patch.object(
+            ShellPermissionResolver, "_segment_write_paths", return_value=None
+        ):
+            assert_handoff(
+                resolve_with_scratchpad(repo, scratch, f"rm -r {scratch}/work")
+            )
 
 
 @pytest.mark.parametrize("command", ["command unset PATH", "/usr/bin/unset PATH"])

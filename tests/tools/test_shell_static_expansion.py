@@ -728,6 +728,45 @@ def test_read_only_positions_accept_resolvable_literals() -> None:
         evaluate_expansion_for_position("head", "positional:1", "$F", {"F": "x.txt"})
         == "x.txt"
     )
+    # v0.7.8 P1c: ls, the sort/uniq input operands, and find's name tests.
+    assert (
+        evaluate_expansion_for_position("ls", "positional:1", "$D", {"D": "sub"})
+        == "sub"
+    )
+    assert (
+        evaluate_expansion_for_position("sort", "positional:1", "$F", {"F": "x.txt"})
+        == "x.txt"
+    )
+    assert (
+        evaluate_expansion_for_position("sort", "positional:4", "$F", {"F": "x.txt"})
+        == "x.txt"
+    )
+    assert (
+        evaluate_expansion_for_position("uniq", "positional:1", "$F", {"F": "x.txt"})
+        == "x.txt"
+    )
+    assert (
+        evaluate_expansion_for_position("uniq", "option-arg:-f", "$N", {"N": "2"})
+        == "2"
+    )
+    assert (
+        evaluate_expansion_for_position(
+            "uniq", "option-arg:--skip-chars", "$N", {"N": "1"}
+        )
+        == "1"
+    )
+    assert (
+        evaluate_expansion_for_position(
+            "find", "option-arg:-name", "$P", {"P": "needle"}
+        )
+        == "needle"
+    )
+    assert (
+        evaluate_expansion_for_position(
+            "find", "option-arg:-iname", "$P", {"P": "needle"}
+        )
+        == "needle"
+    )
 
 
 def test_positional_open_ranges_cover_later_indices() -> None:
@@ -760,9 +799,25 @@ def test_write_positions_reject_everything() -> None:
         )
 
 
+def test_sort_and_uniq_output_positions_reject_everything() -> None:
+    """I8-F1: an expanded value must never reach a table-classified write."""
+    for command, position in (
+        ("sort", "option-arg:-o"),
+        ("sort", "option-arg:--output"),
+        ("uniq", "positional:2"),
+    ):
+        assert not is_read_only_argument_position(command, position)
+        # Write positions reject even plain literals and valid arithmetic.
+        assert evaluate_expansion_for_position(command, position, "5", {}) is None
+        assert (
+            evaluate_expansion_for_position(command, position, "$((N+1))", {"N": "5"})
+            is None
+        )
+
+
 def test_unknown_commands_and_positions_fail_closed() -> None:
-    assert classify_argument_position("sort", "positional:1") is None
-    assert not is_read_only_argument_position("sort", "positional:1")
+    assert classify_argument_position("tr", "positional:1") is None
+    assert not is_read_only_argument_position("tr", "positional:1")
     assert classify_argument_position("head", "option-arg:--unset") is None
     assert not is_read_only_argument_position("head", "positional:0")
     assert evaluate_expansion_for_position("tee", "positional:1", "x", {}) is None
@@ -775,6 +830,16 @@ def test_read_only_positions_listing() -> None:
     assert "positional:1" in read_only_positions("grep")
     assert "positional:1+" in read_only_positions("cat")
     assert read_only_positions("unknown-cmd") == frozenset()
+    # v0.7.8 P1c: the read-position expansions and their write exclusions.
+    assert "positional:1+" in read_only_positions("ls")
+    assert "positional:1+" in read_only_positions("sort")
+    assert "option-arg:-o" not in read_only_positions("sort")
+    assert read_only_positions("uniq") >= {"positional:1", "option-arg:-f"}
+    assert "positional:2" not in read_only_positions("uniq")
+    assert read_only_positions("find") == frozenset({
+        "option-arg:-name",
+        "option-arg:-iname",
+    })
 
 
 # --- S1 safe-pattern admissions (analysis-only, no execution) -----------------
@@ -794,7 +859,9 @@ def test_equals_marker_admission_emits_the_executed_source() -> None:
         assert list(split_shell_tokens(analysis.command_parts[0])) == ["echo", "=ls"]
 
 
-def test_equals_marker_that_can_expand_past_one_word_keeps_its_denial() -> None:
+def test_equals_marker_that_can_expand_past_one_word_keeps_its_denial(
+    zsh_executor,
+) -> None:
     analysis = analyze_shell_command("echo '='*")
 
     assert analysis.approval_reasons == (

@@ -425,15 +425,12 @@ def _classify_single(error: BaseException) -> FailureInfo:  # noqa: PLR0912
     elif status == HTTPStatus.TOO_EARLY:
         category = FailureCategory.TOO_EARLY
     elif status == HTTPStatus.TOO_MANY_REQUESTS:
-        # Only explicitly transient rate-limit codes are safe to replay.
-        category = (
-            FailureCategory.RATE_LIMIT
-            if any(
-                part in token
-                for part in ("rate_limit", "too_many_requests", "overload")
-            )
-            else FailureCategory.UNKNOWN
-        )
+        # A 429 is the provider's own rate-limit signal with or without a
+        # recognized body code: a bare 429 (empty or plain-text body, as
+        # proxies answer) throttles exactly like a coded one. Quota and
+        # billing 429s are already protected above by their structured
+        # tokens, which run before the status branches.
+        category = FailureCategory.RATE_LIMIT
     elif status is not None and status >= HTTPStatus.INTERNAL_SERVER_ERROR:
         category = (
             FailureCategory.OVERLOAD

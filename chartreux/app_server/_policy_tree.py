@@ -49,6 +49,7 @@ from chartreux.app_server.agent_wire import (
 from chartreux.app_server.registry_manifest import RegistryManifest
 from chartreux.app_server.transport import (
     IN_PROCESS_TRANSPORT,
+    TransportSelection,
     resolve_transport_selection,
 )
 from chartreux.core.agent_loop import AgentLoop
@@ -691,16 +692,25 @@ class ProcessPolicyTree:
 
 
 def policy_tree_transport(
-    environ: Mapping[str, str] | None = None,
+    selection: TransportSelection | Mapping[str, str],
 ) -> PolicyTreeTransport:
     """Select the topology for a policy-tree transaction.
 
-    ``CHARTREUX_TRANSPORT=in_process`` (and the programmatic default) keeps
-    every node in this process; the multi-process selectors return the wire
-    adapter. Both run the same transaction code.
+    The production caller passes the SESSION-LEVEL resolved selection: the
+    topology is already a property of the session, so no site re-resolves it
+    from the environment — a default-empty environ would silently answer
+    in-process for a stdio session, which is exactly the unwired state this
+    seam exists to end. ``CHARTREUX_TRANSPORT=in_process`` returns the same
+    in-process topology as the programmatic default; both run the same
+    transaction code. A raw selector mapping stays accepted for the
+    resolution tests, where no session selection exists yet.
     """
-    selection = resolve_transport_selection(environ={} if environ is None else environ)
-    if selection.kind == IN_PROCESS_TRANSPORT:
+    resolved = (
+        selection
+        if isinstance(selection, TransportSelection)
+        else resolve_transport_selection(environ=selection)
+    )
+    if resolved.kind == IN_PROCESS_TRANSPORT:
         return InProcessPolicyTree()
     return ProcessPolicyTree()
 

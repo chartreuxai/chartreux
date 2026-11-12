@@ -421,7 +421,7 @@ class TestTransferPermissionFlow:
         )
         assert isinstance(permission, PermissionContext)
         assert permission.permission is ToolPermission.NEVER
-        assert permission.denial_kind is None
+        assert permission.denial_kind == "out_of_root"
         assert permission.dangerous_command_proposal is None
         assert "outside the authorized workspace" in (permission.reason or "")
 

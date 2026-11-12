@@ -14,7 +14,16 @@ from chartreux.questions import (
     UserQuestionResult,
 )
 
-ROOT_GRANT_TOOLS = frozenset({"read_file", "write_file", "edit", "grep", "read_image"})
+ROOT_GRANT_TOOLS = frozenset({
+    "read_file",
+    "write_file",
+    "edit",
+    "grep",
+    "read_image",
+    "bash",
+})
+# File tools name their path in a tool argument. Bash names no path argument:
+# its denial carries the resolved operand path the shell analysis refused.
 ROOT_GRANT_TARGET_ARG = {
     "read_file": "file_path",
     "write_file": "file_path",
@@ -51,9 +60,14 @@ class SessionRootGrants:
         self.denied_roots.add(root.resolve())
 
 
-def root_grant_target(tool_name: str, args: BaseModel, cwd: Path) -> Path | None:
-    """Resolve the exact target a file tool's permission check denied."""
-    raw = getattr(args, ROOT_GRANT_TARGET_ARG[tool_name], None)
+def root_grant_target(
+    tool_name: str, args: BaseModel, cwd: Path, denied_target: Path | None = None
+) -> Path | None:
+    """Resolve the exact target a tool's permission check denied."""
+    argument = ROOT_GRANT_TARGET_ARG.get(tool_name)
+    if argument is None:
+        return denied_target
+    raw = getattr(args, argument, None)
     if not isinstance(raw, str) or not raw.strip():
         return None
     return resolve_tool_path(raw, cwd)

@@ -881,6 +881,9 @@ def test_public_turn_queue_serializes_order_and_turn_link() -> None:
                 ],
             }
         ],
+        # Item 5 B.2a: ready records the queue had no room for are public
+        # pending work, so the queue state carries them beside its items.
+        "retained": [],
         "paused": True,
         "maxItems": 32,
     }

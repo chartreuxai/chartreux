@@ -108,12 +108,14 @@ from chartreux.core.tools.builtins._shell_git_classifier import (
     _git_config_section_is_push_effecting as _git_config_section_is_push_effecting,
     _git_config_section_operation_guard_reason as _git_config_section_operation_guard_reason,
     _git_config_write_guard_reason as _git_config_write_guard_reason,
+    _GitCheckoutShape as _GitCheckoutShape,
     _grantable_classification as _grantable_classification,
     _hard_denied as _hard_denied,
     _push_destination_fail_closed_reason as _push_destination_fail_closed_reason,
     _push_destination_is_explicit as _push_destination_is_explicit,
     _push_operation_ids as _push_operation_ids,
     _refspec_fail_closed_reason as _refspec_fail_closed_reason,
+    _scan_git_checkout_shape as _scan_git_checkout_shape,
     classify_dangerous_git_command as classify_dangerous_git_command,
     is_dangerous_git_subcommand as is_dangerous_git_subcommand,
 )
@@ -745,6 +747,111 @@ def _uniq_policy(args: list[str]) -> ShellCommandPolicy:
         positional_count += 1
     return ShellCommandPolicy(
         requires_approval=positional_count >= operand_count_with_output
+    )
+
+
+# xargs dispatches one modeled command: its stdin-derived words are appended to
+# that command's argv. Only the read commands whose policy holds for an
+# unbounded tail of positionals are admitted (P5); uniq is excluded outright
+# because its second positional is its OUTPUT file, so two appended matches
+# would write one — the same write-operand exclusion sort -o gets from its own
+# policy. The option grammar is closed: any unmodeled option, missing option
+# value, unmodeled subcommand, or wrapper spelling keeps the blanket denial.
+_XARGS_READ_SUBCOMMANDS = frozenset({"cat", "grep", "sort", "wc"})
+_XARGS_VALUE_LONG_OPTIONS = frozenset({
+    "--arg-file",
+    "--delimiter",
+    "--eof",
+    "--max-args",
+    "--max-chars",
+    "--max-lines",
+    "--max-procs",
+    "--replace",
+})
+_XARGS_VALUE_SHORT_OPTIONS = frozenset("adEnLsIP")
+_XARGS_BOOLEAN_LONG_OPTIONS = frozenset({
+    "--exit",
+    "--no-run-if-empty",
+    "--null",
+    "--verbose",
+})
+_XARGS_BOOLEAN_SHORT_OPTIONS = frozenset("0rtx")
+_XARGS_BLANKET_DENIAL = ShellCommandPolicy(requires_approval=True)
+
+
+def _xargs_policy(args: list[str]) -> ShellCommandPolicy:  # noqa: PLR0911, PLR0912, PLR0915
+    positionals: list[str] = []
+    arg_files: tuple[str, ...] = ()
+    index = 0
+    while index < len(args):
+        token = args[index]
+        if token == "--":
+            positionals = args[index + 1 :]
+            break
+        if not token.startswith("-") or token == "-":
+            positionals = args[index:]
+            break
+        if token.startswith("--"):
+            option, separator, attached = token.partition("=")
+            if option in _XARGS_BOOLEAN_LONG_OPTIONS:
+                if separator:
+                    return _XARGS_BLANKET_DENIAL
+                index += 1
+                continue
+            if option not in _XARGS_VALUE_LONG_OPTIONS:
+                return _XARGS_BLANKET_DENIAL
+            if separator:
+                value = attached
+            elif index + 1 < len(args):
+                value = args[index + 1]
+                index += 1
+            else:
+                return _XARGS_BLANKET_DENIAL
+            if option == "--arg-file":
+                arg_files = (*arg_files, value)
+            index += 1
+            continue
+        # A short cluster admits boolean flags; a value-taking flag ends it,
+        # with its value attached or taken from the next token.
+        consumes_next = False
+        for offset, short in enumerate(token[1:]):
+            if short in _XARGS_BOOLEAN_SHORT_OPTIONS:
+                continue
+            if short not in _XARGS_VALUE_SHORT_OPTIONS:
+                return _XARGS_BLANKET_DENIAL
+            attached = token[2 + offset :]
+            if attached:
+                if short == "a":
+                    arg_files = (*arg_files, attached)
+            elif index + 1 < len(args):
+                if short == "a":
+                    arg_files = (*arg_files, args[index + 1])
+                consumes_next = True
+            else:
+                return _XARGS_BLANKET_DENIAL
+            break
+        index += 2 if consumes_next else 1
+    if not positionals:
+        # Bare xargs runs echo: an unmodeled subcommand, not a read dispatch.
+        return _XARGS_BLANKET_DENIAL
+    subcommand = positionals[0]
+    if subcommand not in _XARGS_READ_SUBCOMMANDS:
+        return _XARGS_BLANKET_DENIAL
+    initial = positionals[1:]
+    if subcommand == "cat":
+        subcommand_policy = ShellCommandPolicy(
+            positional_values=_scan_options(initial, _OptionTable()).positionals
+        )
+    else:
+        subcommand_policy = _standard_policy(subcommand, initial)
+    if subcommand_policy.requires_approval:
+        # The dispatched command's own write or execution surface (sort -o and
+        # --files0-from among them) keeps the whole call denied.
+        return _XARGS_BLANKET_DENIAL
+    return ShellCommandPolicy(
+        inspect_positional_paths=True,
+        option_path_values=(*subcommand_policy.option_path_values, *arg_files),
+        positional_values=subcommand_policy.positional_values or (),
     )
 
 
@@ -1964,7 +2071,7 @@ _COMMAND_POLICIES = {
     "tree": lambda args: _standard_policy("tree", args),
     "uniq": _uniq_policy,
     "wc": lambda args: _standard_policy("wc", args),
-    "xargs": lambda args: ShellCommandPolicy(requires_approval=True),
+    "xargs": _xargs_policy,
 }
 _COMMAND_POLICIES.update({
     name: _compiler_output_policy for name in _COMPILER_OUTPUT_COMMANDS

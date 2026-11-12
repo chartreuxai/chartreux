@@ -39,8 +39,14 @@ from chartreux.core.tools.base import (
     ToolError,
     ToolPermission,
 )
+from chartreux.core.tools.builtins._shell_argument_positions import (
+    is_read_only_argument_position,
+    read_only_positions,
+)
 from chartreux.core.tools.builtins._shell_permission_resolver import (
+    _GLOB_WHITELIST_COMMANDS,
     GlobExecutionPlan,
+    GlobPlanDenial,
     QuotedWordPlanDenial,
     glob_execution_plan_for_command,
     quoted_word_execution_plan_for_command,
@@ -234,6 +240,94 @@ def test_all_literal_call_is_not_the_glob_transport(work: Path) -> None:
     assert _plan(work, "cat alpha.txt") is None
     assert _plan(work, "wc alpha.txt beta.txt") is None
     assert _permission(work, "cat alpha.txt").permission is ToolPermission.ALWAYS
+
+
+def test_non_glob_option_call_reaches_the_ordinary_path(work: Path) -> None:
+    """P2: an option word in a call with no glob is not a path-glob candidate.
+
+    The option-token refusal used to run before the is-this-a-glob test, so
+    ``wc -l file.txt`` denied as "path glob candidate '-l'". It is an
+    ordinary literal call now: no plan binds and the path layer decides.
+    """
+    for command in (
+        "wc -l file.txt",
+        "cat -n file.txt",
+        "head -n 2 file.txt",
+        "sort file.txt",
+        "uniq file.txt",
+    ):
+        assert _plan(work, command) is None, command
+        assert _permission(work, command).permission is ToolPermission.ALWAYS, command
+
+
+def test_glob_whitelist_is_consistent_with_the_read_position_table() -> None:
+    """The transport set carries only table-classified read commands (P1c).
+
+    Every command in the set has at least one read-only positional, and every
+    expanded word the plan produces must land in a read-only position — which
+    is what refuses `uniq`'s second positional in ``_glob_execution_plan``.
+    """
+    for command in _GLOB_WHITELIST_COMMANDS:
+        assert read_only_positions(command), command
+    assert is_read_only_argument_position("cat", "positional:3")
+    assert is_read_only_argument_position("wc", "positional:2")
+    assert is_read_only_argument_position("sort", "positional:2")
+    assert is_read_only_argument_position("uniq", "positional:1")
+    assert not is_read_only_argument_position("uniq", "positional:2")
+
+
+@pytest.mark.asyncio
+async def test_sort_glob_call_binds_a_literal_plan(work: Path) -> None:
+    plan = _plan(work, "sort *.txt")
+
+    assert plan is not None
+    assert plan.argv == ("sort", "alpha.txt", "beta.txt", "file.txt", "with space.txt")
+    assert _permission(work, "sort *.txt").permission is ToolPermission.ALWAYS
+
+    result = await collect_result(_tool(work).run(BashArgs(command="sort *.txt")))
+
+    assert result.exit_code == 0, result
+    assert result.stdout.split() == ["alpha", "beta", "file", "spaced"]
+
+
+def test_uniq_glob_call_refuses_the_write_position(work: Path) -> None:
+    """A second expanded word would be uniq's OUTPUT file: the plan refuses."""
+    with pytest.raises(GlobPlanDenial):
+        _plan(work, "uniq *.txt")
+    context = _permission(work, "uniq *.txt")
+
+    assert context.permission is ToolPermission.NEVER
+    assert "path glob candidate" in (context.reason or "")
+
+
+@pytest.mark.asyncio
+async def test_uniq_single_match_glob_call_binds_a_literal_plan(
+    work: Path, tmp_path: Path
+) -> None:
+    """With one match the second positional stays empty, so the plan binds."""
+    only = tmp_path / "single"
+    only.mkdir()
+    (only / "only.txt").write_text("one\none\ntwo\n", encoding="utf-8")
+
+    plan = _plan(only, "uniq *.txt")
+
+    assert plan is not None
+    assert plan.argv == ("uniq", "only.txt")
+    assert _permission(only, "uniq *.txt").permission is ToolPermission.ALWAYS
+
+    result = await collect_result(_tool(only).run(BashArgs(command="uniq *.txt")))
+
+    assert result.exit_code == 0, result
+    assert result.stdout.splitlines() == ["one", "two"]
+
+
+def test_sort_output_option_glob_call_stays_denied(work: Path) -> None:
+    """The write option keeps its own denial: no plan may carry it."""
+    with pytest.raises(GlobPlanDenial):
+        _plan(work, "sort -o sorted.txt *.txt")
+    assert _permission(work, "sort -o sorted.txt *.txt").permission is (
+        ToolPermission.NEVER
+    )
 
 
 def test_non_whitelist_glob_admissions_never_enter_the_transport(work: Path) -> None:

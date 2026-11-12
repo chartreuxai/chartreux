@@ -54,6 +54,18 @@ from tests.mock.utils import collect_result
 from tests.tools._bash_test_support import bash as bash, locate_file as locate_file
 
 
+@pytest.fixture(autouse=True)
+def _ambient_shell_selects_the_executor(monkeypatch: pytest.MonkeyPatch) -> None:
+    """These pins choose the executor through ``$SHELL``.
+
+    The shipped default (bash) now outranks the ambient ``$SHELL``, so the
+    module disables the bash lookup: each test's own ``SHELL`` pin selects the
+    family its spawn uses, exactly as the executor pins are written.
+    """
+    monkeypatch.setattr(shell_utils, "_locate_bash", lambda: None)
+    shell_utils.reset_executor_selection()
+
+
 def test_shell_results_keep_a_returncode_alias_for_post_tool_hooks():
     # The verbatim result dump is the `tool_output` payload handed to hooks.
     captured = CapturedShellResult(command="x", exit_code=2).model_dump(mode="json")

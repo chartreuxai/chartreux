@@ -732,10 +732,10 @@ class ToolDecisionCoordinator:
         tool_name: str,
         tool_call_id: str | None,
     ) -> ToolDecision | None:
-        """Resolve an out-of-root file denial, prompting when the runtime allows.
+        """Resolve an out-of-root denial, prompting when the runtime allows.
 
         Returns None when the denial must keep the existing behavior: the tool
-        is not a promptable file tool, or no promptable target can be proposed.
+        has no grantable target, or no promptable target can be proposed.
         A child session never prompts, whatever its user-input capability: it
         denies with remediation and the blocker flows back to the parent.
         """
@@ -756,7 +756,9 @@ class ToolDecisionCoordinator:
                 if self._root_grant_port_getter() is not None
                 else None
             )
-        target = root_grant_target(tool_name, args, self._cwd_getter())
+        target = root_grant_target(
+            tool_name, args, self._cwd_getter(), ctx.out_of_root_target
+        )
         root = propose_root_grant(target) if target is not None else None
         if root is None:
             return None

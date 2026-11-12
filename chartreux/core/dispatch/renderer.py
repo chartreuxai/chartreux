@@ -180,12 +180,14 @@ _COMPOSITION_REUSE = (
     "A retained agent keeps its last model and thinking unless overridden. "
     "Launch a new agent when its identity, stack, or assignment must change, "
     "or when work is unrelated or needs independent judgment. A running "
-    "agent is busy; wait for its result with `wait_for_agent` (a "
-    "`still_running` timeout is a normal outcome: end your turn and "
-    "re-invoke the wait in a later turn), and spawn another only for "
-    "independent, non-conflicting work. A `closed` or `evicted` agent cannot "
-    "be reused; retrieve its retained result with `get_agent_result` if "
-    "needed, then start a new agent."
+    "agent is busy: collect its result on the completion notification with "
+    "`get_agent_result`, and wait with `wait_for_agent` only when its "
+    "result is a hard dependency of the next action (a `still_running` "
+    "timeout is a normal outcome: end your turn and re-invoke the wait in "
+    "a later turn). Spawn another only for independent, non-conflicting "
+    "work. A `closed` or `evicted` agent cannot be reused; retrieve its "
+    "retained result with `get_agent_result` if needed, then start a new "
+    "agent."
 )
 
 # The independent-review guidance: the opening clause is pinned verbatim by

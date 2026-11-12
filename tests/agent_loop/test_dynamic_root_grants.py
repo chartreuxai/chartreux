@@ -26,6 +26,7 @@ from chartreux.core.config.types import ConfigSaveResult
 from chartreux.core.events import BaseEvent, ToolResultEvent, UserInputRequestEvent
 from chartreux.core.llm_models import FunctionCall, ToolCall
 from chartreux.core.tools.base import ToolPermission
+from chartreux.core.workspace import Workspace
 from chartreux.questions import UserAnswer, UserQuestionRequest, UserQuestionResult
 from tests.conftest import build_test_agent_loop, build_test_vibe_config
 from tests.mock.utils import mock_llm_chunk
@@ -145,6 +146,88 @@ async def test_sensitive_denial_never_prompts(tmp_path: Path) -> None:
         assert agent._session_root_grants.roots == set()
     finally:
         await agent.aclose()
+
+
+async def test_bash_operand_denial_grants_the_canonical_root(tmp_path: Path) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    nested = outside / "nested"
+    nested.mkdir()
+    target = nested / "note.txt"
+    target.write_text("granted content")
+    backend = FakeBackend([
+        [
+            mock_llm_chunk(
+                tool_calls=[_call("bash", {"command": f"cat {target}"}, "bash-read")]
+            )
+        ],
+        [mock_llm_chunk(content="done")],
+    ])
+    agent = build_test_agent_loop(
+        config=_config(), cwd=project, backend=backend, user_input_capability=True
+    )
+    try:
+        events, requests = await _drive(agent, "Allow this session")
+        assert len(requests) == 1
+        request = requests[0].args
+        assert isinstance(request, UserQuestionRequest)
+        # The grant binds the CANONICAL ROOT of the offending operand, not the
+        # file and not the tool argument (bash names no path argument).
+        assert request.questions[0].question.startswith(f"Grant {nested.resolve()}")
+        assert agent._session_root_grants.roots == {nested.resolve()}
+        results = _results(events)
+        assert len(results) == 1
+        assert not results[0].skipped
+        assert "granted content" in str(results[0].result)
+    finally:
+        await agent.aclose()
+
+
+async def test_bash_child_denial_never_prompts(tmp_path: Path) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    target = outside / "note.txt"
+    target.write_text("secret content")
+    parent = build_test_agent_loop(
+        config=_config(), cwd=project, backend=FakeBackend(), user_input_capability=True
+    )
+    # The child inherits the project workspace and never prompts: its bash
+    # operand denial is bounded, distinct from the interactive canonical-root
+    # grant the parent flow offers for the same command.
+    child = AgentLoop(
+        config_orchestrator=parent.config_orchestrator.copy(),
+        cwd=project,
+        backend=FakeBackend([
+            [
+                mock_llm_chunk(
+                    tool_calls=[
+                        _call("bash", {"command": f"cat {target}"}, "child-bash")
+                    ]
+                )
+            ],
+            [mock_llm_chunk(content="done")],
+        ]),
+        is_subagent=True,
+        inherited_workspace=Workspace.for_session(project),
+        user_input_capability=True,
+    )
+    try:
+        events, requests = await _drive(child, "Allow this session")
+        assert requests == []
+        results = _results(events)
+        assert len(results) == 1
+        assert results[0].skipped
+        assert results[0].skip_reason is not None
+        assert "outside the authorized workspace" in results[0].skip_reason
+        assert "Instead," not in results[0].skip_reason
+        assert child._session_root_grants.roots == set()
+    finally:
+        await child.aclose()
+        await parent.aclose()
 
 
 async def test_one_waiters_cancellation_does_not_cancel_the_shared_decision(

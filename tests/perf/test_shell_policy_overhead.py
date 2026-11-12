@@ -39,7 +39,7 @@ Run post-change in the main tree, serial only, on a quiet machine:
 
 from __future__ import annotations
 
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterator, Sequence
 import json
 import os
 from pathlib import Path
@@ -284,9 +284,21 @@ def trials_count() -> int:
 
 
 @pytest.fixture
-def pinned_shell(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Pin the ambient executor so pre- and post-change runs are comparable."""
+def pinned_shell(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+    """Pin the resolved executor so pre- and post-change runs are comparable.
+
+    The process-level resolution — not the ambient ``$SHELL`` — is what the
+    analysis reads since the shipped bash default was introduced, so the pin
+    installs the frozen denominators' executor directly.
+    """
+    from chartreux.core.utils import shell as shell_module
+
     monkeypatch.setenv("SHELL", PINNED_SHELL)
+    shell_module.apply_executor_selection(PINNED_SHELL)
+    try:
+        yield
+    finally:
+        shell_module.reset_executor_selection()
 
 
 @pytest.fixture

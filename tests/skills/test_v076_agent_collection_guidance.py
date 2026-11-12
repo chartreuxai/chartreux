@@ -236,14 +236,14 @@ class TestPinnedCollisionSites:
         assert "get_agent_result or wait_for_agent to retrieve the " in source
 
     def test_renderer_reuse_block_outside_owned_files(self) -> None:
-        # The fixture-mirror line 19 old claim ("wait for its result with
-        # `wait_for_agent`") renders from core/dispatch/renderer.py's
-        # _COMPOSITION_REUSE block, which this chunk does not own; the
-        # rendered fixture still matches it.
+        # The fixture-mirror line 19 claim renders from core/dispatch/renderer.py's
+        # _COMPOSITION_REUSE block, which this chunk did not own; v0.7.8 package
+        # 13 reconciled that clause to notification-first and regenerated the
+        # fixture, so the pin follows the rendered clause in both places.
         renderer = (ROOT / "chartreux/core/dispatch/renderer.py").read_text()
         fixture = (ROOT / "tests/fixtures/dispatch/standalone/task.md").read_text()
-        assert "wait for its result with `wait_for_agent`" in renderer
-        assert "wait for its result with `wait_for_agent`" in fixture
+        assert "collect its result on the completion notification" in renderer
+        assert "collect its result on the completion notification" in fixture
 
 
 class TestPinnedPhrasesPreserved:

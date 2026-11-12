@@ -17,6 +17,7 @@ import keyring.errors
 import pytest
 import tomli_w
 
+from chartreux.app_server.transport import IN_PROCESS_TRANSPORT, TRANSPORT_ENV_VAR
 from chartreux.cli.textual_ui.app import CORE_VERSION, ChartreuxApp, StartupOptions
 from chartreux.core.agent_loop import AgentLoop
 from chartreux.core.config import (
@@ -102,6 +103,19 @@ def _isolate_provider_transport() -> Generator[None]:
             for name, value in provider_env.items():
                 if value is not None:
                     os.environ[name] = value
+
+
+@pytest.fixture(autouse=True)
+def _isolate_transport_selection(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep the suite off the developer's ambient transport selector.
+
+    A shell that exports ``CHARTREUX_TRANSPORT`` decides which app-server route
+    every harness takes, so an ambient value would silently turn a session test
+    into a spawned-process test whose provider mock the child never sees. The
+    suite runs on the in-process route; the production-entrypoint tests publish
+    ``stdio`` themselves, and a test that needs the selector unset clears it.
+    """
+    monkeypatch.setenv(TRANSPORT_ENV_VAR, IN_PROCESS_TRANSPORT)
 
 
 _LOCAL_XDIST_GROUPS = {

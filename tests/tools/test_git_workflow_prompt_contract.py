@@ -13,7 +13,23 @@ class TestBashPromptCheckoutExemptionContract:
         assert "`git checkout <existing-local-branch>`" in prompt
         assert "`git checkout -b <new-branch> [<start-point>]`" in prompt
         assert "sanctioned delegated switch shapes" in prompt
-        assert "run WITHOUT the dangerous-command approval flow" in prompt
+        assert "runs WITHOUT the dangerous-command approval flow" in prompt
+
+    def test_bash_prompt_documents_routine_branch_creation(self) -> None:
+        prompt = (
+            Path(__file__).parents[2] / "chartreux/core/tools/builtins/prompts/bash.md"
+        ).read_text()
+
+        assert "Branch creation is routine" in prompt
+        assert "the repository state does not gate it" in prompt
+        assert (
+            "a dirty work tree, an in-progress operation marker, and a start point"
+            in (prompt)
+        )
+        assert "keeps the approval flow" in prompt
+        assert "`post-checkout` hook" in prompt
+        assert "Rejected forms stay gated" in prompt
+        assert "a pathspec or `--` tail" in prompt
 
     def test_bash_prompt_documents_whole_call_eligibility(self) -> None:
         prompt = (

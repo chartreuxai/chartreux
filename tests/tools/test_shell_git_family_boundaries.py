@@ -108,8 +108,10 @@ def test_git_family_io_module_boundary() -> None:
     assert "analyze_shell_command_policy" not in inspection_defs
 
 
-def _classify(command: str):
-    return policy.classify_dangerous_git_command(shlex.split(command))
+def _classify(command: str, *, admit_checkout_creation: bool = True):
+    return policy.classify_dangerous_git_command(
+        shlex.split(command), admit_checkout_creation=admit_checkout_creation
+    )
 
 
 # Hard guards, unscannable globals, aliases, unmodeled builtins, and
@@ -165,7 +167,9 @@ GRANTABLE_COMMANDS = (
     ("git push --prune --force origin main", ("git.push.force", "git.push.delete")),
     ("git push --prune --mirror origin", ("git.push.delete", "git.push.mirror")),
     ("git checkout main", ("git.checkout",)),
-    ("git checkout -b feat", ("git.checkout",)),
+    # P3: the routine creation shape (``-b``) carries no operation; the
+    # force-create shape (``-B``) stays consequential.
+    ("git checkout -B feat", ("git.checkout",)),
     ("git restore file", ("git.restore",)),
     ("git restore --worktree --staged file", ("git.restore",)),
     ("git switch -f main", ("git.switch.discard",)),
@@ -194,6 +198,25 @@ def test_grantable_classifications_resolve_operations() -> None:
         ), command
         assert classification.grantable.consequence, command
         assert classification.grantable.call.subcommand, command
+
+
+def test_routine_branch_creation_carries_no_operation() -> None:
+    """P3: the sanctioned creation shape resolves routine, with or without a
+    start point, and the resolver's configuration gate recovers the
+    consequential classification by disabling the admission.
+    """
+    for command in (
+        "git checkout -b feat",
+        "git checkout -b feat main",
+        "git --no-pager checkout -b feat topic",
+    ):
+        classification = _classify(command)
+        assert classification.kind == "routine", command
+        assert classification.grantable is None, command
+        gated = _classify(command, admit_checkout_creation=False)
+        assert gated.kind == "grantable", command
+        assert gated.grantable is not None, command
+        assert gated.grantable.operation_ids == ("git.checkout",), command
 
 
 def test_reader_subcommands_set_inspect_git_repository() -> None:

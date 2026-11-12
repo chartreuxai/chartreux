@@ -18,7 +18,7 @@ from chartreux.app_server.models import (
     ShellEffectInput,
 )
 from chartreux.app_server.protocol import ShellRunParams, ShellRunResponse
-from chartreux.core.llm_models import ManualShellContext
+from chartreux.core.llm_models import ManualShellContext, ManualShellStatus
 from chartreux.core.utils import kill_async_subprocess
 from chartreux.core.utils.shell import spawn_shell_command
 
@@ -44,40 +44,25 @@ def shell_effect_detail(command: str) -> EffectDetail:
     )
 
 
+def shell_result_status(result: ShellRunResponse) -> ManualShellStatus:
+    if result.interrupted:
+        return "interrupted"
+    if result.timed_out:
+        return "timed_out"
+    return "ok" if result.exit_code == 0 else "failed"
+
+
 def shell_effect_state(
     result: ShellRunResponse, *, output_text: str, duration_ms: float
 ) -> EffectState:
-    if result.interrupted:
-        return CancelledEffectState(
-            reason="Command interrupted",
-            output_text=output_text,
-            duration_ms=duration_ms,
-            display=EffectResultDisplay(success=False, message="Command interrupted"),
-        )
-
-    message = f"Ran {result.command}"
-    if result.timed_out:
-        message = "Command timed out"
-    elif result.exit_code != 0:
-        message = f"Command exited with status {result.exit_code}"
-
-    display = EffectResultDisplay(success=result.exit_code == 0, message=message)
-    if result.timed_out or result.exit_code != 0:
-        return FailedEffectState(
-            error=PublicError(message=message),
-            output_text=output_text,
-            duration_ms=duration_ms,
-            display=display,
-        )
-    return CompletedEffectState(
-        output={
-            "stdout": result.stdout,
-            "stderr": result.stderr,
-            "output": output_text,
-        },
+    return _shell_effect_state(
+        command=result.command,
+        status=shell_result_status(result),
+        exit_code=result.exit_code,
+        stdout=result.stdout,
+        stderr=result.stderr,
         output_text=output_text,
         duration_ms=duration_ms,
-        display=display,
     )
 
 
@@ -106,20 +91,59 @@ def shell_effect_cancelled(
 
 
 def restored_shell_effect_state(context: ManualShellContext) -> EffectState:
-    return shell_effect_state(
-        ShellRunResponse(
-            operation_id=context.operation_id,
-            command=context.command,
-            cwd=context.cwd,
-            stdout=context.stdout,
-            stderr=context.stderr,
-            exit_code=context.exit_code,
-            timed_out=context.timed_out,
-            interrupted=context.interrupted,
-        ),
+    return _shell_effect_state(
+        command=context.command,
+        status=context.status,
+        exit_code=context.exit_code,
+        stdout=context.stdout,
+        stderr=context.stderr,
         output_text=context.output_text,
         duration_ms=context.duration_ms,
     )
+
+
+def _shell_effect_state(
+    *,
+    command: str,
+    status: ManualShellStatus,
+    exit_code: int | None,
+    stdout: str,
+    stderr: str,
+    output_text: str,
+    duration_ms: float,
+) -> EffectState:
+    if status == "interrupted":
+        message = "Command interrupted"
+        return CancelledEffectState(
+            reason=message,
+            output_text=output_text,
+            duration_ms=duration_ms,
+            display=EffectResultDisplay(success=False, message=message),
+        )
+    if status == "ok":
+        return CompletedEffectState(
+            output={"stdout": stdout, "stderr": stderr, "output": output_text},
+            output_text=output_text,
+            duration_ms=duration_ms,
+            display=EffectResultDisplay(success=True, message=f"Ran {command}"),
+        )
+    message = _failed_effect_message(status, exit_code)
+    return FailedEffectState(
+        error=PublicError(message=message),
+        output_text=output_text,
+        duration_ms=duration_ms,
+        display=EffectResultDisplay(success=False, message=message),
+    )
+
+
+def _failed_effect_message(status: ManualShellStatus, exit_code: int | None) -> str:
+    if status == "timed_out":
+        return "Command timed out"
+    if status == "refused":
+        return "Command refused"
+    if exit_code is not None:
+        return f"Command exited with status {exit_code}"
+    return "Command failed"
 
 
 class ShellController:

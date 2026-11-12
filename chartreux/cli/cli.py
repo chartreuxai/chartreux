@@ -221,6 +221,23 @@ def _select_transport(
         os.environ[TRANSPORT_ENV_VAR] = selection.selector
 
 
+def _select_executor(config: ChartreuxConfigSchema | None) -> None:
+    """Resolve this run's shell executor once and publish it process-wide.
+
+    The documented chain is config (``[tools.bash] executor``) > bash (the
+    shipped default) > the ambient ``$SHELL`` > the kernel default. The
+    resolution happens here, before any harness or spawned root agent is
+    built, so every spawn site — the bash tool, background jobs, completion
+    checks, the app-server shell, and the system prompt — reads one answer.
+    """
+    from chartreux.core.utils.shell import apply_executor_selection
+
+    tools = getattr(config, "tools", None)
+    entry = tools.get("bash") if isinstance(tools, dict) else None
+    configured = entry.get("executor") if isinstance(entry, dict) else None
+    apply_executor_selection(configured if isinstance(configured, str) else None)
+
+
 def _run_programmatic_mode(args: argparse.Namespace, stdin_prompt: str | None) -> None:
     from chartreux.app_server.local import ClientDescriptor, LocalHarnessOptions
     from chartreux.app_server.protocol import (
@@ -411,6 +428,7 @@ def run_cli(args: argparse.Namespace) -> None:
         _select_transport(
             getattr(orchestrator, "config", None), interactive=not is_programmatic
         )
+        _select_executor(getattr(orchestrator, "config", None))
         if is_programmatic:
             _run_programmatic_mode(args=args, stdin_prompt=stdin_prompt)
         else:

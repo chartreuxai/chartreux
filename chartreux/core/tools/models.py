@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from enum import StrEnum, auto
+from pathlib import Path
 from typing import Literal
 
 from pydantic import BaseModel, model_validator
@@ -44,6 +45,9 @@ class PermissionContext(BaseModel):
     # A grantable dangerous-command denial carries the typed whole-call
     # proposal; every other denial kind never carries one.
     dangerous_command_proposal: DangerousCommandProposal | None = None
+    # A grantable out-of-root denial carries the resolved operand target the
+    # root grant binds; every other denial kind never carries one.
+    out_of_root_target: Path | None = None
 
     @model_validator(mode="after")
     def _check_dangerous_command_proposal(self) -> PermissionContext:
@@ -59,5 +63,11 @@ class PermissionContext(BaseModel):
         elif self.denial_kind == "dangerous_command":
             raise ValueError(
                 "a 'dangerous_command' denial requires a grantable proposal"
+            )
+        if self.out_of_root_target is not None and (
+            self.denial_kind != "out_of_root" or self.permission != ToolPermission.NEVER
+        ):
+            raise ValueError(
+                "out_of_root_target requires a NEVER denial of kind 'out_of_root'"
             )
         return self

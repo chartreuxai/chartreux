@@ -2358,13 +2358,6 @@ class ChartreuxApp(App):  # noqa: PLR0904
         if not input_widget.value:
             input_widget.value = value
 
-    async def _empty_bash_error(self) -> None:
-        await self._mount_and_scroll(
-            ErrorMessage(
-                "No command provided after '!'", collapsed=self._tools_collapsed
-            )
-        )
-
     def _warn_not_queueable(self, message: str) -> None:
         self.notify(message, severity="warning", markup=False)
 
@@ -2398,52 +2391,75 @@ class ChartreuxApp(App):  # noqa: PLR0904
             case Skill(command=command):
                 await self._handle_user_message(command)
             case Bash(command=command):
-                # A shell run has no turn id and never enters the epoch map,
-                # but it does own the record: the bump is what keeps a detached
-                # predecessor failure from reporting over it.
-                self._advance_record_epoch()
-                self._bash_task = asyncio.create_task(
-                    self._handle_bash_command(command)
-                )
-                self._queue.notify_busy_changed()
+                self._start_bash_command(command)
             case EmptyBash():
-                await self._empty_bash_error()
+                # Item 5 B.1: a bare `!` is the one remaining refusal, and it
+                # still produces the one record — so it goes through the shell
+                # resource instead of stopping at the input classifier.
+                self._start_bash_command("")
             case Prompt(text=text):
                 await self._handle_user_message(text)
 
+    def _start_bash_command(self, command: str) -> None:
+        # A shell run has no turn id and never enters the epoch map, but it does
+        # own the record: the bump is what keeps a detached predecessor failure
+        # from reporting over it.
+        self._advance_record_epoch()
+        self._bash_task = asyncio.create_task(self._handle_bash_command(command))
+        self._queue.notify_busy_changed()
+
     async def _handle_paused_submit(self, value: str) -> bool:
-        if value and not await self._handle_queue_submit(
-            value, reject_hint=_REJECT_HINT_PAUSED
-        ):
-            return False
+        if value:
+            if isinstance(
+                classify(
+                    value, commands=self.commands, resolve_skill=self._resolve_skill
+                ),
+                EmptyBash,
+            ):
+                # Item 5 B.1: the bare `!` produces its one refusal record and
+                # consumes the submission. It is not queued work of the user's,
+                # so it never resumes a paused queue.
+                self._start_bash_command("")
+                return True
+            if not await self._handle_queue_submit(
+                value, reject_hint=_REJECT_HINT_PAUSED
+            ):
+                return False
         await self._queue.resume()
         return True
 
     async def _handle_queue_submit(
         self, value: str, *, reject_hint: str, allow_waiting_only: bool = False
     ) -> bool:
-        if self._bash_task is not None and not self._bash_task.done():
-            rejection = f"Input cannot be queued while a shell command is running — {reject_hint}"
-        else:
-            rejection = None
-            match classify(
-                value, commands=self.commands, resolve_skill=self._resolve_skill
-            ):
-                case SlashCommand():
-                    rejection = f"Slash commands cannot be queued — {reject_hint}"
-                case Skill(command=command, name=name):
-                    return await self._enqueue_prompt_with_resources(
-                        command, skill_name=name, allow_waiting_only=allow_waiting_only
-                    )
-                case Bash():
-                    rejection = f"Shell commands cannot be queued — {reject_hint}"
-                case EmptyBash():
-                    await self._empty_bash_error()
-                    return False
-                case Prompt(text=text):
-                    return await self._enqueue_prompt_with_resources(
-                        text, allow_waiting_only=allow_waiting_only
-                    )
+        rejection = None
+        match classify(
+            value, commands=self.commands, resolve_skill=self._resolve_skill
+        ):
+            case SlashCommand():
+                rejection = f"Slash commands cannot be queued — {reject_hint}"
+            case Skill(command=command, name=name):
+                return await self._enqueue_prompt_with_resources(
+                    command, skill_name=name, allow_waiting_only=allow_waiting_only
+                )
+            case Bash(command=command):
+                # A manual `!` command is user input: it queues in the same
+                # FIFO queue as a typed prompt instead of being refused while
+                # another epoch runs. The server runs it at idle and promotes
+                # its record with the queued prompts ahead of it.
+                self._start_bash_command(command)
+                return True
+            case EmptyBash():
+                # A bare `!` refuses without executing anything, and the one
+                # record it produces still belongs to a turn; the shell
+                # resource is what builds it. The submission is consumed: the
+                # record is the command's whole effect, so restoring the input
+                # would let a re-submit mint a second refusal record.
+                self._start_bash_command("")
+                return True
+            case Prompt(text=text):
+                return await self._enqueue_prompt_with_resources(
+                    text, allow_waiting_only=allow_waiting_only
+                )
         if rejection is not None:
             self._warn_not_queueable(rejection)
             return False
@@ -3120,13 +3136,9 @@ class ChartreuxApp(App):  # noqa: PLR0904
     async def _handle_bash_command_inner(
         self, command: str, settlement: _BashSettlement
     ) -> None:
-        if not command:
-            await self._mount_and_scroll(
-                ErrorMessage(
-                    "No command provided after '!'", collapsed=self._tools_collapsed
-                )
-            )
-            return
+        # An empty command is not dropped here: the shell resource builds the
+        # refusal record and the server promotes it, so a bare `!` still reaches
+        # the agent as the ordinary user turn it is.
 
         # Bound before the try: the finally reads it when a cancellation lands
         # inside the loading-widget await itself, and it is re-read after that

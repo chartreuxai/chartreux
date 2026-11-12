@@ -65,6 +65,28 @@ class Diagnostic:
     # denial is created; only SYNTAX denials carry one.
     alternative: str | None = None
 
+    def __post_init__(self) -> None:
+        # The recognition contract is enforced where the denial is created: a
+        # SYNTAX denial without a compliant alternative would leave the model
+        # with no instruction, and a POLICY denial carrying one would invite
+        # the refused action through another form.
+        if self.denial_class is DenialClass.SYNTAX:
+            if self.alternative is None and not (
+                self.related
+                and all(
+                    item.denial_class is DenialClass.SYNTAX and item.alternative
+                    for item in self.related
+                )
+            ):
+                raise ValueError(
+                    f"Syntax denial '{self.code}' lacks a compliant alternative"
+                )
+        elif self.alternative is not None:
+            raise ValueError(
+                f"Policy denial '{self.code}' names an alternative; only a "
+                "syntax denial carries one"
+            )
+
 
 def aggregate_denial_class(related: tuple[Diagnostic, ...]) -> DenialClass:
     """The fail-closed class of an aggregate denial.
@@ -149,10 +171,13 @@ def render_diagnostic(diagnostic: Diagnostic) -> str:  # noqa: PLR0912
     match diagnostic.code:
         case "recursive_rm":
             # A policy hard guard: the blocked requirement is stated plainly
-            # and no alternative deletion method is suggested.
+            # and no alternative deletion method is suggested. Its boundary is
+            # named because two target classes are admitted — the assessed
+            # git-clean tree and the session scratchpad.
             message = (
                 f"Command denied: recursive rm option '{token}' in '{part}'. "
-                "This is a hard guard regardless of target."
+                "This is a hard guard outside the clean-tree and session "
+                "scratchpad carve-outs."
             )
         case "path_glob":
             message = (

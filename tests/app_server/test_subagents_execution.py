@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import AsyncGenerator
 import json
+import logging
 import os
 from pathlib import Path
 from typing import Any, cast
@@ -12,7 +14,12 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from chartreux.app_server._runtime import AgentRuntimeFactory
-from chartreux.app_server._sessions import SessionRuntime, SessionRuntimeRegistry
+from chartreux.app_server._sessions import (
+    AgentRecord,
+    SessionRuntime,
+    SessionRuntimeRegistry,
+    _AgentState,
+)
 from chartreux.app_server._turns import TurnController
 from chartreux.app_server.models import (
     CompletedEffectState,
@@ -27,11 +34,25 @@ from chartreux.app_server.protocol import TurnStartParams
 from chartreux.app_server.server import AppServer
 from chartreux.core.agent_loop import AgentLoop
 from chartreux.core.config import SessionLoggingConfig
-from chartreux.core.llm_models import FunctionCall, Role, ToolCall
+from chartreux.core.config.models import (
+    RecoveryConfig,
+    RecoveryEligibleClass,
+    RecoverySectionConfig,
+)
+from chartreux.core.llm_models import FunctionCall, LLMChunk, LLMMessage, Role, ToolCall
 from chartreux.core.middleware import AutoCompactMiddleware
+from chartreux.core.recovery_models import (
+    FailureClass,
+    FailureConfidence,
+    FailurePhase,
+    RecoveryEligibility,
+    ToolEffectsDisposition,
+)
 from chartreux.core.subagents import (
     AgentAvailability,
     EmptySubagentResponseError,
+    ReconcileOutcome,
+    ResumeOutcome,
     RetentionPolicy,
     RunStatus,
     RunStopReason,
@@ -1328,6 +1349,362 @@ async def test_foreground_submission_passes_a_read_only_bash_command(
 
         assert result.completed is True
         assert result.response == "read the file"
+    finally:
+        await registry.drain_children()
+        await parent.aclose()
+
+
+# ---------------------------------------------------------------------------
+# Child stream truncation (item 2 component B.2): the in-process run and
+# recovery pipeline, end to end.
+#
+# The failure is the typed ``IncompleteStreamError`` the shared gateway raises
+# when a provider stream ends without a finish reason. An in-process child
+# shares the root loop/gateway/turn pipeline, so the truncation terminalizes
+# the child turn and lands in run-level recovery as a typed, MEASURED envelope
+# — these tests build no envelope by hand: they read the one the monitor
+# published for the failed run, then assert the recovery controller's gates
+# and the reconciliation barrier against that published evidence.
+# ---------------------------------------------------------------------------
+
+
+class _ServingParentBackend(FakeBackend):
+    """A parent backend that answers every notification turn quietly.
+
+    The monitor starts a parent turn for every settled background child; an
+    empty ``FakeBackend`` fails those turns, adding gateway telemetry
+    unrelated to the child under test.
+    """
+
+    async def complete(self, **_kwargs: Any) -> LLMChunk:
+        return mock_llm_chunk(content="notification handled")
+
+    async def complete_streaming(
+        self, **_kwargs: Any
+    ) -> AsyncGenerator[LLMChunk, None]:
+        yield mock_llm_chunk(content="notification handled")
+
+
+class _TruncatingChildBackend(FakeBackend):
+    """Script the child's logical calls: optional settled tool call, then a
+    truncated stream, then the resumed successor's completion.
+
+    The truncating response is content-bearing with NO finish reason, so the
+    gateway raises the typed ``IncompleteStreamError`` at its single detection
+    site; the in-call replay only ever admits empty responses, so the fault is
+    served exactly once.
+    """
+
+    def __init__(self, *, settle_first: bool) -> None:
+        super().__init__([])
+        self._settle_first = settle_first
+        self.calls = 0
+
+    def _next_stream(self) -> list[LLMChunk]:
+        self.calls += 1
+        if self._settle_first and self.calls == 1:
+            return [mock_llm_chunk(content="", tool_calls=[_todo_call("todo-1")])]
+        if self.calls == (2 if self._settle_first else 1):
+            return [mock_llm_chunk(content="partial answer", stop_reason=None)]
+        return [mock_llm_chunk(content="recovered")]
+
+    async def complete(self, **_kwargs: Any) -> LLMChunk:
+        chunk_agg = LLMChunk(message=LLMMessage(role=Role.assistant))
+        for chunk in self._next_stream():
+            chunk_agg += chunk
+        return chunk_agg
+
+    async def complete_streaming(
+        self, **_kwargs: Any
+    ) -> AsyncGenerator[LLMChunk, None]:
+        for chunk in self._next_stream():
+            yield chunk
+
+
+async def _until(predicate: Any, timeout: float = 10.0) -> None:
+    """Poll until ``predicate`` holds; a gate, not a latency bound."""
+    async with asyncio.timeout(timeout):
+        while not predicate():
+            await asyncio.sleep(0.005)
+
+
+def _run_of(record: AgentRecord, run_id: str) -> Any:
+    """The run record for ``run_id`` (``current_run`` or retained history)."""
+    return next(
+        item
+        for item in [record.current_run, *record.run_history]
+        if item is not None and item.run_id == run_id
+    )
+
+
+def _truncation_registry(
+    monkeypatch: pytest.MonkeyPatch,
+    backend: _TruncatingChildBackend,
+    *,
+    recovery: RecoveryConfig | None = None,
+) -> tuple[SessionRuntimeRegistry, AgentLoop]:
+    """A registry whose in-process child streams behind ``backend``.
+
+    Subagent loops disable streaming at construction, but the truncation
+    detection site lives on the sharing gateway's streaming path, so the pin
+    drives that path on the child. The default recovery policy zeroes the
+    cooldown and jitter, making the automatic admission immediate and
+    deterministic.
+    """
+    monkeypatch.setattr(
+        "chartreux.core.agent_loop._loop.create_backend", lambda **_: backend
+    )
+    create_child = AgentRuntimeFactory.create_child
+
+    async def streaming_child(
+        factory: AgentRuntimeFactory, loop: AgentLoop, agent_name: str, **kwargs: Any
+    ) -> AgentLoop:
+        child = await create_child(factory, loop, agent_name, **kwargs)
+        child.enable_streaming = True
+        return child
+
+    monkeypatch.setattr(AgentRuntimeFactory, "create_child", streaming_child)
+    policy = recovery or RecoveryConfig(
+        auto_retries_max=1, cooldowns_seconds=[0.0], jitter_fraction=0.0
+    )
+    config = _config(enabled_tools=["task", "todo"]).model_copy(
+        update={"recovery": RecoverySectionConfig(subagents=policy)}
+    )
+    parent = build_test_agent_loop(
+        config=config, backend=_ServingParentBackend(), enable_streaming=True
+    )
+    registry = _retention_registry()
+    root = registry._build_child_runtime(parent)
+    root.turns._projector = MagicMock()
+    root.turns.link_subagent = AsyncMock()
+    registry.bind_root(root)
+    return registry, parent
+
+
+async def _launch_truncating_child(
+    registry: SessionRuntimeRegistry, parent: AgentLoop
+) -> tuple[str, str]:
+    launch = await _background_result(
+        registry,
+        TaskArgs(task="truncate", identity="coder", background=True, retain=True),
+        InvokeContext(tool_call_id="truncate", session_id=parent.session_id),
+    )
+    assert launch.agent_id is not None and launch.run_id is not None
+    failed = await _wait_result(registry, launch.agent_id, launch.run_id)
+    assert not failed.completed
+    return launch.agent_id, launch.run_id
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(60)
+async def test_child_stream_truncation_measures_settled_effects_and_auto_resumes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A child truncation after a settled tool call measures ELIGIBLE.
+
+    End-to-end: a transcript-visible ``todo`` call is requested and settled,
+    then the child's stream ends without a finish reason. The run resolves
+    FAILED with an INCOMPLETE_STREAM MEASURED envelope whose tool effects are
+    SETTLED (ELIGIBLE) — so warm suspension holds the agent and the recovery
+    controller's gates admit the successor through the SAME automatic
+    admission an explicit resume uses.
+    """
+    backend = _TruncatingChildBackend(settle_first=True)
+    registry, parent = _truncation_registry(monkeypatch, backend)
+    resume_calls: list[str] = []
+    original_resume = registry.resume_agent
+
+    async def resume_spy(
+        agent_id: str,
+        expected_run_id: str,
+        idempotency_key: str,
+        *,
+        requester_session_id: str,
+        override_cooldown: bool = False,
+    ) -> Any:
+        resume_calls.append(idempotency_key)
+        return await original_resume(
+            agent_id,
+            expected_run_id,
+            idempotency_key,
+            requester_session_id=requester_session_id,
+            override_cooldown=override_cooldown,
+        )
+
+    monkeypatch.setattr(registry, "resume_agent", resume_spy)
+    try:
+        agent_id, failed_run_id = await _launch_truncating_child(registry, parent)
+        record = registry._agent_records[agent_id]
+        failed_run = _run_of(record, failed_run_id)
+        envelope = failed_run.failure
+        assert failed_run.status is RunStatus.FAILED
+        assert envelope is not None
+        assert envelope.failure.failure_class is FailureClass.INCOMPLETE_STREAM
+        assert envelope.failure.confidence is FailureConfidence.MEASURED
+        assert envelope.failure.phase is FailurePhase.LLM_CALL
+        assert envelope.progress.tool_effects is ToolEffectsDisposition.SETTLED
+        assert "tool_results_settled_in_transcript" in envelope.failure.evidence_codes
+        assert envelope.recovery.eligibility is RecoveryEligibility.ELIGIBLE
+        assert "tool_effects_settled" in envelope.recovery.reason_codes
+
+        # Warm suspension holds the agent; the controller's gates then admit
+        # exactly one successor on the same identity, immediately (zero
+        # cooldown), through the automatic admission key.
+        await _until(lambda: record.latest_run_id != failed_run_id)
+        assert record.same_agent_resumes_used == 1
+        successor = next(
+            run
+            for run in [record.current_run, *record.run_history]
+            if run is not None and run.resumed_from_run_id == failed_run_id
+        )
+        assert successor.agent_id == agent_id
+        done = await _wait_result(registry, agent_id, successor.run_id)
+        assert done.completed is True
+        assert done.response == "recovered"
+        assert len(resume_calls) == 1
+        assert resume_calls[0].startswith("auto-recovery:")
+
+        # The failed run's published result and envelope stay immutable.
+        stored = await registry.get_agent_result(agent_id, failed_run_id)
+        assert stored is not None and not stored.completed
+        assert stored.failure is not None
+        assert stored.failure.event_id == envelope.event_id
+    finally:
+        await registry.drain_children()
+        await parent.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(60)
+async def test_child_stream_truncation_without_visible_calls_requires_reconciliation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No transcript-visible call derives UNKNOWN effects → RECONCILE_REQUIRED.
+
+    The envelope's unknown effects stop the automatic route at its eligibility
+    gate (no schedule, no successor) and block the explicit admission too: the
+    barrier never auto-clears, so recovery is admitted only after an EXPLICIT
+    ``reconcile_result`` submission accounts for the unknown effects.
+    """
+    backend = _TruncatingChildBackend(settle_first=False)
+    registry, parent = _truncation_registry(monkeypatch, backend)
+    try:
+        agent_id, failed_run_id = await _launch_truncating_child(registry, parent)
+        record = registry._agent_records[agent_id]
+        failed_run = _run_of(record, failed_run_id)
+        envelope = failed_run.failure
+        assert failed_run.status is RunStatus.FAILED
+        assert envelope is not None
+        assert envelope.failure.failure_class is FailureClass.INCOMPLETE_STREAM
+        assert envelope.failure.confidence is FailureConfidence.MEASURED
+        assert envelope.progress.tool_effects is ToolEffectsDisposition.UNKNOWN
+        assert "tool_effects_not_transcript_visible" in envelope.failure.evidence_codes
+        assert envelope.recovery.eligibility is RecoveryEligibility.RECONCILE_REQUIRED
+        assert "tool_effects_unknown_reconcile_first" in envelope.recovery.reason_codes
+
+        # Warm suspension still happens (the barrier is explicitly clearable),
+        # but the controller's eligibility gate refuses to schedule anything.
+        await _until(lambda: record.state is _AgentState.SUSPENDED)
+        assert registry._recovery_controller._episodes == {}
+        assert record.latest_run_id == failed_run_id
+        assert record.reconcile_outcome is None
+        assert record.same_agent_resumes_used == 0
+
+        # The explicit admission is blocked by the barrier (and consumes
+        # nothing).
+        blocked = await registry.resume_agent(
+            agent_id,
+            failed_run_id,
+            "explicit-before-reconcile",
+            requester_session_id=parent.session_id,
+        )
+        assert blocked.outcome is ResumeOutcome.RECONCILE_REQUIRED
+        assert blocked.eligibility is RecoveryEligibility.RECONCILE_REQUIRED
+        assert "tool_effects_unknown_reconcile_first" in blocked.reason_codes
+        assert record.same_agent_resumes_used == 0
+        assert record.reconcile_outcome is None
+
+        # Reconciliation is the EXPLICIT step that clears the barrier: the
+        # zero-entry accounting is complete against a barrier with no visible
+        # calls.
+        boundary = envelope.progress.transcript_boundary
+        assert boundary is not None
+        reconciled = await registry.reconcile_result(
+            agent_id,
+            failed_run_id,
+            boundary,
+            [],
+            requester_session_id=parent.session_id,
+        )
+        assert reconciled.outcome is ReconcileOutcome.CLEARED
+        assert reconciled.eligibility is RecoveryEligibility.ELIGIBLE
+        assert record.reconcile_outcome == ReconcileOutcome.CLEARED.value
+
+        # Only now does an explicit admission start the successor.
+        admitted = await registry.resume_agent(
+            agent_id,
+            failed_run_id,
+            "explicit-after-reconcile",
+            requester_session_id=parent.session_id,
+        )
+        assert admitted.outcome is ResumeOutcome.SCHEDULED
+        assert admitted.successor_run_id is not None
+        assert admitted.successor_run_id != failed_run_id
+        done = await _wait_result(registry, agent_id, admitted.successor_run_id)
+        assert done.completed is True
+        assert done.response == "recovered"
+    finally:
+        await registry.drain_children()
+        await parent.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(60)
+async def test_child_stream_truncation_class_gate_bounds_the_automatic_route(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The automatic route stays bounded by the eligible-class allowlist.
+
+    A settled-effects truncation is ELIGIBLE, so warm suspension holds the
+    agent, but a policy whose allowlist excludes ``incomplete_stream`` makes
+    the controller refuse to schedule — the exhaustion milestone names the
+    class gate — while the explicit admission still works.
+    """
+    caplog.set_level(logging.INFO, logger="vibe")
+    policy = RecoveryConfig(
+        auto_retries_max=1,
+        cooldowns_seconds=[0.0],
+        jitter_fraction=0.0,
+        eligible_classes=[RecoveryEligibleClass.TIMEOUT],
+    )
+    backend = _TruncatingChildBackend(settle_first=True)
+    registry, parent = _truncation_registry(monkeypatch, backend, recovery=policy)
+    try:
+        agent_id, failed_run_id = await _launch_truncating_child(registry, parent)
+        record = registry._agent_records[agent_id]
+        failed_run = _run_of(record, failed_run_id)
+        assert failed_run.failure is not None
+        assert failed_run.failure.recovery.eligibility is RecoveryEligibility.ELIGIBLE
+
+        await _until(lambda: record.state is _AgentState.SUSPENDED)
+        assert registry._recovery_controller._episodes == {}
+        assert record.latest_run_id == failed_run_id
+        assert any(
+            "event=exhaustion" in message and "class_not_eligible" in message
+            for message in caplog.messages
+        ), caplog.messages
+
+        admitted = await registry.resume_agent(
+            agent_id,
+            failed_run_id,
+            "explicit-under-gates",
+            requester_session_id=parent.session_id,
+        )
+        assert admitted.outcome is ResumeOutcome.SCHEDULED
+        assert admitted.successor_run_id is not None
+        done = await _wait_result(registry, agent_id, admitted.successor_run_id)
+        assert done.completed is True
+        assert done.response == "recovered"
     finally:
         await registry.drain_children()
         await parent.aclose()

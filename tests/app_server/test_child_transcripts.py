@@ -26,8 +26,11 @@ from chartreux.app_server._subagent_recovery import (
 from chartreux.app_server._subagent_transcript import (
     CHILD_RESULT_FILENAME,
     CHILD_START_MARKER_FILENAME,
+    CHILD_TOMBSTONE_FILENAME,
     ChildResultRecord,
     ChildStartMarker,
+    ChildTombstoneRecord,
+    ChildTranscriptError,
     ChildTranscriptOutcome,
     ChildTranscriptPathError,
     ChildTranscriptStore,
@@ -327,6 +330,112 @@ def test_child_transcript_paths_are_confined_to_the_agents_subtree(
 
 
 # ---------------------------------------------------------------------------
+# Tombstones: the durable retraction the reconciliation scan honors
+# ---------------------------------------------------------------------------
+
+
+def _tombstone(
+    *, attempt_id: str | None = "attempt-0123456789abcdef"
+) -> ChildTombstoneRecord:
+    return ChildTombstoneRecord(
+        session_id="child-session-1",
+        reason="publication-rejected",
+        created_at="2026-01-01T00:00:06+00:00",
+        attempt_id=attempt_id,
+        agent_id="coder:py",
+    )
+
+
+def test_tombstone_record_is_durable_atomic_and_idempotent(tmp_path: Path) -> None:
+    store = _store(_root(tmp_path))
+    by_session = ChildTombstoneRecord(
+        session_id="child-session-1",
+        reason="publication-rejected",
+        created_at="2026-01-01T00:00:06+00:00",
+    )
+    store.record_tombstone(by_session)
+    assert sorted(path.name for path in store.child_dir.iterdir()) == [
+        CHILD_TOMBSTONE_FILENAME
+    ]
+    assert store.read_tombstone() == by_session
+
+    # A retraction by session id upgrades once the attempt id is known.
+    store.record_tombstone(_tombstone())
+    recorded = store.read_tombstone()
+    assert recorded == _tombstone()
+    assert recorded is not None and recorded.attempt_id == "attempt-0123456789abcdef"
+
+    # A repeated retraction of the same attempt keeps the record byte for byte,
+    # and a later id-less retraction never downgrades it.
+    before = store.tombstone_path.read_bytes()
+    store.record_tombstone(_tombstone())
+    assert store.tombstone_path.read_bytes() == before
+    store.record_tombstone(by_session)
+    assert store.tombstone_path.read_bytes() == before
+
+
+def test_adjudication_honors_a_tombstone_over_every_marker(tmp_path: Path) -> None:
+    store = _store(_root(tmp_path))
+    store.record_start(_start())
+    store.record_result(_result())
+    assert store.adjudicate().outcome is ChildTranscriptOutcome.COMPLETED
+
+    store.record_tombstone(_tombstone())
+    adjudication = store.adjudicate()
+    assert adjudication.outcome is ChildTranscriptOutcome.TOMBSTONED
+    assert adjudication.tombstoned is True
+    assert adjudication.tombstone == _tombstone()
+    assert adjudication.attempt_id == "attempt-0123456789abcdef"
+    assert adjudication.result is None
+    assert adjudication.result_id is None
+
+
+def test_a_malformed_tombstone_is_surfaced_not_ignored(tmp_path: Path) -> None:
+    root = _root(tmp_path)
+    store = _store(root)
+    store.record_start(_start())
+    store.tombstone_path.write_text("{torn")
+
+    adjudication = store.adjudicate()
+    assert adjudication.outcome is ChildTranscriptOutcome.UNREADABLE
+    assert adjudication.detail is not None
+    assert CHILD_TOMBSTONE_FILENAME in adjudication.detail
+    with pytest.raises(ChildTranscriptError):
+        store.read_tombstone()
+    reconciliation = ChildTranscriptReconciler(root).reconcile(
+        store.child_dir, agent_id="coder:py"
+    )
+    assert reconciliation.outcome is ChildTranscriptOutcome.UNREADABLE
+
+
+def test_scan_filters_tombstoned_transcripts_and_stays_idempotent(
+    tmp_path: Path,
+) -> None:
+    root = _root(tmp_path)
+    completed = _store(root, "coder-py_20260101_000000_aaaaaaaa")
+    completed.record_start(_start())
+    completed.record_result(_result())
+    retracted = _store(root, "coder-rust_20260101_000000_bbbbbbbb")
+    retracted.record_start(_start())
+    retracted.record_result(_result())
+    retracted.record_tombstone(_tombstone())
+
+    reconciler = ChildTranscriptReconciler(root)
+    scanned = reconciler.scan()
+    assert [item.child_dir.name for item in scanned] == [
+        "coder-py_20260101_000000_aaaaaaaa"
+    ]
+    assert scanned[0].has_unconsumed_result is True
+    # The retracted transcript is never handed over, on this scan or a later one.
+    assert reconciler.scan() == reconciler.scan()
+    reconciliation = reconciler.reconcile(retracted.child_dir)
+    assert reconciliation.outcome is ChildTranscriptOutcome.TOMBSTONED
+    assert reconciliation.has_unconsumed_result is False
+    assert reconciliation.denial is not None
+    assert "retracted" in reconciliation.denial
+
+
+# ---------------------------------------------------------------------------
 # Live paging proxy through the registry manifest
 # ---------------------------------------------------------------------------
 
@@ -545,8 +654,16 @@ async def test_child_factory_binds_the_transcript_to_the_root_agents_subtree(
 ) -> None:
     root = _root(tmp_path)
     requests: list[Any] = []
+    persisted: list[str | None] = []
+
+    async def _persist_empty_session(*, attempt_id: str | None = None) -> None:
+        persisted.append(attempt_id)
+
     loop = SimpleNamespace(
-        session_id="child-session-1", session_logger=SimpleNamespace(session_dir=None)
+        session_id="child-session-1",
+        session_logger=SimpleNamespace(session_dir=None),
+        messages=[],
+        persist_empty_session=_persist_empty_session,
     )
 
     class _Process:
@@ -565,9 +682,13 @@ async def test_child_factory_binds_the_transcript_to_the_root_agents_subtree(
         root_session_dir=root,
         agent_name="coder-py",
         payload={"client_info": {"name": "tests", "version": "1.0"}},
+        attempt_id="attempt-child-1",
     )
 
     assert await factory.open(spawn_spec_to_wire(spec)) is loop
+    # The attempt id lands in the child's FIRST durable write, so a torn
+    # persist-to-link window stays attributable to its publication attempt.
+    assert persisted == ["attempt-child-1"]
     request = requests[0]
     assert request.is_subagent is True
     assert request.parent_session_id == _ROOT_SESSION_ID

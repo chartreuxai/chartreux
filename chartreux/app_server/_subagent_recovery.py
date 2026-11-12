@@ -60,8 +60,11 @@ from chartreux.app_server._subagent_records import (
     _ResumeOperation,
 )
 from chartreux.app_server._subagent_transcript import (
+    ChildTombstoneRecord,
     ChildTranscriptAdjudication,
+    ChildTranscriptError,
     ChildTranscriptOutcome,
+    ChildTranscriptStore,
     child_transcript_dirs,
     read_child_transcript,
 )
@@ -70,6 +73,7 @@ from chartreux.app_server.protocol import TurnStartParams
 from chartreux.core.config.models import RecoveryConfig
 from chartreux.core.llm_models import LLMMessage
 from chartreux.core.recovery_models import FailureEnvelope, RecoveryEligibility
+from chartreux.core.session.session_loader import MESSAGES_FILENAME, SessionLoader
 from chartreux.core.subagents import (
     EffectVerification,
     ReconcileOutcome,
@@ -186,7 +190,10 @@ def _recovery_config(view: RecoveryConfigView) -> RecoveryConfig:
 
 
 def _submission_defect(
-    messages: Sequence[LLMMessage], effects: Sequence[EffectVerification]
+    messages: Sequence[LLMMessage],
+    effects: Sequence[EffectVerification],
+    *,
+    outstanding: set[str] | None = None,
 ) -> tuple[list[str], str] | None:
     """The STALE accounting defect of a clearing submission (review R5).
 
@@ -198,10 +205,16 @@ def _submission_defect(
     fail-safe and is never refused over a technicality, so the defect
     check is skipped when damage is present. Returns (reason_codes,
     reason) for a STALE submission, else None.
+
+    ``outstanding`` overrides the accounting set: a process-backed child owns
+    no in-memory loop, so its ids come from :func:`reconcile_outstanding_ids`
+    reading the topology-neutral transcript disk records.
     """
     if any(effect.disposition == "unrepeatable_damage" for effect in effects):
         return None
-    outstanding = _outstanding_tool_call_ids(messages)
+    accounted = (
+        _outstanding_tool_call_ids(messages) if outstanding is None else outstanding
+    )
     seen: set[str] = set()
     repeated: set[str] = set()
     for effect in effects:
@@ -213,8 +226,8 @@ def _submission_defect(
             ["duplicate_tool_call_id", *sorted(repeated)],
             "The submission repeats a tool call id",
         )
-    unknown = sorted(seen - outstanding)
-    missing = sorted(outstanding - seen)
+    unknown = sorted(seen - accounted)
+    missing = sorted(accounted - seen)
     if unknown or missing:
         mismatch_codes: list[str] = []
         if missing:
@@ -229,6 +242,36 @@ def _submission_defect(
             "outstanding tool call of the failed run",
         )
     return None
+
+
+def reconcile_outstanding_ids(
+    messages: Sequence[LLMMessage] | None = None, *, child_dir: Path | None = None
+) -> set[str] | None:
+    """The outstanding tool-call ids a reconcile submission must account for.
+
+    Two topology-neutral sources read the SAME transcript evidence: the live
+    loop messages of an in-process child, or — when the child owned its own
+    process — the child transcript's disk records (``messages.jsonl`` under the
+    child's session directory). ``None`` means the source could not be read,
+    so the caller must not treat the submission as a complete accounting.
+    """
+    if child_dir is not None:
+        return disk_outstanding_tool_call_ids(child_dir)
+    if messages is None:
+        return None
+    return _outstanding_tool_call_ids(messages)
+
+
+def disk_outstanding_tool_call_ids(child_dir: Path) -> set[str] | None:
+    """The outstanding tool-call ids of one child run, read from its disk records."""
+    child_dir = Path(child_dir)
+    if not (child_dir / MESSAGES_FILENAME).is_file():
+        return None
+    try:
+        messages, _metadata = SessionLoader.load_session(child_dir)
+    except (OSError, ValueError):
+        return None
+    return _outstanding_tool_call_ids(messages)
 
 
 class SubagentRecovery:
@@ -1021,11 +1064,16 @@ class ChildTranscriptReconciliation:
 
     The coordinator reads the child transcript's durable markers (read-only,
     path-confined) and reports exactly one of: never executed, started with
-    an unknown outcome, completed with an unconsumed result, or unreadable.
-    It never returns a replay instruction: an unknown or unreadable outcome
-    is surfaced to the user and the run is not re-executed (design.md:196-205).
-    A completed result is ``unconsumed`` until the root records its receipt,
-    which makes the handoff idempotent.
+    an unknown outcome, completed with an unconsumed result, retracted by a
+    tombstone, or unreadable. It never returns a replay instruction: an
+    unknown or unreadable outcome is surfaced to the user and the run is not
+    re-executed (design.md:196-205). A completed result is ``unconsumed``
+    until the root records its receipt, which makes the handoff idempotent.
+
+    ``attempt_id`` bridges the durable records to the publication attempt that
+    created the child: the child's first write carries it, the run-time start
+    marker joins it, and a tombstone retains it. A legacy record without one
+    retracts through its session id instead.
     """
 
     agent_id: str
@@ -1034,6 +1082,8 @@ class ChildTranscriptReconciliation:
     run_id: str | None = None
     result_id: str | None = None
     digest: str | None = None
+    attempt_id: str | None = None
+    session_id: str | None = None
     unconsumed: bool = False
     denial: str | None = None
 
@@ -1041,6 +1091,11 @@ class ChildTranscriptReconciliation:
     def has_unconsumed_result(self) -> bool:
         """Whether the root still has to adopt this child's result."""
         return self.unconsumed and self.result_id is not None
+
+    @property
+    def tombstoned(self) -> bool:
+        """Whether this transcript was retracted and must never be adopted."""
+        return self.outcome is ChildTranscriptOutcome.TOMBSTONED
 
     def coordinator_message(self) -> dict[str, object]:
         """The explicit coordinator→root message carrying this reconciliation."""
@@ -1053,6 +1108,7 @@ class ChildTranscriptReconciliation:
                 "run_id": self.run_id,
                 "result_id": self.result_id,
                 "digest": self.digest,
+                "attempt_id": self.attempt_id,
                 "unconsumed": self.unconsumed,
                 "denial": self.denial,
             },
@@ -1089,8 +1145,10 @@ class ChildTranscriptReconciler:
     adjudicates a crashed child: it reads the durable start marker and terminal
     result record the CHILD wrote, classifies the run (never executed vs
     started-outcome-unknown vs completed), and surfaces unreadable transcripts
-    instead of concealing them. It never writes a child transcript and never
-    replays a run.
+    instead of concealing them. It never replays a run. The ONE write it may
+    make is :func:`tombstone_child_transcript` — the retraction of an abandoned
+    publication attempt, which is what keeps its records from resurrecting
+    through this scan (item 1 child seam).
     """
 
     def __init__(self, root_session_dir: Path) -> None:
@@ -1110,13 +1168,16 @@ class ChildTranscriptReconciler:
         ``consumed_result_ids`` are the result ids the root already recorded;
         a matching completed result is reported as consumed (idempotent
         receipt), never re-delivered. One unreadable transcript is surfaced
-        as its own UNREADABLE result and never aborts the scan.
+        as its own UNREADABLE result and never aborts the scan. A tombstoned
+        transcript is FILTERED OUT: its publication attempt was retracted, so
+        the scan never hands it to the root and nothing can resurrect it.
         """
         consumed = set(consumed_result_ids)
-        return [
+        reconciled = [
             self._reconcile_dir(child_dir, consumed=consumed)
             for child_dir in child_transcript_dirs(self.root_session_dir)
         ]
+        return [item for item in reconciled if not item.tombstoned]
 
     def _reconcile_dir(
         self,
@@ -1160,6 +1221,8 @@ class ChildTranscriptReconciler:
             run_id=adjudication.run_id,
             result_id=adjudication.result_id,
             digest=adjudication.digest,
+            attempt_id=adjudication.attempt_id,
+            session_id=_adjudicated_session_id(adjudication),
             unconsumed=(
                 adjudication.result_id is not None
                 and adjudication.result_id not in consumed
@@ -1168,12 +1231,82 @@ class ChildTranscriptReconciler:
         )
 
 
+def tombstone_child_transcript(
+    reconciliation: ChildTranscriptReconciliation,
+    *,
+    root_session_dir: Path,
+    reason: str,
+    attempt_id: str | None = None,
+    session_id: str | None = None,
+) -> bool:
+    """Retract one abandoned publication attempt; True when written.
+
+    DELIBERATE FLIP of the coordinator-writes-child-transcript prohibition
+    (item 1 child seam): the coordinator owns physical child lifecycle, so when
+    an attempt's aggregate outcome is lost it must be able to retract the
+    records that attempt persisted — otherwise a torn persist-to-link window
+    stays adoptable through :meth:`ChildTranscriptReconciler.scan` forever.
+    The retraction is the ONLY write the coordinator ever makes in a child
+    transcript: it is bounded to the ``agents/`` subtree, path-confined, atomic,
+    idempotent, and it can only ever REMOVE a transcript from the scan.
+
+    The tombstone bridges on the attempt id the adjudicated records carry, and
+    falls back to the session id the records name, so a legacy record without
+    an id is still retractable. A transcript that carries no identity at all is
+    not retracted (nothing can be keyed to it) and answers False.
+    """
+    resolved_session = session_id or reconciliation.session_id
+    resolved_attempt = attempt_id or reconciliation.attempt_id
+    if resolved_session is None:
+        return False
+    try:
+        store = ChildTranscriptStore(
+            reconciliation.child_dir, root_session_dir=Path(root_session_dir)
+        )
+        store.record_tombstone(
+            ChildTombstoneRecord(
+                session_id=resolved_session,
+                reason=reason,
+                created_at=child_reconciliation_timestamp(),
+                attempt_id=resolved_attempt,
+                agent_id=reconciliation.agent_id,
+            )
+        )
+    except (ChildTranscriptError, OSError) as exc:
+        logger.warning(
+            "Failed to retract child transcript %s: %s", reconciliation.child_dir, exc
+        )
+        return False
+    return True
+
+
+def _adjudicated_session_id(adjudication: ChildTranscriptAdjudication) -> str | None:
+    """The session id the adjudicated records name, for the retraction bridge."""
+    if adjudication.result is not None:
+        return adjudication.result.session_id
+    if adjudication.start_marker is not None:
+        return adjudication.start_marker.session_id
+    if adjudication.tombstone is not None:
+        return adjudication.tombstone.session_id
+    return None
+
+
 def _adjudicated_agent_id(adjudication: ChildTranscriptAdjudication) -> str:
     if adjudication.start_marker is not None:
         return adjudication.start_marker.agent_id
     if adjudication.result is not None:
         return adjudication.result.agent_id
+    if adjudication.tombstone is not None and adjudication.tombstone.agent_id:
+        return adjudication.tombstone.agent_id
     return adjudication.child_dir.name.split("_", 1)[0]
+
+
+def _tombstoned_denial(agent_id: str, child_dir: Path, detail: str) -> str:
+    return (
+        f"Subagent {agent_id} transcript at {child_dir} was retracted by its "
+        f"publication attempt's tombstone ({detail}). Nothing is adopted and "
+        "nothing was replayed."
+    )
 
 
 def _reconciliation_denial(
@@ -1183,6 +1316,10 @@ def _reconciliation_denial(
         return _never_executed_denial(agent_id, adjudication.child_dir)
     if adjudication.outcome is ChildTranscriptOutcome.STARTED_OUTCOME_UNKNOWN:
         return _outcome_unknown_denial(agent_id, adjudication.run_id)
+    if adjudication.outcome is ChildTranscriptOutcome.TOMBSTONED:
+        return _tombstoned_denial(
+            agent_id, adjudication.child_dir, adjudication.detail or "retracted"
+        )
     if adjudication.outcome is ChildTranscriptOutcome.UNREADABLE:
         return _unreadable_denial(
             agent_id, adjudication.child_dir, adjudication.detail or "unreadable"

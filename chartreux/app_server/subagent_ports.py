@@ -41,10 +41,12 @@ from collections.abc import (
     Iterable,
     Iterator,
     Mapping,
+    Sequence,
 )
 from contextlib import aclosing, suppress
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from enum import StrEnum
 from itertools import count
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol
@@ -62,6 +64,11 @@ from chartreux.app_server._subagent_transcript import (
 from chartreux.app_server.agent_wire import (
     AGENT_TURN_ENDED_METHOD,
     AGENT_TURN_EVENT_METHOD,
+    CHILD_TEARDOWN_ATTEMPT_UNKNOWN,
+    CHILD_TEARDOWN_INCONCLUSIVE,
+    CHILD_TEARDOWN_OUTCOMES,
+    CHILD_TEARDOWN_REAPED,
+    CHILD_TEARDOWN_TOMBSTONED,
     TURN_OUTCOME_COMPLETED,
     TURN_OUTCOME_FAILED,
     TURN_OUTCOME_INTERRUPTED,
@@ -73,7 +80,17 @@ from chartreux.core.agent_loop._execution_port import (
     ExecutionTurnRequest,
     TurnExecutionPort,
 )
-from chartreux.core.events import BaseEvent
+from chartreux.core.events import BaseEvent, ToolStreamEvent
+from chartreux.core.llm.failures import FailureCategory, FailureInfo
+from chartreux.core.llm_models import LLMMessage, Role
+from chartreux.core.recovery_models import (
+    CallEvidence,
+    FailureEnvelope,
+    build_failure_envelope,
+)
+from chartreux.core.recovery_observation import FailureObservation, observe_exception
+from chartreux.core.subagents import TaskArgs, TaskResult
+from chartreux.core.tools.base import InvokeContext
 from chartreux.observability.logging import logger
 
 if TYPE_CHECKING:
@@ -88,22 +105,377 @@ class SubagentSpawnDeniedError(SubagentSpawnError):
     """The run's transport selection does not allow this adapter."""
 
 
+# --- the child failure envelope and its derivation inputs (item 2 B.3) --------
+
+CHILD_FAILURE_FRAME_KEY = "failure"
+"""The run-completion frame's failure block: the derived envelope plus its inputs."""
+
+_DEPLOYMENT_ARITY = 3
+"""(base_model, provider, wire_name) — the attempted-deployment identity tuple."""
+
+
+@dataclass(frozen=True, slots=True)
+class ChildFailureEvidence:
+    """One child run's derived failure envelope and the inputs it came from.
+
+    The child derives the envelope where the evidence lives; the completion
+    frame carries BOTH the derived result and the derivation inputs, so the
+    coordinator can re-derive it eligibility-equivalently instead of trusting a
+    field subset. The inputs matter: the in-process builder consumes
+    ``stop_reason`` and ``exclusion_reasons`` to derive the class and
+    eligibility, and a subset without ``stop_reason`` would wrongly admit a
+    budget-stopped run as a recoverable transient.
+    """
+
+    envelope: FailureEnvelope
+    derivation_inputs: dict[str, Any]
+
+    def rebuild(self) -> FailureEnvelope:
+        """Re-derive the envelope from its inputs, exactly as the child did."""
+        inputs = self.derivation_inputs
+        return build_failure_envelope(
+            observation=_observation_from_inputs(_mapping(inputs.get("observation"))),
+            agent_id=str(inputs.get("agent_id") or self.envelope.agent_id),
+            run_id=str(inputs.get("run_id") or self.envelope.run_id),
+            turn_id=_optional_str(inputs.get("turn_id")),
+            turns_used=_optional_int(inputs.get("turns_used")),
+            attempted_deployment=_deployment_identity(
+                inputs.get("attempted_deployment")
+            ),
+            configured_model=_optional_str(inputs.get("configured_model")),
+            stop_reason=_optional_str(inputs.get("stop_reason")),
+            exclusion_reasons=_string_list(inputs.get("exclusion_reasons")),
+            tool_calls_present=bool(inputs.get("tool_calls_present")),
+            tool_calls_pending=bool(inputs.get("tool_calls_pending")),
+            endpoint_correlated=bool(inputs.get("endpoint_correlated")),
+        )
+
+    @property
+    def eligibility_equivalent(self) -> bool:
+        """Whether the parent's rebuild reaches the child's own decision."""
+        try:
+            rebuilt = self.rebuild()
+        except Exception as exc:
+            logger.warning("Failed to rebuild the child failure envelope", exc_info=exc)
+            return False
+        return failure_decision(rebuilt) == failure_decision(self.envelope)
+
+
+def failure_decision(envelope: FailureEnvelope) -> tuple[str, str, tuple[str, ...]]:
+    """The decision triple a rebuild must reproduce: class, eligibility, reasons."""
+    return (
+        envelope.failure.failure_class.value,
+        envelope.recovery.eligibility.value,
+        tuple(envelope.recovery.reason_codes),
+    )
+
+
+def encode_child_failure(evidence: ChildFailureEvidence) -> dict[str, Any]:
+    """Encode one run's failure evidence as the completion frame's block."""
+    return {
+        "envelope": evidence.envelope.model_dump(mode="json"),
+        "derivation_inputs": dict(evidence.derivation_inputs),
+    }
+
+
+def decode_child_failure(payload: object) -> ChildFailureEvidence | None:
+    """Rebuild one run's failure evidence; an absent or malformed block is None."""
+    if not isinstance(payload, Mapping):
+        return None
+    raw_envelope = payload.get("envelope")
+    if not isinstance(raw_envelope, Mapping):
+        return None
+    try:
+        envelope = FailureEnvelope.model_validate(dict(raw_envelope))
+    except Exception:
+        return None
+    inputs = payload.get("derivation_inputs")
+    return ChildFailureEvidence(
+        envelope=envelope, derivation_inputs=dict(_mapping(inputs))
+    )
+
+
+def child_failure_evidence(
+    loop: object,
+    exc: BaseException,
+    *,
+    agent_id: str,
+    run_id: str,
+    turn_id: str | None = None,
+    turns_used: int | None = None,
+    stop_reason: str | None = None,
+    exclusion_reasons: list[str] | None = None,
+) -> ChildFailureEvidence:
+    """Derive one failed child run's envelope where its evidence still lives.
+
+    The observation, the transcript-visible tool-effect evidence, the attempted
+    deployment and the derived envelope are all captured agent-side, because a
+    process-backed child's evidence dies with it. Everything the parent's
+    re-derivation reads rides the returned inputs.
+    """
+    observation = observe_exception(
+        exc, phase="turn", turn_id=turn_id, agent_id=agent_id, run_id=run_id
+    )
+    messages = _loop_messages(loop)
+    tool_calls_present, tool_calls_pending = _transcript_tool_evidence(messages)
+    committed = getattr(loop, "committed_model", None)
+    attempted_deployment = observation.attempted_deployment or _committed_deployment(
+        committed
+    )
+    configured_model = _optional_str(
+        getattr(getattr(loop, "config", None), "active_model", None)
+    )
+    derivation_inputs: dict[str, Any] = {
+        "agent_id": agent_id,
+        "run_id": run_id,
+        "turn_id": turn_id,
+        "turns_used": turns_used,
+        "configured_model": configured_model,
+        "attempted_deployment": (
+            list(attempted_deployment) if attempted_deployment is not None else None
+        ),
+        "stop_reason": stop_reason,
+        "exclusion_reasons": list(exclusion_reasons)
+        if exclusion_reasons is not None
+        else None,
+        "tool_calls_present": tool_calls_present,
+        "tool_calls_pending": tool_calls_pending,
+        "endpoint_correlated": False,
+        "observation": _observation_inputs(observation),
+    }
+    envelope = build_failure_envelope(
+        observation=observation,
+        agent_id=agent_id,
+        run_id=run_id,
+        turn_id=turn_id,
+        turns_used=turns_used,
+        attempted_deployment=attempted_deployment,
+        configured_model=configured_model,
+        stop_reason=stop_reason,
+        exclusion_reasons=exclusion_reasons,
+        tool_calls_present=tool_calls_present,
+        tool_calls_pending=tool_calls_pending,
+        endpoint_correlated=False,
+    )
+    return ChildFailureEvidence(envelope=envelope, derivation_inputs=derivation_inputs)
+
+
+def _loop_messages(loop: object) -> list[LLMMessage]:
+    messages = getattr(loop, "messages", None)
+    return list(messages) if isinstance(messages, (list, tuple)) else []
+
+
+def _transcript_tool_evidence(messages: Sequence[LLMMessage]) -> tuple[bool, bool]:
+    """Transcript-visible tool-effect inputs: (requested, pending).
+
+    Mirrors the in-process monitor's derivation: assistant ``tool_calls``
+    request effects and ``Role.tool`` messages settle them by id. Absence of
+    tool calls is not proof of no effects — hooks, jobs and child launches are
+    not transcript-visible — so "none requested" stays UNKNOWN, never SETTLED.
+    """
+    requested: set[str] = set()
+    settled: set[str] = set()
+    for message in messages:
+        if message.role is Role.assistant:
+            for call in message.tool_calls or ():
+                if call.id:
+                    requested.add(call.id)
+        elif message.role is Role.tool and message.tool_call_id:
+            settled.add(message.tool_call_id)
+    return bool(requested), bool(requested - settled)
+
+
+def _committed_deployment(committed: object) -> tuple[str, str, str] | None:
+    if committed is None:
+        return None
+    base_model = getattr(committed, "base_model", None)
+    provider = getattr(committed, "provider", None)
+    wire_name = getattr(committed, "wire_name", None)
+    if (
+        isinstance(base_model, str)
+        and isinstance(provider, str)
+        and isinstance(wire_name, str)
+    ):
+        return (base_model, provider, wire_name)
+    return None
+
+
+def _observation_inputs(observation: FailureObservation) -> dict[str, Any]:
+    """The serializable form of one observation: the parent's derivation input."""
+    classification = observation.classification
+    evidence = observation.call_evidence
+    return {
+        "exception_type": observation.exception_type,
+        "message": observation.message,
+        "phase": observation.phase,
+        "observed_at": observation.observed_at,
+        "classification": (
+            {
+                "category": classification.category.value,
+                "status": classification.status,
+                "error_code": classification.error_code,
+                "error_type": classification.error_type,
+                "retry_after": classification.retry_after,
+            }
+            if classification is not None
+            else None
+        ),
+        "call_evidence": (
+            {
+                "logical_call_id": evidence.logical_call_id,
+                "started_at": evidence.started_at,
+                "budget_seconds": evidence.budget_seconds,
+                "response_started": evidence.response_started,
+                "semantic_output_published": evidence.semantic_output_published,
+                "transport_attempts": evidence.transport_attempts,
+                "elapsed_seconds": evidence.elapsed_seconds,
+                "budget_exhausted": evidence.budget_exhausted,
+            }
+            if evidence is not None
+            else None
+        ),
+        "attempted_deployment": (
+            list(observation.attempted_deployment)
+            if observation.attempted_deployment is not None
+            else None
+        ),
+        "endpoint": observation.endpoint,
+        "status": observation.status,
+        "error_code": observation.error_code,
+        "error_type": observation.error_type,
+        "turn_id": observation.turn_id,
+        "agent_id": observation.agent_id,
+        "run_id": observation.run_id,
+    }
+
+
+def _observation_from_inputs(inputs: Mapping[str, Any]) -> FailureObservation:
+    """Rebuild the observation a parent-side re-derivation reads."""
+    raw_evidence = _mapping(inputs.get("call_evidence"))
+    call_evidence = None
+    if raw_evidence:
+        logical_call_id = _optional_str(raw_evidence.get("logical_call_id"))
+        started_at = raw_evidence.get("started_at")
+        if logical_call_id is not None and isinstance(started_at, (int, float)):
+            call_evidence = CallEvidence(
+                logical_call_id=logical_call_id,
+                started_at=float(started_at),
+                budget_seconds=_optional_float(raw_evidence.get("budget_seconds")),
+                response_started=_optional_bool(raw_evidence.get("response_started")),
+                semantic_output_published=_optional_bool(
+                    raw_evidence.get("semantic_output_published")
+                ),
+                transport_attempts=_optional_int(
+                    raw_evidence.get("transport_attempts")
+                ),
+                elapsed_seconds=_optional_float(raw_evidence.get("elapsed_seconds")),
+                budget_exhausted=_optional_bool(raw_evidence.get("budget_exhausted")),
+            )
+    classification = None
+    raw_classification = _mapping(inputs.get("classification"))
+    category = _optional_str(raw_classification.get("category"))
+    if category is not None:
+        try:
+            classification = FailureInfo(
+                FailureCategory(category),
+                status=_optional_int(raw_classification.get("status")),
+                error_code=_optional_str(raw_classification.get("error_code")),
+                error_type=_optional_str(raw_classification.get("error_type")),
+                retry_after=_optional_float(raw_classification.get("retry_after")),
+            )
+        except ValueError:
+            classification = None
+    status = inputs.get("status")
+    observed_at = inputs.get("observed_at")
+    return FailureObservation(
+        exception_type=str(inputs.get("exception_type") or "unknown"),
+        message=str(inputs.get("message") or ""),
+        phase=str(inputs.get("phase") or "unknown"),
+        cause_chain=(),
+        classification=classification,
+        observed_at=float(observed_at)
+        if isinstance(observed_at, (int, float))
+        else 0.0,
+        turn_id=_optional_str(inputs.get("turn_id")),
+        agent_id=_optional_str(inputs.get("agent_id")),
+        run_id=_optional_str(inputs.get("run_id")),
+        request_id=None,
+        endpoint=_optional_str(inputs.get("endpoint")),
+        status=status if isinstance(status, int) else None,
+        error_code=_optional_str(inputs.get("error_code")),
+        error_type=_optional_str(inputs.get("error_type")),
+        call_evidence=call_evidence,
+        attempted_deployment=_deployment_identity(inputs.get("attempted_deployment")),
+    )
+
+
+def _deployment_identity(value: object) -> tuple[str, str, str] | None:
+    if not isinstance(value, Sequence) or isinstance(value, (str, bytes)):
+        return None
+    parts = list(value)
+    if len(parts) != _DEPLOYMENT_ARITY or not all(
+        isinstance(part, str) for part in parts
+    ):
+        return None
+    return (parts[0], parts[1], parts[2])
+
+
+def _string_list(value: object) -> list[str] | None:
+    if not isinstance(value, Sequence) or isinstance(value, (str, bytes)):
+        return None
+    return [item for item in value if isinstance(item, str)]
+
+
+def _optional_int(value: object) -> int | None:
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+
+def _optional_float(value: object) -> float | None:
+    if isinstance(value, bool):
+        return None
+    return float(value) if isinstance(value, (int, float)) else None
+
+
+def _optional_bool(value: object) -> bool | None:
+    return value if isinstance(value, bool) else None
+
+
+def _mapping(value: object) -> Mapping[str, Any]:
+    return value if isinstance(value, Mapping) else {}
+
+
 @dataclass(frozen=True, slots=True)
 class SubagentSpawnSpec:
-    """JSON-safe spawn request for one subagent; crosses the process wire."""
+    """JSON-safe spawn request for one subagent; crosses the process wire.
+
+    ``attempt_id`` is the coordinator-minted identity of the publication
+    attempt this spawn belongs to. It rides the spawn request so the child can
+    persist it at its FIRST durable write: a torn persist-to-link window, or a
+    lost aggregate reply, stays attributable to its attempt instead of leaking
+    an adoptable transcript.
+    """
 
     agent_id: str
     parent_session_id: str | None = None
     session_dir: str | None = None
     payload: dict[str, Any] = field(default_factory=dict)
+    attempt_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
 class SubagentCompletion:
-    """Terminal outcome of one subagent run, as the final stream frame."""
+    """Terminal outcome of one subagent run, as the final stream frame.
+
+    ``failure`` carries the run's typed failure evidence when the run failed
+    inside its own process: the child derives the envelope where the evidence
+    lives and the frame carries it (item 2 B.3), because the ``outcome``/
+    ``error`` strings alone cannot reconstruct the measured call evidence and
+    parent-side eligibility would fail closed for every transient family.
+    """
 
     outcome: str
     error: str | None = None
+    failure: ChildFailureEvidence | None = None
 
 
 type SubagentFrame = BaseEvent | SubagentCompletion
@@ -143,6 +515,162 @@ class SubagentSpawnPort(Protocol):
     async def spawn(self, spec: SubagentSpawnSpec) -> SpawnedSubagent: ...
 
 
+CHILD_HANDOFF_PAYLOAD_KEY = "file_state_handoff"
+"""Spawn-payload key carrying the parent's rendered working-set handoff."""
+
+CHILD_TEARDOWN_REASON = "publication-teardown"
+"""Tombstone reason: an attempt whose aggregate outcome was never observed."""
+
+
+class ChildTeardownOutcome(StrEnum):
+    """What a conservative publication teardown ESTABLISHED, never claimed."""
+
+    REAPED = CHILD_TEARDOWN_REAPED
+    """The attempt held nothing durable to retract, and its process is gone."""
+
+    TOMBSTONED = CHILD_TEARDOWN_TOMBSTONED
+    """The attempt's persisted records were retracted before removal."""
+
+    INCONCLUSIVE = CHILD_TEARDOWN_INCONCLUSIVE
+    """The attempt could not be settled inside the bounded rollback wait."""
+
+    ATTEMPT_UNKNOWN = CHILD_TEARDOWN_ATTEMPT_UNKNOWN
+    """This end holds no attempt under that id (settled, or never admitted)."""
+
+
+@dataclass(frozen=True, slots=True)
+class ChildTeardownRequest:
+    """One request to settle a publication attempt whose outcome was lost.
+
+    The coordinator mints the attempt id, so it still holds the identity after
+    a lost reply; the request asks the process that owns the children to settle
+    the attempt conservatively. ``wait_seconds`` bounds how long the owner
+    waits for the attempt's own atomic rollback before it must answer
+    inconclusive.
+    """
+
+    attempt_id: str
+    reason: str = CHILD_TEARDOWN_REASON
+    agent_id: str | None = None
+    wait_seconds: float | None = None
+
+    def to_wire(self) -> dict[str, Any]:
+        return {
+            "attempt_id": self.attempt_id,
+            "reason": self.reason,
+            "agent_id": self.agent_id,
+            "wait_seconds": self.wait_seconds,
+        }
+
+    @classmethod
+    def from_wire(cls, params: Mapping[str, Any]) -> ChildTeardownRequest:
+        attempt_id = params.get("attempt_id")
+        if not isinstance(attempt_id, str) or not attempt_id:
+            raise ValueError("a child teardown request carries no attempt id")
+        wait = params.get("wait_seconds")
+        return cls(
+            attempt_id=attempt_id,
+            reason=_optional_str(params.get("reason")) or CHILD_TEARDOWN_REASON,
+            agent_id=_optional_str(params.get("agent_id")),
+            wait_seconds=(
+                float(wait)
+                if isinstance(wait, (int, float)) and not isinstance(wait, bool)
+                else None
+            ),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class ChildTeardownReport:
+    """What a conservative teardown of one publication attempt established.
+
+    ``retracted`` records whether a tombstone was written, so a caller never
+    has to read a reason string to know whether the attempt's records can
+    resurrect. ``settled`` is False for the inconclusive class: an attempt the
+    owner could not reap inside the bounded wait is never reported as rolled
+    back.
+    """
+
+    attempt_id: str
+    outcome: ChildTeardownOutcome
+    agent_id: str | None = None
+    session_id: str | None = None
+    child_dir: str | None = None
+    retracted: bool = False
+    detail: str | None = None
+
+    @property
+    def settled(self) -> bool:
+        """Whether the attempt is provably settled (never a claimed rollback)."""
+        return self.outcome in {
+            ChildTeardownOutcome.REAPED,
+            ChildTeardownOutcome.TOMBSTONED,
+        }
+
+    def to_wire(self) -> dict[str, Any]:
+        return {
+            "attempt_id": self.attempt_id,
+            "outcome": self.outcome.value,
+            "agent_id": self.agent_id,
+            "session_id": self.session_id,
+            "child_dir": self.child_dir,
+            "retracted": self.retracted,
+            "detail": self.detail,
+        }
+
+    @classmethod
+    def from_wire(cls, payload: Mapping[str, Any]) -> ChildTeardownReport:
+        raw_outcome = payload.get("outcome")
+        if raw_outcome not in CHILD_TEARDOWN_OUTCOMES:
+            raise ValueError("a child teardown report carries no known outcome")
+        attempt_id = payload.get("attempt_id")
+        if not isinstance(attempt_id, str) or not attempt_id:
+            raise ValueError("a child teardown report carries no attempt id")
+        return cls(
+            attempt_id=attempt_id,
+            outcome=ChildTeardownOutcome(str(raw_outcome)),
+            agent_id=_optional_str(payload.get("agent_id")),
+            session_id=_optional_str(payload.get("session_id")),
+            child_dir=_optional_str(payload.get("child_dir")),
+            retracted=bool(payload.get("retracted")),
+            detail=_optional_str(payload.get("detail")),
+        )
+
+
+class ChildPublicationTeardownPort(Protocol):
+    """Settles a publication attempt this end minted, after a lost outcome."""
+
+    async def teardown_attempt(
+        self, request: ChildTeardownRequest
+    ) -> ChildTeardownReport: ...
+
+
+class AgentOwnedSubagentRunner:
+    """The turn offer a coordinator makes for a process-owned root.
+
+    A stdio session's root agent process owns its children: the child launch
+    resolves its candidate, renders the working-set handoff, and records the
+    parent link against the root loop, and only that process holds the loop.
+    So this port never runs a child itself -- it is what the offer means, and
+    the agent builds the runner it owns when the coordinator offers it. A host
+    run that still reaches this end (an agent holding no child host of its
+    own) answers typed instead of streaming an empty result.
+    """
+
+    def run(
+        self, args: TaskArgs, ctx: InvokeContext
+    ) -> AsyncGenerator[ToolStreamEvent | TaskResult, None]:
+        return self._refuse()
+
+    async def _refuse(self) -> AsyncGenerator[ToolStreamEvent | TaskResult, None]:
+        raise SubagentSpawnDeniedError(
+            "This turn's children are owned by the root agent process, which "
+            "serves no host subagent run; restart with "
+            "CHARTREUX_TRANSPORT=in_process to run children in one process."
+        )
+        yield  # pragma: no cover - unreachable; makes this an async generator
+
+
 def spawn_spec_to_wire(spec: SubagentSpawnSpec) -> dict[str, Any]:
     """Encode one spawn spec as the ``subagent/open`` params payload."""
     return {
@@ -150,6 +678,7 @@ def spawn_spec_to_wire(spec: SubagentSpawnSpec) -> dict[str, Any]:
         "parent_session_id": spec.parent_session_id,
         "session_dir": spec.session_dir,
         "payload": spec.payload,
+        "attempt_id": spec.attempt_id,
     }
 
 
@@ -164,6 +693,7 @@ def spawn_spec_from_wire(params: Mapping[str, Any]) -> SubagentSpawnSpec:
         parent_session_id=_optional_str(params.get("parent_session_id")),
         session_dir=_optional_str(params.get("session_dir")),
         payload=dict(payload) if isinstance(payload, Mapping) else {},
+        attempt_id=_optional_str(params.get("attempt_id")),
     )
 
 
@@ -174,6 +704,7 @@ def child_spawn_spec(
     root_session_dir: Path,
     agent_name: str | None = None,
     payload: Mapping[str, Any] | None = None,
+    attempt_id: str | None = None,
 ) -> SubagentSpawnSpec:
     """Build the spawn request for one FRESH child process (WP5 [5C]).
 
@@ -182,12 +713,19 @@ def child_spawn_spec(
     carries the ROOT session dir and the agent name instead of a child
     directory a previous spawn may have used. A later child process is
     therefore a new incarnation with a new transcript record, never a resume.
+
+    ``attempt_id`` is the publication attempt the spawn belongs to; the child
+    persists it at its first durable write, which is what makes a torn
+    persist-to-link window (and a lost aggregate reply) attributable.
     """
     merged: dict[str, Any] = dict(payload or {})
     merged[ROOT_SESSION_DIR_PAYLOAD_KEY] = str(root_session_dir)
     merged[AGENT_NAME_PAYLOAD_KEY] = agent_name or agent_id
     return SubagentSpawnSpec(
-        agent_id=agent_id, parent_session_id=parent_session_id, payload=merged
+        agent_id=agent_id,
+        parent_session_id=parent_session_id,
+        payload=merged,
+        attempt_id=attempt_id,
     )
 
 
@@ -533,15 +1071,23 @@ def subagent_event_frame(
 def subagent_completion_frame(
     agent_id: str, incarnation: int, completion: SubagentCompletion
 ) -> dict[str, Any]:
-    """The terminal completion frame: always the run stream's last frame."""
+    """The terminal completion frame: always the run stream's last frame.
+
+    A failed run's typed failure evidence (the derived envelope plus the inputs
+    it came from) rides this frame, so a process-backed child's measured
+    evidence reaches the coordinator instead of dying with the child.
+    """
+    params: dict[str, Any] = {
+        "agent_id": agent_id,
+        "outcome": completion.outcome,
+        "error": completion.error,
+    }
+    if completion.failure is not None:
+        params[CHILD_FAILURE_FRAME_KEY] = encode_child_failure(completion.failure)
     return {
         "jsonrpc": "2.0",
         "method": AGENT_TURN_ENDED_METHOD,
-        "params": {
-            "agent_id": agent_id,
-            "outcome": completion.outcome,
-            "error": completion.error,
-        },
+        "params": params,
         RELAY_INCARNATION_FIELD: incarnation,
     }
 
@@ -742,9 +1288,17 @@ class AdmittingSubagentSpawn:
 
 
 __all__ = [
+    "CHILD_FAILURE_FRAME_KEY",
+    "CHILD_HANDOFF_PAYLOAD_KEY",
+    "CHILD_TEARDOWN_REASON",
     "MAX_SUBAGENT_DEPTH",
     "AdmittedSubagent",
     "AdmittingSubagentSpawn",
+    "ChildFailureEvidence",
+    "ChildPublicationTeardownPort",
+    "ChildTeardownOutcome",
+    "ChildTeardownReport",
+    "ChildTeardownRequest",
     "InProcessChildFactory",
     "InProcessSpawnedSubagent",
     "InProcessSubagentCompletionSource",
@@ -764,8 +1318,13 @@ __all__ = [
     "SubagentSpawnError",
     "SubagentSpawnPort",
     "SubagentSpawnSpec",
+    "child_failure_evidence",
     "child_result_store",
+    "child_spawn_spec",
     "child_terminal_record",
+    "decode_child_failure",
+    "encode_child_failure",
+    "failure_decision",
     "record_child_terminal",
     "spawn_spec_from_wire",
     "spawn_spec_to_wire",

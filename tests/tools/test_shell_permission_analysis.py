@@ -107,9 +107,6 @@ def test_recursive_argv_security_checks_without_shell_reparse(
         "PIPX_COMPLETION_DIR",
         "PIPX_GLOBAL_COMPLETION_DIR",
         "XDG_STATE_HOME",
-        "TMPDIR",
-        "TMP",
-        "TEMP",
         "SYSTEMDRIVE",
         "UV_PYTHON_DOWNLOADS_JSON_URL",
         "PIP_BUILD_TRACKER",
@@ -246,11 +243,71 @@ def test_ansi_c_string_requires_approval_but_preserves_token() -> None:
     assert analysis.command_parts == ("echo $'x'",)
 
 
-def test_heredoc_requires_approval() -> None:
+def test_unquoted_heredoc_requires_approval() -> None:
     analysis = analyze_shell_command("cat <<EOF\nhi\nEOF")
 
     assert analysis.requires_approval
-    assert "heredocs are unsupported in v0.1" in analysis.approval_reasons
+    assert any(
+        "unquoted heredoc delimiter" in reason for reason in analysis.approval_reasons
+    )
+
+
+@pytest.mark.parametrize(
+    ("command", "expected_part"),
+    [
+        ("cat <<'EOF'\nhi\nEOF", "cat <redirect>"),
+        ('cat <<"EOF"\nhi\nEOF', "cat <redirect>"),
+        ("cat <<\\EOF\nhi\nEOF", "cat <redirect>"),
+        ("wc -l <<'EOF'\nhi\nEOF", "wc -l <redirect>"),
+        ("sort <<'EOF'\nhi\nEOF", "sort <redirect>"),
+        ("uniq <<'EOF'\nhi\nEOF", "uniq <redirect>"),
+        ("grep hi <<'EOF'\nhi\nEOF", "grep hi <redirect>"),
+        ("python3 - <<'EOF'\nprint(1)\nEOF", "python3 <redirect>"),
+        ('python <<"EOF"\nprint(1)\nEOF', "python <redirect>"),
+        ("node - <<'EOF'\n1\nEOF", "node <redirect>"),
+    ],
+)
+def test_quoted_heredoc_feeding_a_stdin_consumer_is_admitted(
+    command: str, expected_part: str
+) -> None:
+    # tree-sitter-bash drops a bare ``-`` operand from the command node once a
+    # heredoc follows it, so the extracted part omits the script dash while
+    # the admission reads the statement slice for the consumer's argv.
+    analysis = analyze_shell_command(command)
+
+    assert not analysis.requires_approval, analysis.approval_reasons
+    assert analysis.command_parts == (expected_part,)
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        # An unquoted delimiter expands the body before the command runs.
+        "python3 - <<EOF\nprint(1)\nEOF",
+        "cat <<EOF\nhi\nEOF",
+        # A quoted body fed to an invocation outside the modeled consumers is
+        # a nested script, not data: the admitted equivalence does not cover it.
+        "sh <<'EOF'\ngit push\nEOF",
+        "bash -e <<'EOF'\necho hi\nEOF",
+        "ansible-playbook <<'EOF'\n- hosts: all\nEOF",
+        # A heredoc whose consumer cannot be located at all.
+        "cd sub && cat <<'EOF' > /dev/null\nhi\nEOF\n<<'EOF2'\ny\nEOF2\n",
+    ],
+)
+def test_heredoc_outside_the_admitted_shapes_requires_approval(command: str) -> None:
+    analysis = analyze_shell_command(command)
+
+    assert analysis.requires_approval
+
+
+def test_heredoc_feeding_a_foreign_consumer_names_the_alternative() -> None:
+    analysis = analyze_shell_command("sh <<'EOF'\ngit push\nEOF")
+
+    diagnostic = analysis.approval_diagnostic.related[0]
+    assert diagnostic.detail == "a heredoc feeding sh"
+    assert diagnostic.denial_class is DenialClass.SYNTAX
+    assert diagnostic.alternative is not None
+    assert "write the body with write_file" in diagnostic.alternative
 
 
 def test_herestring_requires_approval() -> None:
@@ -303,6 +360,30 @@ def test_dangerous_environment_names_require_approval(name: str) -> None:
     assert f"dangerous environment assignment ({name})" in analysis.approval_reasons
 
 
+@pytest.mark.parametrize("name", ["PYTHONINSPECT", "PYTHONSTARTUP", "PYTHONHOME"])
+def test_interpreter_startup_environment_names_require_approval(name: str) -> None:
+    # Execution channels outside the inspected command stay denied.
+    analysis = analyze_shell_command(f"{name}=x python -V")
+
+    assert analysis.requires_approval
+    assert f"dangerous environment assignment ({name})" in analysis.approval_reasons
+
+
+@pytest.mark.parametrize("name", ["TMPDIR", "TMP", "TEMP", "UV_CACHE_DIR"])
+def test_temp_and_cache_destinations_are_relocation_only(name: str) -> None:
+    # These move where files land, never what code runs.
+    analysis = analyze_shell_command(f"{name}=/tmp/x uv run pytest")
+
+    assert not analysis.requires_approval
+    assert analysis.command_parts == ("uv run pytest",)
+
+
+def test_uv_project_environment_is_relocation_only() -> None:
+    analysis = analyze_shell_command("UV_PROJECT_ENVIRONMENT=/tmp/env uv run pytest")
+
+    assert not analysis.requires_approval
+
+
 @pytest.mark.parametrize("name", ["GIT_EDITOR", "GIT_PAGER", "DYLD_INSERT_LIBRARIES"])
 def test_dangerous_environment_prefixes_require_approval(name: str) -> None:
     analysis = analyze_shell_command(f"{name}=x ls")
@@ -311,7 +392,7 @@ def test_dangerous_environment_prefixes_require_approval(name: str) -> None:
     assert f"dangerous environment assignment ({name})" in analysis.approval_reasons
 
 
-@pytest.mark.parametrize("value", ["/abs/path", "relative:/abs/path", "..", "a/..", ""])
+@pytest.mark.parametrize("value", ["..", "a/..", "", "lib:..", "~", "~/lib"])
 def test_pythonpath_dangerous_entries_require_approval(value: str) -> None:
     analysis = analyze_shell_command(f"PYTHONPATH={value} python x")
 
@@ -359,19 +440,77 @@ def test_quoted_non_executable_environment_is_literal(form: str, value: str) -> 
     assert not analysis.requires_approval
 
 
-def test_pythonpath_relative_entries_are_allowed() -> None:
-    analysis = analyze_shell_command("PYTHONPATH=lib:vendor python x")
+@pytest.mark.parametrize(
+    "value", ["lib:vendor", "/abs/path", "relative:/abs/path", ".:/tmp", "/opt/wt:lib"]
+)
+def test_pythonpath_relative_and_absolute_entries_are_allowed(value: str) -> None:
+    analysis = analyze_shell_command(f"PYTHONPATH={value} python x")
 
     assert not analysis.requires_approval
 
 
-def test_lowercase_assignment_name_requires_approval() -> None:
-    analysis = analyze_shell_command("foo=bar ls")
+def test_worktree_pythonpath_recipe_is_admitted() -> None:
+    # The documented worktree recipe as written: an absolute PYTHONPATH entry
+    # prefixing the uv run, after a cd segment.
+    analysis = analyze_shell_command(
+        "cd /tmp/worktree && PYTHONPATH=/tmp/worktree "
+        "uv run --project /home/pav/code/chartreux --no-sync pytest --ignore=tests/perf"
+    )
+
+    assert not analysis.requires_approval
+    assert analysis.command_parts == (
+        "cd /tmp/worktree",
+        "uv run --project /home/pav/code/chartreux --no-sync pytest --ignore=tests/perf",
+    )
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "foo=bar ls",
+        "1x=1 git status",
+        "env foo=bar git status",
+        "env FOO=1 1X=1 git status",
+        "export foo=bar; git status",
+        "declare -x foo=bar; git status",
+    ],
+)
+def test_any_assignment_name_with_a_literal_value_is_admitted(command: str) -> None:
+    assert not analyze_shell_command(command).requires_approval
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "PYTHONPATH=/abs python x",
+        "env PYTHONPATH=/abs python x",
+        "export PYTHONPATH=/abs; python x",
+        "declare -x PYTHONPATH=/abs; python x",
+    ],
+)
+def test_absolute_pythonpath_is_admitted_in_every_form(command: str) -> None:
+    assert not analyze_shell_command(command).requires_approval
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "env HOME=/tmp git status",
+        "export HOME=/tmp; git status",
+        "declare -x HOME=/tmp; git status",
+        "env GIT_DIR=x git status",
+        "export PYTHONPATH=../lib; python x",
+    ],
+)
+def test_protected_names_and_traversing_entries_stay_denied_in_every_form(
+    command: str,
+) -> None:
+    analysis = analyze_shell_command(command)
 
     assert analysis.requires_approval
-    assert (
-        "an environment assignment with a non-uppercase name"
-        in analysis.approval_reasons
+    assert any(
+        "dangerous environment assignment" in reason
+        for reason in analysis.approval_reasons
     )
 
 
@@ -660,7 +799,7 @@ def test_top_level_lookup_mutations_require_approval(command: str) -> None:
 
 
 @pytest.mark.parametrize("word", ["=cmd", "==x", "~user", "***"])
-def test_zsh_sensitive_words_require_approval(word: str) -> None:
+def test_zsh_sensitive_words_require_approval(word: str, zsh_executor) -> None:
     analysis = analyze_shell_command(f"echo {word}")
 
     assert analysis.requires_approval
@@ -759,9 +898,16 @@ def test_source_commands_are_extracted_as_parts(
         ),
         (
             "cat <<EOF\nhi\nEOF",
-            "heredocs are unsupported in v0.1",
-            "use write_file to create the content, or use read_file with "
-            "offset and limit, grep, and the edit tool for existing files",
+            "an unquoted heredoc delimiter (the body would be expanded)",
+            "quote the delimiter (`<<'EOF'`) so the body stays literal, or use "
+            "write_file to create the content",
+        ),
+        (
+            "sh <<'EOF'\ngit push\nEOF",
+            "a heredoc feeding sh",
+            "write the body with write_file and pass the file path, or feed it "
+            "to a reader (cat/wc/head/tail/grep/cut/sort/uniq) or to an "
+            "interpreter reading its program from stdin (`python3 -`)",
         ),
         (
             "for i in 1 2; do echo $i; done",
@@ -834,10 +980,20 @@ def test_source_commands_are_extracted_as_parts(
             "assignment-only statements are not permitted",
             "attach the assignment to a command in the same statement",
         ),
+        (
+            "echo hi > -weird",
+            "an invalid redirection path target",
+            "write the redirection destination as a literal path",
+        ),
+        (
+            "unset PATH",
+            "unsetting shell environment variables cannot be safely inspected",
+            "run the command without unsetting environment variables",
+        ),
     ],
 )
 def test_syntax_reasons_carry_class_and_alternative(
-    command: str, reason: str, alternative: str
+    command: str, reason: str, alternative: str, zsh_executor
 ) -> None:
     # A SYNTAX denial is an unmodeled v0.1 construct: the diagnostic carries
     # the SYNTAX class and the compliant alternative its message names.
@@ -855,7 +1011,7 @@ def test_syntax_reasons_carry_class_and_alternative(
     ("command", "reason", "fragments"),
     [
         (
-            "PYTHONPATH=/abs python x",
+            "PYTHONPATH=.. python x",
             "dangerous environment assignment (PYTHONPATH)",
             ("dangerous environment assignment", "PYTHONPATH"),
         ),
@@ -865,24 +1021,9 @@ def test_syntax_reasons_carry_class_and_alternative(
             ("dangerous environment assignment", "PRELOAD"),
         ),
         (
-            "foo=bar ls",
-            "an environment assignment with a non-uppercase name",
-            ("an environment assignment with a non-uppercase name",),
-        ),
-        (
-            "echo hi > -weird",
-            "an invalid redirection path target",
-            ("an invalid redirection path target",),
-        ),
-        (
             "echo hi > /abs/path",
             "an absolute redirection target",
             ("an absolute redirection target",),
-        ),
-        (
-            "unset PATH",
-            "unsetting shell environment variables cannot be safely inspected",
-            ("unsetting shell environment variables cannot be safely inspected",),
         ),
         (
             "hash -p /usr/bin/curl harmless",
@@ -912,7 +1053,7 @@ def test_policy_reasons_carry_policy_class_and_no_alternative(
 def test_mixed_constructs_classify_as_policy() -> None:
     # A command with both unmodeled syntax and a policy violation is a
     # policy denial: it names no alternative.
-    analysis = analyze_shell_command("PYTHONPATH=/abs cat $(ls)")
+    analysis = analyze_shell_command("PYTHONPATH=.. cat $(ls)")
     assert "command substitution" in analysis.approval_reasons
     assert "dangerous environment assignment (PYTHONPATH)" in analysis.approval_reasons
     assert analysis.approval_diagnostic.denial_class is DenialClass.POLICY
@@ -956,10 +1097,6 @@ def test_diagnostics_keep_their_reasons_class_and_alternative() -> None:
         (
             ["env", "PYTHONPATH=../outside", "python", "-c", "code"],
             "dangerous environment assignment (PYTHONPATH)",
-        ),
-        (
-            ["env", "foo=bar", "echo", "hi"],
-            "an environment assignment with a non-uppercase name",
         ),
         (
             ["hash", "-p", "./fake", "git"],
@@ -1121,7 +1258,9 @@ def test_equals_command_position_resolves_to_executable_path(equals_path: str) -
     assert analysis.command_parts == ("mytool -la",)
 
 
-def test_equals_unresolvable_command_keeps_its_denial(equals_path: str) -> None:
+def test_equals_unresolvable_command_keeps_its_denial(
+    equals_path: str, zsh_executor
+) -> None:
     analysis = analyze_shell_command("=notacommand -la")
 
     assert analysis.requires_approval
@@ -1131,7 +1270,9 @@ def test_equals_unresolvable_command_keeps_its_denial(equals_path: str) -> None:
     assert diagnostic.alternative == _EQUALS_MARKER_ALTERNATIVE
 
 
-def test_equals_in_argument_position_stays_denied(equals_path: str) -> None:
+def test_equals_in_argument_position_stays_denied(
+    equals_path: str, zsh_executor
+) -> None:
     analysis = analyze_shell_command("echo =mytool")
 
     assert analysis.requires_approval
@@ -1162,7 +1303,9 @@ def test_equals_marker_proves_one_literal_argv_word(command: str) -> None:
 
 
 @pytest.mark.parametrize("command", ["echo '='*", "echo \\=*", "echo '='?"])
-def test_equals_marker_that_can_expand_past_one_word_is_denied(command: str) -> None:
+def test_equals_marker_that_can_expand_past_one_word_is_denied(
+    command: str, zsh_executor
+) -> None:
     analysis = analyze_shell_command(command)
 
     assert analysis.requires_approval
@@ -1171,7 +1314,9 @@ def test_equals_marker_that_can_expand_past_one_word_is_denied(command: str) -> 
     )
 
 
-def test_unquoted_equals_marker_denial_names_the_quoting_remediation() -> None:
+def test_unquoted_equals_marker_denial_names_the_quoting_remediation(
+    zsh_executor,
+) -> None:
     for command in ("echo =ls", "echo ===X==="):
         analysis = analyze_shell_command(command)
         assert analysis.requires_approval
@@ -1197,7 +1342,26 @@ def test_same_invocation_status_probe_is_admitted(command: str) -> None:
     analysis = analyze_shell_command(command)
 
     assert not analysis.requires_approval, analysis.approval_reasons
-    assert analysis.command_parts[-1].endswith(" $?")
+    assert analysis.command_parts[-1].endswith("$?")
+
+
+# v0.7.8 P1c: the general probe spelling — one double-quoted word whose
+# literal prefix precedes the status expansion.
+@pytest.mark.parametrize(
+    "command",
+    [
+        'ls; echo "EXIT:$?"',
+        'ls; printf "EXIT:$?"',
+        'ls; echo "exit: $?"',
+        'ls; echo "$?"',
+    ],
+)
+def test_quoted_status_probe_is_admitted(command: str) -> None:
+    analysis = analyze_shell_command(command)
+
+    assert not analysis.requires_approval, analysis.approval_reasons
+    # The emitted part keeps the executed source word, closing quote included.
+    assert analysis.command_parts[-1].endswith('$?"')
 
 
 def test_status_probe_part_keeps_the_executed_source_token() -> None:
@@ -1206,6 +1370,11 @@ def test_status_probe_part_keeps_the_executed_source_token() -> None:
     # Analysis-replacement never diverges from execution: the emitted part is
     # the source the shell runs, and the shell substitutes the status number.
     assert analysis.command_parts == ("ls", "echo $?")
+    # The quoted spelling keeps its own source text too.
+    assert analyze_shell_command('ls; echo "EXIT:$?"').command_parts == (
+        "ls",
+        'echo "EXIT:$?"',
+    )
 
 
 @pytest.mark.parametrize(
@@ -1223,6 +1392,8 @@ def test_status_probe_part_keeps_the_executed_source_token() -> None:
         "echo $?",  # no completed command to report
         "ls\necho $?",  # not `;`-separated
         "ls; echo $?;",  # trailing statement separator
+        "ls; echo EXIT:$?",  # unquoted concatenation
+        'ls; echo "EXIT:$?" extra',  # one word, not the whole argument
     ],
 )
 def test_status_probe_near_misses_stay_denied(command: str) -> None:
@@ -1254,7 +1425,10 @@ def test_status_probe_never_suppresses_a_sibling_denial() -> None:
             "variable expansion (unsupported in v0.1 because it can change arguments)",
         ),
         ("echo $((1+1))", "arithmetic expansion"),
-        ("x=1; echo $x", "an environment assignment with a non-uppercase name"),
+        (
+            "x=1; echo $x",
+            "variable expansion (unsupported in v0.1 because it can change arguments)",
+        ),
     ],
 )
 def test_s1_keep_denied_classes_stay_denied(command: str, reason: str) -> None:
@@ -1271,6 +1445,12 @@ def test_s1_keep_denied_classes_stay_denied(command: str, reason: str) -> None:
         ("grep -m $((2+3)) lit lines.txt", "grep -m 5 lit lines.txt"),
         ("X=5; head -n$X lines.txt", "head -n5 lines.txt"),
         ("X=5; cut -d $X -f1 lines.txt", "cut -d 5 -f1 lines.txt"),
+        # v0.7.8 P1c: ls, the sort/uniq input operands, find's name tests.
+        ("X=sub; ls $X", "ls sub"),
+        ("X=a.txt; sort $X", "sort a.txt"),
+        ("X=a.txt; uniq $X", "uniq a.txt"),
+        ("X=needle; find . -name $X", "find . -name needle"),
+        ("X=needle; find . -iname $X", "find . -iname needle"),
         # Multiple literal assignments bind in one statement.
         ("X=5 Y=3; grep -m $((X+Y)) lit lines.txt", "grep -m 8 lit lines.txt"),
         # A binding persists for later statements of the same invocation
@@ -1330,6 +1510,21 @@ def test_read_only_positions_inline_the_resolved_literal(
             "X='a;b'; grep -m $X lit lines.txt",
             "variable expansion (unsupported in v0.1 because it can change arguments)",
         ),
+        # v0.7.8 P1c exclusions (I8-F1): an expanded value never lands in a
+        # table-classified write operand. sort's -o and uniq's second
+        # positional are output files.
+        (
+            "X=out.txt; sort -o $X in.txt",
+            "variable expansion (unsupported in v0.1 because it can change arguments)",
+        ),
+        (
+            "X=out.txt; sort --output $X in.txt",
+            "variable expansion (unsupported in v0.1 because it can change arguments)",
+        ),
+        (
+            "X=a.txt; uniq src.txt $X",
+            "variable expansion (unsupported in v0.1 because it can change arguments)",
+        ),
     ],
 )
 def test_unresolvable_or_write_position_expansions_deny_unchanged(
@@ -1354,6 +1549,30 @@ def test_quoted_word_in_read_only_option_value_is_admitted(locate_workspace) -> 
     assert analysis.command_parts == ("grep -m 5 lit lines.txt",)
 
 
+# v0.7.8 P1c: the same quoted spelling in the newly classified read operands.
+def test_quoted_word_in_new_read_operands_is_admitted(locate_workspace) -> None:
+    for command, expanded in (
+        ('X=sub; ls "$X"', "ls sub"),
+        ('X=a.txt; sort "$X"', "sort a.txt"),
+        ('X=a.txt; uniq "$X"', "uniq a.txt"),
+        ('X=needle; find . -name "$X"', "find . -name needle"),
+    ):
+        analysis = analyze_shell_command(command)
+
+        assert not analysis.requires_approval, (command, analysis.approval_reasons)
+        assert analysis.admitted_quoted_words == 1, command
+        assert analysis.command_parts == (expanded,), command
+
+
+def test_quoted_word_in_write_operand_stays_denied(locate_workspace) -> None:
+    # I8-F1: the quoted spelling does not open a write position.
+    for command in ('X=out.txt; sort -o "$X" in.txt', 'X=a.txt; uniq src.txt "$X"'):
+        analysis = analyze_shell_command(command)
+
+        assert analysis.requires_approval, command
+        assert analysis.admitted_quoted_words == 0, command
+
+
 def test_for_loop_body_expansion_stays_denied(locate_workspace) -> None:
     analysis = analyze_shell_command(
         "for i in 1; do X=5 grep -m $X lit lines.txt; done"
@@ -1364,7 +1583,7 @@ def test_for_loop_body_expansion_stays_denied(locate_workspace) -> None:
 
 
 def test_dangerous_assignment_wins_over_expansion_resolution(locate_workspace) -> None:
-    analysis = analyze_shell_command("X=5; PYTHONPATH=/abs grep -m $X lit lines.txt")
+    analysis = analyze_shell_command("X=5; PYTHONPATH=.. grep -m $X lit lines.txt")
 
     assert analysis.requires_approval
     assert "dangerous environment assignment (PYTHONPATH)" in analysis.approval_reasons
@@ -1375,7 +1594,7 @@ def test_dangerous_assignment_wins_over_expansion_resolution(locate_workspace) -
 
 def test_approval_label_reflects_the_policy_class() -> None:
     syntax = analyze_shell_command("echo $(whoami)").approval_label
-    policy = analyze_shell_command("PYTHONPATH=/abs python x").approval_label
+    policy = analyze_shell_command("PYTHONPATH=.. python x").approval_label
 
     assert syntax.startswith("unsupported shell syntax: ")
     assert policy.startswith("shell policy restriction: ")

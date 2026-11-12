@@ -80,8 +80,32 @@ is not promised to preserve the local shell's stream split.
 The local model-facing shell is intentionally finite: each call starts a fresh
 shell, closes stdin with EOF, enforces a timeout, and returns separate stdout and
 stderr. It does not retain a process handle across calls or expose managed shell
-continuation, polling, input, cursor, or output-storage controls. User-authored
-manual `!` commands remain a separate shell effect path.
+continuation, polling, input, cursor, or output-storage controls.
+
+A user-authored manual `!` command is user input, not model authority. It runs
+under the user's own authority, so no permission, remote-exec, pathname-
+expansion, or workspace-containment gate stands between the user and the
+command; an explicit `cwd` executes wherever the user points (a missing
+directory is a plain error) and the default remains the session workspace root.
+One record builder covers every outcome — the empty-input no-op, a spawn
+failure (including the fail-closed executor contract), a nonzero exit, a
+timeout, and an interrupt — and applies redaction uniformly before persistence
+and model delivery, so the agent receives the same manual-command result record
+whatever happened. The spawn still binds the pinned executor contract,
+credentials are scrubbed from the child environment, and each captured stream
+is capped.
+
+The command is user input in its scheduling too: because it mutates nothing the
+client coordinates, a `!` submitted while a turn or another command runs waits
+in the same FIFO turn queue as a typed prompt (a shell-input entry kind) instead
+of being refused, and an interrupt before it starts removes it unexecuted. At
+idle the session runs it once and promotes the record exactly as a prompt is
+promoted: the record text is the committed user message and the conversation's
+source of truth, and the manual-command metadata rides on that message for
+timeline display only. Effect-then-turn is serialized by the queue, so no
+concurrent injection exists and a record cannot be lost to a turn-start race. If
+admission rejects the record's turn, the record stays queued as a ready user
+turn — the command's effect is never rerun to recover it.
 
 Persisted settings remain server-owned even when the client applies their
 accepted value to local hardware or presentation.
@@ -444,8 +468,10 @@ resource APIs:
 
 - Textual renders and edits the server-owned prompt queue. It does not keep a
   second accepted queue or schedule queued work itself.
-- Textual `!` commands and non-side-channel slash commands require an idle
-  session. They are rejected while other work or accepted prompts are pending.
+- Textual `!` commands queue in that same prompt queue while other work is
+  pending; the server runs one at idle and promotes its record as a user turn.
+  Non-side-channel slash commands still require an idle session and are
+  rejected while other work or accepted prompts are pending.
 - Other delivery surfaces use the same enqueue, read, remove, and resume
   methods when they add queueing; they do not implement another accepted
   queue.

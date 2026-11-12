@@ -55,6 +55,29 @@ def test_documents_panel_and_no_public_grant_endpoint() -> None:
     assert "permission authority, not standing intent to publish" in DOC
 
 
+def test_documents_routine_branch_creation_and_its_retained_protections() -> None:
+    # P3: the guide states the creation form is routine for every repository
+    # state while naming the two protections that still ride it and the forms
+    # that stay gated.
+    assert "### Routine branch creation (v0.7.8)" in DOC
+    assert "`git checkout -b <new-branch> [<start-point>]` is routine" in DOC
+    assert "the repository state does not gate it" in DOC
+    assert "`git` refuses rather than discards" in DOC
+    assert "a repository whose configuration selects a program" in DOC
+    assert "`post-checkout` hook" in DOC
+    assert "the command as written stays written for display and result surfaces" in DOC
+    assert "The configuration check is fail-closed" in DOC
+    assert "Discard-shaped checkouts and the clean-tree exemption" in DOC
+
+
+def test_documents_the_effective_work_tree_and_injection_scope() -> None:
+    # The exemption paragraphs keep their scope statements: the switch form is
+    # the exempt shape, and the injection covers both modeled whole-call forms.
+    assert "Exempt shape only: `git checkout <branch>`" in DOC
+    assert "the exempt switch and the routine branch creation alike" in DOC
+    assert "The switch form additionally requires the target to exist" in DOC
+
+
 def test_documents_bash_and_bash_start_parity() -> None:
     assert "`bash` and `bash_start` behave identically" in DOC
 

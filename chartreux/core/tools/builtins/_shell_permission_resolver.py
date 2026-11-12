@@ -45,6 +45,9 @@ from chartreux.core.tools.builtins._remote_transfer import (
     pinned_transfer_argv,
     pinned_transfer_command_text,
 )
+from chartreux.core.tools.builtins._shell_argument_positions import (
+    is_read_only_argument_position,
+)
 from chartreux.core.tools.builtins._shell_argv import (
     PatternGlobCandidate,
     ShellToken,
@@ -55,7 +58,6 @@ from chartreux.core.tools.builtins._shell_argv import (
 from chartreux.core.tools.builtins._shell_command_policy import (
     _COMPILER_OUTPUT_COMMANDS,
     _DESTINATION_POSITION_TABLES,
-    _GIT_CHECKOUT_TABLE,
     _GIT_SUBCOMMAND_INDEX,
     _SEVENZIP_ARCHIVE_WRITING_COMMANDS,
     _SEVENZIP_TABLE,
@@ -64,8 +66,7 @@ from chartreux.core.tools.builtins._shell_command_policy import (
     ShellCommandPolicy,
     _has_long,
     _has_short,
-    _scan_classified_git_options,
-    _scan_git_globals,
+    _scan_git_checkout_shape,
     analyze_shell_command_policy,
     canonical_git_command,
     classify_dangerous_git_command,
@@ -115,6 +116,7 @@ from chartreux.core.tools.utils import (
     PathAuthority,
     ambient_workspace,
     effective_scratchpad_roots,
+    is_canonical_scratch_path,
     resolve_tool_path,
 )
 from chartreux.core.utils.shell import current_executor_contract
@@ -177,18 +179,33 @@ def _dangerous_policy_reason(context: PermissionContext) -> Diagnostic:
 
 
 def _authority_denial(
-    decision: PermissionContext, token: str, command_part: str
+    decision: PermissionContext,
+    token: str,
+    command_part: str,
+    *,
+    target: Path | None = None,
 ) -> PermissionContext:
     """The denial for a path-authority NEVER decision.
 
-    Keeps the shell's established outside-scope diagnostic.
+    Keeps the shell's established outside-scope diagnostic. An out-of-root
+    decision names the resolved operand target so an interactive session can
+    bind the canonical root; a bounded decision (a parent ceiling) names no
+    target, so a child never fabricates one.
     """
     if (
         decision.reason
         and decision.reason.startswith("File ")
         and "outside" in decision.reason
     ):
-        return _denied(Diagnostic("path_outside", token, command_part))
+        diagnostic = Diagnostic("path_outside", token, command_part)
+        if decision.denial_kind == "out_of_root":
+            return PermissionContext(
+                permission=ToolPermission.NEVER,
+                reason=render_diagnostic(diagnostic),
+                denial_kind="out_of_root",
+                out_of_root_target=target,
+            )
+        return _denied(diagnostic)
     return _denied(Diagnostic("text", token, command_part, decision.reason))
 
 
@@ -550,11 +567,15 @@ _SHELL_GLOB_CHARACTERS = frozenset("*?[")
 _MAX_EXPANSION_ENTRIES = 4096
 _MAX_EXPANSION_MATCH_STATES = 1 << 19
 
-# The glob-execution whitelist (S2). Only a standalone ``cat``/``wc`` with no
+# The glob-execution whitelist (S2). Only a standalone modeled reader with no
 # options and path operands that are each literal or one single-component glob
 # binds to a literal argv plan; every other glob-bearing operand keeps the
-# existing path-glob denial. The per-call budgets are the four design caps.
-_GLOB_WHITELIST_COMMANDS = frozenset({"cat", "wc"})
+# existing path-glob denial. The set stays consistent with the read-position
+# table (_shell_argument_positions): every word an expansion produces must land
+# in a table-classified read-only position, so `uniq`'s output positional is
+# refused even though `uniq` is listed. The per-call budgets are the four
+# design caps.
+_GLOB_WHITELIST_COMMANDS = frozenset({"cat", "sort", "uniq", "wc"})
 _MAX_GLOB_OPERANDS = 256
 _MAX_GLOB_ARGV_BYTES = 64 * 1024
 _GLOB_METACHARACTERS = frozenset("*?[")
@@ -1176,11 +1197,13 @@ def _glob_execution_plan(
 ) -> GlobExecutionPlan | None:
     """The literal argv plan for one command, or None when not a glob call.
 
-    None means the command is not the whitelist (its shell path is
+    None means the command is not a whitelist glob call (its shell path is
     unaffected); every whitelist-shaped failure raises
-    :class:`GlobPlanDenial`. The whitelist is exactly: standalone ``cat`` or
-    ``wc``, no options (an optional ``--`` terminator only), at least one
-    eligible glob, and every operand either literal or eligible.
+    :class:`GlobPlanDenial`. The whitelist is exactly: standalone ``cat``,
+    ``wc``, ``sort`` or ``uniq``, no options (an optional ``--`` terminator
+    only), at least one eligible glob, and every operand either literal or
+    eligible. A call with no glob operand at all is an ordinary literal call,
+    so its option words are never inspected as path-glob candidates.
     """
     if not tokens:
         return None
@@ -1190,19 +1213,27 @@ def _glob_execution_plan(
     operands = list(tokens[1:])
     if operands and str(operands[0]) == "--":
         operands = operands[1:]
-    for token in operands:
-        if str(token).startswith("-"):
-            raise GlobPlanDenial(str(token), ExpansionFailure.CALLER_DENIED)
     if not any(_glob_word_is_expansion(token) for token in operands):
         # No eligible glob: this is an ordinary literal call, not the
         # literal-argv transport (its shell execution is unchanged).
         return None
+    for token in operands:
+        if str(token).startswith("-"):
+            raise GlobPlanDenial(str(token), ExpansionFailure.CALLER_DENIED)
     words: list[str] = [str(tokens[0])]
     planned: list[GlobOperand] = []
     enumerated = [0]
     match_states = [0]
 
     def append(operand: GlobOperand) -> None:
+        # The expanded words run as the command's positionals, so each one
+        # must land in a position the argument-position table classifies
+        # read-only: `uniq`'s second positional is its OUTPUT file, and only
+        # READ authority was proved for a match.
+        if not is_read_only_argument_position(
+            command, f"positional:{len(planned) + 1}"
+        ):
+            raise GlobPlanDenial(operand.word, ExpansionFailure.CALLER_DENIED)
         words.append(operand.word)
         planned.append(operand)
         if len(planned) > _MAX_GLOB_OPERANDS:
@@ -2181,9 +2212,9 @@ def _collect_outside_dirs(
     return dirs
 
 
-_analysis_cache: ContextVar[dict[tuple[str, bool], ShellPermissionAnalysis] | None] = (
-    ContextVar("shell_launch_analysis", default=None)
-)
+_analysis_cache: ContextVar[
+    dict[tuple[str, bool, str | None], ShellPermissionAnalysis] | None
+] = ContextVar("shell_launch_analysis", default=None)
 
 
 @contextmanager
@@ -2208,19 +2239,24 @@ def _analyze_guardrail_source(
 ) -> ShellPermissionAnalysis:
     """Analyze shell source, reusing pure syntax analysis within one launch.
 
-    The cache key stays (command, nested_source); the scratchpad roots and the
-    workspace roots are deliberately not part of it. Within one launch the
-    local resolver and the parent invocation guard can hold different
+    The cache key is (command, nested_source, executor family); the scratchpad
+    roots and the workspace roots are deliberately not part of it. Within one
+    launch the local resolver and the parent invocation guard can hold different
     authorities, so a cached analysis may carry another caller's roots — a
     spurious approval reason at worst (the false-denial direction). A cached
     scratchpad exemption can never authorize a write outside
     workspace+scratchpad: the resolver's path layer independently gates every
     literal redirect target as a WRITE against the caller's own authority.
     The workspace roots gate only the sed simulation's READ — which file the
-    analysis may read at all — never an authorization.
+    analysis may read at all — never an authorization. The executor family is
+    part of the key because the equals-expansion analysis is family-gated: a
+    zsh analysis must never answer a bash call (or the reverse) inside one
+    launch.
     """
+    contract = current_executor_contract()
+    family = None if contract is None else contract.family
     cache = _analysis_cache.get()
-    key = (command, nested_source)
+    key = (command, nested_source, family)
     if cache is None:
         return analyze_shell_command(
             command,
@@ -2431,6 +2467,7 @@ class ShellPermissionResolver:
             if self._is_standalone_denylisted(part):
                 return _denied(Diagnostic("standalone", command_part=part))
         state_cache: dict[tuple[Path, Path | None, bool, frozenset[Path]], bool] = {}
+        scratchpad_roots = effective_scratchpad_roots(self.path_authority)
         scoped = list(_scoped_guardrail_cwds(expanded, self.cwd))
         policies = [
             ShellCommandPolicy()
@@ -2464,11 +2501,12 @@ class ShellPermissionResolver:
                 if (
                     policy.diagnostic is not None
                     and policy.diagnostic.code == "recursive_rm"
-                    and self._recursive_rm_eligible(
+                    and self._recursive_rm_admitted(
                         tokens,
                         possible_cwds,
                         cwd_unknown,
                         state_cache,
+                        scratchpad_roots,
                         call_footprint=call_footprint,
                         prior_writes=(
                             prior_writes[position]
@@ -2477,11 +2515,11 @@ class ShellPermissionResolver:
                         ),
                     )
                 ):
-                    # Run-class under the full P2-c condition: every expanded
-                    # operand is in-repository, metadata-excluding, and
-                    # recovery-established. The path layer still gates each
-                    # operand independently — a run-class resolution dies at
-                    # a gate — and every other denial path is unchanged.
+                    # An admitted recursive rm: either the full P2-c run-class
+                    # condition or the session-scratchpad containment family.
+                    # The path layer still gates each operand independently —
+                    # an admission dies at a gate — and every other denial path
+                    # is unchanged.
                     continue
                 diagnostic = (
                     Diagnostic(
@@ -2727,6 +2765,85 @@ class ShellPermissionResolver:
                     return False
         return True
 
+    def _recursive_rm_admitted(
+        self,
+        tokens: list[str],
+        possible_cwds: set[Path],
+        cwd_unknown: bool,
+        state_cache: dict[tuple[Path, Path | None, bool, frozenset[Path]], bool],
+        scratchpad_roots: frozenset[Path],
+        *,
+        call_footprint: frozenset[Path] | None,
+        prior_writes: frozenset[Path] | None,
+    ) -> bool:
+        """Whether either admitted recursive-rm family covers this segment.
+
+        The git-clean-tree carve-out is the full P2-c condition; the session
+        scratchpad (v0.7.8 P4) is a containment-only family, because its
+        content is throwaway, session-owned data. Either admission is only a
+        guardrail admission: the path layer still gates every operand
+        independently for sensitive patterns and parent ceilings.
+        """
+        if self._recursive_rm_eligible(
+            tokens,
+            possible_cwds,
+            cwd_unknown,
+            state_cache,
+            call_footprint=call_footprint,
+            prior_writes=prior_writes,
+        ):
+            return True
+        return self._scratchpad_rm_eligible(
+            tokens,
+            possible_cwds,
+            cwd_unknown,
+            scratchpad_roots,
+            call_footprint=call_footprint,
+        )
+
+    def _scratchpad_rm_eligible(
+        self,
+        tokens: list[str],
+        possible_cwds: set[Path],
+        cwd_unknown: bool,
+        scratchpad_roots: frozenset[Path],
+        *,
+        call_footprint: frozenset[Path] | None,
+    ) -> bool:
+        """Whether one recursive rm deletes only session-scratchpad content (P4).
+
+        The session scratchpad is throwaway, session-owned data, so its content
+        needs no repository recovery analysis. Every expanded operand must
+        instead resolve BY CANONICAL PATH strictly inside one of the session's
+        scratchpad roots: an operand equal to a root is refused (the root is
+        not a deletable operand), and a symlink escaping the root resolves
+        outside it and is refused. The whole-call destruction footprint must
+        still be establishable — the scratchpad family skips the git-tree
+        analysis, never the footprint analysis — and every unestablishable
+        aspect (unknown cwd, unexpandable glob, unresolvable path) fails
+        closed to the shipped hard guard. The path layer still gates each
+        operand independently for sensitive patterns and parent ceilings.
+        """
+        if cwd_unknown or call_footprint is None or not scratchpad_roots:
+            return False
+        operands = _rm_operands(tokens)
+        if not operands:
+            # rm without operands removes nothing.
+            return True
+        for cwd in possible_cwds:
+            for token in operands:
+                paths = self._rm_operand_paths(token, cwd)
+                if paths is None:
+                    return False
+                for path in paths:
+                    if not any(
+                        path != root.absolute()
+                        and is_canonical_scratch_path(path, root)
+                        for root in scratchpad_roots
+                    ):
+                        return False
+        return True
+
     def _rm_operand_paths(self, token: str, cwd: Path) -> list[Path] | None:
         """The resolved paths one rm operand deletes, or None (fail closed).
 
@@ -2846,7 +2963,7 @@ class ShellPermissionResolver:
         """The authority decision plus metadata containment for one operand."""
         decision = authority.resolve(str(resolved), access)
         if decision is not None and decision.permission == ToolPermission.NEVER:
-            return _authority_denial(decision, token, command_part)
+            return _authority_denial(decision, token, command_part, target=resolved)
         if metadata_guard is not None and (
             hit := self._operand_metadata_hit(token, resolved, metadata_guard)
         ):
@@ -3208,7 +3325,9 @@ class ShellPermissionResolver:
                 return _denied(Diagnostic("metadata_unlocated"))
             decision = authority.resolve(str(work_tree), PathAccess.MUTATE)
             if decision is not None and decision.permission == ToolPermission.NEVER:
-                return _authority_denial(decision, str(work_tree), entry.text)
+                return _authority_denial(
+                    decision, str(work_tree), entry.text, target=work_tree
+                )
             if ".git" in work_tree.parts or any(
                 work_tree.is_relative_to(directory) for directory in guard.directories
             ):
@@ -3320,16 +3439,16 @@ class ShellPermissionResolver:
         self,
         exemption: _CheckoutExemption,
         scoped_candidates: list[tuple[Path, RepositoryScope]],
-        cache: dict[tuple[Path, Path | None, str, str | None, str | None], bool],
+        cache: dict[tuple[Path, Path | None, str], bool],
     ) -> bool:
         """Whether every candidate repository scope passes the A2 guardrails.
 
         The command may run in any statically possible directory, so every
         candidate scope must pass (a fully clean work tree, no in-progress
         operation marker, no program-selecting repository config, and an
-        existing local target branch for the plain branch form). The cache
-        is per call — one probe set per repository and shape, never across
-        calls — following the resolver's recovery-cache pattern.
+        existing local target branch). The cache is per call — one probe set
+        per repository and target branch, never across calls — following the
+        resolver's recovery-cache pattern.
 
         The probes assess the EFFECTIVE work tree — the same
         core.worktree-aware resolution an actual checkout honors (and the
@@ -3338,7 +3457,6 @@ class ShellPermissionResolver:
         directory probes clean. An effective work tree that cannot be
         established fails the exemption closed.
         """
-        shape = exemption.shape
         entry = exemption.entry
         tokens = (
             list(entry.tokens)
@@ -3360,18 +3478,67 @@ class ShellPermissionResolver:
                 # Probe the work tree the checkout actually rewrites; the
                 # metadata directories stay the discovered repository's.
                 assessed = replace(assessed, work_tree=effective)
-            key = (
-                assessed.git_dir,
-                assessed.work_tree,
-                shape.kind,
-                shape.branch,
-                shape.start,
-            )
+            key = (assessed.git_dir, assessed.work_tree, exemption.branch)
             if key not in cache:
-                cache[key] = _checkout_guardrails_pass(assessed, shape)
+                cache[key] = _checkout_guardrails_pass(assessed, exemption.branch)
             if not cache[key]:
                 return False
         return True
+
+    def _checkout_creation_keeps_approval_class(
+        self, tokens: list[str], possible_cwds: set[Path], cwd_unknown: bool
+    ) -> bool:
+        """Whether a routine branch creation must keep the approval class (P3).
+
+        ``git checkout -b <new> [<start>]`` carries no consequential
+        operation, but the repository configuration check stays: a
+        program-selecting config (``core.hooksPath`` and the other
+        program-selection keys) selects the ``post-checkout`` hook the
+        branch switch runs, which is unreviewed program execution in a
+        child that can never prompt. The gate is fail-closed: a repository
+        that cannot be located, and a config that cannot be read, both keep
+        the approval class. Every other checkout shape reaches this check
+        already classified, so it returns False for them.
+        """
+        shape = _scan_git_checkout_shape(tokens)
+        if shape is None or shape[0].kind != "create":
+            return False
+        if cwd_unknown or not possible_cwds:
+            return True
+        for cwd in possible_cwds:
+            scope = resolve_repository_scope(cwd, GitRepositoryRelocation())
+            if scope is None:
+                return True
+            state = repository_state(scope)
+            if state is None or config_selects_program(state) is not False:
+                return True
+        return False
+
+    def _sole_authority_path_denial(
+        self,
+        permission: PermissionContext,
+        args: ShellCommandArgs,
+        expanded: list[_GuardrailPart],
+        analysis: ShellPermissionAnalysis,
+    ) -> PermissionContext:
+        """A path denial, grantable only as the call's sole missing authority.
+
+        Mirrors the dangerous-command flow's last-word rule: a grant on one
+        operand cannot unblock a call that also lacks a dangerous-command
+        authority or carries a separate analysis denial, so such a call keeps
+        the path denial alone and the runtime raises no root-grant question
+        for one segment of it. The denial kind stays ``out_of_root`` — the
+        operand is still outside the authorized roots — while the grantable
+        target, the only thing the canonical-root binding consumes, is
+        dropped.
+        """
+        if permission.out_of_root_target is None:
+            return permission
+        if analysis.requires_approval or (
+            self._resolve_dangerous_command_permission(args, expanded) is not None
+        ):
+            return permission.model_copy(update={"out_of_root_target": None})
+        return permission
 
     def _resolve_dangerous_command_permission(  # noqa: PLR0911, PLR0912, PLR0914, PLR0915
         self, args: ShellCommandArgs, expanded: list[_GuardrailPart]
@@ -3416,9 +3583,7 @@ class ShellPermissionResolver:
         # flow. The exemption applies only when the entire composed shell
         # command is exactly one eligible git checkout invocation.
         checkout_exemption = _whole_call_checkout_exemption(args.command, expanded)
-        checkout_state_cache: dict[
-            tuple[Path, Path | None, str, str | None, str | None], bool
-        ] = {}
+        checkout_state_cache: dict[tuple[Path, Path | None, str], bool] = {}
         for entry, tokens, possible_cwds, cwd_unknown in _scoped_guardrail_cwds(
             expanded, self.cwd
         ):
@@ -3582,7 +3747,17 @@ class ShellPermissionResolver:
                     remote_exec_destination = destination
             classification = classify_dangerous_git_command(tokens)
             if classification.kind == "routine":
-                continue
+                # P3: the sanctioned branch creation is routine for every
+                # repository state, but a repository whose config selects a
+                # program keeps the approval class (the post-checkout hook
+                # it would run is unreviewed program execution).
+                if not self._checkout_creation_keeps_approval_class(
+                    tokens, possible_cwds, cwd_unknown
+                ):
+                    continue
+                classification = classify_dangerous_git_command(
+                    tokens, admit_checkout_creation=False
+                )
             if classification.kind == "hard_denied":
                 if not is_dangerous_git_subcommand(tokens):
                     # Unmodeled builtins and unrecognized subcommands carry no
@@ -3881,7 +4056,9 @@ class ShellPermissionResolver:
             expanded, glob_authorized=glob_authorized
         )
         if path_permission is not None:
-            return path_permission
+            return self._sole_authority_path_denial(
+                path_permission, args, expanded, analysis
+            )
 
         if analysis.requires_approval:
             # The whole-call denial class is decided BEFORE rendering: a call
@@ -4339,23 +4516,10 @@ def shell_command_mutation_roots(  # noqa: PLR0911
 # --- A2: the fail-closed clean-tree checkout exemption ------------------------
 
 
-#: The flag injected into the executed string of an exempt checkout: an
-#: ignored-file collision fails closed (checkout refuses) instead of
-#: silently clobbering local content.
+#: The flag injected into the executed string of a checkout: an ignored-file
+#: collision fails closed (checkout refuses) instead of silently clobbering
+#: local content.
 _NO_OVERWRITE_IGNORE = "--no-overwrite-ignore"
-
-
-@dataclass(frozen=True)
-class _CheckoutExemptionShape:
-    """One exempt checkout invocation's modeled operands (A2).
-
-    ``switch`` is ``git checkout <branch>``; ``create`` is
-    ``git checkout -b <new> [<start>]``.
-    """
-
-    kind: str
-    branch: str
-    start: str | None
 
 
 @dataclass(frozen=True)
@@ -4363,7 +4527,7 @@ class _CheckoutExemption:
     """One whole-call-eligible exempt checkout invocation (A2)."""
 
     entry: _GuardrailPart
-    shape: _CheckoutExemptionShape
+    branch: str
     checkout_token_index: int
 
 
@@ -4392,18 +4556,17 @@ def _shell_token_spans(text: str) -> list[tuple[str, int, int]] | None:
         return None
 
 
-def _checkout_exemption_shape(  # noqa: PLR0911
-    tokens: list[str],
-) -> tuple[_CheckoutExemptionShape, int] | None:
-    """The exempt checkout shape of one git invocation, with the subcommand's
+def _checkout_exemption_shape(tokens: list[str]) -> tuple[str, int] | None:
+    """The exempt switch shape of one git invocation, with the subcommand's
     token index, or None when the invocation is not an exempt shape.
 
     Exempt only: ``git checkout <branch>`` — no options, exactly one
-    operand — and ``git checkout -b <new> [<start>]`` — the ``-b`` option
-    alone, at most one further operand. Every excluded shape stays gated:
-    pathspecs (a second operand or an end-of-options marker),
-    ``-f``/``--force``/``--discard-changes``/``--merge``,
-    ``--orphan``/``--conflict``/``--pathspec-from-file``/
+    operand. The branch-creation form (``git checkout -b <new> [<start>]``)
+    is not an exemption: it classifies routine for every repository state
+    (P3), so the clean-tree gate has no create shape to admit. Every
+    excluded shape stays gated: pathspecs (a second operand or an
+    end-of-options marker), ``-f``/``--force``/``--discard-changes``/
+    ``--merge``, ``--orphan``/``--conflict``/``--pathspec-from-file``/
     ``--recurse-submodules``, ``-B``, and any other option. Global options
     are restricted to the recognized grammar that neither overrides
     configuration nor relocates the repository: an inline
@@ -4411,41 +4574,10 @@ def _checkout_exemption_shape(  # noqa: PLR0911
     behavior, e.g. core.hooksPath) and repository relocation
     (``-C``/``--git-dir``/``--work-tree``) both fail closed.
     """
-    if not tokens or tokens[0] != "git":
-        # A bare git executable only: no path, no alias form.
+    shape = _scan_git_checkout_shape(tokens)
+    if shape is None or shape[0].kind != "switch":
         return None
-    globals_scan = _scan_git_globals(tokens[1:])
-    if globals_scan.error is not None or globals_scan.end_of_options:
-        return None
-    if globals_scan.relocation != GitRepositoryRelocation():
-        return None
-    args = tokens[1:]
-    if globals_scan.index >= len(args) or args[globals_scan.index] != "checkout":
-        return None
-    scan = _scan_classified_git_options(
-        args[globals_scan.index + 1 :], _GIT_CHECKOUT_TABLE, strict=False
-    )
-    if scan.error is not None or scan.end_of_options:
-        return None
-    subcommand_index = 1 + globals_scan.index
-    if not scan.options and not scan.values and len(scan.operands) == 1:
-        return (
-            _CheckoutExemptionShape("switch", scan.operands[0], None),
-            subcommand_index,
-        )
-    if (
-        scan.options == ("-b",)
-        and len(scan.values) == 1
-        and scan.values[0][0] == "-b"
-        and len(scan.operands) <= 1
-    ):
-        return (
-            _CheckoutExemptionShape(
-                "create", scan.values[0][1], scan.operands[0] if scan.operands else None
-            ),
-            subcommand_index,
-        )
-    return None
+    return shape[0].branch, shape[1]
 
 
 def _whole_call_checkout_exemption(
@@ -4488,9 +4620,7 @@ def _whole_call_checkout_exemption(
     return _CheckoutExemption(entry, shape[0], shape[1])
 
 
-def _checkout_guardrails_pass(
-    state: RepositoryState, shape: _CheckoutExemptionShape
-) -> bool:
+def _checkout_guardrails_pass(state: RepositoryState, branch: str) -> bool:
     """The clean-tree checkout guardrails for one repository scope (A2).
 
     The exemption holds only on a fully clean work tree (no change, no
@@ -4514,42 +4644,37 @@ def _checkout_guardrails_pass(
         return False
     if in_progress_operation(state) is not False:
         return False
-    if shape.kind == "switch":
-        return local_branch_exists(state, shape.branch)
-    return True
+    return local_branch_exists(state, branch)
 
 
 class CheckoutInjectionError(ToolError):
-    """An exempt checkout's protected executed string could not be derived.
+    """A checkout's protected executed string could not be derived.
 
-    The whole-call exemption was re-derived at execution time, but the
+    The injection site was established from the command, but the
     ``--no-overwrite-ignore`` insertion could not be performed safely — or
-    the re-derivation itself failed after the permission-time exemption.
-    The tool call must fail BEFORE execution: running the original string
-    would silently drop the ignored-collision protection the exemption
-    exists to provide, so the error propagates out of the tool's run
-    instead of returning the unprotected command.
+    the recognition itself failed. The tool call must fail BEFORE execution:
+    running the original string would silently drop the ignored-collision
+    protection, so the error propagates out of the tool's run instead of
+    returning the unprotected command.
     """
 
 
-def _exempt_checkout_executed_string(
-    command: str, exemption: _CheckoutExemption
-) -> str:
-    """The executed string of one eligible exempt checkout, with the flag.
+def _checkout_injected_executed_string(command: str, checkout_token_index: int) -> str:
+    """The executed string of one checkout, with the flag.
 
     The rewrite inserts ``--no-overwrite-ignore`` immediately after the
     ``checkout`` subcommand token, by source span, so every other byte of
     the command — quoting, spacing, comments, expansion — is preserved
-    exactly. Every failure mode raises CheckoutInjectionError: an eligible
-    checkout whose protected string cannot be derived must fail the call
-    before execution, never execute the unprotected string.
+    exactly. Every failure mode raises CheckoutInjectionError: a checkout
+    whose protected string cannot be derived must fail the call before
+    execution, never execute the unprotected string.
     """
     spans = _shell_token_spans(command)
-    if spans is None or len(spans) <= exemption.checkout_token_index:
+    if spans is None or len(spans) <= checkout_token_index:
         raise CheckoutInjectionError(
             f"the executed string of {command!r} could not be rewritten safely"
         )
-    token, start, end = spans[exemption.checkout_token_index]
+    token, start, end = spans[checkout_token_index]
     if token != "checkout" or end <= start:
         raise CheckoutInjectionError(
             f"the executed string of {command!r} could not be rewritten safely"
@@ -4561,29 +4686,63 @@ def _exempt_checkout_executed_string(
     return f"{command[:end]} {_NO_OVERWRITE_IGNORE}{command[end:]}"
 
 
+def _checkout_injection_token_index(
+    command: str, expanded: list[_GuardrailPart]
+) -> int | None:
+    """The ``checkout`` token index the executed string must carry the flag
+    at, or None when no injection applies (P3).
+
+    The injection path's own recognition: the modeled checkout shapes — the
+    existing-branch switch form the clean-tree exemption admits, and the
+    routine branch-creation form (``_scan_git_checkout_shape``) — are
+    re-derived from the command here, independently of the permission-time
+    exemption and its state probes. The shape must be the whole composed
+    command: one expanded part with no environment assignment and no
+    enclosing scope whose words are exactly the raw command's, so a
+    wrapper, chained, piped, subshelled, redirected, or assignment-prefixed
+    call never carries the flag.
+    """
+    if len(expanded) != 1:
+        return None
+    entry = expanded[0]
+    if entry.scope or entry.access is not None or entry.assignments:
+        # A synthetic operand, a nested scope, or an environment assignment
+        # is not a bare single git invocation.
+        return None
+    tokens = (
+        list(entry.tokens)
+        if entry.tokens is not None
+        else _split_command_tokens(entry.text)
+    )
+    if not tokens or _split_command_tokens(command) != tokens:
+        # The raw command's own words must be exactly this part's words.
+        return None
+    shape = _scan_git_checkout_shape(tokens)
+    return None if shape is None else shape[1]
+
+
 def shell_command_checkout_no_overwrite_ignore(
     command: str, *, workspace: Workspace, authority: PathAuthority
 ) -> str | None:
-    """The command rewritten with ``--no-overwrite-ignore`` for an exempt
-    checkout, or None when no injection applies (A2).
+    """The command rewritten with ``--no-overwrite-ignore`` for a checkout,
+    or None when no injection applies (A2 + P3).
 
     The bash tool executes a command STRING, and ``Bash.run()`` has no access
-    to the permission decision, so the exemption predicate is re-derived
-    here at execution time through the resolver's whole-call eligibility
-    check (the gate and the exempt shape; the permission-time state probes
-    are not a transaction, and the flag is the execution-time protection).
-    The original command string stays original for display and result
-    surfaces; only the executed string carries the flag, so an ignored-file
-    collision fails closed (checkout refuses) instead of silently clobbering
-    local content.
+    to the permission decision, so the injected-site predicate is re-derived
+    here at execution time from the command's own words: the exempt switch
+    form and the routine branch-creation form alike carry the flag, and the
+    permission-time state probes are not a transaction — the flag is the
+    execution-time protection. The original command string stays original
+    for display and result surfaces; only the executed string carries the
+    flag, so an ignored-file collision fails closed (checkout refuses)
+    instead of silently clobbering local content.
 
     The None/raise distinction is the fail-closed contract: None means the
-    command is NOT a whole-call-eligible exempt checkout, so the caller
-    executes it unmodified; CheckoutInjectionError means the command IS an
-    eligible exempt checkout whose protected string could not be safely
-    derived — or the re-derivation itself failed after the permission-time
-    exemption — so the call fails before execution instead of silently
-    dropping the ignored-collision protection.
+    command is NOT a whole-call-eligible modeled checkout, so the caller
+    executes it unmodified; CheckoutInjectionError means the command IS one
+    whose protected string could not be safely derived — or the
+    re-derivation itself failed — so the call fails before execution
+    instead of silently dropping the ignored-collision protection.
     """
     try:
         scratchpad_roots = effective_scratchpad_roots(authority)
@@ -4603,17 +4762,16 @@ def shell_command_checkout_no_overwrite_ignore(
         )
         if inner_errors:
             return None
-        exemption = _whole_call_checkout_exemption(command, expanded)
-        if exemption is None:
+        checkout_token_index = _checkout_injection_token_index(command, expanded)
+        if checkout_token_index is None:
             return None
-        return _exempt_checkout_executed_string(command, exemption)
+        return _checkout_injected_executed_string(command, checkout_token_index)
     except CheckoutInjectionError:
         raise
     except Exception as exc:
-        # Fail closed: a re-derivation that cannot complete after the
-        # permission-time exemption leaves the protected string
-        # uncertifiable — the call fails instead of executing the
-        # unprotected original.
+        # Fail closed: a re-derivation that cannot complete leaves the
+        # protected string uncertifiable — the call fails instead of
+        # executing the unprotected original.
         raise CheckoutInjectionError(
             f"the executed string of {command!r} could not be rewritten safely"
         ) from exc

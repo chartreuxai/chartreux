@@ -862,6 +862,81 @@ def test_eligibility_transient_classes_need_settled_tool_effects() -> None:
     assert empty.recovery.eligibility is RecoveryEligibility.ELIGIBLE
 
 
+def _bare_429_error(**overrides: Any) -> BackendError:
+    """A 429 with no recognized body code and no transport cause: the only
+    evidence of the condition is the status itself.
+    """
+    kwargs: dict[str, Any] = {"status": 429, "reason": "rate limited"}
+    kwargs.update(overrides)
+    return _backend_error(**kwargs)
+
+
+def test_bare_429_envelope_is_a_rate_limit_with_recovery_eligibility() -> None:
+    """A.1/A.3: a bare 429 derives the PROVIDER_RATE_LIMIT class, so a
+    measured call with settled tool effects is ELIGIBLE — never the UNKNOWN
+    report-and-park class — and measured retries derive ATTEMPTS exhaustion.
+    """
+    error = _bare_429_error()
+    attach_call_evidence(
+        error,
+        CallEvidence(
+            logical_call_id="call-1",
+            started_at=0.0,
+            budget_seconds=900.0,
+            response_started=True,
+            semantic_output_published=False,
+            transport_attempts=2,
+            elapsed_seconds=1.5,
+            budget_exhausted=False,
+        ),
+    )
+
+    envelope = _envelope_for(error, tool_calls_present=True)
+    assert envelope.failure.failure_class is FailureClass.PROVIDER_RATE_LIMIT
+    assert envelope.failure.cause_category is FailureCategory.RATE_LIMIT
+    assert envelope.recovery.eligibility is RecoveryEligibility.ELIGIBLE
+    assert "unknown_cause_report_and_park" not in envelope.recovery.reason_codes
+    assert envelope.request.exhaustion is ExhaustionReason.ATTEMPTS
+
+    # Pending tool results still require reconciliation first.
+    pending_error = _bare_429_error()
+    attach_call_evidence(pending_error, _measured_evidence())
+    pending = _envelope_for(
+        pending_error, tool_calls_present=True, tool_calls_pending=True
+    )
+    assert pending.recovery.eligibility is RecoveryEligibility.RECONCILE_REQUIRED
+
+    # A budget-bounded final attempt keeps its own exhaustion derivation.
+    deadline_error = _bare_429_error()
+    attach_call_evidence(deadline_error, _measured_evidence())
+    deadline = _envelope_for(deadline_error, tool_calls_present=True)
+    assert deadline.request.exhaustion is ExhaustionReason.DEADLINE
+
+    # Without measured call evidence the transient is not authorized at all.
+    unmeasured = _envelope_for(_bare_429_error(), tool_calls_present=True)
+    assert unmeasured.failure.failure_class is FailureClass.PROVIDER_RATE_LIMIT
+    assert unmeasured.recovery.eligibility is RecoveryEligibility.PROHIBITED
+    assert "transient_cause_unmeasured_no_recovery" in (
+        unmeasured.recovery.reason_codes
+    )
+
+
+def test_unrecognized_429_code_is_a_rate_limit_but_quota_stays_protected() -> None:
+    """The flip covers a 429 carrying an UNRECOGNIZED structured code; the
+    protected quota/billing tokens that precede the status branch still win.
+    """
+    unrecognized = _bare_429_error(
+        body_text='{"error": {"code": "upstream_throttled"}}'
+    )
+    assert classify_failure(unrecognized).category is FailureCategory.RATE_LIMIT
+
+    quota = _bare_429_error(body_text='{"error": {"code": "insufficient_quota"}}')
+    assert classify_failure(quota).category is FailureCategory.QUOTA
+
+    billing = _bare_429_error(body_text='{"error": {"code": "insufficient_funds"}}')
+    assert classify_failure(billing).category is FailureCategory.BILLING
+
+
 def test_r2_unmeasured_transient_never_authorizes_recovery() -> None:
     """R2: the child recovery path requires the root's measured-attempt
     evidence gate.

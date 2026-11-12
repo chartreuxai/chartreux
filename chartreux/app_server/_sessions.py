@@ -33,6 +33,17 @@ from chartreux.app_server._execution import (
     SessionExecutionKind,
 )
 from chartreux.app_server._model import ProtocolModel
+from chartreux.app_server._policy_tree import (
+    InProcessPolicyNode,
+    ManifestPolicyTreeJournal,
+    PolicyChange,
+    PolicyNodePort,
+    PolicyTreeTransaction,
+    PolicyTreeTransport,
+    ProcessPolicyNode,
+    ProcessPolicyTree,
+    policy_tree_transport,
+)
 from chartreux.app_server._projection import (
     project_history,
     project_launch_purposes,
@@ -63,6 +74,7 @@ from chartreux.app_server._subagent_execution import (
 from chartreux.app_server._subagent_finalization import _check_runner as _check_runner
 from chartreux.app_server._subagent_launch import (
     ChildLaunchAdmission,
+    ProcessChildSession,
     override_launch_diagnostics,
 )
 from chartreux.app_server._subagent_records import (
@@ -108,6 +120,11 @@ from chartreux.app_server._subagent_retention import AgentRetention, EvictionNot
 from chartreux.app_server._subagent_transcript import TranscriptReads
 from chartreux.app_server._suspension_lifecycle import SuspensionLifecycle
 from chartreux.app_server._turns import DeliverCallback, TurnController, TurnStartAction
+from chartreux.app_server.agent_snapshot import (
+    owned_user_source,
+    session_policy_revision,
+    session_roots_revision,
+)
 from chartreux.app_server.agent_wire import (
     TURN_OUTCOME_COMPLETED,
     TURN_OUTCOME_FAILED,
@@ -136,12 +153,17 @@ from chartreux.app_server.protocol import (
 )
 from chartreux.app_server.subagent_ports import (
     MAX_SUBAGENT_DEPTH,
+    ChildTeardownOutcome,
+    ChildTeardownReport,
+    ChildTeardownRequest,
     SubagentAdmission,
     SubagentAdmissionClosedError,
     SubagentCompletion,
     SubagentDepthDeniedError,
     SubagentEventFeed,
+    SubagentSpawnPort,
 )
+from chartreux.app_server.transport import IN_PROCESS_TRANSPORT, TransportSelection
 from chartreux.core.agent_loop import AgentLoop
 from chartreux.core.agent_loop._loop import _PreparedPolicyReplacement
 from chartreux.core.agents.launch import LaunchCandidate
@@ -151,7 +173,6 @@ from chartreux.core.config._restrictions import (
     SourceRestrictions,
     partition_policy_sources,
 )
-from chartreux.core.config.layers.user import UserConfigLayer
 from chartreux.core.config.models import RecoveryConfig
 from chartreux.core.config.types import ConfigSaveResult
 from chartreux.core.events import BaseEvent, ToolStreamEvent
@@ -338,6 +359,8 @@ class SessionRuntimeRegistry(SubagentRunnerPort):  # noqa: PLR0904
         subagent_event_sink: SubagentEventSink | None = None,
         *,
         shutdown_timeout: float = 10.0,
+        subagent_spawn: SubagentSpawnPort | None = None,
+        transport_selection: TransportSelection | None = None,
     ) -> None:
         if max_running_subagents is not None and (
             isinstance(max_running_subagents, bool)
@@ -375,6 +398,15 @@ class SessionRuntimeRegistry(SubagentRunnerPort):  # noqa: PLR0904
         self._root: SessionRuntime | None = None
         self._children: dict[str, SessionRuntime] = {}
         self._child_links: dict[str, tuple[SessionRuntime, str]] = {}
+        # Item 1 child seam: the process-backed spawn adapter the SESSION
+        # selected (None keeps every child in this process, byte for byte) and
+        # the handles of the children that live in their own process. The
+        # resolved selection is held here, not re-resolved from the
+        # environment, so the policy seam and the health checks read exactly
+        # what this session chose.
+        self._subagent_spawn = subagent_spawn
+        self._transport_selection = transport_selection
+        self._process_children: dict[str, ProcessChildSession] = {}
         self._stored_children: dict[str, StoredChildSession] = {}
         self._readable_children: dict[str, SessionRuntime] = {}
         self._readable_children_identities: dict[str, tuple[str, int]] = {}
@@ -646,40 +678,20 @@ class SessionRuntimeRegistry(SubagentRunnerPort):  # noqa: PLR0904
         """Public revision binds accepted config to the current session lifetime."""
         if self._root is None:
             raise ValueError("Policy requires the registered root session")
-        loop = self._root.agent_loop
-        return (
-            f"{loop.session_id}:{loop._session_generation}:"
-            f"{loop.config_orchestrator.accepted_token}"
-        )
+        return session_policy_revision(self._root.agent_loop)
 
     def root_source(self, session_id: str) -> SourceRestrictions:
         root = self._root
         if root is None or root.agent_loop.session_id != session_id:
             raise ValueError("Roots require the registered root session")
-        orchestrator = root.agent_loop.config_orchestrator
-        sources = [
-            source
-            for source in orchestrator.restrictions
-            if source.kind == "source"
-            and source.identity is not None
-            and source.identity.owner == orchestrator.policy_owner
-            and any(
-                type(layer) is UserConfigLayer
-                and layer.name == source.layer_name
-                and layer.source_locator == source.locator
-                for layer in orchestrator.layers
-            )
-        ]
-        if len(sources) != 1:
-            raise ValueError("Roots require one actual owned user source")
-        return sources[0]
+        return owned_user_source(root.agent_loop.config_orchestrator)
 
     def roots_revision(self, session_id: str) -> str:
-        source = self.root_source(session_id)
-        assert source.identity is not None
-        return (
-            f"{self.policy_revision}:{source.identity.owner}:{source.identity.source}"
-        )
+        self.root_source(session_id)
+        root = self._root
+        if root is None:
+            raise ValueError("Roots require the registered root session")
+        return session_roots_revision(root.agent_loop)
 
     async def replace_roots(
         self, *, session_id: str, roots: list[str], expected_revision: str
@@ -805,7 +817,7 @@ class SessionRuntimeRegistry(SubagentRunnerPort):  # noqa: PLR0904
             destination=destination,
         )
 
-    async def replace_policy(
+    async def replace_policy(  # noqa: PLR0912
         self,
         *,
         session_id: str,
@@ -869,6 +881,13 @@ class SessionRuntimeRegistry(SubagentRunnerPort):  # noqa: PLR0904
                 )
             self._policy_reserved = True
             try:
+                if isinstance(self.policy_transport(), ProcessPolicyTree):
+                    # A process-backed tree publishes through the journaled
+                    # transaction, so every node prepares, commits and retires
+                    # where its own authority lives.
+                    return await self._replace_policy_across_processes(
+                        root, source=source, tools=tools, roots=roots
+                    )
                 prepared_root = (
                     await root.agent_loop._prepare_policy_replacement(
                         source=source, tools=tools, expected_token=token
@@ -974,6 +993,90 @@ class SessionRuntimeRegistry(SubagentRunnerPort):  # noqa: PLR0904
                 )
                 pending.remove(runtime)
         return by_runtime
+
+    def policy_transport(self) -> PolicyTreeTransport:
+        """The policy topology this session selected.
+
+        The session resolves its topology ONCE, at construction, and injects
+        the result here, so this seam never re-reads the environment: a second
+        resolution site would let an ambient selector claim a topology the
+        session did not choose. A registry built without an injected selection
+        therefore gets the programmatic default — in-process — exactly as the
+        unwired default behaved before this seam.
+        """
+        selection = self._transport_selection or TransportSelection(
+            kind=IN_PROCESS_TRANSPORT, selector=IN_PROCESS_TRANSPORT, source="default"
+        )
+        return policy_tree_transport(selection)
+
+    async def _replace_policy_across_processes(
+        self,
+        root: SessionRuntime,
+        *,
+        source: str,
+        tools: dict[str, Any],
+        roots: dict[str, list[str]] | None,
+    ) -> str:
+        """Publish one policy replacement across a process-backed tree.
+
+        A node whose loop lives in this process is an in-process node; a child
+        that lives in its own process is driven through its own wire, so the
+        change is prepared, committed and retired where that child's authority
+        actually lives. Reachability is established BEFORE the first node
+        reserves: a child whose process or wire is gone refuses the whole
+        replacement typed and loudly rather than leaving a half-applied tree
+        behind. The phases are journaled, so a crashed transaction is
+        reconciled from its record instead of guessed.
+        """
+        if roots is not None:
+            raise SessionExecutionConflict(
+                "Replacing the authorized roots across process-backed children "
+                "is not wired in this release; run the session in-process "
+                "(CHARTREUX_TRANSPORT=in_process) to change roots"
+            )
+        unreachable = sorted(
+            session_id
+            for session_id, handle in self._process_children.items()
+            if not self._process_child_reachable(handle)
+        )
+        if unreachable:
+            logger.warning(
+                "Refusing a policy replacement: process-backed child %s is unreachable",
+                unreachable[0],
+            )
+            raise SessionExecutionConflict(
+                "Policy replacement cannot reach process-backed child "
+                f"{unreachable[0]!r}; no node was changed"
+            )
+        manifest = self._runtime_factory.registry_manifest(root.agent_loop)
+        if manifest is None:
+            raise SessionExecutionConflict(
+                "Policy replacement across the process topology needs the "
+                "session registry manifest, and this session has none"
+            )
+        nodes: list[PolicyNodePort] = [
+            InProcessPolicyNode(runtime.agent_loop.session_id, runtime.agent_loop)
+            for runtime in self._policy_runtimes(root)
+            if runtime.agent_loop.session_id not in self._process_children
+        ]
+        nodes.extend(
+            ProcessPolicyNode(session_id, cast(Any, handle.spawned).wire_client)
+            for session_id, handle in self._process_children.items()
+        )
+        transaction_id = f"policy-{uuid4().hex}"
+        transaction = PolicyTreeTransaction(
+            transaction_id,
+            nodes=nodes,
+            journal=ManifestPolicyTreeJournal(manifest, transaction_id),
+            change=PolicyChange(source=source, tools=tools),
+        )
+        await transaction.run()
+        return self.policy_revision
+
+    @staticmethod
+    def _process_child_reachable(handle: ProcessChildSession) -> bool:
+        """Whether this child's wire can be driven at all (never optimistic)."""
+        return handle.alive and getattr(handle.spawned, "wire_client", None) is not None
 
     def bind_root(self, runtime: SessionRuntime) -> None:
         self._require_policy_unreserved()
@@ -3190,3 +3293,107 @@ class SessionRuntimeRegistry(SubagentRunnerPort):  # noqa: PLR0904
     async def _discard_child(child: AgentLoop) -> None:
         """Delegate to the child drain collaborator."""
         await ChildDrain.discard_child(child, close_agent_loop)
+
+    async def create_process_child(
+        self,
+        parent: SessionRuntime,
+        args: TaskArgs,
+        ctx: InvokeContext,
+        *,
+        attempt_id: str | None = None,
+        reuse: ProcessChildSession | None = None,
+        rollback_wait: float | None = None,
+    ) -> ProcessChildSession:
+        """Publish one process-backed child and register its handle.
+
+        The aggregate transaction belongs to the launch admission; the registry
+        owns the canonical handle map, so the handle is registered before it is
+        handed to the caller and a later teardown can always find the attempt.
+        """
+        session = await self._launch_admission.create_process_registered(
+            parent,
+            args,
+            ctx,
+            attempt_id=attempt_id,
+            reuse=reuse,
+            rollback_wait=rollback_wait,
+        )
+        self._process_children[session.session_id] = session
+        return session
+
+    async def teardown_attempt(
+        self, request: ChildTeardownRequest
+    ) -> ChildTeardownReport:
+        """Settle one publication attempt this registry owns; never claim success.
+
+        The coordinator minted the attempt id, so a lost aggregate reply still
+        names its attempt: the owner cancels the prepared child, waits the
+        bounded interval, retracts the durable records it left, and reports the
+        class it ESTABLISHED — the typed inconclusive class when the attempt
+        could not be settled, and the typed attempt-unknown class when this
+        registry holds no such attempt.
+        """
+        session = next(
+            (
+                handle
+                for handle in self._process_children.values()
+                if handle.attempt_id == request.attempt_id
+            ),
+            None,
+        )
+        if session is None:
+            return ChildTeardownReport(
+                attempt_id=request.attempt_id,
+                outcome=ChildTeardownOutcome.ATTEMPT_UNKNOWN,
+                agent_id=request.agent_id,
+                detail="this registry holds no attempt under that id",
+            )
+        from chartreux.app_server.child_agent_process import (
+            DEFAULT_CHILD_ROLLBACK_WAIT,
+            SpawnedAttempt,
+            teardown_spawned_attempt,
+        )
+
+        report = await teardown_spawned_attempt(
+            cast(SpawnedAttempt, session.spawned),
+            attempt_id=request.attempt_id,
+            reason=request.reason,
+            wait_seconds=(
+                DEFAULT_CHILD_ROLLBACK_WAIT
+                if request.wait_seconds is None
+                else request.wait_seconds
+            ),
+        )
+        if report.settled:
+            # A settled attempt leaves no handle: an inconclusive one stays
+            # registered so a later teardown can still settle it.
+            self._process_children.pop(session.session_id, None)
+            session.closed = True
+        return report
+
+    def reconcile_process_children(self) -> dict[str, ChildTranscriptReconciliation]:
+        """Adjudicate every process-backed child whose process has died.
+
+        The dead child's durable markers are read — never replayed — so a
+        crashed process is surfaced as never executed, started with an unknown
+        outcome, or completed with an unconsumed result. A handle whose process
+        is still running is left alone, and a handle that cannot be adjudicated
+        is reported as unreadable rather than dropped.
+        """
+        reconciled: dict[str, ChildTranscriptReconciliation] = {}
+        for session_id, handle in list(self._process_children.items()):
+            if handle.alive:
+                continue
+            reconcile_death = getattr(handle.spawned, "reconcile_death", None)
+            if reconcile_death is None:
+                logger.warning(
+                    "Process child %s exposes no death reconciliation", session_id
+                )
+                continue
+            try:
+                reconciled[session_id] = reconcile_death()
+            except Exception as exc:
+                logger.warning(
+                    "Failed to reconcile process child %s: %s", session_id, exc
+                )
+        return reconciled

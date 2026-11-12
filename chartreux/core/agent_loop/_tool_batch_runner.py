@@ -159,6 +159,29 @@ class ToolBatchRunner:
                 del self._tool_invocations[key]
         self._waiting_only = False
 
+    async def settle_turn_effects(self, turn_id: str, *, grace: float) -> bool:
+        """Cancel the turn's live tool tasks and boundedly await settlement.
+
+        A stream truncation terminalizes while a projected effect may still be
+        in flight. The tool's own task is cancelled and given ``grace`` seconds
+        to reach a terminal state; True means no live task of the turn survives
+        the grace, so every effect is either settled or never executed (the
+        terminalization records it failed). A task that suppresses cancellation
+        past the grace stays UNSETTLED — never a claimed settlement.
+        """
+        tasks = [
+            invocation.task
+            for (identity, _), invocation in self._tool_invocations.items()
+            if identity == turn_id and not invocation.task.done()
+        ]
+        if not tasks:
+            return True
+        for task in tasks:
+            if not task.cancelling():
+                task.cancel()
+        _settled, pending = await asyncio.wait(tasks, timeout=grace)
+        return not pending
+
     def outstanding_wait_call_ids(self, turn_id: str) -> tuple[str, ...]:
         return tuple(
             call_id

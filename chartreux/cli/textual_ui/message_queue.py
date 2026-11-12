@@ -46,6 +46,11 @@ def _queued_turn_user_entry(queued_turn: PublicQueuedTurn) -> TurnUserInputEntry
     )
 
 
+def _queued_turn_entry_id(queued_turn: PublicQueuedTurn) -> str | None:
+    entry = _queued_turn_user_entry(queued_turn)
+    return None if entry is None else entry.entry_id
+
+
 def _queued_image_attachment(block: SessionImageContentBlock) -> ImageAttachment:
     return image_attachment_from_session_block(block)
 
@@ -95,11 +100,15 @@ class _MergedTurn:
     with ``queue/replace`` so the server promotes them together as one turn.
     ``item_id`` is ``None`` until the first enqueue returns and when failed
     steering recovery preserves a local-only block.
+    ``retained`` marks a block that renders a retained record the server holds
+    beside the FIFO: it owns no queue item to replace, so editing it keeps the
+    pending record visible and queues the edited text as its own prompt.
     """
 
     entries: list[_MergedEntry]
     message_entry_id: str
     item_id: str | None = None
+    retained: bool = False
 
 
 @dataclass(slots=True)
@@ -260,15 +269,25 @@ class QueueController:  # noqa: PLR0904
             known.update(
                 block.item_id for block in self._blocks() if block.item_id is not None
             )
-            for item in queue.items:
+            retained_ids = {item.id for item in queue.retained}
+            for item in (*queue.items, *queue.retained):
                 if item.id in known:
                     continue
                 if self._ports.turn_has_started(item.id):
                     continue
+                rebind = self._block_for_entry(_queued_turn_entry_id(item))
+                if rebind is not None:
+                    # The same user entry under a new queue identity: a retained
+                    # record takes the place an admission freed. Rebind the
+                    # rendered block instead of showing the entry twice.
+                    rebind.item_id = item.id
+                    rebind.retained = False
+                    known.add(item.id)
+                    continue
                 # A queued item we do not track yet: restore it as one block.
                 # The CLI only ever creates a single item, so this is the resume
                 # path, where the merged item is one combined user entry.
-                await self._restore_server_item(item)
+                await self._restore_server_item(item, retained=item.id in retained_ids)
                 known.add(item.id)
 
             if self._header is not None:
@@ -521,6 +540,15 @@ class QueueController:  # noqa: PLR0904
     def _blocks(self) -> list[_MergedTurn]:
         return [*([self._merged] if self._merged is not None else []), *self._restored]
 
+    def _block_for_entry(self, entry_id: str | None) -> _MergedTurn | None:
+        """The rendered block that owns one user entry, if any."""
+        if entry_id is None:
+            return None
+        return next(
+            (block for block in self._blocks() if block.message_entry_id == entry_id),
+            None,
+        )
+
     def _manageable_blocks(self) -> list[_MergedTurn]:
         return [*self._blocks(), *(d.block for d in self._unresolved_steering)]
 
@@ -690,6 +718,13 @@ class QueueController:  # noqa: PLR0904
         merged = merged or self._merged
         if merged is None:
             return False
+        if merged.retained:
+            # A retained record has no queue item to replace: the server holds
+            # it beside the FIFO until an admission frees a place. Replacing it
+            # could only answer not_found, so the edit must not discard the
+            # block: the pending record keeps the visible place it has while the
+            # caller queues the edited text as its own prompt.
+            return False
         if merged.item_id is None:
             merged.entries = entries
             self._relink_merged(merged)
@@ -760,7 +795,16 @@ class QueueController:  # noqa: PLR0904
         await self._reset_header_position()
         self._push_loading_queue_count()
 
-    async def _restore_server_item(self, queued_turn: PublicQueuedTurn) -> None:
+    async def _restore_server_item(
+        self, queued_turn: PublicQueuedTurn, *, retained: bool = False
+    ) -> None:
+        """Render one queued or retained server entry as a pending block.
+
+        A retained record is a ready user turn the server holds beside the FIFO
+        until an admission frees a place, so it is rendered as pending queue
+        work. It never becomes the block later prompts fold into: the server
+        has no queue item to replace until the record is admitted.
+        """
         user_entry = _queued_turn_user_entry(queued_turn)
         if user_entry is None:
             return
@@ -788,12 +832,15 @@ class QueueController:  # noqa: PLR0904
             images=images or None,
         )
         merged = self._merged
-        if merged is not None:
+        if merged is not None or retained:
             restored = _MergedTurn(
                 entries=[_MergedEntry(prompt, widget)],
                 message_entry_id=user_entry.entry_id or str(uuid4()),
                 item_id=queued_turn.id,
+                retained=retained,
             )
+            if self._header is None:
+                await self._ensure_header()
             after = self._last_widget()
             await self._ports.mount_and_scroll(widget, after=after)
             self._restored.append(restored)

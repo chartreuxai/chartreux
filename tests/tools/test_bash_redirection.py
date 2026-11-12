@@ -80,9 +80,9 @@ def test_redirection_protects_work_tree_override_metadata(bash, tmp_path):
 @pytest.mark.parametrize(
     "command",
     [
-        "python3 << 'EOF'\nprint(42)\nEOF",
-        "python3 - << 'EOF'\nprint(42)\nEOF",
-        "python3 <<'PYEOF'\nimport sys\nprint('hello')\nPYEOF",
+        "python3 << EOF\nprint(42)\nEOF",
+        "python3 - << EOF\nprint(42)\nEOF",
+        "python3 <<PYEOF\nimport sys\nprint('hello')\nPYEOF",
         "python3 < input.txt",
     ],
 )

@@ -18,20 +18,23 @@ separate hard bound the adapter can never exceed ([7A]).
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncGenerator, Mapping, Sequence
-from contextlib import aclosing
+from collections.abc import AsyncGenerator, Awaitable, Callable, Mapping, Sequence
+from contextlib import aclosing, suppress
 import os
 from pathlib import Path
 import subprocess
 import sys
-from typing import Any
+from typing import Any, Protocol
 
 from chartreux.app_server._subagent_recovery import (
     ChildTranscriptReconciler,
     ChildTranscriptReconciliation,
+    tombstone_child_transcript,
 )
 from chartreux.app_server._subagent_transcript import (
+    ChildTranscriptAdjudication,
     ChildTranscriptError,
+    ChildTranscriptOutcome,
     root_session_dir_from_spec,
 )
 from chartreux.app_server.agent_wire import (
@@ -57,6 +60,11 @@ from chartreux.app_server.root_agent_process import (
     RootAgentRequestError,
 )
 from chartreux.app_server.subagent_ports import (
+    CHILD_FAILURE_FRAME_KEY,
+    CHILD_TEARDOWN_REASON,
+    ChildFailureEvidence,
+    ChildTeardownOutcome,
+    ChildTeardownReport,
     SpawnedSubagent,
     SubagentCompletion,
     SubagentCompletionSource,
@@ -64,6 +72,7 @@ from chartreux.app_server.subagent_ports import (
     SubagentSpawnDeniedError,
     SubagentSpawnPort,
     SubagentSpawnSpec,
+    decode_child_failure,
     spawn_spec_to_wire,
 )
 from chartreux.app_server.transport import (
@@ -137,6 +146,7 @@ class ProcessSubagentCompletionSource:
     async def _stream(
         self, request: ExecutionTurnRequest
     ) -> AsyncGenerator[SubagentFrame, None]:
+        turn_id = request.turn_options.turn_id if request.turn_options else None
         try:
             async with aclosing(self._process.run_turn(request)) as events:
                 async for event in events:
@@ -145,7 +155,14 @@ class ProcessSubagentCompletionSource:
             yield SubagentCompletion(outcome=TURN_OUTCOME_INTERRUPTED)
             return
         except AgentProcessTurnFailed as exc:
-            yield SubagentCompletion(outcome=TURN_OUTCOME_FAILED, error=str(exc))
+            # A failed run's typed failure evidence rides the child's terminal
+            # frame: the child derived it where the evidence lived, and the
+            # coordinator rebuilds it instead of failing closed.
+            yield SubagentCompletion(
+                outcome=TURN_OUTCOME_FAILED,
+                error=str(exc),
+                failure=terminal_failure(self._process, turn_id),
+            )
             return
         yield SubagentCompletion(outcome=TURN_OUTCOME_COMPLETED)
 
@@ -165,6 +182,30 @@ class ProcessSpawnedSubagent:
     @property
     def process(self) -> subprocess.Popen[bytes]:
         return self._process.process
+
+    @property
+    def session_id(self) -> str | None:
+        """The session id the child adopted when its open reply was consumed."""
+        return self._process.session_id
+
+    @property
+    def child_session_dir(self) -> str | None:
+        """The transcript dir the child created for itself, when it announced one."""
+        return self._process.child_session_dir
+
+    @property
+    def root_session_dir(self) -> str | None:
+        """The root session dir the child transcript nests under."""
+        return self._process.root_session_dir
+
+    @property
+    def wire_client(self) -> ChildAgentProcess:
+        """The coordinator-side client of this child's own pipe.
+
+        The policy-tree seam drives a process-backed node through it, and the
+        publication teardown settles the attempt through it.
+        """
+        return self._process
 
     @property
     def alive(self) -> bool:
@@ -202,6 +243,159 @@ def child_agent_command() -> list[str]:
     return [sys.executable, "-m", CHILD_AGENT_MODULE]
 
 
+DEFAULT_CHILD_ROLLBACK_WAIT = 5.0
+"""How long a conservative teardown waits for an attempt's own rollback."""
+
+_TEARDOWN_POLL_SECONDS = 0.05
+"""The teardown's liveness poll period inside the bounded wait."""
+
+
+class SpawnedAttempt(Protocol):
+    """The lifecycle surface one spawned publication attempt exposes."""
+
+    @property
+    def agent_id(self) -> str: ...
+
+    @property
+    def alive(self) -> bool: ...
+
+    @property
+    def child_session_dir(self) -> str | None: ...
+
+    @property
+    def root_session_dir(self) -> str | None: ...
+
+    async def close(self) -> None: ...
+
+    def reconcile_death(self) -> ChildTranscriptReconciliation: ...
+
+
+async def teardown_spawned_attempt(
+    spawned: SpawnedAttempt,
+    *,
+    attempt_id: str,
+    reason: str = CHILD_TEARDOWN_REASON,
+    wait_seconds: float = DEFAULT_CHILD_ROLLBACK_WAIT,
+    sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+) -> ChildTeardownReport:
+    """Settle one spawned publication attempt conservatively; never claim success.
+
+    The aggregate publication transaction answers ONE outcome, so a lost reply
+    leaves the attempt's own state unknown. The owner settles it in three
+    bounded steps: cancel the prepared child, wait a bounded interval for its
+    atomic rollback, then adjudicate the durable records it left and retract
+    them. An attempt still alive after the wait — or one whose retraction could
+    not be written — answers the typed INCONCLUSIVE class: the caller must not
+    report a rollback it could not observe.
+    """
+    agent_id = spawned.agent_id
+    child_dir = spawned.child_session_dir
+    root_dir = spawned.root_session_dir
+    if spawned.alive:
+        with suppress(Exception):
+            await spawned.close()
+    for _ in range(max(1, int(wait_seconds / _TEARDOWN_POLL_SECONDS))):
+        if not spawned.alive:
+            break
+        await sleep(_TEARDOWN_POLL_SECONDS)
+    if spawned.alive:
+        return ChildTeardownReport(
+            attempt_id=attempt_id,
+            outcome=ChildTeardownOutcome.INCONCLUSIVE,
+            agent_id=agent_id,
+            child_dir=child_dir,
+            detail=(
+                "the prepared child was still alive after the bounded rollback "
+                f"wait of {wait_seconds}s; nothing was retracted"
+            ),
+        )
+    try:
+        reconciliation = spawned.reconcile_death()
+    except ChildTranscriptError as exc:
+        # No transcript directory at all: the attempt persisted nothing.
+        return ChildTeardownReport(
+            attempt_id=attempt_id,
+            outcome=ChildTeardownOutcome.REAPED,
+            agent_id=agent_id,
+            child_dir=child_dir,
+            detail=str(exc),
+        )
+    if reconciliation.outcome is ChildTranscriptOutcome.TOMBSTONED:
+        return ChildTeardownReport(
+            attempt_id=attempt_id,
+            outcome=ChildTeardownOutcome.TOMBSTONED,
+            agent_id=agent_id,
+            session_id=reconciliation.session_id,
+            child_dir=str(reconciliation.child_dir),
+            retracted=True,
+            detail="the attempt was already retracted",
+        )
+    if root_dir is None or reconciliation.session_id is None:
+        # Nothing keyed to this attempt was ever persisted, so the removal is
+        # the whole settlement: no record can resurrect from the scan.
+        return ChildTeardownReport(
+            attempt_id=attempt_id,
+            outcome=ChildTeardownOutcome.REAPED,
+            agent_id=agent_id,
+            session_id=reconciliation.session_id,
+            child_dir=str(reconciliation.child_dir),
+            detail="the attempt persisted no record to retract",
+        )
+    retracted = tombstone_child_transcript(
+        reconciliation,
+        root_session_dir=Path(root_dir),
+        reason=reason,
+        attempt_id=attempt_id,
+    )
+    if not retracted:
+        return ChildTeardownReport(
+            attempt_id=attempt_id,
+            outcome=ChildTeardownOutcome.INCONCLUSIVE,
+            agent_id=agent_id,
+            session_id=reconciliation.session_id,
+            child_dir=str(reconciliation.child_dir),
+            detail="the attempt's records could not be retracted",
+        )
+    return ChildTeardownReport(
+        attempt_id=attempt_id,
+        outcome=ChildTeardownOutcome.TOMBSTONED,
+        agent_id=agent_id,
+        session_id=reconciliation.session_id,
+        child_dir=str(reconciliation.child_dir),
+        retracted=True,
+        detail=(
+            f"the persisted records were retracted ({reconciliation.outcome.value})"
+        ),
+    )
+
+
+def terminal_failure(
+    process: RootAgentProcess, turn_id: str | None
+) -> ChildFailureEvidence | None:
+    """The typed failure evidence a child run's terminal frame carried."""
+    if turn_id is None:
+        return None
+    terminal = process.turn_terminal(turn_id)
+    if terminal is None:
+        return None
+    return decode_child_failure(terminal.get(CHILD_FAILURE_FRAME_KEY))
+
+
+def persisted_child_failure(
+    adjudication: ChildTranscriptAdjudication,
+) -> ChildFailureEvidence | None:
+    """The failure evidence a crashed child left in its terminal record.
+
+    The child writes its result record save-before-emit, so a crash between the
+    record and the completion frame still leaves the run's measured evidence on
+    disk. Reconciliation reads it there instead of replaying the run.
+    """
+    result = adjudication.result
+    if result is None:
+        return None
+    return decode_child_failure(result.failure)
+
+
 def multi_process_child_selected(environ: Mapping[str, str] | None = None) -> bool:
     """Whether this run selects the multi-process (stdio) route."""
     source = os.environ if environ is None else environ
@@ -233,6 +427,11 @@ class ProcessSubagentSpawn(SubagentSpawnPort):
         # coordinator spawns draws on the same hard tree cap (design.md:448).
         self._budget = budget if budget is not None else ProcessTreeBudget()
         self._tree_shutdown: ProcessTreeShutdown | None = None
+
+    @property
+    def budget(self) -> ProcessTreeBudget:
+        """The hard tree cap this adapter's spawns draw their slots from."""
+        return self._budget
 
     async def shutdown_tree(self) -> ProcessTreeShutdownReport:
         """Stop the whole spawned-child tree in design order (WP7 [7B]).
@@ -312,10 +511,13 @@ class ProcessSubagentSpawn(SubagentSpawnPort):
 
 
 __all__ = [
+    "DEFAULT_CHILD_ROLLBACK_WAIT",
     "ChildAgentProcess",
     "ProcessSpawnedSubagent",
     "ProcessSubagentCompletionSource",
     "ProcessSubagentSpawn",
+    "SpawnedAttempt",
     "child_agent_command",
     "multi_process_child_selected",
+    "teardown_spawned_attempt",
 ]

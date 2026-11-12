@@ -22,6 +22,7 @@ from chartreux.core.dangerous_commands import (
 )
 from chartreux.core.tools.builtins import _shell_git_classifier, _shell_git_support
 from chartreux.core.tools.builtins._shell_command_policy import (
+    _scan_git_checkout_shape,
     analyze_shell_command_policy,
     classify_dangerous_git_command,
     is_dangerous_git_subcommand,
@@ -48,14 +49,23 @@ FROZEN_OPERATION_IDS = (
 )
 
 
-def classify(command: str) -> DangerousCommandClassification:
+def classify(
+    command: str, *, admit_checkout_creation: bool = True
+) -> DangerousCommandClassification:
     """Classify one shell command string as a whole expanded call."""
-    return classify_dangerous_git_command(shlex.split(command))
+    return classify_dangerous_git_command(
+        shlex.split(command), admit_checkout_creation=admit_checkout_creation
+    )
 
 
-def assert_grantable(command: str, operation_ids: tuple[str, ...]) -> None:
+def assert_grantable(
+    command: str,
+    operation_ids: tuple[str, ...],
+    *,
+    admit_checkout_creation: bool = True,
+) -> None:
     """Assert a command classifies as grantable with exactly these IDs."""
-    result = classify(command)
+    result = classify(command, admit_checkout_creation=admit_checkout_creation)
     assert result.kind == "grantable"
     assert result.grantable is not None
     assert result.grantable.operation_ids == operation_ids
@@ -300,15 +310,19 @@ def test_consumed_global_operand_is_not_a_flag() -> None:
     [
         ("git checkout", "git.checkout"),
         ("git checkout main", "git.checkout"),
-        ("git checkout -b feat", "git.checkout"),
         ("git checkout -B feat", "git.checkout"),
         ("git checkout --detach main", "git.checkout"),
         ("git checkout --orphan new", "git.checkout"),
         ("git checkout -q main", "git.checkout"),
         ("git checkout --conflict=merge main", "git.checkout"),
         ("git checkout main file.txt", "git.checkout"),
-        # Every checkout form is consequential; git itself rejects unmodeled
-        # options, so recording them does not weaken the classification.
+        # The routine branch creation is the one admitted checkout shape; the
+        # resolver's gate (a program-selecting repository config) gets the
+        # consequential classification back by disabling that admission.
+        ("git checkout -b feat", "git.checkout"),
+        # Every other checkout form is consequential; git itself rejects
+        # unmodeled options, so recording them does not weaken the
+        # classification.
         ("git checkout --bogus main", "git.checkout"),
         ("git restore", "git.restore"),
         ("git restore file", "git.restore"),
@@ -322,8 +336,72 @@ def test_consumed_global_operand_is_not_a_flag() -> None:
 def test_checkout_and_restore_are_always_consequential(
     command: str, operation_id: str
 ) -> None:
-    assert_grantable(command, (operation_id,))
+    assert_grantable(command, (operation_id,), admit_checkout_creation=False)
     assert OPERATION_REGISTRY[operation_id].command_class == "consequential"
+
+
+@pytest.mark.parametrize(
+    ("command", "branch", "start"),
+    [
+        ("git checkout -b feat", "feat", None),
+        ("git checkout -b feat main", "feat", "main"),
+        ("git --no-pager checkout -b feat main", "feat", "main"),
+    ],
+)
+def test_branch_creation_is_routine(
+    command: str, branch: str, start: str | None
+) -> None:
+    # P3: the sanctioned creation form carries no dangerous operation.
+    result = classify(command)
+    assert result.kind == "routine"
+    shape = _scan_git_checkout_shape(command.split())
+    assert shape is not None
+    assert shape[0].kind == "create"
+    assert shape[0].branch == branch
+    assert shape[0].start == start
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "git checkout",
+        "git checkout -b",
+        "git checkout -B feat",
+        "git checkout -f main",
+        "git checkout --force main",
+        "git checkout --ours main",
+        "git checkout --theirs main",
+        "git checkout --detach main",
+        "git checkout main file.txt",
+        "git checkout -b feat main file.txt",
+        "git checkout main -- file.txt",
+        "git checkout -- main",
+        "git checkout -q -b feat",
+        "git checkout --orphan feat",
+        "git -c core.hooksPath=hooks checkout -b feat",
+        "git -C . checkout -b feat",
+    ],
+)
+def test_branch_creation_rejects_every_other_shape(command: str) -> None:
+    # The rejection list: only the bare creation form is routine. Everything
+    # else keeps its classification (grantable, or a hard guard for the
+    # unmodeled end-of-options and dangling-value forms).
+    result = classify(command)
+    assert result.kind != "routine"
+    excluded = classify(command, admit_checkout_creation=False)
+    assert result == excluded
+
+
+def test_branch_creation_admission_is_switchable() -> None:
+    # The resolver's configuration gate: disabling the admission returns the
+    # consequential classification the approval flow needs.
+    admitted = classify("git checkout -b feat")
+    gated = classify("git checkout -b feat", admit_checkout_creation=False)
+    assert admitted.kind == "routine"
+    assert gated.kind == "grantable"
+    assert gated.grantable is not None
+    assert gated.grantable.operation_ids == ("git.checkout",)
+    assert gated.grantable.call.option_values == (("-b", "feat"),)
 
 
 @pytest.mark.parametrize(
@@ -1463,7 +1541,7 @@ def test_modeled_operands_and_option_values() -> None:
     assert push.grantable.call.option_values == (("--repo", "upstream"),)
     assert push.grantable.call.operands == ("origin", "main:dev", "+old:new")
 
-    checkout = classify("git checkout -b feat")
+    checkout = classify("git checkout -b feat", admit_checkout_creation=False)
     assert checkout.kind == "grantable"
     assert checkout.grantable is not None
     assert checkout.grantable.call.subcommand == "checkout"

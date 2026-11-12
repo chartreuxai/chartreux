@@ -328,3 +328,127 @@ def test_bash_scratchpad_redirect_obeys_parent_tool_ceiling(tmp_path: Path) -> N
     result = tool.resolve_permission(BashArgs(command=f"echo hi > {scratch}/log.txt"))
     assert result is not None
     assert result.permission is ToolPermission.NEVER
+
+
+# --- v0.7.8 P4: recursive rm confined to the session scratchpad ---
+
+
+def scratch_rm_tool(workspace: Path, scratch: Path) -> Bash:
+    return Bash(
+        config_getter=lambda: BashToolConfig(),
+        state=BaseToolState(),
+        cwd=workspace,
+        scratchpad_dir=scratch,
+    )
+
+
+def scratch_rm_verdict(tool: Bash, command: str) -> PermissionContext:
+    result = tool.resolve_permission(BashArgs(command=command))
+    assert result is not None, command
+    return result
+
+
+class TestScratchpadRecursiveRmCarveOut:
+    def test_contained_recursive_removal_resolves_run_class(self, tmp_path: Path):
+        workspace = tmp_path / "workspace"
+        workspace.mkdir()
+        scratch = tmp_path / "scratch"
+        (scratch / "work" / "nested").mkdir(parents=True)
+        (scratch / "work" / "nested" / "draft.txt").write_text("draft\n")
+        tool = scratch_rm_tool(workspace, scratch)
+        for command in (
+            f"rm -r {scratch}/work",
+            f"rm -rf {scratch}/work/nested",
+            f"rm -r {scratch}/work {scratch}/work/nested",
+            f"rm -r -- {scratch}/work",
+            # A literal operand that does not exist yet is still contained.
+            f"rm -rf {scratch}/not-created-yet",
+        ):
+            result = scratch_rm_verdict(tool, command)
+            assert result.permission is ToolPermission.ALWAYS, command
+
+    def test_scratchpad_root_itself_is_not_a_deletable_operand(self, tmp_path: Path):
+        workspace = tmp_path / "workspace"
+        workspace.mkdir()
+        scratch = tmp_path / "scratch"
+        scratch.mkdir()
+        tool = scratch_rm_tool(workspace, scratch)
+        for command in (f"rm -r {scratch}", f"rm -rf {scratch}/"):
+            result = scratch_rm_verdict(tool, command)
+            assert result.permission is ToolPermission.NEVER, command
+            assert "hard guard" in (result.reason or ""), command
+
+    def test_symlink_escaping_the_root_is_denied_on_the_resolved_path(
+        self, tmp_path: Path
+    ):
+        workspace = tmp_path / "workspace"
+        workspace.mkdir()
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        (outside / "keep.txt").write_text("keep\n")
+        scratch = tmp_path / "scratch"
+        scratch.mkdir()
+        (scratch / "escape").symlink_to(outside, target_is_directory=True)
+        (scratch / "escape-file").symlink_to(outside / "keep.txt")
+        tool = scratch_rm_tool(workspace, scratch)
+        for command in (
+            f"rm -r {scratch}/escape",
+            f"rm -r {scratch}/escape/keep.txt",
+            f"rm -r {scratch}/escape-file",
+        ):
+            result = scratch_rm_verdict(tool, command)
+            assert result.permission is ToolPermission.NEVER, command
+            assert "hard guard" in (result.reason or ""), command
+
+    def test_mixed_and_outside_operands_stay_hard_guards(self, tmp_path: Path):
+        workspace = tmp_path / "workspace"
+        workspace.mkdir()
+        (workspace / "build").mkdir()
+        scratch = tmp_path / "scratch"
+        scratch.mkdir()
+        tool = scratch_rm_tool(workspace, scratch)
+        for command in (
+            f"rm -r {scratch} build",
+            "rm -r build",
+            "rm -r ..",
+            f"rm -r {workspace}",
+        ):
+            result = scratch_rm_verdict(tool, command)
+            assert result.permission is ToolPermission.NEVER, command
+            assert "hard guard" in (result.reason or ""), command
+
+    def test_unestablishable_call_footprint_stays_a_hard_guard(self, tmp_path: Path):
+        # The scratchpad carve-out skips the git-tree analysis, never the
+        # footprint analysis: a statement whose write surface cannot be
+        # modeled keeps the recursive removal denied.
+        workspace = tmp_path / "workspace"
+        workspace.mkdir()
+        scratch = tmp_path / "scratch"
+        (scratch / "work").mkdir(parents=True)
+        tool = scratch_rm_tool(workspace, scratch)
+        result = scratch_rm_verdict(tool, f"rm -r {scratch}/work; eval ls")
+        assert result.permission is ToolPermission.NEVER
+        assert "hard guard" in (result.reason or "")
+
+    def test_sensitive_operand_inside_the_scratchpad_stays_denied(self, tmp_path: Path):
+        # The scratchpad carve-out is a guardrail admission; the path layer's
+        # sensitive-file rule still gates every operand.
+        workspace = tmp_path / "workspace"
+        workspace.mkdir()
+        scratch = tmp_path / "scratch"
+        scratch.mkdir()
+        (scratch / ".env").write_text("SESSION_TOKEN=not-a-credential\n")
+        tool = scratch_rm_tool(workspace, scratch)
+        result = scratch_rm_verdict(tool, f"rm -r {scratch}/.env")
+        assert result.permission is ToolPermission.NEVER
+        assert "Sensitive file access denied" in (result.reason or "")
+
+    def test_without_a_scratchpad_root_the_hard_guard_stands(self, tmp_path: Path):
+        workspace = tmp_path / "workspace"
+        (workspace / "build").mkdir(parents=True)
+        tool = Bash(
+            config_getter=lambda: BashToolConfig(), state=BaseToolState(), cwd=workspace
+        )
+        result = scratch_rm_verdict(tool, "rm -r build")
+        assert result.permission is ToolPermission.NEVER
+        assert "hard guard" in (result.reason or "")

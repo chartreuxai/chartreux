@@ -68,9 +68,11 @@ from chartreux.core.model_catalog.loader import CatalogSnapshot
 from chartreux.core.model_catalog.resolver import ModelResolver
 from chartreux.core.model_catalog.schema import ModelCatalog
 from chartreux.core.recovery_models import (
+    CallEvidence,
     FailureClass,
     FailureEnvelope,
     PackageTier,
+    attach_call_evidence,
     build_failure_envelope,
 )
 from chartreux.core.recovery_observation import observe_exception
@@ -341,6 +343,93 @@ def test_unknown_endpoint_identity_cannot_prove_independence() -> None:
     assert (
         "candidate_endpoint_unknown_cannot_prove_independence" in decision.reason_codes
     )
+
+
+def _bare_429(endpoint: str, *, provider: str = "beta") -> BackendError:
+    """A bare 429 (no recognized body code) carrying the attempted endpoint,
+    with the measured call evidence the gateway attaches.
+    """
+    error = BackendError(
+        provider=provider,
+        endpoint=endpoint,
+        status=429,
+        reason="rate limited",
+        headers=None,
+        body_text=None,
+        parsed_error=None,
+        model="main-wire",
+        payload_summary=_payload_summary(),
+    )
+    attach_call_evidence(
+        error,
+        CallEvidence(
+            logical_call_id="call-1",
+            started_at=0.0,
+            budget_seconds=900.0,
+            response_started=True,
+            semantic_output_published=False,
+            transport_attempts=1,
+            elapsed_seconds=1.0,
+            budget_exhausted=False,
+        ),
+    )
+    return error
+
+
+def _rate_limit_envelope(*, endpoint: str = "https://beta.test/v1") -> FailureEnvelope:
+    """One ELIGIBLE rate-limited envelope (bare 429, settled tool effects)."""
+    return build_failure_envelope(
+        observation=observe_exception(
+            _bare_429(endpoint), phase="turn", turn_id="turn-1"
+        ),
+        agent_id="agent-1",
+        run_id="run-1",
+        attempted_deployment=("main-model", "beta", "main-wire"),
+        configured_model="main-model",
+        tool_calls_present=True,
+        work_package_id="wp-1",
+    )
+
+
+def test_rate_limit_envelope_rejects_same_endpoint_substitution() -> None:
+    """A.4(a): a rate-limited call's replacement leg rejects a same-endpoint
+    claim — an alias or a different model on the throttled endpoint is fake
+    relief — and selects an independent endpoint.
+    """
+    envelope = _rate_limit_envelope()
+    assert envelope.failure.failure_class is FailureClass.PROVIDER_RATE_LIMIT
+    config = RecoveryConfig()
+
+    alias = _candidate("main-model", "beta", "https://beta.test/v1", wire="alias-wire")
+    decision = validate_replacement_selection(
+        envelope=envelope,
+        package_tier=PackageTier.SUBSTANTIVE,
+        claimed=alias,
+        candidates=[alias],
+        config=config,
+    )
+    assert decision.disposition == "rejected"
+    assert "same_endpoint_substitution_rejected" in decision.reason_codes
+
+    same_endpoint_model = _candidate("alt-model", "beta", "https://beta.test/v1")
+    decision = validate_replacement_selection(
+        envelope=envelope,
+        package_tier=PackageTier.SUBSTANTIVE,
+        claimed=same_endpoint_model,
+        candidates=[same_endpoint_model],
+        config=config,
+    )
+    assert decision.disposition == "rejected"
+    assert "same_endpoint_substitution_rejected" in decision.reason_codes
+
+    decision = validate_replacement_selection(
+        envelope=envelope,
+        package_tier=PackageTier.SUBSTANTIVE,
+        claimed=_ALT,
+        candidates=[_ALT],
+        config=config,
+    )
+    assert decision.disposition == "selected"
 
 
 def test_luna_rejected_for_substantive_packages() -> None:

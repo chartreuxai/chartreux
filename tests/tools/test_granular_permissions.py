@@ -127,9 +127,9 @@ class TestBashGranularPermissions:
     @pytest.mark.parametrize(
         "command",
         [
-            "python3 << 'EOF'\nprint(42)\nEOF",
-            "python3 - << 'EOF'\nprint(42)\nEOF",
-            "python3 <<'PYEOF'\nimport sys\nprint('hello')\nPYEOF",
+            "python3 << EOF\nprint(42)\nEOF",
+            "python3 - << EOF\nprint(42)\nEOF",
+            "python3 <<PYEOF\nimport sys\nprint('hello')\nPYEOF",
             "python3 < input.txt",
         ],
     )

@@ -21,7 +21,14 @@ from chartreux.app_server._sessions import (
     SessionRuntimeRegistry,
     _AgentState,
 )
-from chartreux.app_server._subagent_launch import ChildLaunchAdmission
+from chartreux.app_server._subagent_launch import (
+    ChildLaunchAdmission,
+    ChildPublicationError,
+    ChildPublicationStage,
+    OverrideMint,
+    ProcessChildSession,
+)
+from chartreux.app_server._subagent_transcript import ChildTranscriptError
 from chartreux.app_server._turns import TurnController
 from chartreux.app_server.models import (
     PublicEffectEntry,
@@ -30,7 +37,12 @@ from chartreux.app_server.models import (
 )
 from chartreux.app_server.protocol import AppServerResponseError, ProtocolErrorCode
 from chartreux.app_server.server import AppServer
-from chartreux.app_server.subagent_ports import SubagentCapacityDeniedError
+from chartreux.app_server.subagent_ports import (
+    ChildTeardownOutcome,
+    ChildTeardownRequest,
+    SubagentCapacityDeniedError,
+    SubagentSpawnSpec,
+)
 from chartreux.core.agent_loop import AgentLoop
 from chartreux.core.agents.identity_launch import (
     InvalidChildIdentityError,
@@ -1005,20 +1017,35 @@ async def test_prelaunch_registry_lock_cancellation_aborts_real_prepared_turn(
         "projection",
         "ensure_lock",
         "registry_lock",
+        "attempt_id",
     ],
 )
 @pytest.mark.parametrize("identity_change", ["session_id", "generation"])
 async def test_background_creation_fences_live_identity_at_each_admission_boundary(
-    boundary: str, identity_change: str, monkeypatch: pytest.MonkeyPatch
+    boundary: str, identity_change: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """Every awaited creation boundary rejects a changed live root identity."""
-    parent = build_test_agent_loop(config=_config(), backend=FakeBackend())
+    """Every awaited creation boundary rejects a changed live root identity.
+
+    The seventh boundary is the attempt-id persistence window: the launch is
+    suspended AFTER the first durable write landed, so the rejected attempt
+    proves the publication attempt id is durable before the parent link
+    exists (a session-logging child is required for a durable record).
+    """
+    logging = (
+        SessionLoggingConfig(
+            enabled=True, save_dir=str(tmp_path / "sessions"), session_prefix="session"
+        )
+        if boundary == "attempt_id"
+        else None
+    )
+    parent = build_test_agent_loop(config=_config(logging), backend=FakeBackend())
     registry = _retention_registry()
     root = registry._build_child_runtime(parent)
     registry.bind_root(root)
     root.turns._projector = MagicMock()
     entered = asyncio.Event()
     release = asyncio.Event()
+    persisted: dict[str, Any] = {}
     original_factory = registry._runtime_factory.create_child
 
     async def gate(awaitable):
@@ -1046,17 +1073,39 @@ async def test_background_creation_fences_live_identity_at_each_admission_bounda
     elif boundary == "persistence":
         original = AgentLoop.persist_empty_session
 
-        async def persist(child: AgentLoop) -> None:
-            await gate(original(child))
+        async def persist(child: AgentLoop, *, attempt_id: str | None = None) -> None:
+            await gate(original(child, attempt_id=attempt_id))
 
         monkeypatch.setattr(AgentLoop, "persist_empty_session", persist)
+    elif boundary == "attempt_id":
+        original = AgentLoop.persist_empty_session
+
+        async def persist_after_write(
+            child: AgentLoop, *, attempt_id: str | None = None
+        ) -> None:
+            await original(child, attempt_id=attempt_id)
+            child_dir = child.session_logger.session_dir
+            assert child_dir is not None
+            persisted["attempt_id"] = attempt_id
+            persisted["recorded"] = SessionLoader.load_metadata(child_dir).attempt_id
+            entered.set()
+            await release.wait()
+
+        monkeypatch.setattr(AgentLoop, "persist_empty_session", persist_after_write)
     elif boundary == "metadata":
         original = AgentLoop.record_child_session
 
         async def record(
-            parent: AgentLoop, child: AgentLoop, tool_call_id: str, agent_name: str
+            parent: AgentLoop,
+            child: AgentLoop,
+            tool_call_id: str,
+            agent_name: str,
+            *,
+            attempt_id: str | None = None,
         ) -> None:
-            await gate(original(parent, child, tool_call_id, agent_name))
+            await gate(
+                original(parent, child, tool_call_id, agent_name, attempt_id=attempt_id)
+            )
 
         monkeypatch.setattr(AgentLoop, "record_child_session", record)
     elif boundary == "projection":
@@ -1105,6 +1154,12 @@ async def test_background_creation_fences_live_identity_at_each_admission_bounda
         assert registry._children == {}
         assert registry._child_links == {}
         assert registry._monitor_tasks == set()
+        if boundary == "attempt_id":
+            # The attempt id is durable at the FIRST write, before the parent
+            # link exists: exactly the torn persist-to-link window.
+            assert isinstance(persisted["attempt_id"], str)
+            assert persisted["attempt_id"].startswith("attempt-")
+            assert persisted["recorded"] == persisted["attempt_id"]
     finally:
         release.set()
         if not launch.done():
@@ -2814,4 +2869,431 @@ async def test_child_logging_rebuild_parent_orchestrator_not_mutated(
     finally:
         if child is not None:
             await child.aclose()
+        await parent.aclose()
+
+
+# ---------------------------------------------------------------------------
+# Package 20a: process-backed child publication and conservative teardown
+# ---------------------------------------------------------------------------
+
+_PROCESS_ATTEMPT = "attempt-child-1"
+
+
+class _SpawnedProcessChild:
+    """A spawned publication attempt whose liveness and death records the test owns."""
+
+    def __init__(
+        self,
+        *,
+        child_dir: Path,
+        root_dir: Path,
+        session_id: str | None,
+        survives_close: bool = False,
+    ) -> None:
+        self.agent_id = "coder-process-child"
+        self.session_id = session_id
+        self.child_session_dir = str(child_dir)
+        self.root_session_dir = str(root_dir)
+        self.completion_source: Any = None
+        self.closes = 0
+        self._survives_close = survives_close
+        self._alive = True
+        self.reconciliation: Any = None
+
+    @property
+    def alive(self) -> bool:
+        return self._alive
+
+    async def close(self) -> None:
+        self.closes += 1
+        if not self._survives_close:
+            self._alive = False
+
+    def die(self, reconciliation: Any) -> None:
+        self._alive = False
+        self.reconciliation = reconciliation
+
+    def reconcile_death(self) -> Any:
+        if self.reconciliation is None:
+            raise ChildTranscriptError("the attempt persisted no transcript")
+        return self.reconciliation
+
+
+class _RecordingProcessSpawn:
+    """The process-backed spawn adapter one session selected, recorded for the test."""
+
+    def __init__(
+        self,
+        root_dir: Path,
+        *,
+        session_id: str | None = "child-session-1",
+        survives_close: bool = False,
+    ) -> None:
+        self.root_dir = root_dir
+        self.session_id = session_id
+        self.survives_close = survives_close
+        self.specs: list[SubagentSpawnSpec] = []
+        self.spawned: list[_SpawnedProcessChild] = []
+        self.error: Exception | None = None
+
+    async def spawn(self, spec: SubagentSpawnSpec) -> _SpawnedProcessChild:
+        self.specs.append(spec)
+        if self.error is not None:
+            raise self.error
+        child = _SpawnedProcessChild(
+            child_dir=self.root_dir / "agents" / f"coder_{spec.attempt_id}",
+            root_dir=self.root_dir,
+            session_id=self.session_id,
+            survives_close=self.survives_close,
+        )
+        self.spawned.append(child)
+        return child
+
+
+def _process_parent(tmp_path: Path) -> AgentLoop:
+    """A root loop with a real session directory for the child's own transcript."""
+    logging = SessionLoggingConfig(
+        enabled=True, save_dir=str(tmp_path / "sessions"), session_prefix="session"
+    )
+    return build_test_agent_loop(
+        config=_config().model_copy(update={"session_logging": logging}),
+        backend=FakeBackend([mock_llm_chunk(content="ack")]),
+    )
+
+
+def _process_registry(
+    parent: AgentLoop, spawn: _RecordingProcessSpawn
+) -> tuple[SessionRuntimeRegistry, SessionRuntime]:
+    registry = SessionRuntimeRegistry(
+        AsyncMock(),
+        AsyncMock(),
+        lambda _session_id: 0,
+        clock=_ManualClock(),
+        subagent_spawn=spawn,
+    )
+    root = registry._build_child_runtime(parent)
+    root.turns._projector = MagicMock()
+    root.turns.link_subagent = AsyncMock()
+    root.turns.unlink_subagent = AsyncMock()
+    registry.bind_root(root)
+    return registry, root
+
+
+async def _publish_process_child(
+    registry: SessionRuntimeRegistry,
+    root: SessionRuntime,
+    parent: AgentLoop,
+    *,
+    tool_call_id: str = "task-1",
+    retain: bool | None = None,
+    reuse: ProcessChildSession | None = None,
+    attempt_id: str = _PROCESS_ATTEMPT,
+) -> ProcessChildSession:
+    return await registry.create_process_child(
+        root,
+        TaskArgs(task="Inspect the project", identity="coder", retain=retain),
+        InvokeContext(tool_call_id=tool_call_id, session_id=parent.session_id),
+        attempt_id=attempt_id,
+        reuse=reuse,
+    )
+
+
+@pytest.mark.asyncio
+async def test_process_child_publication_spawns_links_and_projects(
+    tmp_path: Path,
+) -> None:
+    parent = _process_parent(tmp_path)
+    root_dir = parent.session_logger.session_dir
+    assert root_dir is not None
+    spawn = _RecordingProcessSpawn(root_dir)
+    registry, root = _process_registry(parent, spawn)
+    try:
+        handle = await _publish_process_child(registry, root, parent)
+
+        assert len(spawn.specs) == 1
+        spec = spawn.specs[0]
+        assert spec.attempt_id == _PROCESS_ATTEMPT
+        assert spec.parent_session_id == parent.session_id
+        assert spec.payload["root_session_dir"] == str(root_dir)
+        assert spec.payload["agent_name"] == "coder"
+
+        assert handle.session_id == "child-session-1"
+        assert handle.attempt_id == _PROCESS_ATTEMPT
+        assert handle.retained is False
+        assert handle.alive is True
+        assert registry._process_children == {"child-session-1": handle}
+
+        metadata = parent.session_logger.session_metadata
+        assert metadata is not None
+        assert len(metadata.child_sessions) == 1
+        link = metadata.child_sessions[0]
+        assert link.session_id == "child-session-1"
+        assert link.tool_call_id == "task-1"
+        assert link.agent == "coder"
+        assert link.attempt_id == _PROCESS_ATTEMPT
+        assert link.relative_path == str(Path("agents") / f"coder_{_PROCESS_ATTEMPT}")
+        cast(Any, root.turns).link_subagent.assert_awaited_once_with(
+            "task-1", "child-session-1"
+        )
+    finally:
+        await parent.aclose()
+
+
+@pytest.mark.asyncio
+async def test_retained_process_child_keeps_its_process_across_retasks(
+    tmp_path: Path,
+) -> None:
+    parent = _process_parent(tmp_path)
+    root_dir = parent.session_logger.session_dir
+    assert root_dir is not None
+    spawn = _RecordingProcessSpawn(root_dir)
+    registry, root = _process_registry(parent, spawn)
+    try:
+        first = await _publish_process_child(
+            registry, root, parent, retain=True, attempt_id="attempt-a"
+        )
+        second = await _publish_process_child(
+            registry,
+            root,
+            parent,
+            tool_call_id="task-2",
+            reuse=first,
+            attempt_id="attempt-b",
+        )
+
+        # A retained child keeps its process: the re-task links the new tool
+        # call to the process that already exists.
+        assert second is first
+        assert len(spawn.specs) == 1
+        assert spawn.spawned[0].closes == 0
+        assert first.retained is True
+        metadata = parent.session_logger.session_metadata
+        assert metadata is not None
+        assert [link.tool_call_id for link in metadata.child_sessions] == [
+            "task-1",
+            "task-2",
+        ]
+        assert {link.session_id for link in metadata.child_sessions} == {
+            "child-session-1"
+        }
+    finally:
+        await parent.aclose()
+
+
+@pytest.mark.asyncio
+async def test_process_child_publication_names_the_spawn_stage(tmp_path: Path) -> None:
+    parent = _process_parent(tmp_path)
+    root_dir = parent.session_logger.session_dir
+    assert root_dir is not None
+    spawn = _RecordingProcessSpawn(root_dir)
+    spawn.error = RuntimeError("spawn refused")
+    registry, root = _process_registry(parent, spawn)
+    try:
+        with pytest.raises(ChildPublicationError) as caught:
+            await _publish_process_child(registry, root, parent)
+        # Nothing was spawned, so there is nothing to retract.
+        assert caught.value.stage is ChildPublicationStage.SPAWN
+        assert caught.value.retraction is None
+        assert registry._process_children == {}
+        metadata = parent.session_logger.session_metadata
+        assert metadata is not None and metadata.child_sessions == []
+    finally:
+        await parent.aclose()
+
+
+@pytest.mark.asyncio
+async def test_process_child_publication_names_the_persistence_stage(
+    tmp_path: Path,
+) -> None:
+    parent = _process_parent(tmp_path)
+    root_dir = parent.session_logger.session_dir
+    assert root_dir is not None
+    spawn = _RecordingProcessSpawn(root_dir, session_id=None)
+    registry, root = _process_registry(parent, spawn)
+    try:
+        with pytest.raises(ChildPublicationError) as caught:
+            await _publish_process_child(registry, root, parent)
+        # A spawn that announces no session id cannot be attributed, so the
+        # attempt is retracted before anything is linked or projected.
+        assert caught.value.stage is ChildPublicationStage.PERSISTENCE
+        assert caught.value.retraction is ChildTeardownOutcome.REAPED
+        assert spawn.spawned[0].closes == 1
+        assert registry._process_children == {}
+        metadata = parent.session_logger.session_metadata
+        assert metadata is not None and metadata.child_sessions == []
+        cast(Any, root.turns).link_subagent.assert_not_awaited()
+    finally:
+        await parent.aclose()
+
+
+@pytest.mark.asyncio
+async def test_process_child_publication_names_the_linkage_stage(
+    tmp_path: Path,
+) -> None:
+    parent = _process_parent(tmp_path)
+    root_dir = parent.session_logger.session_dir
+    assert root_dir is not None
+    spawn = _RecordingProcessSpawn(root_dir)
+    registry, root = _process_registry(parent, spawn)
+    metadata = parent.session_logger.session_metadata
+    assert metadata is not None
+    conflicting = ChildSessionLink(
+        session_id="other-session",
+        tool_call_id="task-1",
+        agent="coder",
+        attempt_id="other-attempt",
+    )
+    metadata.child_sessions.append(conflicting)
+    try:
+        with pytest.raises(ChildPublicationError) as caught:
+            await _publish_process_child(registry, root, parent)
+        # The conflicting link is never overwritten, and the attempt that
+        # could not link is retracted.
+        assert caught.value.stage is ChildPublicationStage.LINKAGE
+        assert metadata.child_sessions == [conflicting]
+        assert spawn.spawned[0].closes == 1
+        assert registry._process_children == {}
+    finally:
+        await parent.aclose()
+
+
+@pytest.mark.asyncio
+async def test_process_child_publication_names_the_projection_stage(
+    tmp_path: Path,
+) -> None:
+    parent = _process_parent(tmp_path)
+    root_dir = parent.session_logger.session_dir
+    assert root_dir is not None
+    spawn = _RecordingProcessSpawn(root_dir)
+    registry, root = _process_registry(parent, spawn)
+    root.turns.link_subagent = AsyncMock(side_effect=RuntimeError("projection failed"))
+    try:
+        with pytest.raises(ChildPublicationError) as caught:
+            await _publish_process_child(registry, root, parent)
+        # A rejected projection drops the link this attempt published and
+        # retracts the child: no adoptable parent-side trace survives.
+        assert caught.value.stage is ChildPublicationStage.PROJECTION
+        cast(Any, root.turns).unlink_subagent.assert_awaited_once_with(
+            "task-1", "child-session-1"
+        )
+        metadata = parent.session_logger.session_metadata
+        assert metadata is not None and metadata.child_sessions == []
+        assert spawn.spawned[0].closes == 1
+        assert registry._process_children == {}
+    finally:
+        await parent.aclose()
+
+
+@pytest.mark.asyncio
+async def test_process_child_publication_releases_a_refused_permit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    parent = _process_parent(tmp_path)
+    root_dir = parent.session_logger.session_dir
+    assert root_dir is not None
+    spawn = _RecordingProcessSpawn(root_dir)
+    registry, root = _process_registry(parent, spawn)
+    released: list[object] = []
+
+    class _Ledger:
+        def release(self, permit: object) -> None:
+            released.append(permit)
+
+    permit = object()
+    monkeypatch.setattr(
+        ChildLaunchAdmission,
+        "mint_override_permit",
+        lambda *_args, **_kwargs: cast(Any, OverrideMint)(
+            permit=permit, ledger=_Ledger(), endpoint="small"
+        ),
+    )
+    monkeypatch.setattr(
+        ChildLaunchAdmission,
+        "resolve_candidate",
+        lambda *_args, **_kwargs: MagicMock(identity="coder"),
+    )
+    try:
+        with pytest.raises(ChildPublicationError) as caught:
+            await _publish_process_child(registry, root, parent)
+        # A process-backed child cannot consume the permit in this release, so
+        # the refusal happens before transport and the reservation is released
+        # instead of stranding the endpoint's in-flight slot.
+        assert caught.value.stage is ChildPublicationStage.PERMIT
+        assert released == [permit]
+        assert spawn.specs == []
+        assert registry._process_children == {}
+    finally:
+        await parent.aclose()
+
+
+@pytest.mark.asyncio
+async def test_process_child_teardown_removes_a_settled_attempt(tmp_path: Path) -> None:
+    parent = _process_parent(tmp_path)
+    root_dir = parent.session_logger.session_dir
+    assert root_dir is not None
+    spawn = _RecordingProcessSpawn(root_dir)
+    registry, root = _process_registry(parent, spawn)
+    try:
+        handle = await _publish_process_child(registry, root, parent)
+        report = await registry.teardown_attempt(
+            ChildTeardownRequest(attempt_id=_PROCESS_ATTEMPT)
+        )
+        assert report.outcome is ChildTeardownOutcome.REAPED
+        assert report.settled is True
+        assert handle.closed is True
+        assert registry._process_children == {}
+        # The same attempt id is no longer owned: a repeated teardown answers
+        # the typed unknown class instead of claiming a second rollback.
+        repeated = await registry.teardown_attempt(
+            ChildTeardownRequest(attempt_id=_PROCESS_ATTEMPT)
+        )
+        assert repeated.outcome is ChildTeardownOutcome.ATTEMPT_UNKNOWN
+    finally:
+        await parent.aclose()
+
+
+@pytest.mark.asyncio
+async def test_process_child_teardown_keeps_an_inconclusive_attempt(
+    tmp_path: Path,
+) -> None:
+    parent = _process_parent(tmp_path)
+    root_dir = parent.session_logger.session_dir
+    assert root_dir is not None
+    spawn = _RecordingProcessSpawn(root_dir, survives_close=True)
+    registry, root = _process_registry(parent, spawn)
+    try:
+        handle = await _publish_process_child(registry, root, parent)
+        report = await registry.teardown_attempt(
+            ChildTeardownRequest(attempt_id=_PROCESS_ATTEMPT, wait_seconds=0.01)
+        )
+        # The bounded wait expired with the child alive: the attempt stays
+        # registered so a later teardown can still settle it.
+        assert report.outcome is ChildTeardownOutcome.INCONCLUSIVE
+        assert report.settled is False
+        assert registry._process_children == {"child-session-1": handle}
+    finally:
+        await parent.aclose()
+
+
+@pytest.mark.asyncio
+async def test_process_child_reconciliation_reports_only_dead_children(
+    tmp_path: Path,
+) -> None:
+    parent = _process_parent(tmp_path)
+    root_dir = parent.session_logger.session_dir
+    assert root_dir is not None
+    spawn = _RecordingProcessSpawn(root_dir)
+    registry, root = _process_registry(parent, spawn)
+    try:
+        handle = await _publish_process_child(registry, root, parent)
+
+        # A live child is never adjudicated from its on-disk markers.
+        assert registry.reconcile_process_children() == {}
+
+        adjudication = object()
+        spawn.spawned[0].die(adjudication)
+        assert registry.reconcile_process_children() == {
+            handle.session_id: adjudication
+        }
+    finally:
         await parent.aclose()

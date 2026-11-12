@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from functools import lru_cache
 import os
 from pathlib import Path
+import shutil
 
 from chartreux.core.tools.builtins._shell_argv import ShellToken, split_shell_tokens
 from chartreux.core.tools.secret_redaction import scrub_child_env
@@ -34,8 +35,19 @@ _TERMINAL_EXPANSION_REFUSAL = (
 # expansion-bearing commands and the spawn refuses.
 
 
+# The variable the resolved executor travels to spawned children in. The root
+# agent process reads no config, so the parent's one startup resolution is
+# published here and every descendant spawn resolves the same binary.
+EXECUTOR_ENV_VAR = "CHARTREUX_SHELL_EXECUTOR"
+
+# The one executor resolution this process installs at startup (config > bash
+# > $SHELL > kernel default). ``None`` means no override was installed, so
+# :func:`shell_executor` falls back to the same chain.
+_executor_override: str | None = None
+
+
 class UnknownShellExecutorError(ValueError):
-    """The ambient shell has no pinned executor option contract."""
+    """The resolved executor has no pinned executor option contract."""
 
 
 @dataclass(frozen=True)
@@ -136,7 +148,7 @@ def current_executor_contract() -> ExecutorOptionContract | None:
     """The contract of the shell binary shell text is spawned under right now.
 
     Reads :func:`shell_executor` on every call (the cache is keyed on the
-    resolved binary, so a changed ``$SHELL`` is honored) and never a prior
+    resolved binary, so a changed selection is honored) and never a prior
     probe: the identity reported is the one the spawn uses.
     """
     return executor_option_contract(shell_executor())
@@ -276,12 +288,97 @@ def _shell_environment(
 def shell_executor() -> str | None:
     """The shell binary shell-text commands execute under, as spawned.
 
-    Read here and handed to the spawn, so the identity reported is the one the
-    executor actually uses and never a separate prior probe. ``None`` means the
-    environment names no shell: the kernel default (``/bin/sh``) applies and
-    the executor is unnamed rather than pinned.
+    One resolution answers here, in precedence order: the process-level
+    override this run installed at startup (the ``[tools.bash] executor``
+    config value, else the shipped default — see
+    :func:`apply_executor_selection`), the value the parent process published
+    for this child (:data:`EXECUTOR_ENV_VAR`), and finally the ambient chain
+    of :func:`resolve_shell_executor`. Read here and handed to the spawn, so
+    the identity reported is the one the executor actually uses and never a
+    separate prior probe. ``None`` means nothing names a shell: the kernel
+    default (``/bin/sh``) applies and the executor is unnamed rather than
+    pinned.
     """
-    return os.environ.get("SHELL")
+    if _executor_override is not None:
+        return _executor_override
+    published = os.environ.get(EXECUTOR_ENV_VAR)
+    if published:
+        return _resolve_executor_path(published)
+    return resolve_shell_executor()
+
+
+def resolve_shell_executor(configured: str | None = None) -> str | None:
+    """Resolve the executor the chain selects, in its documented order.
+
+    ``configured`` (``[tools.bash] executor``) wins. Without it the shipped
+    default OUTRANKS the ambient ``$SHELL``: bash when the host has it, the
+    ambient ``$SHELL`` as the fallback, and ``None`` (the kernel default) when
+    neither exists. A configured value that names no program stays exactly as
+    configured: its contract lookup fails closed, so the session denies
+    expansion-bearing commands and refuses the spawn instead of silently
+    running another shell.
+    """
+    if configured is not None and configured.strip():
+        return _resolve_executor_path(configured)
+    located = _locate_bash()
+    if located is not None:
+        return located
+    return _resolve_executor_path(os.environ.get("SHELL"))
+
+
+def apply_executor_selection(configured: str | None) -> str | None:
+    """Resolve the executor once at startup and install the process override.
+
+    This is the ``apply_invocation_selections`` pattern for the shell: the
+    resolution is taken once, from the config value, and every later reader —
+    the bash tool, the permission analysis, background jobs, completion
+    checks, the app-server shell, and the system prompt — sees that one
+    answer. The resolved binary reaches spawned children through
+    :func:`publish_shell_executor`, never as a process-global side effect.
+    """
+    global _executor_override
+    _executor_override = resolve_shell_executor(configured)
+    return _executor_override
+
+
+def reset_executor_selection() -> None:
+    """Drop the startup override, returning to the ambient resolution chain."""
+    global _executor_override
+    _executor_override = None
+
+
+def publish_shell_executor(env: Mapping[str, str] | None) -> dict[str, str]:
+    """The env for a spawned child, carrying this process's resolved executor.
+
+    A child that reads no config (the root agent process) still resolves the
+    same executor: the value is published only when the mapping does not
+    already name one, so an explicit caller value stays authoritative.
+    """
+    published = dict(os.environ if env is None else env)
+    executor = shell_executor()
+    if executor is not None:
+        published.setdefault(EXECUTOR_ENV_VAR, executor)
+    return published
+
+
+def _locate_bash() -> str | None:
+    """The host's bash, the shipped default executor, when it is present."""
+    return shutil.which("bash")
+
+
+def _resolve_executor_path(value: str | None) -> str | None:
+    """One configured or ambient executor value, as the binary to spawn.
+
+    A bare program name is looked up on ``PATH``; an absolute or relative path
+    is kept as given, so an absent one stays fail-closed at the contract
+    lookup instead of silently selecting another shell.
+    """
+    text = (value or "").strip()
+    if not text:
+        return None
+    if os.sep in text:
+        return text
+    return shutil.which(text) or text
 
 
 def terminal_shell_text_refusal(
@@ -292,7 +389,7 @@ def terminal_shell_text_refusal(
     F1pkg1(a) elected the REFUSAL lane of the design's terminal-executor
     decision (Amendment F). The app-server terminal transports hand shell text
     to an executor this process does not own: the session shell runs under the
-    ambient ``$SHELL`` (:func:`shell_executor`) and a client terminal executor
+    process's resolved executor (:func:`shell_executor`), and a client executor
     is spawned by the client, so the permission model's expansion decisions
     describe no executor pinned here. The design's client-capability
     attestation (Amendment X/CC) covers network-namespace locality and transfer
@@ -327,11 +424,16 @@ def _carries_unquoted_glob(text: str) -> bool:
 
 
 __all__ = [
+    "EXECUTOR_ENV_VAR",
     "ExecutorOptionContract",
     "UnknownShellExecutorError",
     "apply_executor_contract_env",
+    "apply_executor_selection",
     "current_executor_contract",
     "executor_option_contract",
+    "publish_shell_executor",
+    "reset_executor_selection",
+    "resolve_shell_executor",
     "shell_executor",
     "spawn_argv_command",
     "spawn_shell_command",

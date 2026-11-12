@@ -1361,7 +1361,12 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
         )
 
     async def record_child_session(
-        self, child: AgentLoop, tool_call_id: str, agent_name: str
+        self,
+        child: AgentLoop,
+        tool_call_id: str,
+        agent_name: str,
+        *,
+        attempt_id: str | None = None,
     ) -> ChildSessionLink:
         parent_dir = self.session_logger.session_dir
         child_dir = child.session_logger.session_dir
@@ -1375,6 +1380,7 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
             tool_call_id=tool_call_id,
             agent=agent_name,
             relative_path=relative_path,
+            attempt_id=attempt_id,
         )
         metadata = self.session_logger.session_metadata
         if metadata is None:
@@ -1464,7 +1470,18 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
             metadata.child_sessions.insert(index, link)
             raise
 
-    async def persist_empty_session(self) -> None:
+    async def persist_empty_session(self, *, attempt_id: str | None = None) -> None:
+        """Write the session's first durable record, empty conversation allowed.
+
+        ``attempt_id`` is the publication attempt a child is created under:
+        recording it HERE, in the first durable write, is what makes the torn
+        persist-to-link window attributable — a crash before the parent link is
+        recorded still leaves an attempt-keyed child record on disk. Optional
+        and keyword-only: every existing caller keeps its call shape.
+        """
+        metadata = self.session_logger.session_metadata
+        if attempt_id is not None and metadata is not None:
+            metadata.attempt_id = attempt_id
         await self._save_messages(allow_empty=True)
 
     async def refresh_config(self) -> None:
@@ -2733,6 +2750,15 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
 
     def _recorded_tool_call_event(self, event: ToolCallEvent) -> ToolCallEvent:
         return self._transcript_recorder.record_call_event(event)
+
+    async def settle_turn_tool_effects(self, turn_id: str, *, grace: float) -> bool:
+        """Settle the turn's in-flight tool effects within a bounded grace.
+
+        The app server calls this at a stream-truncation terminalization: the
+        live tool tasks are cancelled and awaited for at most ``grace``
+        seconds, and False means an effect suppressed cancellation past it.
+        """
+        return await self._tool_batch_runner.settle_turn_effects(turn_id, grace=grace)
 
     def outstanding_wait_call_ids(self, turn_id: str) -> tuple[str, ...]:
         # Compatibility delegate: the batch wait registry lives on the

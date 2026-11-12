@@ -11,6 +11,7 @@ from chartreux.core.llm.exceptions import BackendErrorBuilder
 from chartreux.core.llm.failures import FailureCategory, RequestRetryBudget, classify
 from chartreux.core.llm_models import LLMMessage, Role
 from chartreux.core.utils.retry import (
+    RetryCategory,
     RetryReason,
     _next_delay,
     async_generator_retry,
@@ -83,7 +84,19 @@ def _http_error(
             True,
             True,
         ),
-        (_http_error(429), FailureCategory.UNKNOWN, False, False),
+        (_http_error(429), FailureCategory.RATE_LIMIT, True, True),
+        (
+            _http_error(429, code="unrecognized_gateway_code"),
+            FailureCategory.RATE_LIMIT,
+            True,
+            True,
+        ),
+        (
+            _http_error(429, code="insufficient_funds"),
+            FailureCategory.BILLING,
+            False,
+            False,
+        ),
     ],
 )
 def test_failure_classification_matrix(
@@ -243,5 +256,93 @@ async def test_permanent_structured_failure_is_not_retried(
     else:
         with pytest.raises(httpx.HTTPStatusError) as caught:
             await async_retry(tries=3)(attempt)()
+    assert caught.value is error
+    assert calls == 1
+
+
+def test_plain_text_429_body_classifies_rate_limit() -> None:
+    """A proxy answers a 429 with a plain-text body: the status alone is the
+    provider's rate-limit signal, so the category is RATE_LIMIT and the
+    failure is retry/failover eligible.
+    """
+    request = httpx.Request("POST", "https://provider.invalid/chat")
+    response = httpx.Response(429, request=request, text="Too Many Requests")
+    info = classify(
+        httpx.HTTPStatusError("provider error", request=request, response=response)
+    )
+    assert info.category is FailureCategory.RATE_LIMIT
+    assert info.retry_eligible is True
+    assert info.failover_eligible is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("streaming", [False, True])
+async def test_bare_429_retries_within_a_sufficient_budget(
+    monkeypatch: pytest.MonkeyPatch, streaming: bool
+) -> None:
+    """A bare 429 behaves exactly like a coded one: one deployment with a
+    sufficient budget retries in-call and honors Retry-After.
+    """
+    attempts = 0
+    sleeps: list[float] = []
+    notices: list[RetryReason] = []
+    error = _http_error(429, retry_after="7")
+
+    async def attempt() -> None:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise error
+
+    async def observe(reason: RetryReason) -> None:
+        notices.append(reason)
+
+    async def sleep(delay: float) -> None:
+        sleeps.append(delay)
+
+    monkeypatch.setattr("chartreux.core.utils.retry.asyncio.sleep", sleep)
+    if streaming:
+
+        async def stream() -> AsyncGenerator[None]:
+            await attempt()
+            yield None
+
+        retried = async_generator_retry(
+            tries=None, budget=RequestRetryBudget(300.0), on_retry=observe
+        )(stream)
+        assert [item async for item in retried()] == [None]
+    else:
+        call = async_retry(
+            tries=None, budget=RequestRetryBudget(300.0), on_retry=observe
+        )(attempt)
+        await call()
+
+    assert attempts == 2
+    assert sleeps == [7.0]
+    assert [notice.category for notice in notices] == [RetryCategory.RATE_LIMITED]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("code", ["insufficient_quota", "insufficient_funds"])
+async def test_protected_429_never_retries(
+    monkeypatch: pytest.MonkeyPatch, code: str
+) -> None:
+    """Quota and billing 429s keep their protected categories: the bare-429
+    flip never grants them retry authority.
+    """
+    calls = 0
+    error = _http_error(429, code=code)
+
+    async def attempt() -> None:
+        nonlocal calls
+        calls += 1
+        raise error
+
+    async def no_sleep(_delay: float) -> None:
+        pytest.fail("protected 429s must not back off")
+
+    monkeypatch.setattr("chartreux.core.utils.retry.asyncio.sleep", no_sleep)
+    with pytest.raises(httpx.HTTPStatusError) as caught:
+        await async_retry(tries=3)(attempt)()
     assert caught.value is error
     assert calls == 1

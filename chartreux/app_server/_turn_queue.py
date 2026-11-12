@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Collection
 from dataclasses import dataclass
 import time
 from uuid import uuid4
@@ -164,17 +164,36 @@ class TurnQueue:
             self._idempotency[key] = record
         return TurnQueueEnqueueResult(record, duplicate=False)
 
-    def peek_next(self) -> QueuedTurnRecord | None:
-        if self._paused or not self._items:
+    def peek_next(self, *, skip: Collection[str] = ()) -> QueuedTurnRecord | None:
+        """The next promotable record, ignoring held queue item ids."""
+        if self._paused:
             return None
-        return self._items[0]
+        held = set(skip)
+        return next(
+            (item for item in self._items if item.queued_turn.id not in held), None
+        )
 
-    def pop_next(self) -> QueuedTurnRecord | None:
-        if self.peek_next() is None:
+    def pop_next(self, *, skip: Collection[str] = ()) -> QueuedTurnRecord | None:
+        record = self.peek_next(skip=skip)
+        if record is None:
             return None
-        record = self._items.pop(0)
+        index = next(
+            position for position, item in enumerate(self._items) if item is record
+        )
+        self._items.pop(index)
         self._reset_pause_if_empty()
         return record
+
+    def restore(self, record: QueuedTurnRecord) -> None:
+        """Put one popped record back at the front of the queue.
+
+        A promotion that popped a record other than the one it peeked restores
+        that record here instead of dropping it: an item a concurrent mutation
+        exposed must keep its place and its work.
+        """
+        if any(item.queued_turn.id == record.queued_turn.id for item in self._items):
+            return
+        self._items.insert(0, record)
 
     def remove(self, queue_item_id: str) -> bool:
         index = next(

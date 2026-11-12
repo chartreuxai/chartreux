@@ -257,9 +257,10 @@ async def test_queued_head_skill_injects_skill_tool_message(
 
 
 @pytest.mark.asyncio
-async def test_skill_prompt_runs_after_following_bash_is_rejected(
+async def test_skill_prompt_runs_after_following_bash_is_queued(
     chartreux_app_with_skills: ChartreuxApp,
 ) -> None:
+    """Item-5 A.4: a `!` submitted while busy queues instead of being refused."""
     async with chartreux_app_with_skills.run_test() as pilot:
         chat_input = chartreux_app_with_skills.query_one(ChatInputContainer)
         backend = await _block_agent_job(chartreux_app_with_skills, pilot)
@@ -270,13 +271,20 @@ async def test_skill_prompt_runs_after_following_bash_is_rejected(
                 pilot,
                 lambda: (
                     len(chartreux_app_with_skills._queue) == 1
-                    and any(
-                        "Shell commands cannot be queued" in notification.message
-                        for notification in chartreux_app_with_skills._notifications
-                    )
+                    and [
+                        entry.command
+                        for item in chartreux_app_with_skills.app_server.turn_queue.items
+                        for entry in item.entries
+                        if entry.role == "shell"
+                    ]
+                    == ["echo queued"]
                 ),
             )
-            assert chat_input.value == "!echo queued"
+            assert chat_input.value == ""
+            assert not any(
+                "cannot be queued" in notification.message
+                for notification in chartreux_app_with_skills._notifications
+            )
         finally:
             await _release_agent_job(chartreux_app_with_skills, pilot, backend)
 
@@ -294,12 +302,13 @@ async def test_skill_prompt_runs_after_following_bash_is_rejected(
                     widget.tool_name == "skill"
                     for widget in chartreux_app_with_skills.query(ToolResultMessage)
                 )
+                # FIFO: the queued shell input ran after the skill turn.
+                and any(
+                    widget.tool_name == "shell"
+                    for widget in chartreux_app_with_skills.query(ToolResultMessage)
+                )
             ),
             timeout=5.0,
         )
 
         assert _skill_effect_loaded(chartreux_app_with_skills, "my-skill")
-        assert not any(
-            widget.tool_name == "shell"
-            for widget in chartreux_app_with_skills.query(ToolResultMessage)
-        )

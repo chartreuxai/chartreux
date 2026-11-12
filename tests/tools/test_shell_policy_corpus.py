@@ -78,11 +78,18 @@ Families (see :data:`OBSERVERS` for the exact recipe of each):
   modeled-wrapper spellings. The v0.5.9 P3-c rows are the recursive-`rm`
   form-composition matrix: the P2-c paired fixtures and metadata rows
   probed across quoting, pipes, command lists, and modeled wrappers,
-  plus the fail-closed no-repository and corrupt-`.git` fixtures.
+  plus the fail-closed no-repository and corrupt-`.git` fixtures. The
+  v0.7.8 P4/P5 rows pin the session-scratchpad recursive-`rm` carve-out
+  (contained deletions run-class; the root itself, an escaping symlink, a
+  mixed or outside operand, and an unestablishable call footprint denied)
+  and the modeled read-only `xargs` dispatch (`find … -print0 | xargs -0`
+  first-class; uniq's output operand, `sort -o`, an unmodeled subcommand,
+  and the read-path gates still denied).
 
 Set-derived outputs are recorded sorted (their iteration order is hash-seed
 dependent), and absolute fixture paths are recorded relative to the fixture
-root (``<FIXTURES>`` in message text) so the corpus is machine-independent.
+root (``<FIXTURES>`` in message text) or to the built session scratchpad
+(``<SCRATCHPAD>``) so the corpus is machine-independent.
 
 Regenerate after an intentional behavior change (never to mask a regression):
 
@@ -135,6 +142,11 @@ FIXTURES_SOURCE = CORPUS_DIR / "fixtures"
 GIT_MARKER = ".git"
 PLACEHOLDER = "git-dir"
 FIXTURES_TOKEN = "<FIXTURES>"
+# The P4/P5 rows' session scratchpad: a fixture-built directory the resolver
+# receives as the tool's own scratchpad root, spelled by a token in recorded
+# text so the corpus stays machine-independent.
+SCRATCHPAD_DIR = "session-scratchpad"
+SCRATCHPAD_TOKEN = "<SCRATCHPAD>"
 
 # ---------------------------------------------------------------------------
 # Corpus argv matrices
@@ -1449,6 +1461,7 @@ def fixtures_root(tmp_path_factory: pytest.TempPathFactory) -> Path:
     build_curl_destination_fixtures(root)
     build_glob_fixtures(root)
     build_git_workflow_fixtures(root)
+    build_scratchpad_fixtures(root)
     return root
 
 
@@ -1832,6 +1845,27 @@ def build_glob_fixtures(root: Path) -> None:
     dot.mkdir(parents=True, exist_ok=True)
     (dot / ".hidden.txt").write_text("hidden\n", encoding="utf-8")
     (dot / "visible.txt").write_text("visible\n", encoding="utf-8")
+
+
+def build_scratchpad_fixtures(root: Path) -> None:
+    """Build the session-scratchpad layout the P4/P5 permission rows resolve.
+
+    ``session-scratchpad`` is the scratchpad root the resolver receives for a
+    row that asks for one; ``scratchpad-outside`` is an ordinary fixture
+    directory beside it. The two symlinks under the scratchpad point INTO that
+    outside directory, so the containment rows pin the resolved-path rule rather
+    than the operand's spelling. The build is deterministic (fixed names and
+    contents, relative symlink targets, no timestamps), so the corpus replays.
+    """
+    scratchpad = root / SCRATCHPAD_DIR
+    (scratchpad / "work").mkdir(parents=True, exist_ok=True)
+    (scratchpad / "work" / "notes.txt").write_text("notes\n", encoding="utf-8")
+    (scratchpad / "more").mkdir(exist_ok=True)
+    outside = root / "scratchpad-outside"
+    outside.mkdir(exist_ok=True)
+    (outside / "secret.txt").write_text("secret\n", encoding="utf-8")
+    os.symlink("../scratchpad-outside", scratchpad / "escape")
+    os.symlink("../scratchpad-outside/secret.txt", scratchpad / "escape-file")
 
 
 def build_git_workflow_fixtures(root: Path) -> None:
@@ -3441,14 +3475,19 @@ PERMISSION_R7_CASES: list[dict[str, Any]] = [
 # value — so the operand scan consumes them all, whatever the name: the
 # wrapped command is re-analyzed exactly like a directly spelled invocation
 # and no longer hides behind an invalid-name operand. The consumed operands
-# also reach the documented assignment-name audit (uppercase names only),
-# which aggregates fail-closed with the wrapped command's own gate exactly
-# like the strict-valid lowercase equivalent (`env FOO=1 x=1 git push`) and
-# the shell-level spelling (`1X=1 git push`); hard-guard inner commands keep
-# their unwrapped denial verbatim. Controls: the uppercase-operand and
-# assignment-less env forms are unchanged, a leading invalid name still fails
-# closed at admission, a non-assignment operand stays the command, and the
-# sudo forms from R7 are unchanged. Rows append after R7; ids continue.
+# also reach the documented assignment-name audit, which aggregates
+# fail-closed with the wrapped command's own gate exactly like the
+# shell-level spelling (`1X=1 git push`); hard-guard inner commands keep
+# their unwrapped denial verbatim. Controls: the assignment-less env form is
+# unchanged, a leading invalid name still fails closed at admission, a
+# non-assignment operand stays the command, and the sudo forms from R7 are
+# unchanged. Rows append after R7; ids continue.
+#
+# v0.7.8 P1d re-decides the audit rows: the name-case rule is repealed, so
+# the invalid-name and lowercase operands no longer deny on their own and
+# these rows now record the wrapped command's gate alone (the invalid-name
+# operands of R8 are otherwise admitted). The P1d family below pins the
+# relaxation itself; these rows keep the operand-consumption matrix intact.
 PERMISSION_R8_CASES: list[dict[str, Any]] = [
     # Egress: a non-loopback proxy operand gates the wrapped client even
     # when an invalid-name operand shifts it into the assignment prefix.
@@ -4211,8 +4250,10 @@ PERMISSION_R13_CASES: list[dict[str, Any]] = [
     # (6) env's attached option spellings are option operands, not
     # assignments: --unset=BAR and --chdir=. match their separate
     # counterparts (both admitted — the invocation-wide loop used to
-    # policy-deny the attached spellings as non-uppercase assignments).
-    # The assignment checks still fire for genuine assignment operands.
+    # policy-deny the attached spellings as assignments). The assignment
+    # checks still fire for genuine assignment operands, and an invalid-name
+    # operand is consumed and admitted since v0.7.8 P1d (its row keeps the
+    # operand-consumption evidence; the HOME row keeps the name-table one).
     {"argv": ["env", "FOO=bar", "--unset=BAR", "curl", "http://127.0.0.1/x"]},
     {"argv": ["env", "FOO=bar", "--unset", "BAR", "curl", "http://127.0.0.1/x"]},
     {"argv": ["env", "FOO=bar", "--chdir=.", "curl", "http://127.0.0.1/x"]},
@@ -4315,14 +4356,17 @@ PERMISSION_R14_CASES: list[dict[str, Any]] = (
 
 
 PERMISSION_R15_CASES: list[dict[str, Any]] = [
-    # A3 R15: the clean-tree checkout exemption's guardrail states, one
-    # fixture per state (build_git_workflow_fixtures). On the clean
-    # repository every guardrail passes and both exempt forms ride the
-    # exemption; every other state fails closed to the existing approval
-    # class.
+    # A3 R15 + P3: the checkout states, one fixture per state
+    # (build_git_workflow_fixtures). The existing-branch switch rides the
+    # state-aware exemption on the clean repository and fails closed to the
+    # existing approval class in every other state. The branch creation is
+    # routine for every state — the dirty tree and the in-progress markers
+    # do not gate it — except under a program-selecting configuration,
+    # which keeps its approval class (the post-checkout hook it would run).
     {"argv": ["git", "checkout", "topic"], "cwd": "gw-clean"},
     {"argv": ["git", "checkout", "-b", "feature"], "cwd": "gw-clean"},
-    # An unsaved modification dirties the tree: fail closed.
+    # An unsaved modification dirties the tree: the switch fails closed, the
+    # creation stays routine (the P3 rows pin the dirty-and-start-point form).
     {"argv": ["git", "checkout", "topic"], "cwd": "gw-dirty"},
     {"argv": ["git", "checkout", "-b", "feature"], "cwd": "gw-dirty"},
     # The in-progress markers each fail closed on an otherwise clean tree,
@@ -4331,7 +4375,9 @@ PERMISSION_R15_CASES: list[dict[str, Any]] = [
     {"argv": ["git", "checkout", "-b", "feature"], "cwd": "gw-merge-in-progress"},
     {"argv": ["git", "checkout", "topic"], "cwd": "gw-rebase-in-progress"},
     {"argv": ["git", "checkout", "-b", "feature"], "cwd": "gw-rebase-in-progress"},
-    # A program-selecting configuration fails closed.
+    # A program-selecting configuration fails closed for the switch and keeps
+    # the creation's consequential approval class (the P3 rows add the
+    # start-point form).
     {"argv": ["git", "checkout", "topic"], "cwd": "gw-hookspath"},
     {"argv": ["git", "checkout", "-b", "feature"], "cwd": "gw-hookspath"},
     # Publication status does not gate the exemption — checkout rewrites no
@@ -4341,16 +4387,20 @@ PERMISSION_R15_CASES: list[dict[str, Any]] = [
     {"argv": ["git", "checkout", "topic"], "cwd": "gw-published"},
     # Unestablishable state fails closed: a directory governed by no
     # repository, and a corrupted git dir whose state probes cannot be
-    # established (the recursive-rm fixtures reused here).
+    # established (the recursive-rm fixtures reused here). The creation gate
+    # fails closed the same way, because it cannot read the config of a
+    # repository it cannot locate (the P3 rows pin that).
     {"argv": ["git", "checkout", "main"], "cwd": "rm-norepo"},
     {"argv": ["git", "checkout", "main"], "cwd": "rm-corrupt"},
 ]
 
 
 PERMISSION_R16_CASES: list[dict[str, Any]] = [
-    # A3 R16: the git-workflow permission surface, pinned against the
-    # gw-clean / gw-published fixtures.
-    # The exempt shapes resolve run-class (always) on the clean tree.
+    # A3 R16 + P3: the git-workflow permission surface, pinned against the
+    # gw-clean / gw-published / gw-dirty fixtures.
+    # The switch forms resolve run-class (always) on the clean tree, and the
+    # creation forms are routine for every repository state (the appended P3
+    # rows pin the dirty, hookspath, no-repository, and composed states).
     {"argv": ["git", "checkout", "main"], "cwd": "gw-clean"},
     {"argv": ["git", "checkout", "topic"], "cwd": "gw-clean"},
     {"argv": ["git", "checkout", "-b", "feature"], "cwd": "gw-clean"},
@@ -4486,12 +4536,14 @@ PERMISSION_S1_CASES: list[dict[str, Any]] = [
     {"argv": [], "raw": "ls > out.txt; echo $?"},
     {"argv": [], "raw": "env ls; echo $?"},
     {"argv": [], "raw": "ls; echo $?; id"},
-    # Equals-marker negatives: the unquoted live forms and a marker that can
-    # still expand past one word.
-    {"argv": [], "raw": "echo =ls"},
-    {"argv": [], "raw": "echo ===X==="},
-    {"argv": [], "raw": "echo '='*"},
-    {"argv": [], "raw": "echo =$(id)"},
+    # Equals-marker negatives, pinned to the zsh executor: zsh expands an
+    # unquoted leading marker, so the live forms and a marker that can still
+    # expand past one word stay denied there (the shipped bash default, which
+    # never expands the marker, has its own rows in PERMISSION_P1A_CASES).
+    {"argv": [], "raw": "echo =ls", "shell": "zsh"},
+    {"argv": [], "raw": "echo ===X===", "shell": "zsh"},
+    {"argv": [], "raw": "echo '='*", "shell": "zsh"},
+    {"argv": [], "raw": "echo =$(id)", "shell": "zsh"},
     # KEEP-DENIED classes.
     {"argv": [], "raw": "echo $(id)"},
     {"argv": [], "raw": "for i in 1 2; do echo $i; done"},
@@ -4953,6 +5005,275 @@ PERMISSION_F2_CASES: list[dict[str, Any]] = [
 ]
 
 
+# v0.7.8 P1d: the environment-assignment relaxation. The uppercase-only name
+# rule is gone at every enforcement site (the assignment analysis, the env
+# operand twin, and the export/declare re-encodings), the temp-dir and uv
+# cache/project-environment names leave the protected table, and absolute
+# PYTHONPATH entries are admitted because the documented worktree recipe
+# needs them. The admission rows come first (the recipe spellings, the
+# relocation-only names, any-case names in every form), then the retained
+# denials (traversing, tilde and empty PYTHONPATH entries; the code-injection
+# name table and its prefixes in every form; the literal-value and
+# no-substitution checks, which still fire whatever the name's case), then
+# the two controls that show what P1d did NOT touch: a leading invalid-name
+# env operand still fails closed at admission, and a non-loopback proxy
+# assignment in a lower-case-mixed operand run still resolves ask-class.
+PERMISSION_P1D_CASES: list[dict[str, Any]] = [
+    # The worktree recipe as written: an absolute PYTHONPATH entry prefixing
+    # the uv run, and the same entry through a cd-chain segment.
+    {"argv": [], "raw": "PYTHONPATH=/opt/chartreux/worktree uv run --no-sync pytest"},
+    {
+        "argv": [],
+        "raw": "cd . && PYTHONPATH=/opt/chartreux uv run --project . --no-sync pytest",
+    },
+    {
+        "argv": [],
+        "raw": (
+            "env PYTHONPATH=/opt/chartreux UV_CACHE_DIR=/tmp/uv uv run --no-sync pytest"
+        ),
+    },
+    # The relocation-only names: where files land, not what code runs.
+    {"argv": [], "raw": "UV_CACHE_DIR=/tmp/uv-cache uv run --no-sync pytest"},
+    {"argv": [], "raw": "UV_PROJECT_ENVIRONMENT=/tmp/env uv run --no-sync pytest"},
+    {"argv": [], "raw": "TMPDIR=/tmp/x uv run --no-sync pytest"},
+    {"argv": [], "raw": "TMP=/tmp/x uv run --no-sync pytest"},
+    {"argv": [], "raw": "TEMP=/tmp/x uv run --no-sync pytest"},
+    {"argv": [], "raw": "TMPDIR=/tmp/x git status"},
+    # Any-case names in every assignment form.
+    {"argv": [], "raw": "lower=value git status"},
+    {"argv": [], "raw": "env FOO=1 1X=1 git status"},
+    {"argv": [], "raw": "env FOO=1 lower=value git status"},
+    {"argv": [], "raw": "env FOO=1 x=1 git status"},
+    {"argv": [], "raw": "env FOO=1 TMPDIR=/tmp/x git status"},
+    {"argv": [], "raw": "env FOO=1 PYTHONPATH=/opt/wt git status"},
+    {"argv": [], "raw": "export PYTHONPATH=/opt/chartreux; git status"},
+    {"argv": [], "raw": "declare -x PYTHONPATH=/opt/chartreux; git status"},
+    # Retained: PYTHONPATH entries that traverse or do not name a directory.
+    {"argv": [], "raw": "PYTHONPATH=../lib uv run --no-sync pytest"},
+    {"argv": [], "raw": "PYTHONPATH=~/lib uv run --no-sync pytest"},
+    {"argv": [], "raw": "PYTHONPATH= uv run --no-sync pytest"},
+    {"argv": [], "raw": "env FOO=1 PYTHONPATH=../wt git status"},
+    # Retained: the code-injection name table and its prefixes, in every
+    # assignment form (command prefix, env operand, export/declare).
+    {"argv": [], "raw": "HOME=/tmp git status"},
+    {"argv": [], "raw": "env HOME=/tmp git status"},
+    {"argv": [], "raw": "export HOME=/tmp; git status"},
+    {"argv": [], "raw": "declare -x HOME=/tmp; git status"},
+    {"argv": [], "raw": "PATH=/tmp git status"},
+    {"argv": [], "raw": "LD_PRELOAD=x ls"},
+    {"argv": [], "raw": "GIT_DIR=x git status"},
+    {"argv": [], "raw": "DYLD_INSERT_LIBRARIES=x ls"},
+    {"argv": [], "raw": "NPM_CONFIG_USERCONFIG=x ls"},
+    {"argv": [], "raw": "PYTHONINSPECT=1 python -V"},
+    {"argv": [], "raw": "PYTHONSTARTUP=x python -V"},
+    # Retained: the literal-value check fires whatever the name's case.
+    {"argv": [], "raw": "lower=$X git status"},
+    # The egress gate still composes through the relaxed operand run.
+    {
+        "argv": [],
+        "raw": ("env FOO=1 1X=1 HTTP_PROXY=http://evil:3128 curl http://127.0.0.1/x"),
+    },
+    {
+        "argv": [],
+        "raw": (
+            "env FOO=1 1X=1 HTTP_PROXY=http://127.0.0.1:3128 curl http://127.0.0.1/x"
+        ),
+    },
+    # Control: a leading invalid-name operand still fails closed at
+    # admission (the env boundary engine, untouched by P1d).
+    {"argv": [], "raw": "env 1X=1 git status"},
+]
+
+
+# v0.7.8 P1a: the equals-expansion family is gated on the resolved executor.
+# Under the zsh executor an unquoted leading `=` is live expansion, so the
+# equals rules fire; under the shipped bash default the same words are one
+# literal argument each and the rules do not. The named-directory and
+# symlink-following star checks are NOT equals rules, so they keep firing
+# under every family. Every row pins its executor: the recorded verdict must
+# not depend on the recording host's ambient $SHELL.
+PERMISSION_P1A_CASES: list[dict[str, Any]] = [
+    # The zsh family: the live marker and the still-expanding marker deny.
+    {"argv": [], "raw": "echo =ls", "shell": "zsh"},
+    {"argv": [], "raw": "echo ===X===", "shell": "zsh"},
+    {"argv": [], "raw": "echo '='*", "shell": "zsh"},
+    # The shipped bash default: the marker is literal, so the same words are
+    # admitted. An argument-position equals word has no other policy surface.
+    {"argv": [], "raw": "echo =ls", "shell": "bash"},
+    {"argv": [], "raw": "echo ===X===", "shell": "bash"},
+    {"argv": [], "raw": "echo === hi", "shell": "bash"},
+    # Non-equals checks stay: a named-directory tilde and a star run.
+    {"argv": [], "raw": "echo ~user", "shell": "bash"},
+    {"argv": [], "raw": "echo ***", "shell": "bash"},
+    {"argv": [], "raw": "echo ~user", "shell": "zsh"},
+    {"argv": [], "raw": "echo ***", "shell": "zsh"},
+]
+
+
+# v0.7.8 P1c: the read-position expansions (ls, the sort/uniq input operands,
+# find's name tests) and the widened same-invocation status probe are admitted;
+# the table-classified WRITE operands (sort -o, uniq's second positional) stay
+# denied for expanded values (I8-F1). The rows resolve through the shipped
+# policy exactly as the analyzer renders them, so the recorded verdicts are
+# the end-to-end permission classes, not the analyzer's internal admission.
+PERMISSION_P1C_CASES: list[dict[str, Any]] = [
+    # Positive read-position admissions: unquoted and quoted spellings.
+    {"argv": [], "raw": "X=f.txt; ls $X"},
+    {"argv": [], "raw": "X=f.txt; sort $X"},
+    {"argv": [], "raw": "X=f.txt; uniq $X"},
+    {"argv": [], "raw": "X=2; uniq -f $X f.txt"},
+    {"argv": [], "raw": "X=needle; find . -name $X"},
+    {"argv": [], "raw": "X=needle; find . -iname $X"},
+    {"argv": [], "raw": 'X=f.txt; ls "$X"'},
+    {"argv": [], "raw": 'X=f.txt; sort "$X"'},
+    {"argv": [], "raw": 'X=f.txt; uniq "$X"'},
+    # The widened status probe: the quoted word keeps the executed source.
+    {"argv": [], "raw": 'ls; echo "EXIT:$?"'},
+    {"argv": [], "raw": 'ls; printf "EXIT:$?"'},
+    # Exclusion regressions (I8-F1): the write operands stay denied.
+    {"argv": [], "raw": "X=out.txt; sort -o $X in.txt"},
+    {"argv": [], "raw": "X=out.txt; sort --output $X in.txt"},
+    {"argv": [], "raw": "X=out.txt; sort --output=$X in.txt"},
+    {"argv": [], "raw": "X=a.txt; uniq src.txt $X"},
+    {"argv": [], "raw": 'X=out.txt; sort -o "$X" in.txt'},
+    {"argv": [], "raw": 'X=a.txt; uniq src.txt "$X"'},
+    # Near misses keep the ordinary expansion denial.
+    {"argv": [], "raw": "ls; echo EXIT:$?"},
+    {"argv": [], "raw": 'ls; echo "EXIT:$?"; id'},
+    {"argv": [], "raw": 'ls; echo "EXIT:$?" extra'},
+    # Attached-option spellings: sort's own option policy still denies the
+    # write, and find's dash-leading pattern operand is not a positional.
+    {"argv": [], "raw": "X=merged.txt; sort -o$X in.txt"},
+    {"argv": [], "raw": "X=pat; find . -name$X"},
+]
+
+
+# v0.7.8 P1e/P2: quoted heredocs and the glob option-token defect. A heredoc
+# whose delimiter is quoted feeds a literal body to a modeled stdin consumer
+# (a reader or an interpreter reading its program from stdin) and is admitted; an
+# unquoted delimiter expands and stays denied, as does a body fed to any other
+# invocation. The glob rows pin the option-token reorder: a NON-GLOB operand
+# call reaches the ordinary path, while a glob-bearing option call keeps its
+# denial; the whitelist grows to the sort/uniq read modals with the
+# table-classified write position still refused (I8-F1).
+PERMISSION_P1EP2_CASES: list[dict[str, Any]] = [
+    # Quoted heredocs feeding modeled stdin consumers.
+    {"argv": [], "raw": "cat <<'EOF'\nhi\nEOF"},
+    {"argv": [], "raw": 'cat <<"EOF"\nhi\nEOF'},
+    {"argv": [], "raw": "cat <<\\EOF\nhi\nEOF"},
+    {"argv": [], "raw": "wc -l <<'EOF'\nhi\nEOF"},
+    {"argv": [], "raw": "sort <<'EOF'\nb\na\nEOF"},
+    {"argv": [], "raw": "uniq <<'EOF'\na\nb\nEOF"},
+    {"argv": [], "raw": "grep hi <<'EOF'\nhi\nEOF"},
+    {"argv": [], "raw": "python3 - <<'EOF'\nprint(1)\nEOF"},
+    # An unquoted delimiter expands the body: denied as before.
+    {"argv": [], "raw": "cat <<EOF\nhi\nEOF"},
+    {"argv": [], "raw": "python3 - <<EOF\nprint(1)\nEOF"},
+    # A quoted body fed to a non-consumer is a nested script, not data.
+    {"argv": [], "raw": "sh <<'EOF'\ngit push\nEOF"},
+    {"argv": [], "raw": "bash -e <<'EOF'\necho hi\nEOF"},
+    # P2: a non-glob option call is an ordinary literal call.
+    {"argv": [], "raw": "wc -l alpha.txt", "cwd": "glob-whitelist/ok"},
+    {"argv": [], "raw": "cat -n alpha.txt", "cwd": "glob-whitelist/ok"},
+    {"argv": [], "raw": "head -n 1 alpha.txt", "cwd": "glob-whitelist/ok"},
+    {"argv": [], "raw": "sort alpha.txt", "cwd": "glob-whitelist/ok"},
+    {"argv": [], "raw": "uniq alpha.txt", "cwd": "glob-whitelist/ok"},
+    # A glob-bearing option call keeps its denial-correct refusal.
+    {"argv": [], "raw": "wc -l *.txt", "cwd": "glob-whitelist/ok"},
+    {"argv": [], "raw": "cat -n *.txt", "cwd": "glob-whitelist/ok"},
+    # The whitelist grows to the read modals; uniq's write position refuses.
+    {"argv": [], "raw": "sort *.txt", "cwd": "glob-whitelist/ok"},
+    {"argv": [], "raw": "uniq *.txt", "cwd": "glob-whitelist/ok"},
+    {"argv": [], "raw": "sort *.txt", "cwd": "glob-whitelist/option-like"},
+    {"argv": [], "raw": "uniq *.nomatch", "cwd": "glob-whitelist/ok"},
+    # The write option keeps its own denial on the grown set.
+    {"argv": [], "raw": "sort -o sorted.txt *.txt", "cwd": "glob-whitelist/ok"},
+]
+
+
+PERMISSION_P3_CASES: list[dict[str, Any]] = [
+    # P3: the routine branch creation, appended at the family's end so every
+    # earlier entry keeps its recorded id. The dirty tree and the start-point
+    # form are the anecdote's states; the composed form is admitted without
+    # the whole-call gate (the injection stays whole-call-only).
+    {"argv": ["git", "checkout", "-b", "feature", "main"], "cwd": "gw-dirty"},
+    {"argv": ["git", "checkout", "-b", "feature", "main"], "cwd": "gw-hookspath"},
+    {"argv": ["git", "checkout", "-b", "feature"], "cwd": "rm-norepo"},
+    {"argv": [], "raw": "git checkout -b feature && git status", "cwd": "gw-dirty"},
+]
+
+
+# v0.7.8 P4/P5: the session-scratchpad recursive-rm carve-out and the modeled
+# read-only xargs dispatch, appended at the family's end so every earlier entry
+# keeps its recorded id. A ``"scratchpad": True`` row resolves with the built
+# scratchpad fixture root as the tool's own scratchpad and spells that root
+# ``<SCRATCHPAD>``. The admissions are pinned WITH their exclusions: the root
+# itself, a symlink resolving outside it, a mixed operand, an outside target,
+# and an unestablishable call footprint stay hard guards; uniq's output operand
+# and sort -o keep xargs denied, and an unmodeled subcommand or option keeps the
+# blanket denial.
+PERMISSION_P4P5_CASES: list[dict[str, Any]] = [
+    # P4 admissions: every operand canonically inside the scratchpad root.
+    {"argv": [], "raw": "rm -r <SCRATCHPAD>/work", "scratchpad": True},
+    {"argv": [], "raw": "rm -rf <SCRATCHPAD>/work/notes.txt", "scratchpad": True},
+    {
+        "argv": [],
+        "raw": "rm -r <SCRATCHPAD>/work <SCRATCHPAD>/more",
+        "scratchpad": True,
+    },
+    {"argv": [], "raw": "rm -r -- <SCRATCHPAD>/more", "scratchpad": True},
+    # The scratchpad root itself is not a deletable operand.
+    {"argv": [], "raw": "rm -r <SCRATCHPAD>", "scratchpad": True},
+    {"argv": [], "raw": "rm -rf <SCRATCHPAD>/", "scratchpad": True},
+    # A symlink that resolves outside the root is refused on the resolved path.
+    {"argv": [], "raw": "rm -r <SCRATCHPAD>/escape", "scratchpad": True},
+    {"argv": [], "raw": "rm -r <SCRATCHPAD>/escape-file", "scratchpad": True},
+    # A mixed operand, an outside target, and an unestablishable footprint.
+    {
+        "argv": [],
+        "raw": "rm -r <SCRATCHPAD>/work scratchpad-outside",
+        "scratchpad": True,
+    },
+    {"argv": [], "raw": "rm -r scratchpad-outside", "scratchpad": True},
+    {"argv": [], "raw": "rm -r <SCRATCHPAD>/work; eval ls", "scratchpad": True},
+    # P5: the robust NUL-delimited dispatch is first-class.
+    {
+        "argv": [],
+        "raw": "find . -print0 | xargs -0 grep alpha",
+        "cwd": "glob-whitelist/ok",
+    },
+    {"argv": [], "raw": "find . -print0 | xargs -0 cat", "cwd": "glob-whitelist/ok"},
+    {"argv": [], "raw": "xargs -0 grep alpha alpha.txt", "cwd": "glob-whitelist/ok"},
+    {"argv": [], "raw": "xargs -0 wc -l alpha.txt", "cwd": "glob-whitelist/ok"},
+    {"argv": [], "raw": "xargs sort alpha.txt", "cwd": "glob-whitelist/ok"},
+    {"argv": [], "raw": "xargs -a alpha.txt cat", "cwd": "glob-whitelist/ok"},
+    {"argv": [], "raw": "xargs -0 -- cat alpha.txt", "cwd": "glob-whitelist/ok"},
+    # The table-classified WRITE operands keep xargs denied (I8-F1).
+    {"argv": [], "raw": "xargs uniq", "cwd": "glob-whitelist/ok"},
+    {"argv": [], "raw": "xargs uniq alpha.txt", "cwd": "glob-whitelist/ok"},
+    {"argv": [], "raw": "xargs sort -o out.txt alpha.txt", "cwd": "glob-whitelist/ok"},
+    {
+        "argv": [],
+        "raw": "xargs sort --output=out.txt alpha.txt",
+        "cwd": "glob-whitelist/ok",
+    },
+    {"argv": [], "raw": "xargs wc --files0-from alpha.txt", "cwd": "glob-whitelist/ok"},
+    # The dispatched command's operands keep their own denials.
+    {"argv": [], "raw": "xargs cat /etc/passwd", "cwd": "glob-whitelist/ok"},
+    {"argv": [], "raw": "xargs cat .env", "cwd": "glob-whitelist/ok"},
+    {"argv": [], "raw": "xargs -a /etc/passwd cat", "cwd": "glob-whitelist/ok"},
+    {"argv": [], "raw": "X=alpha.txt; xargs cat $X", "cwd": "glob-whitelist/ok"},
+    # Unmodeled subcommands, options, and option values stay fail-closed.
+    {"argv": [], "raw": "xargs git push", "cwd": "glob-whitelist/ok"},
+    {"argv": [], "raw": "xargs echo hi", "cwd": "glob-whitelist/ok"},
+    {"argv": [], "raw": "xargs rm -rf build", "cwd": "glob-whitelist/ok"},
+    {"argv": [], "raw": "xargs -p cat", "cwd": "glob-whitelist/ok"},
+    {"argv": [], "raw": "xargs -n", "cwd": "glob-whitelist/ok"},
+    {"argv": [], "raw": "xargs -0", "cwd": "glob-whitelist/ok"},
+    {"argv": [], "raw": "xargs", "cwd": "glob-whitelist/ok"},
+]
+
+
 # A3: the runtime-aware divergence records for the checkout exemption. The
 # frozen pure classifier still classifies every exempt form as a dangerous
 # git operation, while the runtime resolver grants it on the clean
@@ -5036,15 +5357,26 @@ def observe_permission(entry: dict[str, Any], root: Path) -> dict[str, Any]:
     not the recording host's interfaces or resolver. A row may name the
     executing shell (``"shell"``); the F1pkg2 trailing-star rows do, so their
     executor-family verdicts do not depend on the recording host's ``$SHELL``.
+    A row may also request the session scratchpad (``"scratchpad": True``): the
+    resolver then runs with the built scratchpad fixture root as the tool's own
+    scratchpad, and the recorded text spells that root ``<SCRATCHPAD>``.
     """
+    scratchpad = root / SCRATCHPAD_DIR if entry.get("scratchpad") else None
     if entry.get("raw") is not None:
         command = str(entry["raw"])
     else:
         command = shlex.join([str(token) for token in entry["argv"]])
+    if scratchpad is not None:
+        command = command.replace(SCRATCHPAD_TOKEN, str(scratchpad))
     # P2-c rows name the fixture directory the call resolves in; the rest
     # resolve in the fixture root itself.
     cwd = root / str(entry["cwd"]) if entry.get("cwd") else root
-    tool = Bash(config_getter=lambda: BashToolConfig(), state=BaseToolState(), cwd=cwd)
+    tool = Bash(
+        config_getter=lambda: BashToolConfig(),
+        state=BaseToolState(),
+        cwd=cwd,
+        scratchpad_dir=scratchpad,
+    )
     fixed_interfaces = frozenset({
         ipaddress.ip_address("192.168.10.20"),
         ipaddress.ip_address("fe80::1%eth0"),
@@ -5217,6 +5549,18 @@ def build_family_entries(family: str, root: Path) -> list[dict[str, Any]]:
         for case in PERMISSION_F1PKG3_CASES:
             add(case, observe_permission(case, root))
         for case in PERMISSION_F2_CASES:
+            add(case, observe_permission(case, root))
+        for case in PERMISSION_P1D_CASES:
+            add(case, observe_permission(case, root))
+        for case in PERMISSION_P1A_CASES:
+            add(case, observe_permission(case, root))
+        for case in PERMISSION_P1C_CASES:
+            add(case, observe_permission(case, root))
+        for case in PERMISSION_P1EP2_CASES:
+            add(case, observe_permission(case, root))
+        for case in PERMISSION_P3_CASES:
+            add(case, observe_permission(case, root))
+        for case in PERMISSION_P4P5_CASES:
             add(case, observe_permission(case, root))
     else:
         raise AssertionError(f"unknown corpus family: {family}")
@@ -5452,6 +5796,278 @@ def test_f2_https_rows_pin_the_intended_verdicts(fixtures_root: Path) -> None:
             assert context["denial_kind"] is None, key
             assert context["proposal"] is None, key
             assert str(context["reason"]).startswith("Command denied:"), key
+
+
+# The P1d rows' INTENDED verdicts, written independently of the recorded
+# corpus values: the reviewed diff checks every recorded row against this
+# table, so a recorder run can never silently bless a widened admission.
+# "admitted" is run-class, "ask" is the network.egress proposal, and "deny"
+# is a grammar denial with no approval path.
+_P1D_INTENDED_VERDICTS: dict[str, str] = {
+    # The worktree recipe and the relocation-only destinations.
+    "PYTHONPATH=/opt/chartreux/worktree uv run --no-sync pytest": "admitted",
+    "cd . && PYTHONPATH=/opt/chartreux uv run --project . --no-sync pytest": "admitted",
+    "env PYTHONPATH=/opt/chartreux UV_CACHE_DIR=/tmp/uv uv run --no-sync pytest": (
+        "admitted"
+    ),
+    "UV_CACHE_DIR=/tmp/uv-cache uv run --no-sync pytest": "admitted",
+    "UV_PROJECT_ENVIRONMENT=/tmp/env uv run --no-sync pytest": "admitted",
+    "TMPDIR=/tmp/x uv run --no-sync pytest": "admitted",
+    "TMP=/tmp/x uv run --no-sync pytest": "admitted",
+    "TEMP=/tmp/x uv run --no-sync pytest": "admitted",
+    "TMPDIR=/tmp/x git status": "admitted",
+    # Any-case names in every assignment form.
+    "lower=value git status": "admitted",
+    "env FOO=1 1X=1 git status": "admitted",
+    "env FOO=1 lower=value git status": "admitted",
+    "env FOO=1 x=1 git status": "admitted",
+    "env FOO=1 TMPDIR=/tmp/x git status": "admitted",
+    "env FOO=1 PYTHONPATH=/opt/wt git status": "admitted",
+    "export PYTHONPATH=/opt/chartreux; git status": "admitted",
+    "declare -x PYTHONPATH=/opt/chartreux; git status": "admitted",
+    # Retained PYTHONPATH entry denials.
+    "PYTHONPATH=../lib uv run --no-sync pytest": "deny",
+    "PYTHONPATH=~/lib uv run --no-sync pytest": "deny",
+    "PYTHONPATH= uv run --no-sync pytest": "deny",
+    "env FOO=1 PYTHONPATH=../wt git status": "deny",
+    # Retained protected names and prefixes, in every assignment form.
+    "HOME=/tmp git status": "deny",
+    "env HOME=/tmp git status": "deny",
+    "export HOME=/tmp; git status": "deny",
+    "declare -x HOME=/tmp; git status": "deny",
+    "PATH=/tmp git status": "deny",
+    "LD_PRELOAD=x ls": "deny",
+    "GIT_DIR=x git status": "deny",
+    "DYLD_INSERT_LIBRARIES=x ls": "deny",
+    "NPM_CONFIG_USERCONFIG=x ls": "deny",
+    "PYTHONINSPECT=1 python -V": "deny",
+    "PYTHONSTARTUP=x python -V": "deny",
+    # Retained literal-value check, whatever the name's case.
+    "lower=$X git status": "deny",
+    # The egress gate composes through the relaxed operand run.
+    "env FOO=1 1X=1 HTTP_PROXY=http://evil:3128 curl http://127.0.0.1/x": "ask",
+    "env FOO=1 1X=1 HTTP_PROXY=http://127.0.0.1:3128 curl http://127.0.0.1/x": (
+        "admitted"
+    ),
+    # A leading invalid-name operand still fails closed at admission.
+    "env 1X=1 git status": "deny",
+}
+
+
+def test_p1d_environment_rows_pin_the_intended_verdicts(fixtures_root: Path) -> None:
+    """Every P1d row resolves exactly as the reviewed intent says."""
+    assert len(_P1D_INTENDED_VERDICTS) == len(PERMISSION_P1D_CASES)
+    for case in PERMISSION_P1D_CASES:
+        key = case["raw"]
+        assert key in _P1D_INTENDED_VERDICTS, case
+        context = observe_permission(case, fixtures_root)["context"]
+        assert context is not None, key
+        intended = _P1D_INTENDED_VERDICTS[key]
+        if intended == "admitted":
+            assert context["permission"] == "always", key
+            continue
+        assert context["permission"] == "never", key
+        if intended == "ask":
+            assert context["denial_kind"] == "dangerous_command", key
+            proposal = context["proposal"]
+            assert proposal is not None, key
+            assert proposal["operations"] == ["network.egress"], key
+        else:
+            assert context["denial_kind"] is None, key
+            assert context["proposal"] is None, key
+            assert str(context["reason"]).startswith("Command denied:"), key
+
+
+# The P1a rows' INTENDED verdicts, written independently of the recorded
+# corpus values: the equals-expansion family is denied under zsh and literal
+# under the shipped bash default, while the non-equals word checks keep firing
+# under both. A recorder run can never silently bless a widened admission.
+_P1A_INTENDED_VERDICTS = {
+    ("echo =ls", "zsh"): "never",
+    ("echo ===X===", "zsh"): "never",
+    ("echo '='*", "zsh"): "never",
+    ("echo =ls", "bash"): "always",
+    ("echo ===X===", "bash"): "always",
+    ("echo === hi", "bash"): "always",
+    ("echo ~user", "bash"): "never",
+    ("echo ***", "bash"): "never",
+    ("echo ~user", "zsh"): "never",
+    ("echo ***", "zsh"): "never",
+}
+
+
+def test_p1a_executor_family_rows_pin_the_intended_verdicts(
+    fixtures_root: Path,
+) -> None:
+    """Every P1a row resolves exactly as the reviewed intent says."""
+    assert len(_P1A_INTENDED_VERDICTS) == len(PERMISSION_P1A_CASES)
+    for case in PERMISSION_P1A_CASES:
+        key = (case["raw"], case["shell"])
+        assert key in _P1A_INTENDED_VERDICTS, case
+        context = observe_permission(case, fixtures_root)["context"]
+        assert context is not None, key
+        assert context["permission"] == _P1A_INTENDED_VERDICTS[key], key
+
+
+# The P1c rows' INTENDED verdicts, written independently of the recorded
+# corpus values: an expanded value is admitted only in a table-classified READ
+# position, so the write operands (sort -o/--output, uniq's second positional)
+# and the probe near misses stay denied whatever the recorder observed.
+_P1C_INTENDED_VERDICTS: dict[str, str] = {
+    # Accepted read-position expansions, unquoted and quoted.
+    "X=f.txt; ls $X": "always",
+    "X=f.txt; sort $X": "always",
+    "X=f.txt; uniq $X": "always",
+    "X=2; uniq -f $X f.txt": "always",
+    "X=needle; find . -name $X": "always",
+    "X=needle; find . -iname $X": "always",
+    'X=f.txt; ls "$X"': "always",
+    'X=f.txt; sort "$X"': "always",
+    'X=f.txt; uniq "$X"': "always",
+    'ls; echo "EXIT:$?"': "always",
+    'ls; printf "EXIT:$?"': "always",
+    # I8-F1 exclusion regressions: the table-classified writes stay denied.
+    "X=out.txt; sort -o $X in.txt": "never",
+    "X=out.txt; sort --output $X in.txt": "never",
+    "X=out.txt; sort --output=$X in.txt": "never",
+    "X=a.txt; uniq src.txt $X": "never",
+    'X=out.txt; sort -o "$X" in.txt': "never",
+    'X=a.txt; uniq src.txt "$X"': "never",
+    # Probe near misses keep the ordinary expansion denial.
+    "ls; echo EXIT:$?": "never",
+    'ls; echo "EXIT:$?"; id': "never",
+    'ls; echo "EXIT:$?" extra': "never",
+    # Attached-option spellings stay denied end to end.
+    "X=merged.txt; sort -o$X in.txt": "never",
+    "X=pat; find . -name$X": "never",
+}
+
+
+def test_p1c_read_position_rows_pin_the_intended_verdicts(fixtures_root: Path) -> None:
+    """Every P1c row resolves exactly as the reviewed intent says."""
+    assert len(_P1C_INTENDED_VERDICTS) == len(PERMISSION_P1C_CASES)
+    for case in PERMISSION_P1C_CASES:
+        key = case["raw"]
+        assert key in _P1C_INTENDED_VERDICTS, case
+        context = observe_permission(case, fixtures_root)["context"]
+        assert context is not None, key
+        assert context["permission"] == _P1C_INTENDED_VERDICTS[key], key
+
+
+# The P1e/P2 rows' INTENDED verdicts, written independently of the recorded
+# corpus values: a QUOTED delimiter admits the body to a modeled stdin
+# consumer, an unquoted delimiter and a non-consumer stay denied, and a
+# non-glob option call reaches the ordinary path while a glob-bearing option
+# call and uniq's write position keep their denials.
+_P1EP2_INTENDED_VERDICTS: dict[tuple[str, str], str] = {
+    # Quoted heredocs feeding modeled stdin consumers.
+    ("cat <<'EOF'\nhi\nEOF", ""): "always",
+    ('cat <<"EOF"\nhi\nEOF', ""): "always",
+    ("cat <<\\EOF\nhi\nEOF", ""): "always",
+    ("wc -l <<'EOF'\nhi\nEOF", ""): "always",
+    ("sort <<'EOF'\nb\na\nEOF", ""): "always",
+    ("uniq <<'EOF'\na\nb\nEOF", ""): "always",
+    ("grep hi <<'EOF'\nhi\nEOF", ""): "always",
+    ("python3 - <<'EOF'\nprint(1)\nEOF", ""): "always",
+    # An unquoted delimiter expands the body.
+    ("cat <<EOF\nhi\nEOF", ""): "never",
+    ("python3 - <<EOF\nprint(1)\nEOF", ""): "never",
+    # A quoted body fed to a non-consumer is a nested script, not data.
+    ("sh <<'EOF'\ngit push\nEOF", ""): "never",
+    ("bash -e <<'EOF'\necho hi\nEOF", ""): "never",
+    # P2: a non-glob option call is an ordinary literal call.
+    ("wc -l alpha.txt", "glob-whitelist/ok"): "always",
+    ("cat -n alpha.txt", "glob-whitelist/ok"): "always",
+    ("head -n 1 alpha.txt", "glob-whitelist/ok"): "always",
+    ("sort alpha.txt", "glob-whitelist/ok"): "always",
+    ("uniq alpha.txt", "glob-whitelist/ok"): "always",
+    # A glob-bearing option call stays denial-correct.
+    ("wc -l *.txt", "glob-whitelist/ok"): "never",
+    ("cat -n *.txt", "glob-whitelist/ok"): "never",
+    # The grown whitelist, and the write-position refusal (the option-like
+    # fixture's dash-leading match keeps its caller-side denial).
+    ("sort *.txt", "glob-whitelist/ok"): "always",
+    ("uniq *.txt", "glob-whitelist/ok"): "never",
+    ("sort *.txt", "glob-whitelist/option-like"): "never",
+    ("uniq *.nomatch", "glob-whitelist/ok"): "never",
+    # The write option keeps its own denial on the grown set.
+    ("sort -o sorted.txt *.txt", "glob-whitelist/ok"): "never",
+}
+
+
+def test_p1ep2_heredoc_and_glob_option_rows_pin_the_intended_verdicts(
+    fixtures_root: Path,
+) -> None:
+    """Every P1e/P2 row resolves exactly as the reviewed intent says."""
+    assert len(_P1EP2_INTENDED_VERDICTS) == len(PERMISSION_P1EP2_CASES)
+    for case in PERMISSION_P1EP2_CASES:
+        key = (case["raw"], case.get("cwd", ""))
+        assert key in _P1EP2_INTENDED_VERDICTS, case
+        context = observe_permission(case, fixtures_root)["context"]
+        assert context is not None, key
+        assert context["permission"] == _P1EP2_INTENDED_VERDICTS[key], key
+
+
+# The P4/P5 rows' INTENDED verdicts, written independently of the recorded
+# corpus values: a recursive rm is admitted only when every operand resolves
+# strictly inside the scratchpad root and the call footprint is establishable,
+# and xargs is admitted only for a modeled read subcommand whose words cannot
+# land in a write operand.
+_P4P5_INTENDED_VERDICTS: dict[tuple[str, str], str] = {
+    # P4: contained scratchpad deletions are run-class.
+    ("rm -r <SCRATCHPAD>/work", ""): "always",
+    ("rm -rf <SCRATCHPAD>/work/notes.txt", ""): "always",
+    ("rm -r <SCRATCHPAD>/work <SCRATCHPAD>/more", ""): "always",
+    ("rm -r -- <SCRATCHPAD>/more", ""): "always",
+    # The root, an escaping symlink, a mixed/outside operand, and an
+    # unestablishable footprint stay hard guards.
+    ("rm -r <SCRATCHPAD>", ""): "never",
+    ("rm -rf <SCRATCHPAD>/", ""): "never",
+    ("rm -r <SCRATCHPAD>/escape", ""): "never",
+    ("rm -r <SCRATCHPAD>/escape-file", ""): "never",
+    ("rm -r <SCRATCHPAD>/work scratchpad-outside", ""): "never",
+    ("rm -r scratchpad-outside", ""): "never",
+    ("rm -r <SCRATCHPAD>/work; eval ls", ""): "never",
+    # P5: modeled read dispatches, including the NUL-delimited pipeline.
+    ("find . -print0 | xargs -0 grep alpha", "glob-whitelist/ok"): "always",
+    ("find . -print0 | xargs -0 cat", "glob-whitelist/ok"): "always",
+    ("xargs -0 grep alpha alpha.txt", "glob-whitelist/ok"): "always",
+    ("xargs -0 wc -l alpha.txt", "glob-whitelist/ok"): "always",
+    ("xargs sort alpha.txt", "glob-whitelist/ok"): "always",
+    ("xargs -a alpha.txt cat", "glob-whitelist/ok"): "always",
+    ("xargs -0 -- cat alpha.txt", "glob-whitelist/ok"): "always",
+    # The write operands and the read-path/sensitive gates stay denied.
+    ("xargs uniq", "glob-whitelist/ok"): "never",
+    ("xargs uniq alpha.txt", "glob-whitelist/ok"): "never",
+    ("xargs sort -o out.txt alpha.txt", "glob-whitelist/ok"): "never",
+    ("xargs sort --output=out.txt alpha.txt", "glob-whitelist/ok"): "never",
+    ("xargs wc --files0-from alpha.txt", "glob-whitelist/ok"): "never",
+    ("xargs cat /etc/passwd", "glob-whitelist/ok"): "never",
+    ("xargs cat .env", "glob-whitelist/ok"): "never",
+    ("xargs -a /etc/passwd cat", "glob-whitelist/ok"): "never",
+    ("X=alpha.txt; xargs cat $X", "glob-whitelist/ok"): "never",
+    # Unmodeled dispatches stay fail-closed.
+    ("xargs git push", "glob-whitelist/ok"): "never",
+    ("xargs echo hi", "glob-whitelist/ok"): "never",
+    ("xargs rm -rf build", "glob-whitelist/ok"): "never",
+    ("xargs -p cat", "glob-whitelist/ok"): "never",
+    ("xargs -n", "glob-whitelist/ok"): "never",
+    ("xargs -0", "glob-whitelist/ok"): "never",
+    ("xargs", "glob-whitelist/ok"): "never",
+}
+
+
+def test_p4p5_scratchpad_and_xargs_rows_pin_the_intended_verdicts(
+    fixtures_root: Path,
+) -> None:
+    """Every P4/P5 row resolves exactly as the reviewed intent says."""
+    assert len(_P4P5_INTENDED_VERDICTS) == len(PERMISSION_P4P5_CASES)
+    for case in PERMISSION_P4P5_CASES:
+        key = (case["raw"], case.get("cwd", ""))
+        assert key in _P4P5_INTENDED_VERDICTS, case
+        context = observe_permission(case, fixtures_root)["context"]
+        assert context is not None, key
+        assert context["permission"] == _P4P5_INTENDED_VERDICTS[key], key
 
 
 # The two table-driven denial texts the policy layer emits for unmodeled
@@ -5749,6 +6365,7 @@ def main(argv: list[str] | None = None) -> int:
         build_curl_destination_fixtures(root)
         build_glob_fixtures(root)
         build_git_workflow_fixtures(root)
+        build_scratchpad_fixtures(root)
         entries = build_entries(root)
     text = serialize_entries(entries)
     if args.record:

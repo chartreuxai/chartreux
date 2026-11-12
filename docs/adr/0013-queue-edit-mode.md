@@ -15,8 +15,12 @@ In selection mode:
 - Escape exits queue mode and restores the original draft.
 
 Submitting an edit calls `app_server/session/turn/queue/replace`. The server
-keeps the prompt's queue ID and FIFO position. Shell commands and slash commands
-are never present because the app-server queue accepts user turns only.
+keeps the prompt's queue ID and FIFO position. Slash commands are never present
+because they are not queue items. A manual `!` shell input IS a queue item — it
+shares the queue with prompts and keeps its FIFO place — but it is not text the
+user edits: selection mode applies to queued prompts only, and the queue model
+exposes the shell input as its own entry kind so a client never mistakes it for
+an editable prompt.
 
 When the agent is busy and the queue is empty, Up falls back to normal history
 navigation.
@@ -98,7 +102,8 @@ persistent input history with temporary app-server queue entries.
 
 ## Flag To User When
 
-- Shell commands or slash commands are added to queue selection.
+- Shell inputs appear in queue selection. They are not editable text; the
+  editable queue is prompts only.
 - An edit bypasses `queue/replace` or a removal bypasses `queue/remove`.
 - A cached numeric index is used after an `await` without re-resolving the
   selected widget.

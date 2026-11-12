@@ -38,6 +38,9 @@ _ENVIRONMENT_CONTROLS = frozenset({
     # (WP1 [1A]): read by the CLI and the app-server bootstrap, never config.
     "TRANSPORT",
     "PROCESS_BOOTSTRAP",
+    # The resolved shell executor a parent publishes into its spawned root
+    # agent's environment (v0.7.8 P1b): read by the shell layer, never config.
+    "SHELL_EXECUTOR",
 })
 
 # Retired configuration inputs (design §12; package 16a) are recognized BEFORE

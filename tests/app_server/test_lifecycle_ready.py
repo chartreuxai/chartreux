@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 from inspect import signature
+import json
 from pathlib import Path
 import sys
 import time
@@ -341,3 +342,19 @@ def test_the_child_spawn_adapter_owns_a_default_tree_budget() -> None:
     port = ProcessSubagentSpawn()
 
     assert port._budget.capacity == DEFAULT_MAX_CHILD_PROCESSES
+
+
+def test_the_ready_frame_publishes_no_directory_claims() -> None:
+    """S9-C4: the jobs directory publishes in the open reply, not the ready frame.
+
+    Jobs cannot spawn before the session is open, so the startup frame carries
+    the installed protocol version and nothing else; the open reply (and the
+    identity-transition replies after it) is where the directories travel.
+    """
+    payload = json.loads(encode_ready_frame().decode())
+
+    assert payload == {
+        "chartreuxBootstrap": "ready",
+        "protocolVersion": PROCESS_PROTOCOL_VERSION,
+    }
+    assert not {"jobs_dir", "session_dir", "jobs"} & payload.keys()

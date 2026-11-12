@@ -400,8 +400,11 @@ def test_commit_signature_uses_literal_shell_syntax(
 
     assert "Co-Authored-By: Chartreux" in prompt
     assert "git commit -m '<Commit message here>'" in prompt
-    assert "$(" not in prompt
-    assert "<<" not in prompt
+    start = prompt.index("When you want to commit changes")
+    end = prompt.index("```", prompt.index("```bash", start) + 3) + 3
+    signature = prompt[start:end]
+    assert "$(" not in signature
+    assert "<<" not in signature
 
 
 def test_scratchpad_section_included_when_passed(
@@ -1228,6 +1231,136 @@ def test_orchestrator_identity_carries_the_failure_time_replacement_paragraph() 
     assert "never route a substantive package to a mechanical-tier model" in prompt
     assert "A HEAD/branch/workspace preflight stop stays a stop" in prompt
     assert "park it and continue independent work" in prompt
+
+
+def test_composed_orchestrator_prompt_carries_the_escalation_ladder(
+    build_config: ConfigBuilder,
+    load_orchestrator: OrchestratorLoader[ChartreuxConfigSchema],
+) -> None:
+    """v0.7.8 item 3: the composed orchestrator prompt carries the dispatch
+    escalation ladder — the configured canonical chain in order with its
+    terminal fallback, one deliberate same-rung retry at every rung, the
+    two-leg rung entry with skip-and-continue, the reconcile-first discipline
+    on unclaimed legs, the out-of-chain entry rule, and the reset-on-completion
+    scope — and it stays orchestrator dispatch policy, never harness fallback.
+    """
+    prompt = _compose_orchestrator_prompt(build_config, load_orchestrator)
+
+    assert "**Escalation ladder.**" in prompt
+    chain = (
+        "`zai-glm-5-3-flash`",
+        "`deepseek-v4-1-flash-1017`",
+        "`mistral-large-4`",
+        "`zai-glm-5-3`",
+        "`gpt-6.1-terra`",
+    )
+    for model in chain:
+        assert model in prompt
+    positions = [prompt.index(model) for model in chain]
+    assert positions == sorted(positions)
+    assert "`zai-glm-5-3` as the terminal fallback after a terra failure" in prompt
+    # One deliberate retry per rung, uniform across the initial, escalated, and
+    # fallback rungs.
+    assert "Every rung — the initial dispatch's model, each escalated rung" in prompt
+    assert "receives exactly one deliberate same-rung retry" in prompt
+    assert (
+        "an explicit `resume_agent` where the run is suspended and admissible" in prompt
+    )
+    assert "only a failed retry escalates one rung" in prompt
+    # The two-leg rung entry: the validated claim versus the intra-family launch.
+    assert "Endpoint-independent rungs ride the validated lineage claim" in prompt
+    assert (
+        "a claim any guard declines forfeits that rung — skip it and continue "
+        "down the chain, never read a guard-fired decline as exhaustion" in prompt
+    )
+    assert (
+        "an intra-family rung sharing the failed attempt's endpoint identity "
+        "launches as an unclaimed fresh task of the same briefing" in prompt
+    )
+    # Reconcile-first on unclaimed legs, including the prohibited disposition.
+    assert "Unclaimed legs reconcile first" in prompt
+    assert "`reconcile_result` and verified dispositions" in prompt
+    assert (
+        "a prohibited disposition — unrepeatable damage — parks the task and is "
+        "never relaunched" in prompt
+    )
+    # Out-of-chain entry at the nearest family rung, else the glm5.3 rung.
+    assert "enters at the nearest canonical-family rung" in prompt
+    assert "an unknown family enters at the `zai-glm-5-3` rung" in prompt
+    # The pinned no-automatic-fallback claim holds; the intra-family leg is the
+    # one scoped precedence exception, not a second fallback mechanism.
+    assert "there is no automatic cross-model fallback" in prompt
+    assert (
+        "the intra-family leg is the one deliberate exception — for this ladder "
+        "only — to the endpoint-independence rule above" in prompt
+    )
+    # The ladder is scoped to the failed task.
+    assert (
+        "a task that completes successfully releases the ladder, and the next "
+        "task dispatches under normal policy" in prompt
+    )
+
+
+def test_composed_orchestrator_prompt_carries_the_protected_failures(
+    build_config: ConfigBuilder,
+    load_orchestrator: OrchestratorLoader[ChartreuxConfigSchema],
+) -> None:
+    """v0.7.8 item 3: protected classes never enter the ladder — the user-named
+    budget stop (typed ``budget_stop``) and the harness's full no-replacement
+    set park with the typed cause, and no unclaimed launch may route around the
+    protection — while a typed audit or completion rejection escalates
+    immediately through the lineage with no same-rung retry.
+    """
+    prompt = _compose_orchestrator_prompt(build_config, load_orchestrator)
+
+    assert "**Protected failures.**" in prompt
+    assert "A budget stop (the typed `budget_stop`)" in prompt
+    assert "takes no same-rung retry and no escalation" in prompt
+    assert (
+        "preflight, cancellation, authorization, permanent-config, "
+        "task-constraint, unknown-causation, and internal failures" in prompt
+    )
+    assert "equally outside the ladder in any form" in prompt
+    assert (
+        "never relaunch a protected failure unclaimed to route around that "
+        "protection" in prompt
+    )
+    assert (
+        "park the task with the typed cause named in the consolidated blocker "
+        "report" in prompt
+    )
+    assert (
+        "A typed audit or completion rejection is exempt the other way: escalate "
+        "it immediately through the existing lineage" in prompt
+    )
+    # Unattended resilience names the ladder as the treatment before parking.
+    assert (
+        "The escalation ladder is the standard treatment of a typed provider or "
+        "infrastructure failure" in prompt
+    )
+
+
+def test_composed_orchestrator_prompt_carries_the_notification_first_wait_rule(
+    build_config: ConfigBuilder,
+    load_orchestrator: OrchestratorLoader[ChartreuxConfigSchema],
+) -> None:
+    """v0.7.8 item 6: the orchestrator's lifecycle paragraph is notification-
+    first — collect on the completion notification, wait only on a hard
+    dependency — with its pinned lifecycle substrings preserved.
+    """
+    prompt = _compose_orchestrator_prompt(build_config, load_orchestrator)
+
+    assert (
+        "and collect it on the completion notification with `get_agent_result`"
+        in prompt
+    )
+    assert (
+        "wait with `wait_for_agent` only when the result is a hard dependency of "
+        "the next action and no other work can proceed" in prompt
+    )
+    assert "Manage delegated work through the agent-lifecycle tools" in prompt
+    assert "Launch in the background even when the result is a dependency" in prompt
+    assert "`still_running` timeout result is a normal outcome" in prompt
 
 
 def test_composed_orchestrator_prompt_narrows_the_first_hand_check_exceptions(

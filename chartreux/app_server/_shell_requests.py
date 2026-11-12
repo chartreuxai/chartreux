@@ -16,32 +16,31 @@ from chartreux.app_server._execution import SessionExecution, SessionExecutionKi
 from chartreux.app_server._model import validate_wire
 from chartreux.app_server._shell import (
     ShellController,
+    restored_shell_effect_state,
     shell_effect_cancelled,
     shell_effect_detail,
     shell_effect_error,
     shell_effect_state,
+    shell_result_status,
+)
+from chartreux.app_server._shell_record import (
+    ManualShellOutcome,
+    ManualShellRecord,
+    build_manual_shell_record,
 )
 from chartreux.app_server._turns import TurnController
 from chartreux.app_server._utils import now_ms
-from chartreux.app_server.models import TextContentBlock
 from chartreux.app_server.protocol import (
-    ContextInjectParams,
     ProtocolErrorCode,
     SessionShellCommandParams,
     SessionShellCommandResponse,
     ShellRunParams,
     ShellRunResponse,
+    TurnShellInputEntry,
 )
 from chartreux.core.agent_loop import AgentLoop
-from chartreux.core.llm_models import ManualShellContext
 from chartreux.core.tools import secret_redaction
-from chartreux.core.tools.builtins._remote_exec import RemoteExecDenial
-from chartreux.core.tools.builtins._shell_permission_resolver import (
-    remote_exec_plan_for_command,
-)
 from chartreux.core.tools.builtins.bash import BashToolConfig
-from chartreux.core.tools.utils import effective_scratchpad_roots
-from chartreux.core.utils.shell import terminal_shell_text_refusal
 
 
 class ShellRequestHandler:
@@ -59,6 +58,8 @@ class ShellRequestHandler:
         self._require_attached = require_attached
         self._current_event_id = current_event_id
         self._shell = ShellController(agent_loop.cwd)
+        # The queue owns when a queued shell input runs; this handler owns how.
+        turns.bind_shell_executor(self._execute_queued_shell)
 
     async def dispatch(self, method: str, raw_params: dict[str, Any]) -> DispatchResult:
         if method != "session/shellCommand":
@@ -78,68 +79,107 @@ class ShellRequestHandler:
     ) -> SessionShellCommandResponse:
         self._require_attached(params.session_id)
         command = params.command or ""
-        if not command.strip():
-            raise RequestFailure(
-                ProtocolErrorCode.INVALID_PARAMS, "Shell command cannot be empty"
-            )
-        # F1pkg1(a)/(c) terminal consumption contract: the session shell
-        # transport is non-attesting — it runs shell text under the ambient
-        # executor and no client attests one, so expansion refuses before any
-        # effect starts and before the executor is reached. Non-expanding
-        # text runs through the same spawn_shell_command that consumes the
-        # pinned executor contract at execution in this process (_shell.py),
-        # so the approved semantics equal the actual spawn.
-        refusal = terminal_shell_text_refusal(command)
-        if refusal is not None:
-            raise RequestFailure(ProtocolErrorCode.FORBIDDEN, refusal)
-        # S4b1b + S4b2a: the session shell spawns in this process, so its
-        # executor is the server itself — attested by construction. A
-        # standalone ssh invocation with a positive destination (literal IP,
-        # or a hostname resolved uniquely non-local) runs with the pinned
-        # plan (resolved address + fixed host-key identity in the actual
-        # argv); every other ssh spelling hard-refuses here, before any
-        # effect starts. The manual `!` path is direct user authority, so no
-        # model-side grant flow applies — but the pin still lands at the spawn.
-        try:
-            path_authority = self._agent_loop.tool_manager.path_authority("bash")
-            remote_plan = remote_exec_plan_for_command(
-                command,
-                cwd=self._agent_loop.cwd,
-                workspace=self._agent_loop.tool_manager.workspace,
-                authority=path_authority,
-                scratchpad_roots=effective_scratchpad_roots(path_authority),
-                workspace_roots=frozenset(
-                    self._agent_loop.tool_manager.workspace.authorized_roots
-                ),
-            )
-        except RemoteExecDenial as exc:
-            raise RequestFailure(ProtocolErrorCode.FORBIDDEN, str(exc)) from exc
-        if remote_plan is not None:
-            command = remote_plan.command
+        cwd = self._command_cwd(params.cwd)
         operation_id = params.operation_id or str(uuid4())
-        run_params = ShellRunParams(
+        if not command.strip():
+            # Item 5 B.1: the empty-input no-op is the one remaining refusal,
+            # and it still produces the one record. Nothing executes, but the
+            # record becomes the user's turn like any other command's.
+            await self._record_empty_command(params.session_id, operation_id, cwd)
+            return SessionShellCommandResponse(
+                last_event_id=self._current_event_id(params.session_id)
+            )
+        # A manual `!` command is the user's own input, not model authority: it
+        # carries no permission machinery and is never denied for being early.
+        # It takes its FIFO place in the turn queue beside queued prompts; at
+        # idle the queue runs it once and promotes its record as a user turn.
+        completion = self._turns.enqueue_shell_input(
             session_id=params.session_id,
             operation_id=operation_id,
             command=command,
+            cwd=cwd,
             timeout_seconds=params.timeout_seconds or 30.0,
-            cwd=self._workspace_cwd(params.cwd),
         )
-        execution = self._execution.begin(SessionExecutionKind.SHELL, operation_id)
+        try:
+            await completion
+        except asyncio.CancelledError:
+            # The request went away before its turn: a command that never ran
+            # is dropped unexecuted rather than fired later for nobody.
+            self._turns.discard_queued_shell_input(operation_id)
+            raise
+        return SessionShellCommandResponse(
+            last_event_id=self._current_event_id(params.session_id)
+        )
+
+    async def _record_empty_command(
+        self, session_id: str, operation_id: str, cwd: str
+    ) -> None:
+        """Refuse an empty command through the one record, never a wire error.
+
+        The no-op executes nothing, so the record is ready before the queue sees
+        it; the effect tile is completed here so the live timeline matches what
+        a rebuild projects from the record metadata.
+        """
+        await self._turns.start_effect(
+            session_id=session_id,
+            entry_id=operation_id,
+            title="shell",
+            detail=shell_effect_detail(""),
+        )
+        record = build_manual_shell_record(
+            ManualShellOutcome(
+                operation_id=operation_id,
+                command="",
+                cwd=cwd,
+                status="refused",
+                created_at=now_ms(),
+                error="Shell command cannot be empty",
+            ),
+            max_output_bytes=self._max_output_bytes(),
+        )
+        await self._turns.complete_effect(
+            operation_id, restored_shell_effect_state(record.context)
+        )
+        self._turns.enqueue_shell_record(
+            session_id=session_id, operation_id=operation_id, record=record
+        )
+
+    async def _execute_queued_shell(
+        self, entry: TurnShellInputEntry, session_id: str
+    ) -> ManualShellRecord:
+        """Run one queued command's effect; the queue owns its user turn.
+
+        The spawn still binds the pinned executor contract, the environment is
+        scrubbed, and the record is capped; every outcome reaches the record
+        builder, so an infra failure or interrupt is a record, not a denial.
+        """
+        run_params = ShellRunParams(
+            session_id=session_id,
+            operation_id=entry.operation_id,
+            command=entry.command,
+            timeout_seconds=entry.timeout_seconds or 30.0,
+            cwd=entry.cwd,
+        )
+        execution = self._execution.begin(
+            SessionExecutionKind.SHELL, entry.operation_id
+        )
         output: list[str] = []
         started_at = time.monotonic()
         created_at = now_ms()
         duration_ms = 0.0
+        response: ShellRunResponse | None = None
+        failure: Exception | None = None
 
         async def observe_output(chunk: str) -> None:
             output.append(chunk)
-            await self._turns.append_effect_output(operation_id, chunk)
+            await self._turns.append_effect_output(entry.operation_id, chunk)
 
         try:
             await self._turns.start_effect(
-                session_id=params.session_id,
-                entry_id=operation_id,
+                session_id=session_id,
+                entry_id=entry.operation_id,
                 title="shell",
-                detail=shell_effect_detail(command),
+                detail=shell_effect_detail(entry.command),
             )
             try:
                 response = secret_redaction.redact_model(
@@ -147,7 +187,7 @@ class ShellRequestHandler:
                 )
             except asyncio.CancelledError:
                 await self._turns.complete_effect(
-                    operation_id,
+                    entry.operation_id,
                     shell_effect_cancelled(
                         output_text="".join(output),
                         duration_ms=(time.monotonic() - started_at) * 1000,
@@ -155,58 +195,36 @@ class ShellRequestHandler:
                 )
                 raise
             except Exception as exc:
+                failure = exc
                 await self._turns.complete_effect(
-                    operation_id,
+                    entry.operation_id,
                     shell_effect_error(
                         exc,
                         output_text="".join(output),
                         duration_ms=(time.monotonic() - started_at) * 1000,
                     ),
                 )
-                raise
             duration_ms = (time.monotonic() - started_at) * 1000
-            await self._turns.complete_effect(
-                operation_id,
-                shell_effect_state(
-                    response, output_text="".join(output), duration_ms=duration_ms
-                ),
-            )
+            if response is not None:
+                await self._turns.complete_effect(
+                    entry.operation_id,
+                    shell_effect_state(
+                        response, output_text="".join(output), duration_ms=duration_ms
+                    ),
+                )
         finally:
             self._execution.finish(execution)
 
-        bash_config = self._agent_loop.tool_manager.get_tool_config("bash")
-        max_output_bytes = (
-            bash_config.max_output_bytes
-            if isinstance(bash_config, BashToolConfig)
-            else 16_000
-        )
-        await self._turns.inject(
-            ContextInjectParams(
-                session_id=params.session_id,
-                input=[
-                    TextContentBlock(
-                        text=_manual_shell_context(
-                            response, max_output_bytes=max_output_bytes
-                        )
-                    )
-                ],
-            ),
-            manual_shell=ManualShellContext(
-                operation_id=response.operation_id,
-                command=response.command,
-                cwd=response.cwd,
-                stdout=response.stdout,
-                stderr=response.stderr,
+        return build_manual_shell_record(
+            _manual_shell_outcome(
+                run_params,
+                response=response,
+                failure=failure,
                 output_text="".join(output),
-                exit_code=response.exit_code,
-                timed_out=response.timed_out,
-                interrupted=response.interrupted,
                 duration_ms=duration_ms,
                 created_at=created_at,
             ),
-        )
-        return SessionShellCommandResponse(
-            last_event_id=self._current_event_id(params.session_id)
+            max_output_bytes=self._max_output_bytes(),
         )
 
     async def _interrupt(
@@ -218,12 +236,17 @@ class ShellRequestHandler:
                 ProtocolErrorCode.INVALID_PARAMS,
                 "operation_id is required for action='interrupt'",
             )
-        await self._shell.interrupt(params.operation_id)
+        # Before execution an interrupt removes the queued command unexecuted;
+        # once it runs, the interrupt belongs to the running shell process and
+        # becomes the interrupted record its user turn carries.
+        if not self._turns.discard_queued_shell_input(params.operation_id):
+            await self._shell.interrupt(params.operation_id)
         return SessionShellCommandResponse(
             last_event_id=self._current_event_id(params.session_id)
         )
 
-    def _workspace_cwd(self, requested_cwd: str | None) -> str:
+    def _command_cwd(self, requested_cwd: str | None) -> str:
+        """Execute where the user points; only a missing directory is an error."""
         root = self._agent_loop.cwd.resolve()
         cwd = Path(requested_cwd).expanduser().resolve() if requested_cwd else root
         if not cwd.is_dir():
@@ -231,40 +254,46 @@ class ShellRequestHandler:
                 ProtocolErrorCode.INVALID_PARAMS,
                 f"Shell working directory does not exist: {cwd}",
             )
-        try:
-            cwd.relative_to(root)
-        except ValueError as exc:
-            raise RequestFailure(
-                ProtocolErrorCode.FORBIDDEN,
-                f"Shell working directory is outside the workspace: {cwd}",
-            ) from exc
         return str(cwd)
 
-
-def _manual_shell_context(result: ShellRunResponse, *, max_output_bytes: int) -> str:
-    stdout = _cap_output(result.stdout, max_output_bytes)
-    stderr = _cap_output(result.stderr, max_output_bytes)
-    sections = [
-        "Manual `!` command result from the user. Use this as context only.",
-        f"Command: `{result.command}`",
-        f"Working directory: `{result.cwd}`",
-    ]
-    if result.timed_out:
-        sections.append("Status: timed out")
-    elif result.interrupted:
-        sections.append("Status: interrupted by user")
-    else:
-        sections.append(f"Exit code: {result.exit_code}")
-    if stdout:
-        sections.append(f"Stdout:\n```text\n{stdout.rstrip()}\n```")
-    if stderr:
-        sections.append(f"Stderr:\n```text\n{stderr.rstrip()}\n```")
-    if not stdout and not stderr:
-        sections.append("Output:\n```text\n(no output)\n```")
-    return "\n\n".join(sections)
+    def _max_output_bytes(self) -> int:
+        bash_config = self._agent_loop.tool_manager.get_tool_config("bash")
+        if isinstance(bash_config, BashToolConfig):
+            return bash_config.max_output_bytes
+        return 16_000
 
 
-def _cap_output(text: str, limit: int) -> str:
-    if len(text) <= limit:
-        return text
-    return f"{text[:limit]}\n... [truncated]"
+def _manual_shell_outcome(
+    run_params: ShellRunParams,
+    *,
+    response: ShellRunResponse | None,
+    failure: Exception | None,
+    output_text: str,
+    duration_ms: float,
+    created_at: int,
+) -> ManualShellOutcome:
+    if response is None:
+        return ManualShellOutcome(
+            operation_id=run_params.operation_id,
+            command=run_params.command,
+            cwd=run_params.cwd or "",
+            status="failed",
+            output_text=output_text,
+            duration_ms=duration_ms,
+            created_at=created_at,
+            error=(str(failure) or type(failure).__name__) if failure else None,
+        )
+    return ManualShellOutcome(
+        operation_id=response.operation_id,
+        command=response.command,
+        cwd=response.cwd,
+        status=shell_result_status(response),
+        exit_code=response.exit_code,
+        timed_out=response.timed_out,
+        interrupted=response.interrupted,
+        stdout=response.stdout,
+        stderr=response.stderr,
+        output_text=output_text,
+        duration_ms=duration_ms,
+        created_at=created_at,
+    )

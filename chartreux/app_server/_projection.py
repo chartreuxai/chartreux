@@ -704,6 +704,10 @@ def _project_stored_message(
         return
     match message.role:
         case Role.user:
+            # A manual `!` command's record is an ordinary user message; its
+            # metadata only adds the shell effect the live timeline showed, so
+            # a rebuild restores the same pair without an injected branch.
+            _append_shell_effect_history(session_id, message, entries)
             entries.append(
                 _history_user_message(session_id, message, index, created_at)
             )
@@ -742,6 +746,17 @@ def _history_worktree(session_id: str, worktree: WorktreeContext) -> PublicEffec
 def _append_injected_history(
     session_id: str, message: LLMMessage, entries: list[PublicHistoryEntry]
 ) -> None:
+    _append_shell_effect_history(session_id, message, entries)
+
+
+def _append_shell_effect_history(
+    session_id: str, message: LLMMessage, entries: list[PublicHistoryEntry]
+) -> None:
+    """Restore the shell effect a manual ``!`` record's metadata describes.
+
+    The record text is the source of truth; the context is display metadata,
+    so this adds the timeline tile only — never a second message.
+    """
     shell = message.manual_shell
     if shell is None:
         return

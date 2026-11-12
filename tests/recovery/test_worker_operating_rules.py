@@ -49,10 +49,18 @@ def test_child_prompt_includes_the_operating_rules() -> None:
     assert "2. Strategy switch: after the second denial" in rendered
     # The tool-semantics fragment carries the shell grammar into every prompt.
     assert (
-        "Shell grammar: the shell has no variable expansion, command substitution, or loops; "
-        "commands must be literal. Environment assignments prefixing commands must use "
-        "uppercase names. No leading `=` in command names. Run scripts through an explicit "
-        "interpreter, not implicit `uv`."
+        "Shell grammar: command substitution and loops are unsupported, and "
+        "variable/arithmetic expansion is admitted only in the modeled read-only "
+        "argument positions (cat/wc/head/tail/grep/cut, `ls`, `sort` and `uniq` input "
+        "operands, `find -name`/`-iname`) bound by a literal assignment in the same "
+        "invocation — `sort -o` and `uniq`'s second operand are write positions and "
+        "stay denied; every other command must be literal. A heredoc is admitted only "
+        "with a quoted delimiter (`<<'EOF'`, `<<\"EOF\"`, `<<\\EOF`) feeding a modeled "
+        "reader or an interpreter reading its program from stdin (`python3 -`), "
+        "so its body stays literal; an unquoted delimiter stays denied. Environment "
+        "assignments prefixing "
+        "commands must carry literal values. No leading `=` in command names. Run "
+        "scripts through an explicit interpreter, not implicit `uv`."
     ) in rendered
 
 

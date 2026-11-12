@@ -77,18 +77,18 @@ Inside a trusted folder, the project `.env` (the trusted folder's `.env` plus `$
 
 `bash` runs a finite command in a fresh POSIX shell. Standard input is closed, a timeout is enforced, and stdout and stderr are returned separately. Shell state, process handles, continued stdin, polling, and cursor-based output do not persist between calls. Configure its `permission`, `max_output_bytes`, `default_timeout`, `denylist`, `denylist_standalone`, and `sensitive_patterns` under `[tools.bash]`; runtime path and sensitive-file protections still apply.
 
-The default `denylist` no longer contains the recognized dangerous git operations (`git push`, `git checkout`, `git restore`, `git stash drop`, `git stash clear`, `git switch --discard-changes`, `git switch -f`, `git reflog expire`, `git reflog delete`): they are classified by the [dangerous-command policy](#dangerous-git-commands) and denied pending typed authority. Explicit `denylist` entries remain an absolute veto: a matching entry denies the command before any grant is even considered, and only the user removing the entry lifts it. Hard guards are separate and non-overridable: `git reset --hard` and forced non-dry-run `git clean` stay denied regardless of `denylist`, `permission`, or approval settings, and `git -c ...`/`--config-env` spellings are denied by the policy layer even with the denylist cleared. Recursive `rm` is denied on the same fail-closed terms except where the git-status-aware operand analysis establishes the clean-tree carve-out (see [Recursive rm analysis](#recursive-rm-analysis)). The denylist covers direct command spellings and modeled wrappers (for example `git -C . push`); it does not cover arbitrary unmodeled executors such as make targets, scripts, or inline interpreter code.
+The default `denylist` no longer contains the recognized dangerous git operations (`git push`, `git checkout`, `git restore`, `git stash drop`, `git stash clear`, `git switch --discard-changes`, `git switch -f`, `git reflog expire`, `git reflog delete`): they are classified by the [dangerous-command policy](#dangerous-git-commands) and denied pending typed authority. Explicit `denylist` entries remain an absolute veto: a matching entry denies the command before any grant is even considered, and only the user removing the entry lifts it. Hard guards are separate and non-overridable: `git reset --hard` and forced non-dry-run `git clean` stay denied regardless of `denylist`, `permission`, or approval settings, and `git -c ...`/`--config-env` spellings are denied by the policy layer even with the denylist cleared. Recursive `rm` is denied on the same fail-closed terms except where the git-status-aware operand analysis establishes the clean-tree carve-out, or where every operand resolves inside the session scratchpad (see [Recursive rm analysis](#recursive-rm-analysis)). The denylist covers direct command spellings and modeled wrappers (for example `git -C . push`); it does not cover arbitrary unmodeled executors such as make targets, scripts, or inline interpreter code.
 
 ## Dangerous git commands
 
-Recognized dangerous git operations have first-class typed policy instead of denylist membership. A pure classifier assigns each whole shell call an operation set from a frozen registry, and execution is denied unless authority exists for every required operation in the command's exact repository scope (`git_dir`/`work_tree`; sibling worktrees are isolated) — except for the narrow state-aware clean-tree checkout exemption described below.
+Recognized dangerous git operations have first-class typed policy instead of denylist membership. A pure classifier assigns each whole shell call an operation set from a frozen registry, and execution is denied unless authority exists for every required operation in the command's exact repository scope (`git_dir`/`work_tree`; sibling worktrees are isolated) — except for the routine branch creation and the narrow state-aware clean-tree checkout exemption described below.
 
 There are four policy classes:
 
 - **Publication** (`git.push`, ordinary `git push` only; `network.egress`, non-loopback egress through a modeled client) — grantable in an interactive session with the choices Deny (default), Allow once, Allow this session, or Always for this project.
 - **Remote-exec** (`network.remote-exec`, a command run on a remote machine) — grantable with the same four choices, but the persistent grant is a destination grant: it authorizes one exact `user@host:port` destination, never the operation in general, and never a contained payload. See [remote-exec destination grants](#remote-exec-destination-grants-v070).
 - **Consequential** (`git.push.force`, `git.push.delete`, `git.push.mirror`, `git.checkout`, `git.restore`, `git.switch.discard`, `git.stash.drop`, `git.stash.clear`, `git.reflog.expire`, `git.reflog.delete`) — grantable with Deny (default), Allow once, or Allow this session. **Never** "Always": a push combining consequential mechanisms requires all classified consequential operations, and `git.push` authority never covers them.
-- **Hard guards** (`git reset --hard`, forced non-dry-run `git clean`, unmodeled or ambiguous forms; recursive `rm` everywhere outside the clean-tree carve-out below) — no operation ID and no grant path: the user runs the command themselves.
+- **Hard guards** (`git reset --hard`, forced non-dry-run `git clean`, unmodeled or ambiguous forms; recursive `rm` everywhere outside the clean-tree and session-scratchpad carve-outs below) — no operation ID and no grant path: the user runs the command themselves.
 
 Grant and denial semantics:
 
@@ -102,13 +102,19 @@ Grant and denial semantics:
 - **Child sessions** deny dangerous commands outright regardless of user-input capability: the denial with remediation returns a blocker to the parent, and the persisted grant fields are the only child pre-authorization paths — `dangerous_command_grants_by_project` for the scope-keyed operations and `remote_exec_grants_by_project` for a remote-exec destination. A saved project grant runs in a child with no prompt, while a session grant never propagates: grants are store-local to the loop that owns them. Main interactive sessions keep their approval dialogs. The same blanket denial covers ask-class `network.egress` egress, remote-exec, and the out-of-root grant flow: a child never surfaces the interactive root-grant prompt, and out-of-root scope comes only from already-issued child-local grants, parent-directed scope changes, or `authorized_roots_by_project`.
 - Revocation and inspection: the app server exposes `policy/dangerous_commands/read` and `policy/dangerous_commands/revoke` (see [App server](../integrations/app-server.md)); there is deliberately no public "grant an arbitrary operation" endpoint — grants come only from the runtime approval flow. The Textual settings panel **Settings > Shell Permissions** (in the Advanced & Tools group) shows live and saved dangerous-command authority and lets the user revoke it — destination-scoped for remote-exec, with the whole-scope revoke kept as its own confirmed row (see [remote-exec destination revocation](#remote-exec-destination-revocation-v071)). There is no sessionless CLI and no approval-prompt control: a revocation needs a live registered session.
 
+### Routine branch creation (v0.7.8)
+
+`git checkout -b <new-branch> [<start-point>]` is routine: the classifier assigns it no operation, so it neither needs nor prompts for consequential authority, and the repository state does not gate it. A dirty work tree, an in-progress operation marker, and a start point are all admitted — `git` refuses rather than discards when the start point's content conflicts with unsaved work. Rejected forms stay consequential: `-B`, `-f`/`--force`/`--discard-changes`, `-m`/`--merge`, `--orphan`/`--conflict`/`--pathspec-from-file`/`--recurse-submodules`, a pathspec or `--` tail, any other option, inline `-c` configuration, and repository relocation. Discard-shaped checkouts and the clean-tree exemption for `git checkout <existing-local-branch>` are unchanged.
+
+Two protections remain load-bearing on the routine path. The executed command carries an injected `--no-overwrite-ignore` immediately after the `checkout` token — the command as written stays written for display and result surfaces — so an ignored-file collision fails closed instead of silently overwriting local content. And a repository whose configuration selects a program (`core.hooksPath` and the other program-selection keys) keeps the consequential approval class: the branch switch runs that program's `post-checkout` hook, which is unreviewed program execution in a child session that can never prompt. The configuration check is fail-closed: a repository that cannot be located, and a config that cannot be read, both keep the approval flow.
+
 ### State-aware clean-tree checkout exemption
 
-`git checkout` keeps its consequential classification, but the permission resolver grants a narrow, state-aware exemption from the approval flow. Exempt shapes only: `git checkout <branch>` where the target is an existing local branch, and `git checkout -b <new> [<start>]` for branch creation — no pathspec, no `--`, no `-f`/`--force`/`--discard-changes`/`--merge`/`--orphan`/`--conflict`/`--pathspec-from-file`/`--recurse-submodules`, no `-B`, and no other option. The exemption applies only when the entire composed shell call is exactly one eligible git invocation: no preceding or chained commands, no pipeline segments, no environment assignments, no wrapper commands, and no inline configuration options (any `git -c <key>=<value>` form is ineligible). Display-only global options (`--no-pager` and equivalents) do not break eligibility; repository relocation (`-C`/`--git-dir`/`--work-tree`) fails closed. Every ineligible shape falls back to the consequential approval flow above.
+`git checkout` keeps its consequential classification, but the permission resolver grants a narrow, state-aware exemption from the approval flow for the existing-branch switch. Exempt shape only: `git checkout <branch>` where the target is an existing local branch — no pathspec, no `--`, no `-f`/`--force`/`--discard-changes`/`--merge`/`--orphan`/`--conflict`/`--pathspec-from-file`/`--recurse-submodules`, no `-B`, and no other option. The exemption applies only when the entire composed shell call is exactly one eligible git invocation: no preceding or chained commands, no pipeline segments, no environment assignments, no wrapper commands, and no inline configuration options (any `git -c <key>=<value>` form is ineligible). Display-only global options (`--no-pager` and equivalents) do not break eligibility; repository relocation (`-C`/`--git-dir`/`--work-tree`) fails closed. Every ineligible shape falls back to the consequential approval flow above.
 
-The exemption holds only when every candidate repository scope passes the state guardrails, each fail-closed on any unestablishable state: a fully clean work tree (no unstaged, staged, or untracked changes), no in-progress operation marker (merge, rebase, cherry-pick, revert), and no repository configuration that selects a program the invocation could run (`core.hooksPath` and the other program-selection keys). The plain branch form additionally requires the target to exist as a local branch (a sanitized `show-ref` probe), so a pathspec fallback, a tag, a remote-tracking name, or a commit-ish never rides the exemption.
+The exemption holds only when every candidate repository scope passes the state guardrails, each fail-closed on any unestablishable state: a fully clean work tree (no unstaged, staged, or untracked changes), no in-progress operation marker (merge, rebase, cherry-pick, revert), and no repository configuration that selects a program the invocation could run (`core.hooksPath` and the other program-selection keys). The switch form additionally requires the target to exist as a local branch (a sanitized `show-ref` probe), so a pathspec fallback, a tag, a remote-tracking name, or a commit-ish never rides the exemption.
 
-Because the bash tool executes a command string, the executed command of every exempt checkout is rewritten at execution time — `--no-overwrite-ignore` is inserted immediately after the `checkout` subcommand token, leaving every other byte of the command untouched — so an ignored-file collision fails closed (checkout refuses) instead of silently clobbering local content; the original string stays original for display and result surfaces. The exemption never bypasses the denylist veto, parent ceilings, or any other recheck, and the pure classifier's `git.checkout` classification is unchanged. Branch merging, switches to remote-tracking branches, and operations on branches other than the current working branch remain user-owned. See [ADR 0019](../adr/0019-dangerous-git-permissions.md).
+Because the bash tool executes a command string, the executed command of every modeled whole-call checkout — the exempt switch and the routine branch creation alike — is rewritten at execution time: `--no-overwrite-ignore` is inserted immediately after the `checkout` subcommand token, leaving every other byte of the command untouched, so an ignored-file collision fails closed (checkout refuses) instead of silently clobbering local content; the original string stays original for display and result surfaces. Neither admission path bypasses the denylist veto, parent ceilings, or any other recheck. Branch merging, switches to remote-tracking branches, and operations on branches other than the current working branch remain user-owned. See [ADR 0019](../adr/0019-dangerous-git-permissions.md).
 
 ### Remote-exec destination grants (v0.7.0)
 
@@ -166,7 +172,13 @@ option families off, startup files redirected, and the locale pinned, while an
 unknown executor, an option-changing invocation, and a nested shell re-entry
 with an expansion-bearing payload fail closed; the contract is read at
 execution, and the argv, shell-string, background, and terminal transports
-either consume the bound plan or hard-deny. The two admissions are a
+either consume the bound plan or hard-deny. The executor itself is resolved
+once at startup — the `[tools.bash] executor` config value, else bash when the
+host has it, else the ambient `$SHELL`, else the kernel default — and that one
+resolution feeds every spawn and the permission analysis. The shipped bash
+default therefore outranks an ambient zsh login shell, and the zsh-only
+equals-expansion rules fire only under a zsh executor, because bash never
+expands a leading `=` word. The two admissions are a
 single-component trailing `**` for the read whitelist and one whole
 double-quoted variable word preceded by a literal assignment; everything else
 retains its conservative denial. HTTPie's `https` entry point is modeled under
@@ -288,7 +300,8 @@ dangerous-command policy as `bash`: `bash` and `bash_start` behave identically, 
 dangerous launch prompts the user for approval in interactive sessions (and is
 denied with remediation otherwise), and a denied launch creates no active job.
 The hard guards (`git reset --hard`, forced non-dry-run
-`git clean`, and recursive `rm` outside the clean-tree carve-out) are not
+`git clean`, and recursive `rm` outside the clean-tree and session-scratchpad
+carve-outs) are not
 grantable. There is no separate
 `[tools.bash_start]` permission key and no separate interactive launch approval
 beyond the dangerous-command flow. Ordinary
@@ -377,6 +390,19 @@ the operand, nested repositories included. Every unestablishable aspect —
 operand scope, metadata overlap, recovery status, glob expansion, path
 resolution — and any mixed operand (an eligible one alongside an ineligible
 one) resolves the whole command to the hard-guard denial.
+
+The session scratchpad is a second, independent carve-out (v0.7.8): a
+recursive `rm` resolves run-class when EVERY expanded operand resolves by
+canonical path strictly inside a session scratchpad root, because that content
+is throwaway, session-owned data. The scratchpad root itself is not a deletable
+operand, and a symlink that resolves outside the root is refused — the
+containment test is the resolved path, never the spelling. The scratchpad
+family skips the git-tree analysis (clean-tree state, metadata overlap,
+repository recovery) but never the footprint analysis: the whole call's
+destruction surface must still be establishable, so a statement whose writes
+cannot be modeled (`eval`, an unresolvable operand) keeps the hard-guard
+denial. Sensitive-file patterns and parent ceilings still deny through the
+path layer, which gates every operand independently of this admission.
 
 Its hard-guard denial names the original
 option or cluster, such as `-r`, `-rf`, or `--recursive`, and recommends

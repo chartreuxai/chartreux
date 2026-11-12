@@ -16,9 +16,11 @@ fresh shell, closes stdin with EOF, enforces a timeout, and returns separate loc
 stdout and stderr. It retains no process handle across calls. Managed background
 sessions, continued stdin, polling, cursor-based output, and managed shell storage
 APIs are intentionally removed; existing stored session/output records are left
-untouched. User-authored `!` commands remain a separate manual
-shell path. ACP client-terminal delegation remains an explicit client capability; its
-client-produced output may be merged and is not promised to have the local shell's
+untouched. User-authored `!` commands are the user's own input: they carry no
+model permission machinery, and their result reaches the agent as user-role
+input through one redacted record whatever the outcome. ACP client-terminal
+delegation remains an explicit client capability; its client-produced output may
+be merged and is not promised to have the local shell's
 separate streams.
 
 Extensions should be discoverable, filterable, typed where possible, and isolated
@@ -58,9 +60,9 @@ parallel discovery, authentication, or lifecycle implementations.
 - Preserve direct MCP descriptor, OAuth, cancellation, and revision-safe save behavior.
   Keep private descriptor contexts session-only, all stdio cache use non-persistent,
   and anonymous HTTP persistence separate.
-- Keep the model-facing shell finite and fresh per call; preserve manual `!` and
-  explicit ACP client-terminal delegation without claiming managed continuation or
-  split streams for client-produced output.
+- Keep the model-facing shell finite and fresh per call; keep manual `!` commands
+  ungated user input and preserve explicit ACP client-terminal delegation without
+  claiming managed continuation or split streams for client-produced output.
 - Return canonical public resource views after mutations and refresh client state
   through app-server notifications.
 - Do not add compatibility facades for removed account, registry, plugin, cloud,

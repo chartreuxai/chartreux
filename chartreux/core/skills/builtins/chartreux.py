@@ -314,8 +314,12 @@ user turn instead of sending them in the Responses function output.
 
 The built-in shell surface exposes the POSIX `bash` tool. It reads permissions
 and denylists from `[tools.bash]`; its resolver's hard guards determine shell
-policy. The historical `[tools.bash].allowlist` key is rejected in v0.1; remove
-it from configuration files. Recognized dangerous git commands carry typed
+policy. `[tools.bash].executor` selects the shell binary shell text runs under
+(unset means the shipped default: bash when the host has it, otherwise the
+ambient `$SHELL`); the resolved executor is read once at startup and used by
+every shell spawn. The historical `[tools.bash].allowlist` key is rejected in
+v0.1; remove it from configuration files. Recognized dangerous git commands
+carry typed
 policy: `git push` (publication) and the consequential operations (forced,
 deleting, or mirrored pushes, `git checkout`, `git restore`,
 `git switch --discard-changes`/`-f`, `git stash drop`/`clear`,

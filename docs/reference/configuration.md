@@ -60,7 +60,7 @@ Every ordinary `[tools.<name>]` table accepts `permission` (`always` or `never`)
 | `tools.read_file` | `max_read_bytes = 51200`; permission `always`. |
 | `tools.write_file` | `max_write_bytes = 64000`, `create_parent_dirs = true`. |
 | `tools.grep` | `max_output_bytes = 64000`, `default_max_matches = 100`, `context_lines = 2`, `default_timeout = 60`, `exclude_patterns` (the built-in exclusion list), `codeignore_file = ".chartreuxignore"`; permission `always`. |
-| `tools.bash` | `max_output_bytes = 16000`, `default_timeout = 300`, `denylist`, `denylist_standalone`, and `sensitive_patterns`; it does not accept `allowlist`. |
+| `tools.bash` | `max_output_bytes = 16000`, `default_timeout = 300`, `denylist`, `denylist_standalone`, `sensitive_patterns`, and `executor` (unset by default); it does not accept `allowlist`. |
 | `tools.bash_read`, `tools.bash_stop`, `tools.bash_list` | Permission `always`; no additional documented fields. Job ownership checks also apply. |
 | `tools.web_fetch` | `default_timeout = 30`, `max_timeout = 120`, `max_content_bytes = 120000`, `user_agent` (the built-in browser-like value). |
 | `tools.web_search` | `provider = "auto"`, `api_key_env_var` and `base_url` unset, `timeout = 120` (> 0), `max_results = 5`, `model = "mistral-vibe-cli-with-tools"`. A blank or unset `base_url` uses the selected provider's default endpoint. Provider is `auto`, `mistral`, `exa`, `brave`, or `duckduckgo`; `auto` means Mistral only and never falls back. Configure it in Settings > Web search or with `/web-search`. `Configured; connection not verified` reflects configuration and credential availability, not a connectivity check. |
@@ -69,6 +69,16 @@ Every ordinary `[tools.<name>]` table accepts `permission` (`always` or `never`)
 | `tools.read_image` | Permission `always`; no additional documented fields. |
 | `tools.edit` | Permission `always`; no additional documented fields. |
 | `tools.wait_for_agent`, `tools.ask_user_question`, `tools.get_agent_result`, `tools.skill`, `tools.check_agents`, `tools.cancel_agent`, `tools.release_agent` | Permission `always`; no additional documented fields. |
+
+The shell executor is resolved once at startup and used by every shell spawn —
+the bash tool, background jobs, acceptance checks, and the session shell — and
+by the system prompt's reported shell. The chain is `[tools.bash] executor` >
+bash (the shipped default when the host has it) > the ambient `$SHELL` > the
+kernel default (`/bin/sh`). The shipped default deliberately outranks an ambient
+`$SHELL`, so a zsh login shell does not select zsh; set `executor = "zsh"` to run
+shell text under zsh. An executor with no pinned option contract (an unknown or
+aliased binary) fails closed: expansion-bearing commands are denied and the
+spawn refuses.
 
 `bash_start` honors `[tools.bash]` launch permission and shell restrictions,
 including parent restrictions; there is no separate `[tools.bash_start]`

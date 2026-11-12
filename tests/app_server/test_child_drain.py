@@ -22,7 +22,10 @@ from chartreux.app_server._child_runtime_lifecycle import (
     ChildDrainStatus,
 )
 from chartreux.app_server._sessions import SessionRuntimeRegistry
+from chartreux.app_server._subagent_recovery import ChildTranscriptReconciler
 from chartreux.app_server._subagent_transcript import (
+    ChildStartMarker,
+    ChildTranscriptError,
     ChildTranscriptOutcome,
     ChildTranscriptStore,
 )
@@ -31,8 +34,10 @@ from chartreux.app_server.agent_wire import (
     TURN_OUTCOME_COMPLETED,
     TURN_OUTCOME_INTERRUPTED,
 )
+from chartreux.app_server.child_agent_process import teardown_spawned_attempt
 from chartreux.app_server.subagent_ports import (
     AdmittingSubagentSpawn,
+    ChildTeardownOutcome,
     SpawnedSubagent,
     SubagentAdmission,
     SubagentCompletion,
@@ -358,3 +363,112 @@ async def test_timed_out_drain_is_typed_and_never_reports_success() -> None:
         notify.assert_awaited_with([], [])
     finally:
         await registry.close()
+
+
+# ---------------------------------------------------------------------------
+# Item 1 child seam: the conservative publication teardown
+# ---------------------------------------------------------------------------
+
+
+class _TeardownAttempt:
+    """A spawned publication attempt whose liveness the test decides."""
+
+    def __init__(
+        self,
+        root: Path,
+        *,
+        alive_after_close: bool = False,
+        reconciliation: Any = None,
+        reconcile_error: Exception | None = None,
+    ) -> None:
+        self.agent_id = "coder-py"
+        self.child_session_dir = str(
+            root / "agents" / "coder-py_20260101_000000_abcdef12"
+        )
+        self.root_session_dir = str(root)
+        self._alive = True
+        self._alive_after_close = alive_after_close
+        self._reconciliation = reconciliation
+        self._reconcile_error = reconcile_error
+        self.closed = 0
+
+    @property
+    def alive(self) -> bool:
+        return self._alive
+
+    async def close(self) -> None:
+        self.closed += 1
+        if not self._alive_after_close:
+            self._alive = False
+
+    def reconcile_death(self) -> Any:
+        if self._reconcile_error is not None:
+            raise self._reconcile_error
+        return self._reconciliation
+
+
+@pytest.mark.asyncio
+async def test_teardown_of_a_still_live_attempt_reports_inconclusive(
+    tmp_path: Path,
+) -> None:
+    attempt = _TeardownAttempt(tmp_path, alive_after_close=True)
+    report = await teardown_spawned_attempt(
+        attempt, attempt_id="attempt-live", wait_seconds=0.1, sleep=AsyncMock()
+    )
+    # The bounded wait expired with the child still alive: the teardown claims
+    # no rollback, and nothing was retracted.
+    assert report.outcome is ChildTeardownOutcome.INCONCLUSIVE
+    assert report.settled is False
+    assert report.retracted is False
+    assert attempt.closed == 1
+    assert "still alive" in (report.detail or "")
+
+
+@pytest.mark.asyncio
+async def test_teardown_retracts_the_records_a_dead_attempt_left(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "sessions" / "root-session-1"
+    child_dir = root / "agents" / "coder-py_20260101_000000_abcdef12"
+    child_dir.mkdir(parents=True)
+    store = ChildTranscriptStore(child_dir, root_session_dir=root)
+    store.record_start(
+        ChildStartMarker(
+            agent_id="coder:py",
+            session_id="child-session-1",
+            run_id="turn-1",
+            started_at="2026-01-01T00:00:00+00:00",
+            attempt_id="attempt-dead",
+        )
+    )
+    reconciliation = ChildTranscriptReconciler(root).reconcile(
+        child_dir, agent_id="coder:py"
+    )
+    attempt = _TeardownAttempt(tmp_path, reconciliation=reconciliation)
+    attempt.root_session_dir = str(root)
+    attempt.child_session_dir = str(child_dir)
+    report = await teardown_spawned_attempt(
+        attempt, attempt_id="attempt-dead", sleep=AsyncMock()
+    )
+    assert report.outcome is ChildTeardownOutcome.TOMBSTONED
+    assert report.settled is True
+    assert report.retracted is True
+    assert report.session_id == "child-session-1"
+    # The retraction is durable and gates the reconciliation scan.
+    assert store.adjudicate().outcome is ChildTranscriptOutcome.TOMBSTONED
+    assert ChildTranscriptReconciler(root).scan() == []
+
+
+@pytest.mark.asyncio
+async def test_teardown_of_an_attempt_without_records_is_reaped(tmp_path: Path) -> None:
+    attempt = _TeardownAttempt(
+        tmp_path, reconcile_error=ChildTranscriptError("no transcript directory")
+    )
+    report = await teardown_spawned_attempt(
+        attempt, attempt_id="attempt-empty", sleep=AsyncMock()
+    )
+    # Nothing was ever persisted under an attempt key, so the removal is the
+    # whole settlement and no record can resurrect.
+    assert report.outcome is ChildTeardownOutcome.REAPED
+    assert report.settled is True
+    assert report.retracted is False

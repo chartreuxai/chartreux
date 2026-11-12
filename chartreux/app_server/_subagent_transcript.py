@@ -24,6 +24,7 @@ from chartreux.app_server._subagent_records import (
 )
 from chartreux.core.agent_loop import AgentLoop
 from chartreux.core.config.models import SessionLoggingConfig
+from chartreux.core.session.session_permissions import METADATA_FILENAME
 from chartreux.core.session_types import ChildSessionLink
 from chartreux.core.subagents import UnknownAgentError
 from chartreux.utils.session_id import shorten_session_id
@@ -354,6 +355,9 @@ CHILD_START_MARKER_FILENAME = "child-start.json"
 CHILD_RESULT_FILENAME = "child-result.json"
 """The durable terminal result record the child writes save-before-emit."""
 
+CHILD_TOMBSTONE_FILENAME = "child-tombstone.json"
+"""The durable retraction record that retires a child publication attempt."""
+
 CHILD_MARKER_VERSION = 1
 """Schema version of the marker and result records."""
 
@@ -378,6 +382,7 @@ class ChildTranscriptOutcome(StrEnum):
     NEVER_EXECUTED = "never_executed"
     STARTED_OUTCOME_UNKNOWN = "started_outcome_unknown"
     COMPLETED = "completed"
+    TOMBSTONED = "tombstoned"
     UNREADABLE = "unreadable"
 
 
@@ -387,17 +392,22 @@ class ChildStartMarker:
 
     A start marker without a matching terminal result is "started, outcome
     unknown" after a crash: the crash may have landed before or during
-    execution, so the run is never replayed.
+    execution, so the run is never replayed. The run-time semantics are
+    unchanged: the marker is written immediately before the run, never at
+    publication (which would misclassify a never-run child). ``attempt_id``
+    joins the payload when the publication attempt is known, so the marker
+    bridges to the attempt that created the child.
     """
 
     agent_id: str
     session_id: str
     run_id: str
     started_at: str
+    attempt_id: str | None = None
     version: int = CHILD_MARKER_VERSION
 
     def to_payload(self) -> dict[str, object]:
-        return {
+        payload: dict[str, object] = {
             "version": self.version,
             "kind": "child-start",
             "agent_id": self.agent_id,
@@ -405,10 +415,18 @@ class ChildStartMarker:
             "run_id": self.run_id,
             "started_at": self.started_at,
         }
+        if self.attempt_id is not None:
+            payload["attempt_id"] = self.attempt_id
+        return payload
 
     @classmethod
     def from_payload(cls, payload: dict[str, Any]) -> ChildStartMarker:
-        """Rebuild one start marker, refusing a malformed record."""
+        """Rebuild one start marker, refusing a malformed record.
+
+        ``attempt_id`` is tolerated in both directions: a marker written before
+        the field existed loads without it, and an unknown value is ignored
+        rather than failing the whole record.
+        """
         if payload.get("kind") != "child-start":
             raise ValueError("not a child start marker")
         return cls(
@@ -416,6 +434,7 @@ class ChildStartMarker:
             session_id=_required_marker_str(payload, "session_id"),
             run_id=_required_marker_str(payload, "run_id"),
             started_at=_required_marker_str(payload, "started_at"),
+            attempt_id=_optional_marker_str(payload, "attempt_id"),
             version=_marker_version(payload),
         )
 
@@ -438,10 +457,16 @@ class ChildResultRecord:
     outcome: str
     completed_at: str
     error: str | None = None
+    # The run's typed failure evidence (item 2 B.3): the derived envelope plus
+    # the inputs it was derived from, written with the terminal record so a
+    # crash between the record and the completion frame still leaves the
+    # measured evidence on disk. Absent on completed runs and on records a
+    # pre-rider child wrote.
+    failure: dict[str, object] | None = None
     version: int = CHILD_MARKER_VERSION
 
     def to_payload(self) -> dict[str, object]:
-        return {
+        payload: dict[str, object] = {
             "version": self.version,
             "kind": "child-result",
             "agent_id": self.agent_id,
@@ -453,13 +478,23 @@ class ChildResultRecord:
             "completed_at": self.completed_at,
             "error": self.error,
         }
+        if self.failure is not None:
+            payload["failure"] = self.failure
+        return payload
 
     @classmethod
     def from_payload(cls, payload: dict[str, Any]) -> ChildResultRecord:
-        """Rebuild one terminal result record, refusing a malformed record."""
+        """Rebuild one terminal result record, refusing a malformed record.
+
+        ``failure`` is tolerated in both directions: a record written before
+        the field existed loads without it, and a malformed block is dropped
+        rather than failing the whole record — the outcome is the record's
+        contract, the envelope is additive evidence.
+        """
         if payload.get("kind") != "child-result":
             raise ValueError("not a child result record")
         error = payload.get("error")
+        failure = payload.get("failure")
         return cls(
             agent_id=_required_marker_str(payload, "agent_id"),
             session_id=_required_marker_str(payload, "session_id"),
@@ -469,6 +504,7 @@ class ChildResultRecord:
             outcome=_required_marker_str(payload, "outcome"),
             completed_at=_required_marker_str(payload, "completed_at"),
             error=error if isinstance(error, str) else None,
+            failure=dict(failure) if isinstance(failure, dict) else None,
             version=_marker_version(payload),
         )
 
@@ -492,20 +528,73 @@ def child_result_digest(
 
 
 @dataclass(frozen=True, slots=True)
+class ChildTombstoneRecord:
+    """The durable retraction of one child publication attempt.
+
+    Written by the teardown/rollback course when the persisted records of an
+    abandoned attempt must never resurrect: a tombstoned transcript adjudicates
+    as ``TOMBSTONED`` and the reconciliation scan never hands it to the root.
+    The record carries the attempt id the publication's first durable write
+    bridged, and it falls back to the pre-existing session id, so both a
+    v0.7.8 attempt and a legacy record without an id are retractable.
+    """
+
+    session_id: str
+    reason: str
+    created_at: str
+    attempt_id: str | None = None
+    agent_id: str | None = None
+    version: int = CHILD_MARKER_VERSION
+
+    def to_payload(self) -> dict[str, object]:
+        return {
+            "version": self.version,
+            "kind": "child-tombstone",
+            "session_id": self.session_id,
+            "attempt_id": self.attempt_id,
+            "agent_id": self.agent_id,
+            "reason": self.reason,
+            "created_at": self.created_at,
+        }
+
+    @classmethod
+    def from_payload(cls, payload: dict[str, Any]) -> ChildTombstoneRecord:
+        """Rebuild one tombstone record, refusing a malformed retraction."""
+        if payload.get("kind") != "child-tombstone":
+            raise ValueError("not a child tombstone record")
+        return cls(
+            session_id=_required_marker_str(payload, "session_id"),
+            reason=_required_marker_str(payload, "reason"),
+            created_at=_required_marker_str(payload, "created_at"),
+            attempt_id=_optional_marker_str(payload, "attempt_id"),
+            agent_id=_optional_marker_str(payload, "agent_id"),
+            version=_marker_version(payload),
+        )
+
+
+@dataclass(frozen=True, slots=True)
 class ChildTranscriptAdjudication:
     """The marker-based state of one child transcript after its process died.
 
     ``NEVER_EXECUTED`` (no start marker) is distinct from
     ``STARTED_OUTCOME_UNKNOWN`` (start marker, no matching terminal result).
     Neither is ever a replay instruction: an ambiguous or unknown outcome is
-    surfaced to the user, never re-executed (design.md:196-205).
+    surfaced to the user, never re-executed (design.md:196-205). A
+    ``TOMBSTONED`` transcript is retracted: the attempt was abandoned, so no
+    outcome is reported and nothing may be adopted from it.
     """
 
     child_dir: Path
     outcome: ChildTranscriptOutcome
     start_marker: ChildStartMarker | None = None
     result: ChildResultRecord | None = None
+    tombstone: ChildTombstoneRecord | None = None
+    attempt_id: str | None = None
     detail: str = ""
+
+    @property
+    def tombstoned(self) -> bool:
+        return self.outcome is ChildTranscriptOutcome.TOMBSTONED
 
     @property
     def result_id(self) -> str | None:
@@ -597,6 +686,12 @@ def _required_marker_str(payload: dict[str, Any], key: str) -> str:
     return value
 
 
+def _optional_marker_str(payload: dict[str, Any], key: str) -> str | None:
+    """A tolerated optional field: absent or unknown values read as None."""
+    value = payload.get(key)
+    return value if isinstance(value, str) and value else None
+
+
 def _marker_version(payload: dict[str, Any]) -> int:
     value = payload.get("version")
     if isinstance(value, bool) or not isinstance(value, int) or value < 1:
@@ -615,6 +710,10 @@ class ChildTranscriptStore:
     the previous complete record or the new complete record, never a torn
     one. ``root_session_dir`` confines the target to the root session's
     ``agents/`` subtree.
+
+    The tombstone is the one coordinator-authorized WRITE: a publication
+    attempt that could not be completed is retracted with it, so its persisted
+    records can never resurrect through the disk scan.
     """
 
     def __init__(self, child_dir: Path, *, root_session_dir: Path) -> None:
@@ -622,6 +721,7 @@ class ChildTranscriptStore:
         self.child_dir = _confined_child_dir(child_dir, self.root_session_dir)
         self.start_marker_path = self.child_dir / CHILD_START_MARKER_FILENAME
         self.result_path = self.child_dir / CHILD_RESULT_FILENAME
+        self.tombstone_path = self.child_dir / CHILD_TOMBSTONE_FILENAME
 
     def record_start(self, marker: ChildStartMarker) -> None:
         """Durably record the start marker before the run executes."""
@@ -633,8 +733,46 @@ class ChildTranscriptStore:
         self._ensure_dir()
         _atomic_write_json(self.result_path, result.to_payload())
 
+    def record_tombstone(self, tombstone: ChildTombstoneRecord) -> None:
+        """Durably retract this transcript; a repeated retraction is a no-op.
+
+        Idempotence is keyed on the retracted session and attempt: an attempt
+        retracted twice keeps its original record byte for byte, a retraction
+        by session id alone is upgraded once the attempt id is known, and a
+        known attempt id is never downgraded.
+        """
+        try:
+            existing = self.read_tombstone()
+        except ChildTranscriptError:
+            existing = None
+        if existing is not None and existing.session_id == tombstone.session_id:
+            if existing.attempt_id == tombstone.attempt_id:
+                return
+            if tombstone.attempt_id is None:
+                return
+        self._ensure_dir()
+        _atomic_write_json(self.tombstone_path, tombstone.to_payload())
+
+    def read_tombstone(self) -> ChildTombstoneRecord | None:
+        """Read this transcript's retraction record, when one exists."""
+        payload, error = _read_marker_payload(self.tombstone_path)
+        if error is not None:
+            raise ChildTranscriptError(error)
+        if payload is None:
+            return None
+        try:
+            return ChildTombstoneRecord.from_payload(payload)
+        except ValueError as exc:
+            raise ChildTranscriptError(str(exc)) from exc
+
     def adjudicate(self) -> ChildTranscriptAdjudication:
         """Classify this child transcript from its markers, never replaying."""
+        retraction = self._retraction()
+        if retraction is not None:
+            return retraction
+        return self._marker_verdict()
+
+    def _marker_verdict(self) -> ChildTranscriptAdjudication:
         start_payload, start_error = _read_marker_payload(self.start_marker_path)
         result_payload, result_error = _read_marker_payload(self.result_path)
         errors = [error for error in (start_error, result_error) if error is not None]
@@ -650,9 +788,14 @@ class ChildTranscriptStore:
         result = _parse_marker(ChildResultRecord.from_payload, result_payload)
         if isinstance(result, str):
             return _unreadable(self.child_dir, self.result_path, result)
+        attempt_id = (start.attempt_id if start is not None else None) or (
+            persisted_child_attempt_id(self.child_dir)
+        )
         if start is None and result is None:
             return ChildTranscriptAdjudication(
-                child_dir=self.child_dir, outcome=ChildTranscriptOutcome.NEVER_EXECUTED
+                child_dir=self.child_dir,
+                outcome=ChildTranscriptOutcome.NEVER_EXECUTED,
+                attempt_id=attempt_id,
             )
         if result is not None and (start is None or start.run_id == result.run_id):
             return ChildTranscriptAdjudication(
@@ -660,16 +803,56 @@ class ChildTranscriptStore:
                 outcome=ChildTranscriptOutcome.COMPLETED,
                 start_marker=start,
                 result=result,
+                attempt_id=attempt_id,
             )
         return ChildTranscriptAdjudication(
             child_dir=self.child_dir,
             outcome=ChildTranscriptOutcome.STARTED_OUTCOME_UNKNOWN,
             start_marker=start,
             result=result,
+            attempt_id=attempt_id,
+        )
+
+    def _retraction(self) -> ChildTranscriptAdjudication | None:
+        """The retraction verdict, when this transcript carries a tombstone.
+
+        A retracted attempt reports no outcome at all: the tombstone wins over
+        every marker, so a completed-looking record can never be adopted after
+        its publication was abandoned.
+        """
+        payload, error = _read_marker_payload(self.tombstone_path)
+        if error is not None:
+            return _unreadable(self.child_dir, self.tombstone_path, error)
+        tombstone = _parse_marker(ChildTombstoneRecord.from_payload, payload)
+        if isinstance(tombstone, str):
+            return _unreadable(self.child_dir, self.tombstone_path, tombstone)
+        if tombstone is None:
+            return None
+        return ChildTranscriptAdjudication(
+            child_dir=self.child_dir,
+            outcome=ChildTranscriptOutcome.TOMBSTONED,
+            tombstone=tombstone,
+            attempt_id=tombstone.attempt_id,
+            detail=f"{CHILD_TOMBSTONE_FILENAME}: {tombstone.reason}",
         )
 
     def _ensure_dir(self) -> None:
         self.child_dir.mkdir(parents=True, mode=0o700, exist_ok=True)
+
+
+def persisted_child_attempt_id(child_dir: Path) -> str | None:
+    """The publication attempt id the child's persisted first write carries.
+
+    The publication transaction persists the empty child session BEFORE the
+    parent link, so this bridge is what attributes a torn persist-to-link
+    window to its attempt. A missing, torn, or pre-v0.7.8 record simply
+    carries no id and retracts through its session id instead.
+    """
+    payload, error = _read_marker_payload(Path(child_dir) / METADATA_FILENAME)
+    if error is not None or payload is None:
+        return None
+    value = payload.get("attempt_id")
+    return value if isinstance(value, str) and value else None
 
 
 def _confined_child_dir(child_dir: Path, root_session_dir: Path) -> Path:
@@ -755,10 +938,12 @@ __all__ = [
     "CHILD_MARKER_VERSION",
     "CHILD_RESULT_FILENAME",
     "CHILD_START_MARKER_FILENAME",
+    "CHILD_TOMBSTONE_FILENAME",
     "CHILD_TRANSCRIPTS_DIRNAME",
     "ROOT_SESSION_DIR_PAYLOAD_KEY",
     "ChildResultRecord",
     "ChildStartMarker",
+    "ChildTombstoneRecord",
     "ChildTranscriptAdjudication",
     "ChildTranscriptError",
     "ChildTranscriptOutcome",
@@ -772,6 +957,7 @@ __all__ = [
     "child_transcript_logging",
     "child_transcript_root_for",
     "child_transcripts_root",
+    "persisted_child_attempt_id",
     "read_child_transcript",
     "resolve_child_root_session_dir",
     "root_session_dir_from_spec",

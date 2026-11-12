@@ -35,10 +35,21 @@ from typing import Any, cast
 import httpx
 import pytest
 
+from chartreux.app_server._projection import project_session_log
 from chartreux.app_server._projector import ProjectedUpdate
 from chartreux.app_server._root_recovery import (
     RootRecoveryGate,
     RootRecoverySessionView,
+)
+from chartreux.app_server.agent_snapshot import (
+    MARKER_ABSENT,
+    MARKER_STALE,
+    build_session_snapshot,
+    marker_verdict,
+)
+from chartreux.app_server.agent_wire import (
+    decode_session_snapshot,
+    encode_session_snapshot,
 )
 from chartreux.app_server.models import PublicTurnStatus, RootRecoveryNoticeDetail
 from chartreux.app_server.protocol import (
@@ -68,6 +79,7 @@ from chartreux.core.recovery_models import (
 )
 from chartreux.core.recovery_observation import observe_exception
 from chartreux.core.session_types import CommittedModelIdentity
+from tests.conftest import build_test_agent_loop
 from tests.recovery.conftest import FakeClock
 
 ENDPOINT_URL = "https://api.shared.test/v1"
@@ -1096,6 +1108,43 @@ async def test_gate_declines_unsettled_effects_and_interaction_barriers() -> Non
 
 
 @pytest.mark.asyncio
+async def test_gate_admits_a_settled_truncation_and_keeps_other_declines() -> None:
+    """Item 2 B.1: the ``effects_unsettled`` cliff is removed for a stream
+    truncation whose in-flight effect SETTLED within the terminalization's
+    bounded grace — the gate then schedules as for any eligible transient.
+
+    A truncation whose grace expired keeps the decline, and every other
+    failure class keeps it too (the settlement is truncation-only).
+    """
+    truncation = {
+        "cause_category": FailureCategory.INCOMPLETE_STREAM,
+        "failure_class": FailureClass.INCOMPLETE_STREAM,
+    }
+
+    harness = _GateHarness()
+    harness.capture(_failure(**truncation))
+    scheduled = await harness.schedule()
+    assert scheduled.decision == "scheduled"
+    assert scheduled.eligible_class == "incomplete_stream"
+    assert len(harness.notices("scheduled")) == 1
+
+    harness = _GateHarness()
+    harness.capture(_failure(effects_settled=False, **truncation))
+    declined = await harness.schedule()
+    assert declined.decision == "declined"
+    assert declined.reason == "effects_unsettled"
+    assert harness.staged == []
+
+    # Another class with the same unsettled effect keeps the cliff.
+    harness = _GateHarness()
+    harness.capture(_failure(effects_settled=False))
+    declined = await harness.schedule()
+    assert declined.decision == "declined"
+    assert declined.reason == "effects_unsettled"
+    assert harness.staged == []
+
+
+@pytest.mark.asyncio
 async def test_gate_delay_waits_for_cooldown_retry_after_and_endpoint() -> None:
     """Item 8: due = max(configured backoff, candidate cooldown,
     endpoint cooldown, applicable Retry-After) + bounded jitter.
@@ -1524,3 +1573,72 @@ async def test_gate_meta_recovery_a_notice_or_read_failure_never_blocks() -> Non
     harness.gate.observe_turn_started("turn-2", scheduled.idempotency_key)
     await harness.gate.observe_turn_finished("turn-2", PublicTurnStatus.COMPLETED)
     assert len(harness.notices("recovered")) == 1
+
+
+# ---------------------------------------------------------------------------
+# Op 4: the agent-side snapshot is the gate's recovery input
+# ---------------------------------------------------------------------------
+#
+# A coordinator cannot recompute the gate's decision from a copy: the
+# eligibility view is computed against the committed model and the live
+# availability registry. The agent builds it where the loop lives, and the
+# payload carries the DECISION, never the raw gate inputs behind it.
+
+
+def test_the_snapshot_carries_the_gate_decision_and_the_committed_model() -> None:
+    loop = build_test_agent_loop()
+
+    snapshot = build_session_snapshot(loop, markers=(), incarnation_id="inc-1")
+    encoded = encode_session_snapshot(snapshot)
+    decoded = decode_session_snapshot(encoded)
+
+    assert decoded.committed_model == loop.committed_model
+    assert decoded.availability == snapshot.availability
+    assert decoded.availability.available is True
+    # The decision view is complete on its own: the raw inputs it was computed
+    # from never cross the boundary.
+    assert "catalog" not in encoded
+    assert "allowed_models" not in encoded
+    assert "thinking" not in encoded["availability"]
+
+
+def test_the_snapshot_log_projection_is_the_loop_projection() -> None:
+    loop = build_test_agent_loop()
+
+    snapshot = build_session_snapshot(loop, markers=(), incarnation_id="inc-1")
+
+    assert snapshot.log == project_session_log(loop)
+    assert decode_session_snapshot(encode_session_snapshot(snapshot)).log == (
+        snapshot.log
+    )
+
+
+def test_a_pre_deadline_payload_never_proves_never_admitted() -> None:
+    """The absence proof keys to CONSTRUCTION, not consumption (S8-B1)."""
+    loop = build_test_agent_loop()
+
+    early = build_session_snapshot(
+        loop, markers=(), incarnation_id="inc-1", clock=lambda: 10.0
+    )
+    verdict = marker_verdict(early, request_id="coordinator:7", deadline=10.5)
+
+    assert verdict.state == MARKER_STALE
+    assert verdict.never_admitted is False
+
+    late = build_session_snapshot(
+        loop, markers=(), incarnation_id="inc-1", clock=lambda: 11.0
+    )
+    proven = marker_verdict(late, request_id="coordinator:7", deadline=10.5)
+
+    assert proven.state == MARKER_ABSENT
+    assert proven.never_admitted is True
+
+    # A payload from another incarnation proves nothing about this request:
+    # that table was cleared at the rebind.
+    elsewhere = build_session_snapshot(
+        loop, markers=(), incarnation_id="inc-2", clock=lambda: 11.0
+    )
+    foreign = marker_verdict(
+        elsewhere, request_id="coordinator:7", deadline=10.5, incarnation_id="inc-1"
+    )
+    assert foreign.state == MARKER_STALE

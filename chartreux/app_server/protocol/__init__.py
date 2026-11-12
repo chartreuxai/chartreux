@@ -86,6 +86,7 @@ from chartreux.app_server.models import (
     ToolSummary as ToolSummary,
     TurnContextInputEntry as TurnContextInputEntry,
     TurnInputEntry as TurnInputEntry,
+    TurnShellInputEntry as TurnShellInputEntry,
     TurnUserInputEntry as TurnUserInputEntry,
     UsageComponentBreakdown as UsageComponentBreakdown,
     UsageCoverageWarning as UsageCoverageWarning,

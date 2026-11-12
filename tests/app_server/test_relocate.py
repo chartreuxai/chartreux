@@ -1,15 +1,22 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, AsyncIterator
 from pathlib import Path
-from typing import Any
+import subprocess
+from typing import Any, cast
 
 from git import Repo
 import pytest
 
+from chartreux.app_server.agent_wire import AGENT_SESSION_RELOCATE_METHOD
 from chartreux.app_server.models import PublicCheckpointEntry, PublicMessageEntry
+from chartreux.app_server.process_bootstrap import ReadyFrame, SpawnedProcess
 from chartreux.app_server.protocol import AppServerResponseError, ProtocolErrorCode
+from chartreux.app_server.root_agent_process import (
+    RootAgentDeferredOperation,
+    RootAgentProcess,
+)
 from chartreux.app_server.session import AppServerSession
 from chartreux.core.config.harness_files import HarnessFilesManager
 from chartreux.core.git.worktree import ManagedWorktree, WorktreeRepository
@@ -326,3 +333,62 @@ async def test_a_busy_session_refuses_the_move(tmp_path: Path) -> None:
         backend.released.set()
         await turn.aclose()
         await _close(session)
+
+
+class _QuietTransport:
+    """A transport that records its sends and never yields a frame."""
+
+    def __init__(self) -> None:
+        self.sent: list[dict[str, Any]] = []
+        self._never = asyncio.Event()
+
+    async def send(self, message: dict[str, Any]) -> None:
+        self.sent.append(message)
+
+    async def messages(self) -> AsyncIterator[dict[str, Any]]:
+        await self._never.wait()
+        if False:  # pragma: no cover - an async generator must contain a yield
+            yield {}
+
+    async def close(self) -> None:
+        return None
+
+
+class _LiveBody:
+    """A process handle double that never exits."""
+
+    def poll(self) -> int | None:
+        return None
+
+    def terminate(self) -> None:
+        return None
+
+    def kill(self) -> None:
+        return None
+
+
+@pytest.mark.asyncio
+async def test_a_process_root_refuses_a_relocate_before_a_frame_is_sent() -> None:
+    """Relocate is deferred over the process wire; the refusal is coordinator-side.
+
+    A frame would only be refused at the far end, so the handle mints the same
+    typed refusal the agent would and names the in_process escape. Nothing
+    reaches the wire.
+    """
+    transport = _QuietTransport()
+    spawned = SpawnedProcess(
+        process=cast("subprocess.Popen[bytes]", _LiveBody()),
+        transport=cast("Any", transport),
+        ready=ReadyFrame(protocol_version=1),
+    )
+    process = RootAgentProcess(spawned, heartbeat_interval=30.0)
+    try:
+        with pytest.raises(RootAgentDeferredOperation) as refusal:
+            process.refuse_deferred_session_operation(AGENT_SESSION_RELOCATE_METHOD)
+    finally:
+        await process.close()
+
+    message = str(refusal.value)
+    assert AGENT_SESSION_RELOCATE_METHOD in message
+    assert "in_process" in message
+    assert transport.sent == []

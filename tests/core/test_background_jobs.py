@@ -1037,8 +1037,13 @@ async def test_background_spawn_consumes_the_pinned_contract_and_rolls_back(
     contract at execution — an unknown executor hard-denies before any process
     starts, and the reservation rolls back.
     """
+    from chartreux.core.utils import shell as shell_module
     from chartreux.core.utils.shell import UnknownShellExecutorError
 
+    # The ambient chain only reaches $SHELL when the host has no bash, and no
+    # earlier startup resolution may stand in for the pin.
+    monkeypatch.setattr(shell_module, "_locate_bash", lambda: None)
+    shell_module.reset_executor_selection()
     monkeypatch.setenv("SHELL", "/nonexistent/chartreux-unknown-executor")
     registry = BackgroundJobRegistry()
     port = registry.root_port()

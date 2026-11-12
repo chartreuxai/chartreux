@@ -2,11 +2,17 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 import shlex
+import time
 
 import pytest
 
+from chartreux.core.background_jobs import BackgroundJobRegistry
+from chartreux.core.completion_checks import CompletionCheckRunner
+from chartreux.core.completion_contract import CompletionCheckTemplate
+from chartreux.core.system_prompt import _get_os_system_prompt
 from chartreux.core.tools.base import ToolPermission
 from chartreux.core.tools.builtins._shell_command_policy import (
     _package_module_tokens,
@@ -15,15 +21,26 @@ from chartreux.core.tools.builtins._shell_command_policy import (
     inline_interpreter_switch,
     path_candidates,
 )
+from chartreux.core.tools.builtins._shell_permission_analysis import (
+    analyze_shell_command,
+)
 from chartreux.core.tools.builtins._shell_permission_resolver import (
+    _analyze_guardrail_source,
     _has_unquoted_extended_syntax,
+    shell_analysis_scope,
 )
 from chartreux.core.tools.builtins.bash import Bash, BashArgs
+from chartreux.core.utils import shell as shell_module
 from chartreux.core.utils.shell import (
+    EXECUTOR_ENV_VAR,
     UnknownShellExecutorError,
     _shell_environment,
+    apply_executor_selection,
     current_executor_contract,
     executor_option_contract,
+    publish_shell_executor,
+    reset_executor_selection,
+    resolve_shell_executor,
     shell_executor,
     spawn_shell_command,
 )
@@ -31,6 +48,22 @@ from tests.tools._shell_policy_test_support import (
     EXECUTOR_REGISTRY,
     bash_tool as bash_tool,
 )
+
+
+@pytest.fixture(autouse=True)
+def _isolated_executor_selection() -> object:
+    """Keep one test's process-level executor out of the next."""
+    reset_executor_selection()
+    yield
+    reset_executor_selection()
+
+
+@pytest.fixture
+def ambient_shell(monkeypatch: pytest.MonkeyPatch) -> pytest.MonkeyPatch:
+    """Resolve from $SHELL alone: no shipped bash default in front of it."""
+    monkeypatch.setattr(shell_module, "_locate_bash", lambda: None)
+    reset_executor_selection()
+    return monkeypatch
 
 
 @pytest.mark.parametrize("selector", ["/usr/bin/printf", "../outside.sh"])
@@ -831,21 +864,247 @@ def test_executor_option_contract_pins_every_known_family() -> None:
     assert executor_option_contract("/usr/local/bin/mybash") is None
 
 
-def test_current_executor_contract_follows_the_ambient_shell(
+def test_executor_chain_is_config_then_bash_then_shell_then_kernel(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setenv("SHELL", "/usr/bin/bash")
-    assert current_executor_contract() is not None
-    assert current_executor_contract().family == "bash"  # type: ignore[union-attr]
-    monkeypatch.setenv("SHELL", "/usr/bin/fish")
-    assert current_executor_contract() is None
-    assert shell_executor() == "/usr/bin/fish"
+    """P1b: the shipped bash default OUTRANKS the ambient ``$SHELL``.
+
+    The documented chain is config (``[tools.bash] executor``) > bash > the
+    ambient ``$SHELL`` > the kernel default, in that order.
+    """
+    monkeypatch.setenv("SHELL", "/usr/bin/zsh")
+    monkeypatch.setattr(shell_module, "_locate_bash", lambda: "/usr/bin/bash")
+    # The shipped default wins over an ambient zsh host.
+    assert resolve_shell_executor() == "/usr/bin/bash"
+    # An explicit config value wins over both.
+    assert resolve_shell_executor("/usr/bin/zsh") == "/usr/bin/zsh"
+    # No bash on the host: the ambient $SHELL is the documented fallback.
+    monkeypatch.setattr(shell_module, "_locate_bash", lambda: None)
+    assert resolve_shell_executor() == "/usr/bin/zsh"
+    # Neither names a shell: the kernel default applies, unnamed.
+    monkeypatch.delenv("SHELL", raising=False)
+    assert resolve_shell_executor() is None
 
 
-def test_shell_environment_pins_startup_and_locale(
+def test_shell_executor_prefers_the_process_override_over_the_chain(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("SHELL", "/usr/bin/zsh")
+    monkeypatch.setattr(shell_module, "_locate_bash", lambda: "/usr/bin/bash")
+    assert apply_executor_selection("/usr/bin/zsh") == "/usr/bin/zsh"
+    assert shell_executor() == "/usr/bin/zsh"
+    assert current_executor_contract() is not None
+    assert current_executor_contract().family == "zsh"  # type: ignore[union-attr]
+    # The resolution travels to children through the publish helper, never as
+    # a process-global environment side effect.
+    assert publish_shell_executor({})[EXECUTOR_ENV_VAR] == "/usr/bin/zsh"
+    assert EXECUTOR_ENV_VAR not in os.environ
+    reset_executor_selection()
+    assert shell_executor() == "/usr/bin/bash"
+
+
+def test_a_child_process_resolves_the_published_executor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The root agent reads no config: the parent's value is authoritative."""
+    monkeypatch.setenv("SHELL", "/usr/bin/zsh")
+    monkeypatch.setattr(shell_module, "_locate_bash", lambda: "/usr/bin/bash")
+    monkeypatch.setenv(EXECUTOR_ENV_VAR, "/usr/bin/zsh")
+    assert shell_executor() == "/usr/bin/zsh"
+    assert current_executor_contract() is not None
+    assert current_executor_contract().family == "zsh"  # type: ignore[union-attr]
+
+
+def test_publish_shell_executor_fills_only_a_missing_name(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(shell_module, "_locate_bash", lambda: "/usr/bin/bash")
+    assert publish_shell_executor({"A": "1"})[EXECUTOR_ENV_VAR] == "/usr/bin/bash"
+    explicit = publish_shell_executor({"A": "1", EXECUTOR_ENV_VAR: "/bin/sh"})
+    assert explicit[EXECUTOR_ENV_VAR] == "/bin/sh"
+    # Nothing resolves: nothing is published.
+    monkeypatch.setattr(shell_module, "_locate_bash", lambda: None)
+    monkeypatch.delenv("SHELL", raising=False)
+    assert EXECUTOR_ENV_VAR not in publish_shell_executor({})
+
+
+def test_equals_expansion_rules_are_gated_on_the_executor_family(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(shell_module, "_locate_bash", lambda: "/usr/bin/bash")
+    assert not analyze_shell_command("echo ===X===").requires_approval
+    assert not analyze_shell_command("echo =ls").requires_approval
+    apply_executor_selection("/usr/bin/zsh")
+    assert analyze_shell_command("echo ===X===").approval_reasons == (
+        "Zsh equals expansion",
+    )
+    assert analyze_shell_command("echo =ls").approval_reasons == (
+        "Zsh equals expansion",
+    )
+
+
+def test_non_equals_word_checks_stay_under_every_family(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`~name` and `***` are not equals rules and keep firing under bash."""
+    monkeypatch.setattr(shell_module, "_locate_bash", lambda: "/usr/bin/bash")
+    for executor in ("/usr/bin/bash", "/usr/bin/zsh"):
+        apply_executor_selection(executor)
+        assert analyze_shell_command("echo ~user").approval_reasons == (
+            "shell-specific named-directory expansion",
+        ), executor
+        assert analyze_shell_command("echo ***").approval_reasons == (
+            "Zsh symlink-following glob",
+        ), executor
+
+
+def test_resolver_gates_the_equals_family_on_the_executor(
+    bash_tool: Bash, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(shell_module, "_locate_bash", lambda: "/usr/bin/bash")
+    admitted = bash_tool.resolve_permission(BashArgs(command="echo === hi"))
+    assert admitted is not None and admitted.permission is ToolPermission.ALWAYS
+    apply_executor_selection("/usr/bin/zsh")
+    denied = bash_tool.resolve_permission(BashArgs(command="echo === hi"))
+    assert denied is not None and denied.permission is ToolPermission.NEVER
+    assert "Zsh equals expansion" in (denied.reason or "")
+
+
+def test_analysis_cache_is_keyed_on_the_executor_family(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(shell_module, "_locate_bash", lambda: "/usr/bin/bash")
+    with shell_analysis_scope():
+        bash_analysis = _analyze_guardrail_source("echo =ls")
+        apply_executor_selection("/usr/bin/zsh")
+        zsh_analysis = _analyze_guardrail_source("echo =ls")
+        # The second family's entry is REUSED, never the first family's.
+        assert _analyze_guardrail_source("echo =ls") is zsh_analysis
+    assert not bash_analysis.requires_approval
+    assert zsh_analysis.approval_reasons == ("Zsh equals expansion",)
+
+
+def test_os_line_reports_the_resolved_executor(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("SHELL", "/usr/bin/zsh")
+    monkeypatch.setattr(shell_module, "_locate_bash", lambda: "/usr/bin/bash")
+    assert _get_os_system_prompt().endswith("with shell `/usr/bin/bash`")
+    apply_executor_selection("/usr/bin/zsh")
+    assert _get_os_system_prompt().endswith("with shell `/usr/bin/zsh`")
+
+
+# A shell-text probe whose output names the executing shell: bash sets
+# BASH_VERSION in the spawned shell itself, a POSIX shell leaves the word list
+# at its default. Passed as shell TEXT (never as argv), so it exercises the
+# executor the spawn resolves.
+_EXECUTOR_PROBE = "printf '%s' ${BASH_VERSION:-posix}"
+
+
+@pytest.mark.asyncio
+async def test_the_shell_spawn_funnel_uses_the_resolved_executor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(shell_module, "_locate_bash", lambda: "/usr/bin/bash")
+    bash_spawn = await spawn_shell_command(_EXECUTOR_PROBE, cwd=tmp_path)
+    bash_output, _ = await bash_spawn.communicate()
+    assert bash_output.strip() != b"posix"
+    apply_executor_selection("/bin/sh")
+    posix_spawn = await spawn_shell_command(_EXECUTOR_PROBE, cwd=tmp_path)
+    posix_output, _ = await posix_spawn.communicate()
+    assert posix_output.strip() == b"posix"
+
+
+@pytest.mark.asyncio
+async def test_the_manual_shell_spawn_uses_the_resolved_executor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from chartreux.app_server._shell import ShellController
+    from chartreux.app_server.protocol import ShellRunParams
+
+    monkeypatch.setattr(shell_module, "_locate_bash", lambda: "/usr/bin/bash")
+    controller = ShellController(tmp_path)
+
+    def params(operation_id: str) -> ShellRunParams:
+        return ShellRunParams(
+            session_id="session",
+            operation_id=operation_id,
+            command=_EXECUTOR_PROBE,
+            cwd=str(tmp_path),
+        )
+
+    assert (await controller.run(params("op-bash"))).stdout.strip() != "posix"
+    apply_executor_selection("/bin/sh")
+    assert (await controller.run(params("op-posix"))).stdout.strip() == "posix"
+
+
+@pytest.mark.asyncio
+async def test_the_background_job_spawn_uses_the_resolved_executor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(shell_module, "_locate_bash", lambda: "/usr/bin/bash")
+    registry = BackgroundJobRegistry()
+    bash_process = await registry._spawn_checked(
+        _EXECUTOR_PROBE, cwd=tmp_path, extra_env={}
+    )
+    bash_output, _ = await bash_process.communicate()
+    assert bash_output.strip() != b"posix"
+    apply_executor_selection("/bin/sh")
+    posix_process = await registry._spawn_checked(
+        _EXECUTOR_PROBE, cwd=tmp_path, extra_env={}
+    )
+    posix_output, _ = await posix_process.communicate()
+    assert posix_output.strip() == b"posix"
+
+
+@pytest.mark.asyncio
+async def test_the_completion_check_spawn_uses_the_resolved_executor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runner = CompletionCheckRunner(cwd=tmp_path, workspace=None, path_authority=None)
+    spawned: list[object] = []
+
+    class _FakeProcess:
+        returncode = 0
+
+        async def communicate(self) -> tuple[bytes, bytes]:
+            return b"", b""
+
+    async def create_subprocess_shell(*args: object, **kwargs: object) -> object:
+        del args
+        spawned.append(kwargs["executable"])
+        return _FakeProcess()
+
+    async def spawn_registered_process(spawn: object) -> object:
+        await spawn  # type: ignore[misc]
+        return _FakeProcess()
+
+    monkeypatch.setattr(
+        shell_module.asyncio, "create_subprocess_shell", create_subprocess_shell
+    )
+    monkeypatch.setattr(
+        shell_module, "spawn_registered_process", spawn_registered_process
+    )
+    monkeypatch.setattr(shell_module, "_locate_bash", lambda: "/usr/bin/bash")
+
+    await runner._spawn(
+        CompletionCheckTemplate.PYTEST,
+        ("printf", "%s", "hi"),
+        tmp_path,
+        time.monotonic(),
+    )
+    apply_executor_selection("/bin/sh")
+    await runner._spawn(
+        CompletionCheckTemplate.PYTEST,
+        ("printf", "%s", "hi"),
+        tmp_path,
+        time.monotonic(),
+    )
+    assert spawned == ["/usr/bin/bash", "/bin/sh"]
+
+
+def test_shell_environment_pins_startup_and_locale(
+    ambient_shell: pytest.MonkeyPatch,
+) -> None:
+    ambient_shell.setenv("SHELL", "/usr/bin/zsh")
     env = _shell_environment({
         "BASH_ENV": "/tmp/hostile",
         "ENV": "/tmp/hostile",
@@ -864,9 +1123,10 @@ def test_shell_environment_pins_startup_and_locale(
 
 @pytest.mark.asyncio
 async def test_spawn_shell_command_refuses_an_unknown_executor(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, ambient_shell: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setenv("SHELL", "/usr/bin/fish")
+    ambient_shell.setenv("SHELL", "/usr/bin/fish")
+    assert shell_executor() == "/usr/bin/fish"
     with pytest.raises(UnknownShellExecutorError, match="no pinned executor"):
         await spawn_shell_command("echo hi", cwd=tmp_path)
 
@@ -924,7 +1184,8 @@ def test_option_changing_shell_invocation_keeps_the_recursive_rm_reason(
     assert result is not None and result.permission is ToolPermission.NEVER
     assert result.reason == (
         "Command denied: recursive rm option '-r' in 'rm -r build'. "
-        "This is a hard guard regardless of target."
+        "This is a hard guard outside the clean-tree and session scratchpad "
+        "carve-outs."
     )
 
 
@@ -1001,9 +1262,9 @@ def test_extended_syntax_detection_is_quote_aware() -> None:
     "command", ["ls *", "cat *.py", "echo ^foo", "ls foo#", "bash -c 'echo *.py'"]
 )
 def test_unknown_executor_fails_closed_for_expansion_bearing_commands(
-    bash_tool, monkeypatch: pytest.MonkeyPatch, command: str
+    bash_tool, ambient_shell: pytest.MonkeyPatch, command: str
 ) -> None:
-    monkeypatch.setenv("SHELL", "/usr/bin/fish")
+    ambient_shell.setenv("SHELL", "/usr/bin/fish")
     result = bash_tool.resolve_permission(BashArgs(command=command))
     assert result is not None and result.permission is ToolPermission.NEVER, command
     assert "no pinned executor option contract" in (result.reason or ""), command
@@ -1011,9 +1272,9 @@ def test_unknown_executor_fails_closed_for_expansion_bearing_commands(
 
 @pytest.mark.parametrize("command", ["echo hi", "git status", "bash -c 'echo hi'"])
 def test_unknown_executor_still_admits_plain_commands(
-    bash_tool, monkeypatch: pytest.MonkeyPatch, command: str
+    bash_tool, ambient_shell: pytest.MonkeyPatch, command: str
 ) -> None:
-    monkeypatch.setenv("SHELL", "/usr/bin/fish")
+    ambient_shell.setenv("SHELL", "/usr/bin/fish")
     result = bash_tool.resolve_permission(BashArgs(command=command))
     assert result is not None and result.permission is ToolPermission.ALWAYS, command
 

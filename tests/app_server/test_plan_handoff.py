@@ -19,6 +19,13 @@ from chartreux.app_server._session_model import (
     override_thinking_level,
     set_session_thinking_override,
 )
+from chartreux.app_server.agent_reconfigure import AgentReconfigureService
+from chartreux.app_server.agent_snapshot import build_session_snapshot
+from chartreux.app_server.agent_wire import (
+    RECONFIGURE_MODE_PLAN_HANDOFF,
+    RECONFIGURE_OUTCOME_ACCEPTED,
+    ReconfigureRequest,
+)
 from chartreux.app_server.client import AppServerClient
 from chartreux.app_server.models import PublicTurn
 from chartreux.app_server.protocol import (
@@ -394,3 +401,71 @@ async def test_plan_handoff_restores_planner_key_to_pre_entry_value(
         assert override_thinking_level(orch, EXECUTOR) == "medium"
     finally:
         await session.close()
+
+
+# --- Item 1 op 10: the handoff carried over the process wire ---------------
+#
+# The pipe carries no deferred action, so the post-response step the in-process
+# handler answers with runs inside the operation boundary, on the live loop,
+# before the reply is written; its outcome rides the receipt instead of a
+# promise the peer cannot keep.
+
+
+def _reconfigure_service(loop: AgentLoop, after: Any) -> AgentReconfigureService:
+    return AgentReconfigureService(
+        loop,
+        turn_active=lambda: False,
+        snapshot=lambda: build_session_snapshot(
+            loop, markers=(), incarnation_id="inc-reconfigure"
+        ),
+        after_response=after,
+    )
+
+
+def _handoff_request() -> ReconfigureRequest:
+    return ReconfigureRequest(
+        mode=RECONFIGURE_MODE_PLAN_HANDOFF, session_id="initial", handoff=_params()
+    )
+
+
+@pytest.mark.asyncio
+async def test_the_wire_handoff_runs_the_post_response_step_before_answering(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    loop = await _layered_loop(monkeypatch, tmp_path)
+    observed: list[str] = []
+
+    async def after(mode: str) -> str:
+        # Read the LIVE selection at call time: the step runs after the
+        # executor install, inside the operation boundary.
+        observed.append(f"{mode}:{override_active_model(loop.config_orchestrator)}")
+        return "post-response-ran"
+
+    reply = await _reconfigure_service(loop, after).plan_handoff(_handoff_request())
+
+    # The step already ran when the reply was built, and its outcome is part of
+    # the receipt: there is no deferred action for the peer to run later.
+    assert observed == [f"{RECONFIGURE_MODE_PLAN_HANDOFF}:{EXECUTOR}"]
+    assert reply.outcome == RECONFIGURE_OUTCOME_ACCEPTED
+    assert reply.followup == "post-response-ran"
+    assert reply.snapshot is not None
+    assert reply.episode_id is None
+
+
+@pytest.mark.asyncio
+async def test_a_failed_post_response_step_rides_the_receipt(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    loop = await _layered_loop(monkeypatch, tmp_path)
+
+    async def after(_mode: str) -> str:
+        raise RuntimeError("the queued prompt refused")
+
+    reply = await _reconfigure_service(loop, after).plan_handoff(_handoff_request())
+
+    # The handoff itself landed, so it is not reported as a failed accept; the
+    # step that could not finish is named in the receipt.
+    assert reply.outcome == RECONFIGURE_OUTCOME_ACCEPTED
+    assert "the post-response step failed" in reply.followup
+    assert "the queued prompt refused" in reply.followup
+    assert override_active_model(loop.config_orchestrator) == EXECUTOR

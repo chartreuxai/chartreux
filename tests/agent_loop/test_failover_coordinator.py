@@ -38,6 +38,7 @@ from chartreux.core.model_catalog.availability import (
 )
 from chartreux.core.model_catalog.loader import CatalogSnapshot
 from chartreux.core.model_catalog.schema import ModelCatalog
+from chartreux.core.recovery_models import canonical_endpoint_identity
 from chartreux.core.session_types import CommittedModelIdentity, LaunchMetadataV2
 from chartreux.core.subagents import AgentAvailability, AgentSummary, TaskResult
 from chartreux.core.utils import retry
@@ -1557,3 +1558,175 @@ def test_r0_failover_candidates_include_same_endpoint_alternative() -> None:
         "base-a",
         "base-b",
     ]
+
+
+# ---------------------------------------------------------------------------
+# Bare 429: classification-driven failover and endpoint exclusion
+# ---------------------------------------------------------------------------
+
+
+def _http_429(*, code: str | None = None) -> httpx.HTTPStatusError:
+    """A 429 the way a proxy answers it: no recognized rate-limit code."""
+    request = httpx.Request("POST", "https://provider.invalid/chat")
+    detail = {"code": code} if code is not None else {}
+    response = httpx.Response(429, request=request, json={"error": detail})
+    return httpx.HTTPStatusError("rate limited", request=request, response=response)
+
+
+def _same_endpoint_agent() -> AgentLoop:
+    snapshot = _same_endpoint_snapshot()
+    config = ChartreuxConfigSchema.model_validate(
+        {"active_model": "base"}, context={"catalog_snapshot": snapshot}
+    ).attach_catalog_snapshot(snapshot)
+    return build_test_agent_loop(config=config, backend=FakeBackend())
+
+
+def _backends_by_provider(agent: AgentLoop, backends: dict[str, FakeBackend]) -> None:
+    def backend_for_attempt(
+        _self: AgentLoop, model: ModelConfig, _budget: object
+    ) -> FakeBackend:
+        return backends[model.provider]
+
+    agent._backend_for_attempt = MethodType(backend_for_attempt, agent)  # type: ignore[method-assign]
+
+
+@pytest.mark.asyncio
+async def test_bare_429_fails_over_across_deployments() -> None:
+    """A bare 429 is failover-eligible: with an alternative deployment the
+    call moves to its independent endpoint. The first attempt carries a zero
+    retry budget (an alternative exists, so it fails over immediately); the
+    final attempt keeps the shared budget.
+    """
+    agent = _agent()
+    budgets: list[RequestRetryBudget] = []
+    first = FakeBackend(exception_to_raise=_http_429())
+    second = FakeBackend([mock_llm_chunk(content="ok")])
+
+    def backend_for_attempt(
+        _self: AgentLoop, model: ModelConfig, budget: object
+    ) -> FakeBackend:
+        budgets.append(cast(RequestRetryBudget, budget))
+        return {"test-first": first, "test-second": second}[model.provider]
+
+    agent._backend_for_attempt = MethodType(backend_for_attempt, agent)  # type: ignore[method-assign]
+
+    assert (await agent._chat()).message.content == "ok"
+    assert [budget.exhausted for budget in budgets] == [True, False]
+    committed = agent.committed_model
+    if committed is None:
+        raise RuntimeError("expected a committed model after successful chat")
+    assert committed.provider == "test-second"
+
+
+@pytest.mark.asyncio
+async def test_rate_limit_failure_skips_same_endpoint_candidates() -> None:
+    """After a RATE_LIMIT failure the remaining candidates on that SAME
+    endpoint are skipped: endpoint throttling makes a sibling deployment
+    there fake relief (the in-call leg of the same-endpoint exclusion the
+    replacement guard applies at failure time).
+    """
+    agent = _same_endpoint_agent()
+    first = FakeBackend(exception_to_raise=_http_429())
+    second = FakeBackend([mock_llm_chunk(content="must not run")])
+    _backends_by_provider(agent, {"test-a": first, "test-b": second})
+
+    with pytest.raises(RuntimeError, match="API error"):
+        await agent._chat()
+
+    assert agent._completion_providers[-1] == ("test-a",)
+    assert second.requests_messages == []
+
+
+@pytest.mark.asyncio
+async def test_connection_failure_still_fails_over_to_same_endpoint_alternative() -> (
+    None
+):
+    """The endpoint skip is rate-limit-specific: a connection failure still
+    moves to the sibling deployment on the same endpoint.
+    """
+    agent = _same_endpoint_agent()
+    first = FakeBackend(exception_to_raise=httpx.ConnectError("down"))
+    second = FakeBackend([mock_llm_chunk(content="ok")])
+    _backends_by_provider(agent, {"test-a": first, "test-b": second})
+
+    assert (await agent._chat()).message.content == "ok"
+    assert agent._completion_providers[-1] == ("test-a", "test-b")
+
+
+@pytest.mark.asyncio
+async def test_protected_429_stops_without_substitution() -> None:
+    """A quota-coded 429 keeps its protected category: no deployment is
+    substituted for it, on the same endpoint or any other.
+    """
+    agent = _same_endpoint_agent()
+    first = FakeBackend(exception_to_raise=_http_429(code="insufficient_quota"))
+    second = FakeBackend([mock_llm_chunk(content="must not run")])
+    _backends_by_provider(agent, {"test-a": first, "test-b": second})
+
+    with pytest.raises(RuntimeError, match="API error"):
+        await agent._chat()
+
+    assert agent._completion_providers[-1] == ("test-a",)
+
+
+def _shared_endpoint_two_models_snapshot() -> CatalogSnapshot:
+    """Two base models behind ONE endpoint: the cross-model correlation shape."""
+    return CatalogSnapshot(
+        ModelCatalog.model_validate({
+            "providers": {"shared": {"api_base": "https://shared.invalid"}},
+            "models": {
+                "base": {
+                    "deployments": [{"provider": "shared", "name": "base-shared"}]
+                },
+                "other": {
+                    "deployments": [{"provider": "shared", "name": "other-shared"}]
+                },
+            },
+            "roles": {},
+        }),
+        "test-revision",
+    )
+
+
+@pytest.mark.asyncio
+async def test_bare_429_records_a_correlatable_endpoint_signature() -> None:
+    """A bare 429 records a non-empty structured signature (``rate_limit:429::``),
+    so the same endpoint throttling two DIFFERENT base models arms the
+    endpoint-wide correlation cooldown — the correct reading of a proxy-level
+    throttle, and impossible while a bare 429 classified UNKNOWN.
+    """
+    snapshot = _shared_endpoint_two_models_snapshot()
+    config = ChartreuxConfigSchema.model_validate(
+        {"active_model": "base"}, context={"catalog_snapshot": snapshot}
+    ).attach_catalog_snapshot(snapshot)
+    agent = build_test_agent_loop(config=config, backend=FakeBackend())
+    registry = agent.config_orchestrator.availability_registry
+    registry.initial_cooldown = 0
+
+    def backend_for_attempt(
+        _self: AgentLoop, _model: ModelConfig, _budget: object
+    ) -> FakeBackend:
+        return FakeBackend(exception_to_raise=_http_429())
+
+    agent._backend_for_attempt = MethodType(backend_for_attempt, agent)  # type: ignore[method-assign]
+
+    endpoint = canonical_endpoint_identity("https://shared.invalid")
+    assert endpoint is not None
+    with pytest.raises(RuntimeError, match="API error"):
+        await agent._chat()
+    # One model's 429 is a per-deployment cooldown, never an endpoint signal.
+    assert registry.endpoint_correlation_active(endpoint) is False
+
+    identity = CommittedModelIdentity(
+        base_model="other",
+        provider="shared",
+        wire_name="other-shared",
+        catalog_revision="test-revision",
+    )
+    agent.committed_model = identity
+    agent.config.attach_committed_model(identity)
+
+    with pytest.raises(RuntimeError, match="API error"):
+        await agent._chat()
+
+    assert registry.endpoint_correlation_active(endpoint) is True

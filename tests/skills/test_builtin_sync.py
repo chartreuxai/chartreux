@@ -110,11 +110,15 @@ class TestBuiltinSkills:
             "(`<simple-command>; echo $?`)" in prompt
         )
         # A5 additive pins: the clean-tree checkout exemption documented in
-        # the prompt (existing pins above are unchanged by the addition).
+        # the prompt (existing pins above are unchanged by the addition), plus
+        # the v0.7.8 routine branch creation it now sits beside.
         assert "Clean-tree checkout exemption" in prompt
         assert "sanctioned delegated switch shapes" in prompt
         assert "--no-overwrite-ignore" in prompt
         assert "Anything unestablishable fails closed to the approval flow" in prompt
+        assert "Branch creation is routine" in prompt
+        assert "the repository state does not gate it" in prompt
+        assert "`post-checkout` hook" in prompt
         assert (
             "Branch merging, switches to remote-tracking branches, and "
             "operations on branches other than the current working branch "

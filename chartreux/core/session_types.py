@@ -314,6 +314,11 @@ class ChildSessionLink(BaseModel):
     tool_call_id: str
     agent: str
     relative_path: str | None = None
+    # The publication attempt the link was recorded under. Optional with a
+    # default because the schema is strict: a link persisted before the field
+    # existed must still load, and such a record retracts through its
+    # session id instead.
+    attempt_id: str | None = None
 
 
 # Session state rather than a message, because the worktree is created before
@@ -423,6 +428,11 @@ class SessionMetadata(BaseModel):
     origin_directory: str | None = None
     username: str
     child_sessions: list[ChildSessionLink] = Field(default_factory=list)
+    # The publication attempt this session was created under, written by the
+    # publishing transaction's FIRST durable save. A torn persist-to-link
+    # window therefore stays attributable to its attempt from the child's own
+    # record; absent on every session created outside a publication attempt.
+    attempt_id: str | None = None
     loops: list[ScheduledLoop] = Field(default_factory=list)
     title: str | None = None
     title_source: Literal["auto", "manual"] = "auto"

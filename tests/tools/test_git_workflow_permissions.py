@@ -1,46 +1,47 @@
-"""A2 acceptance pins: the fail-closed clean-tree checkout exemption.
+"""Checkout acceptance pins: the routine branch creation and the A2 exemption.
 
-``git checkout <existing-local-branch>`` and ``git checkout -b <new>
-[<start>]`` are exempt from dangerous-command approval only when the entire
-composed shell command is exactly one eligible git invocation and every
-candidate repository scope passes the clean-tree guardrails: a fully clean
-work tree, no in-progress operation marker, no repository configuration
-that selects a program, and — for the plain branch form — an existing LOCAL
-target branch (an exact-ref sanitized probe, so commit-ishes never ride the
-exemption). Every other shape stays gated:
-pathspecs, forcing/conflict options, other options, chained or wrapped
-calls, inline ``-c`` configuration, repository relocation, and non-branch
-operands (tags, remote-tracking names, commit-ishes). ``git switch`` is
-untouched.
+``git checkout -b <new> [<start>]`` is routine for EVERY repository state (P3):
+a dirty work tree, an in-progress operation marker, and a start point do not
+gate it, and it carries no dangerous operation. Two protections stay on that
+path: a repository whose config selects a program (``core.hooksPath`` and the
+other program-selection keys) keeps it in the consequential approval class,
+because the branch switch runs that config's ``post-checkout`` hook, and the
+executed command carries ``--no-overwrite-ignore``. The rejected shapes stay
+gated: ``-B``, forcing/conflict options, any other option, a pathspec or
+``--`` tail, inline configuration, and repository relocation.
 
-The executed command string carries ``--no-overwrite-ignore`` — inserted
-immediately after the ``checkout`` subcommand token — so an ignored-file
-collision fails closed (checkout refuses) instead of silently clobbering
-local content, while the original command string stays original on every
-display and result surface, including the stored summary of a managed
-(bash_start) job.
+``git checkout <existing-local-branch>`` keeps the A2 exemption: it needs the
+entire composed shell command to be exactly one eligible git invocation and
+every candidate repository scope to pass the clean-tree guardrails — a fully
+clean work tree, no in-progress operation marker, no repository configuration
+that selects a program, and an existing LOCAL target branch (an exact-ref
+probe, so commit-ishes never ride the exemption). ``git switch`` is untouched.
 
-Coverage: branch-vs-file ambiguity; -b with/without start; every excluded
-shape; clean/dirty/unknown state; every operation marker; hooks config; the
-per-call guardrail cache. The deep-review repairs land their own regressions
-here: the guardrail ORDERING (a program-selecting config declines before any
-state probe spawns), the EFFECTIVE-WORKTREE probe (a core.worktree-relocated
-work tree is the tree assessed), and the injection FAIL-CLOSED contract (a
-rewrite failure on an exempt shape fails the call before execution on both
-the foreground and the managed-start paths). A4's extension (below) lands
-the dimensions A2's checkpoint deferred: the cross-call cache lifetime (no
-cache survives a resolution, in neither direction), the reachable slice of
-the scope-permutation dimension (scope resolution from a subdirectory —
-true multi-scope permutations stay unreachable under the whole-call gate
-and are documented there, not forced), the end-to-end conflicted workflows
-(a conflicted squash-merge and an unpublished-branch conflicted rebase
-complete through the real permission boundary with zero denials), the
-adjudicated race cases (a conflicting concurrent change refuses and is
-preserved; a non-conflicting one survives the successful non-forcing
-checkout), the ignored-collision race (an ignored file created after the
-permission probe still refuses through the executed flag), the
-reviewer-context composition, and the denied destructive forms refused
-before execution.
+The executed command string of both whole-call forms carries
+``--no-overwrite-ignore`` — inserted immediately after the ``checkout``
+subcommand token — so an ignored-file collision fails closed (checkout
+refuses) instead of silently clobbering local content, while the original
+command string stays original on every display and result surface, including
+the stored summary of a managed (bash_start) job.
+
+Coverage: branch-vs-file ambiguity; -b with/without start on clean and dirty
+trees; every excluded shape; dirty/marker/unknown state for the switch form;
+hooks config keeping the creation approval class; the per-call guardrail
+cache. The deep-review repairs land their own regressions here: the guardrail
+ORDERING (a program-selecting config declines before any state probe spawns),
+the EFFECTIVE-WORKTREE probe (a core.worktree-relocated work tree is the tree
+assessed), and the injection FAIL-CLOSED contract (a rewrite failure on an
+injectable shape fails the call before execution on both the foreground and
+the managed-start paths). A4's extension (below) lands the dimensions A2's
+checkpoint deferred: the cross-call cache lifetime, the reachable slice of
+the scope-permutation dimension, the end-to-end conflicted workflows (a
+conflicted squash-merge and an unpublished-branch conflicted rebase complete
+through the real permission boundary with zero denials), the adjudicated
+race cases (a conflicting concurrent change refuses and is preserved; a
+non-conflicting one survives the successful non-forcing checkout), the
+ignored-collision races (an ignored file created after the permission probe
+still refuses through the executed flag), the reviewer-context composition,
+and the denied destructive forms refused before execution.
 """
 
 from __future__ import annotations
@@ -177,25 +178,25 @@ def workspace_and_authority(cwd: Path) -> tuple[Workspace, PathAuthority]:
     return workspace, authority
 
 
-# --- the exempt shapes ---------------------------------------------------------
+# --- the routine branch creation (P3) ------------------------------------------
 
 
 @pytest.mark.parametrize(
     "command",
     [
-        "git checkout main",
-        "git checkout topic",
         "git checkout -b feature",
         "git checkout -b feature main",
         "git checkout -b feature topic",
-        "git --no-pager checkout topic",
-        "git checkout 'topic'",
+        "git checkout -b feature v1.0",
+        "git --no-pager checkout -b feature",
     ],
 )
-def test_exempt_checkout_shapes_are_allowed_on_a_clean_tree(
-    tmp_path: Path, command: str
-) -> None:
+def test_branch_creation_is_routine(tmp_path: Path, command: str) -> None:
+    # P3: `git checkout -b <new> [<start>]` carries no dangerous operation,
+    # for any repository state and with any start point — a start point IS
+    # allowed (git refuses rather than discards when content conflicts).
     repo = make_repo(tmp_path / "repo")
+    git(repo, "tag", "v1.0")
     assert_allowed(resolve(repo, command), command)
 
 
@@ -226,13 +227,34 @@ async def test_exempt_checkout_executes_and_keeps_the_original_string(
 
 
 @pytest.mark.asyncio
-async def test_exempt_create_checkout_executes_with_the_flag(tmp_path: Path) -> None:
+async def test_create_checkout_executes_on_a_dirty_tree(tmp_path: Path) -> None:
+    # The dirty tree was the anecdote's failure: creation preserves work, so
+    # it executes routinely and the uncommitted change survives untouched.
     repo = make_repo(tmp_path / "repo")
+    (repo / "tracked.txt").write_text("unsaved work\n", encoding="utf-8")
+    assert_allowed(resolve(repo, "git checkout -b feature"), "git checkout -b feature")
     result = await collect_result(
         bash_tool(repo).run(BashArgs(command="git checkout -b feature"))
     )
     assert result.command == "git checkout -b feature"
     assert git(repo, "rev-parse", "--abbrev-ref", "HEAD").stdout.strip() == "feature"
+    assert (repo / "tracked.txt").read_text(encoding="utf-8") == "unsaved work\n"
+
+
+@pytest.mark.asyncio
+async def test_create_checkout_with_a_start_point_executes(tmp_path: Path) -> None:
+    # The start point form switches the work tree to the start point, so it
+    # is the creation shape the injected flag protects.
+    repo = make_repo(tmp_path / "repo")
+    assert_allowed(
+        resolve(repo, "git checkout -b feature topic"), "git checkout -b feature topic"
+    )
+    result = await collect_result(
+        bash_tool(repo).run(BashArgs(command="git checkout -b feature topic"))
+    )
+    assert result.command == "git checkout -b feature topic"
+    assert git(repo, "rev-parse", "--abbrev-ref", "HEAD").stdout.strip() == "feature"
+    assert (repo / "topic").read_text(encoding="utf-8") == "topic version\n"
 
 
 @pytest.mark.asyncio
@@ -248,6 +270,25 @@ async def test_create_form_for_an_existing_branch_fails_at_execution(
             bash_tool(repo).run(BashArgs(command="git checkout -b topic"))
         )
     assert git(repo, "rev-parse", "--abbrev-ref", "HEAD").stdout.strip() == "main"
+
+
+# --- the existing-branch exemption's shapes ------------------------------------
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "git checkout main",
+        "git checkout topic",
+        "git --no-pager checkout topic",
+        "git checkout 'topic'",
+    ],
+)
+def test_exempt_switch_shapes_are_allowed_on_a_clean_tree(
+    tmp_path: Path, command: str
+) -> None:
+    repo = make_repo(tmp_path / "repo")
+    assert_allowed(resolve(repo, command), command)
 
 
 # --- the excluded shapes -------------------------------------------------------
@@ -360,6 +401,23 @@ def test_whole_call_ineligible_shapes_stay_gated(tmp_path: Path, command: str) -
     assert context.reason, command
 
 
+def test_composed_creation_is_routine_but_carries_no_injection(tmp_path: Path) -> None:
+    # The creation admission needs no whole-call gate (creation preserves
+    # work), so a composed creation is routinely admitted, while the
+    # executed-string injection stays whole-call-only. Pinned so the
+    # asymmetry is deliberate rather than accidental.
+    repo = make_repo(tmp_path / "repo")
+    command = "git checkout -b feature && git status"
+    assert_allowed(resolve(repo, command), command)
+    workspace, authority = workspace_and_authority(repo)
+    assert (
+        shell_command_checkout_no_overwrite_ignore(
+            command, workspace=workspace, authority=authority
+        )
+        is None
+    )
+
+
 def test_git_switch_classification_is_untouched(tmp_path: Path) -> None:
     # A2 exempts checkout forms only: the plain switch form stays routine,
     # the discarding forms stay gated with their own operation.
@@ -375,11 +433,13 @@ def test_git_switch_classification_is_untouched(tmp_path: Path) -> None:
         assert proposal.operations == ("git.switch.discard",), command
 
 
-# --- the dirty / marker / hooks fail-closed cases ------------------------------
+# --- the dirty / marker / hooks cases ----------------------------------------
 
 
 @pytest.mark.parametrize("dirty", ["modified", "staged", "untracked"])
-def test_dirty_tree_fails_closed(tmp_path: Path, dirty: str) -> None:
+def test_dirty_tree_fails_closed_for_the_switch_form(
+    tmp_path: Path, dirty: str
+) -> None:
     repo = make_repo(tmp_path / "repo")
     if dirty == "modified":
         (repo / "tracked.txt").write_text("modified\n", encoding="utf-8")
@@ -388,8 +448,11 @@ def test_dirty_tree_fails_closed(tmp_path: Path, dirty: str) -> None:
         git(repo, "add", "-A")
     else:
         (repo / "untracked.txt").write_text("untracked\n", encoding="utf-8")
-    for command in ("git checkout topic", "git checkout -b feature"):
-        assert_gated(resolve(repo, command), command)
+    # The switch exemption is state-aware; the creation form is not (P3), so
+    # the same dirty tree leaves the creation routine.
+    assert_gated(resolve(repo, "git checkout topic"), "git checkout topic")
+    for command in ("git checkout -b feature", "git checkout -b feature main"):
+        assert_allowed(resolve(repo, command), command)
 
 
 @pytest.mark.parametrize(
@@ -404,24 +467,29 @@ def test_dirty_tree_fails_closed(tmp_path: Path, dirty: str) -> None:
         "sequencer",
     ],
 )
-def test_in_progress_operation_marker_fails_closed(tmp_path: Path, marker: str) -> None:
+def test_in_progress_operation_marker_fails_closed_for_the_switch_form(
+    tmp_path: Path, marker: str
+) -> None:
     repo = make_repo(tmp_path / "repo")
     marker_path = repo / ".git" / marker
     if marker in {"rebase-merge", "rebase-apply", "sequencer"}:
         marker_path.mkdir()
     else:
         marker_path.write_text("in progress\n", encoding="utf-8")
-    for command in ("git checkout topic", "git checkout -b feature"):
-        assert_gated(resolve(repo, command), command)
+    assert_gated(resolve(repo, "git checkout topic"), "git checkout topic")
+    assert_allowed(resolve(repo, "git checkout -b feature"), "git checkout -b feature")
 
 
 @pytest.mark.parametrize(
     ("key", "value"),
     [("core.hooksPath", "/tmp/chartreux-fixture-hooks"), ("core.editor", "vim")],
 )
-def test_program_selecting_config_fails_closed(
+def test_program_selecting_config_keeps_the_approval_class(
     tmp_path: Path, key: str, value: str
 ) -> None:
+    # P3 keeps the config gate on BOTH paths: the switch exemption declines,
+    # and the routine creation keeps the consequential approval class, so
+    # the program-selecting repository config is never silently run.
     repo = make_repo(tmp_path / "repo")
     git(repo, "config", key, value)
     for command in ("git checkout topic", "git checkout -b feature"):
@@ -436,7 +504,7 @@ def test_program_selecting_config_declines_before_any_state_probe(
     # `git status` can pass work-tree contents through repository-configured
     # clean/smudge process filters. A repository whose config selects a
     # program must be declined WITHOUT the subprocess-touching state probes
-    # ever running.
+    # ever running — on the switch exemption and on the creation gate alike.
     repo = make_repo(tmp_path / "repo")
     git(repo, "config", "core.hooksPath", "hooks")
     probes: list[str] = []
@@ -472,20 +540,24 @@ def test_program_selecting_config_declines_before_any_state_probe(
 
 def test_unknown_state_fails_closed(tmp_path: Path) -> None:
     # A directory governed by no repository: the nominal scope carries no
-    # git dir, so the guardrails cannot be established.
+    # git dir, so the guardrails cannot be established — and the creation
+    # gate fails closed the same way, because it cannot read the config of a
+    # repository it cannot locate.
     plain = tmp_path / "plain"
     plain.mkdir()
-    context = resolve(plain, "git checkout main")
-    assert isinstance(context, PermissionContext)
-    assert context.permission is ToolPermission.NEVER
+    for command in ("git checkout main", "git checkout -b feature"):
+        context = resolve(plain, command)
+        assert isinstance(context, PermissionContext), command
+        assert context.permission is ToolPermission.NEVER, command
 
     # A .git marker that is not a usable repository pointer.
     broken = tmp_path / "broken"
     broken.mkdir()
     (broken / ".git").write_text("not a repository pointer\n", encoding="utf-8")
-    context = resolve(broken, "git checkout main")
-    assert isinstance(context, PermissionContext)
-    assert context.permission is ToolPermission.NEVER
+    for command in ("git checkout main", "git checkout -b feature"):
+        context = resolve(broken, command)
+        assert isinstance(context, PermissionContext), command
+        assert context.permission is ToolPermission.NEVER, command
 
 
 def test_the_effective_work_tree_is_probed_not_the_discovery_directory(
@@ -507,8 +579,7 @@ def test_the_effective_work_tree_is_probed_not_the_discovery_directory(
     worktree.mkdir()
     (worktree / "tracked.txt").write_text("dirty\n", encoding="utf-8")
     git(repo, "config", "core.worktree", str(worktree))
-    for command in ("git checkout topic", "git checkout -b feature"):
-        assert_gated(resolve_wide(repo, command), command)
+    assert_gated(resolve_wide(repo, "git checkout topic"), "git checkout topic")
 
     # Control: the divergence reads the other way — a DIRTY discovery
     # directory whose configured work tree is CLEAN keeps the exemption,
@@ -523,8 +594,7 @@ def test_the_effective_work_tree_is_probed_not_the_discovery_directory(
     shutil.copyfile(mirror / "sub" / "inner.txt", clean_worktree / "sub" / "inner.txt")
     (mirror / "tracked.txt").write_text("unsaved\n", encoding="utf-8")
     git(mirror, "config", "core.worktree", str(clean_worktree))
-    for command in ("git checkout topic", "git checkout -b feature"):
-        assert_allowed(resolve_wide(mirror, command), command)
+    assert_allowed(resolve_wide(mirror, "git checkout topic"), "git checkout topic")
 
 
 def test_the_guardrail_cache_is_per_call(tmp_path: Path) -> None:
@@ -560,12 +630,13 @@ def test_the_guardrail_cache_is_per_call(tmp_path: Path) -> None:
         ("git checkout 'topic'", "git checkout --no-overwrite-ignore 'topic'"),
     ],
 )
-def test_exempt_spellings_rewrite_the_executed_string(
+def test_modeled_whole_call_spellings_rewrite_the_executed_string(
     tmp_path: Path, command: str, expected: str
 ) -> None:
     # The flag is injected immediately after the checkout subcommand token;
     # every other byte of the command string is preserved exactly. The flag
-    # is not required as user input.
+    # is not required as user input. Both modeled whole-call forms carry it —
+    # the exempt switch and the routine creation alike (P3).
     repo = make_repo(tmp_path / "repo")
     workspace, authority = workspace_and_authority(repo)
     assert (
@@ -576,15 +647,35 @@ def test_exempt_spellings_rewrite_the_executed_string(
     )
 
 
+def test_creation_injection_does_not_depend_on_the_clean_tree_exemption(
+    tmp_path: Path,
+) -> None:
+    # P3: the injection path's recognition is its own, so the flag rides a
+    # creation the state guardrails would decline — the dirty tree that made
+    # the anecdote fail stays injected.
+    repo = make_repo(tmp_path / "repo")
+    (repo / "tracked.txt").write_text("unsaved\n", encoding="utf-8")
+    assert_gated(resolve(repo, "git checkout topic"), "git checkout topic")
+    workspace, authority = workspace_and_authority(repo)
+    assert (
+        shell_command_checkout_no_overwrite_ignore(
+            "git checkout -b feature", workspace=workspace, authority=authority
+        )
+        == "git checkout --no-overwrite-ignore -b feature"
+    )
+
+
 @pytest.mark.parametrize(
     "command",
     [
         "git checkout -f topic",
         "git checkout topic -- file.txt",
         "git checkout topic && git status",
+        "git checkout -b feature && git status",
         "FOO=1 git checkout topic",
         "git -c core.hooksPath=/tmp/hooks checkout topic",
         "git -C . checkout topic",
+        "git -C . checkout -b feature",
         "git checkout topic > out.txt",
         "git switch topic",
         "git switch -c feature",
@@ -602,8 +693,8 @@ def test_ineligible_spellings_do_not_rewrite(tmp_path: Path, command: str) -> No
     )
 
 
-def _injected_rewrite_failure(command: str, exemption: object) -> str:
-    """The fault injection: the rewrite of an eligible exempt checkout fails."""
+def _injected_rewrite_failure(command: str, checkout_token_index: int) -> str:
+    """The fault injection: the rewrite of an injectable checkout fails."""
     raise RuntimeError("injected rewrite failure")
 
 
@@ -613,9 +704,9 @@ def test_an_eligible_rewrite_failure_raises_instead_of_returning_none(
     # Deep-review F3, the unit pin of the fail-closed contract: the
     # executed-string re-derivation distinguishes "not an eligible checkout"
     # (None — the caller executes the command unmodified) from "eligible but
-    # could not safely rewrite" (a hard error). A rewrite failure on an
-    # exempt shape raises, never returns None, which would execute the
-    # unprotected original string.
+    # could not safely rewrite" (a hard error). A rewrite failure on a
+    # modeled whole-call shape raises, never returns None, which would
+    # execute the unprotected original string.
     repo = make_repo(tmp_path / "repo")
     workspace, authority = workspace_and_authority(repo)
     # Not an eligible checkout: None — the caller executes it unmodified.
@@ -628,13 +719,14 @@ def test_an_eligible_rewrite_failure_raises_instead_of_returning_none(
     # Eligible, but the rewrite fails: a hard error, never None.
     monkeypatch.setattr(
         permission_resolver,
-        "_exempt_checkout_executed_string",
+        "_checkout_injected_executed_string",
         _injected_rewrite_failure,
     )
-    with pytest.raises(CheckoutInjectionError):
-        shell_command_checkout_no_overwrite_ignore(
-            "git checkout topic", workspace=workspace, authority=authority
-        )
+    for command in ("git checkout topic", "git checkout -b feature"):
+        with pytest.raises(CheckoutInjectionError):
+            shell_command_checkout_no_overwrite_ignore(
+                command, workspace=workspace, authority=authority
+            )
 
 
 @pytest.mark.asyncio
@@ -659,13 +751,12 @@ async def test_a_failed_injection_rewrite_fails_the_call_before_execution(
     monkeypatch.setattr(bash_module, "spawn_shell_command", refusing_spawn)
     monkeypatch.setattr(
         permission_resolver,
-        "_exempt_checkout_executed_string",
+        "_checkout_injected_executed_string",
         _injected_rewrite_failure,
     )
-    with pytest.raises(CheckoutInjectionError):
-        await collect_result(
-            bash_tool(repo).run(BashArgs(command="git checkout topic"))
-        )
+    for command in ("git checkout topic", "git checkout -b feature"):
+        with pytest.raises(CheckoutInjectionError):
+            await collect_result(bash_tool(repo).run(BashArgs(command=command)))
     assert spawned == []
     assert git(repo, "rev-parse", "--abbrev-ref", "HEAD").stdout.strip() == "main"
 
@@ -688,11 +779,12 @@ async def test_a_failed_injection_rewrite_fails_the_managed_start_before_a_job(
         )
         monkeypatch.setattr(
             permission_resolver,
-            "_exempt_checkout_executed_string",
+            "_checkout_injected_executed_string",
             _injected_rewrite_failure,
         )
-        with pytest.raises(CheckoutInjectionError):
-            await _run_start(tool, BashStartArgs(command="git checkout topic"), ctx)
+        for command in ("git checkout topic", "git checkout -b feature"):
+            with pytest.raises(CheckoutInjectionError):
+                await _run_start(tool, BashStartArgs(command=command), ctx)
         listed = port.list(BashListArgs(include_finished=True))
         assert listed.jobs == ()
         assert git(repo, "rev-parse", "--abbrev-ref", "HEAD").stdout.strip() == "main"
@@ -725,6 +817,30 @@ async def test_ignored_file_collision_refuses_instead_of_clobbering(
     assert git(repo, "rev-parse", "--abbrev-ref", "HEAD").stdout.strip() == "main"
     # The error surface keeps the ORIGINAL command string.
     assert str(err.value).splitlines()[0] == "Command failed: 'git checkout topic'"
+
+
+@pytest.mark.asyncio
+async def test_creation_from_a_start_point_refuses_an_ignored_collision(
+    tmp_path: Path,
+) -> None:
+    # P3: the routine creation switch runs under the same executed-string
+    # flag, so a start point whose tree tracks a path the work tree holds as
+    # an IGNORED file refuses instead of clobbering it. The local artifact is
+    # the irreversible harm the injection exists to prevent.
+    repo = ignored_collision_repo(tmp_path / "repo")
+    command = "git checkout -b feature topic"
+    assert_allowed(resolve(repo, command), command)
+
+    with pytest.raises(FailedShellCommand) as err:
+        await collect_result(bash_tool(repo).run(BashArgs(command=command)))
+
+    assert (repo / "build.txt").read_text(encoding="utf-8") == (
+        "local precious content\n"
+    )
+    assert git(repo, "rev-parse", "--abbrev-ref", "HEAD").stdout.strip() == "main"
+    assert git(repo, "branch", "--list", "feature", check=False).stdout == ""
+    # The error surface keeps the ORIGINAL command string.
+    assert str(err.value).splitlines()[0] == f"Command failed: {command!r}"
 
 
 async def _run_start(tool: BashStart, args: BashStartArgs, ctx: InvokeContext):
@@ -892,12 +1008,11 @@ async def test_unpublished_branch_conflicted_rebase_completes_with_zero_denials(
 ) -> None:
     # An unpublished-branch conflicted rebase completes through the real
     # permission boundary with zero denials: the sanctioned -b creation of
-    # the unpublished branch rides the exemption, the rebase is routine, and
+    # the unpublished branch is routine (P3), the rebase is routine, and
     # the conflicted rebase stops on git's own refusal before the resolution
     # and the continuation complete it. The continuation cannot block on an
     # editor: the conflict is committed with --no-edit first (rebase
-    # --continue then only advances), so no program-selecting editor config
-    # is ever needed — which also keeps the -b creation exempt.
+    # --continue then only advances).
     repo = diverged_repo(tmp_path / "repo")
     tool = bash_tool(repo)
     command = "git checkout -b feature topic"
@@ -1130,10 +1245,10 @@ def test_exempt_scope_resolution_from_a_subdirectory(tmp_path: Path) -> None:
     # synthetic call.
     repo = make_repo(tmp_path / "repo")
     sub = repo / "sub"
+    tool = bash_tool(sub)
+    # The real session composition: the session started at the repo root, so
+    # the authorized workspace root is the repository while the shell cwd
+    # sits in a subdirectory. The creation form is routine from anywhere.
+    tool.workspace = Workspace.for_session(repo)
     for command in ("git checkout topic", "git checkout -b feature"):
-        tool = bash_tool(sub)
-        # The real session composition: the session started at the repo root,
-        # so the authorized workspace root is the repository while the shell
-        # cwd sits in a subdirectory.
-        tool.workspace = Workspace.for_session(repo)
         assert_allowed(tool.resolve_permission(BashArgs(command=command)), command)

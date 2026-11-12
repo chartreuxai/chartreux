@@ -41,7 +41,13 @@ from chartreux.app_server.transport import (
     terminate_process,
 )
 
-PROCESS_PROTOCOL_VERSION = 1
+PROCESS_PROTOCOL_VERSION = 2
+"""The process wire version both ends must share.
+
+Version 2 is the bidirectional agent-wire extension: origin-prefixed request
+ids and the closed per-direction dispatch tables. A pair that does not share a
+version rejects at the ready frame instead of misreading frames.
+"""
 
 BOOTSTRAP_ENV_VAR = "CHARTREUX_PROCESS_BOOTSTRAP"
 

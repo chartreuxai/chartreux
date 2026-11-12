@@ -57,7 +57,7 @@ from chartreux.core.compaction import reorder_for_tool_adjacency
 from chartreux.core.compaction.context import select_model_context
 from chartreux.core.config import ChartreuxConfigSchema, ModelConfig, ProviderConfig
 from chartreux.core.config.orchestrator import ConfigOrchestrator
-from chartreux.core.llm.failures import RequestRetryBudget, classify
+from chartreux.core.llm.failures import FailureCategory, RequestRetryBudget, classify
 from chartreux.core.llm.format import APIToolFormatHandler
 from chartreux.core.llm.types import BackendLike
 from chartreux.core.llm_models import (
@@ -554,6 +554,27 @@ class CompletionCoordinator:
             return api_base
         return None
 
+    def _endpoint_throttled(
+        self,
+        candidate: EligibleDeployment,
+        throttled: set[str],
+        forced: OverridePermit | None,
+    ) -> bool:
+        """Whether this candidate shares an endpoint already rate-limited.
+
+        Endpoint-wide throttling makes a sibling deployment on the SAME
+        endpoint fake relief, so a RATE_LIMIT failure excludes it for the
+        rest of the logical call. A forced-override permit is exempt: its
+        endpoint is the attempt the caller explicitly asked for, and that
+        attempt is terminal.
+        """
+        if not throttled:
+            return False
+        identity = canonical_endpoint_identity(candidate.resolved.provider.api_base)
+        if identity is None or identity not in throttled:
+            return False
+        return forced is None or forced.endpoint != identity
+
     def _release_unconsumed_override(
         self, permit: OverridePermit | None, ledger: CooldownOverrideLedger | None
     ) -> None:
@@ -739,12 +760,15 @@ class CompletionCoordinator:
         registry = self._config_orchestrator.availability_registry
         last_error: BaseException | None = None
         attempted: set[str] = set()
+        rate_limited_endpoints: set[str] = set()
         providers_used: list[str] = []
         try:  # noqa: PLR1702
             for candidate_index, candidate in enumerate(candidates):
                 resolved = candidate.resolved
                 provider_name = resolved.deployment.provider
                 if provider_name in attempted:
+                    continue
+                if self._endpoint_throttled(candidate, rate_limited_endpoints, forced):
                     continue
 
                 replacement: BackendLike | None = None
@@ -880,6 +904,15 @@ class CompletionCoordinator:
                         # signature, so cross-model rate-limit evidence on one
                         # endpoint is representable WITHOUT log parsing.
                         endpoint = self._failure_endpoint(model)
+                        if failure.category is FailureCategory.RATE_LIMIT:
+                            # Endpoint throttling reaches every deployment
+                            # on that endpoint, so the rest of this logical
+                            # call skips them (the in-call leg of the
+                            # same-endpoint exclusion the replacement guard
+                            # applies at failure time).
+                            throttled = canonical_endpoint_identity(endpoint)
+                            if throttled is not None:
+                                rate_limited_endpoints.add(throttled)
                         registry.record_failure(
                             resolved.base_model,
                             provider_name,

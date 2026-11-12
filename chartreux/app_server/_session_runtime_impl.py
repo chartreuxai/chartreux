@@ -5,6 +5,7 @@ from collections.abc import Awaitable, Callable
 from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
+from typing import TYPE_CHECKING
 from uuid import uuid4
 
 from chartreux.app_server._child_runtime_lifecycle import TreeNotReapedError
@@ -103,6 +104,14 @@ from chartreux.core.subagents import AgentEviction
 from chartreux.core.usage import UsageAttribution, UsagePurpose
 from chartreux.observability.logging import logger
 
+if TYPE_CHECKING:
+    from chartreux.app_server.protocol import SessionPlanHandoffParams
+    from chartreux.app_server.root_agent_process import (
+        ReconfigureReply,
+        ReplaceReply,
+        RootAgentProcess,
+    )
+
 type OpenRoot = Callable[[RootOpenRequest], Awaitable[AgentLoop]]
 type StageRoot = Callable[[AgentLoop], Awaitable[None]]
 type AllocateStartupAccounting = Callable[
@@ -113,12 +122,110 @@ type AbandonStartupAccounting = Callable[[StartupAccountingContext], Awaitable[N
 type TrackStartupProducer = Callable[
     [StartupAccountingContext, asyncio.Task[WorktreeResolution]], None
 ]
+type ReapCohort = Callable[[], Awaitable[object]]
+type PlanSettlement = Callable[[], Awaitable[str | None]]
 
 
 @dataclass(frozen=True, slots=True)
 class OpenedRuntime:
     agent_loop: AgentLoop
     worktree_resolution: WorktreeResolution
+
+
+def switch_refusal(exc: BaseException) -> RequestFailure:
+    """The typed refusal a session switch answers when its cohort is not reaped.
+
+    The reaper is retried until it completes (or the session fails), so the
+    refusal names the retry and the tree budget's shutdown end instead of
+    leaving the caller with a stuck budget and no next step.
+    """
+    if isinstance(exc, TreeNotReapedError):
+        return RequestFailure(
+            ProtocolErrorCode.CONFLICT,
+            "The previous session tree was not fully reaped inside its bound: no "
+            "new tree starts before the old one is reaped. Retry the cohort "
+            "reaper, and end the process-tree budget's shutdown if it is still "
+            "shutting down. Nothing was switched.",
+        )
+    return RequestFailure(
+        ProtocolErrorCode.INTERNAL_ERROR,
+        f"Failed to close the previous session tree: {exc}",
+    )
+
+
+class ProcessRootReplace:
+    """The coordinator's replace leg for a process-backed root.
+
+    The coordinator owns the child handles and the tree budget; the agent owns
+    the session. A rebind sent before the old cohort is fully reaped would leave
+    the old tree unowned while the new identity already runs, so the reap runs
+    first and its refusal ends the transition BEFORE a frame is sent.
+    """
+
+    def __init__(self, *, process: RootAgentProcess, reap: ReapCohort) -> None:
+        self._process = process
+        self._reap = reap
+
+    async def replace(
+        self, *, session_id: str | None = None, continue_latest: bool = False
+    ) -> ReplaceReply:
+        """Reap the old cohort, then rebind the agent to the stored session."""
+        await self._reap_cohort()
+        return await self._process.replace(
+            session_id=session_id, continue_latest=continue_latest
+        )
+
+    async def _reap_cohort(self) -> None:
+        try:
+            await self._reap()
+        except Exception as exc:
+            raise switch_refusal(exc) from exc
+
+
+class ProcessRootReconfigure:
+    """The coordinator's reconfigure leg for a process-backed root.
+
+    Settings and the history clear are short modes; the plan handoff is a long
+    operation. The coordinator-owned preparation never moves across the
+    boundary: the /clear plan-episode settlement and the pin removal are the
+    coordinator TUI's own steps and run BEFORE this leg is entered, so this leg
+    only consults their outcome -- a refused settlement ends the clear with the
+    same "Nothing was cleared" refusal the user reads on the in-process path,
+    and no clear frame is ever sent.
+    """
+
+    def __init__(
+        self,
+        *,
+        process: RootAgentProcess,
+        plan_settlement: PlanSettlement | None = None,
+    ) -> None:
+        self._process = process
+        self._plan_settlement = plan_settlement
+
+    async def update_settings(
+        self, *, max_turns: int | None = None, max_tokens: int | None = None
+    ) -> ReconfigureReply:
+        """Apply the session bounds in the agent process: apply and acknowledge."""
+        return await self._process.update_settings(
+            max_turns=max_turns, max_tokens=max_tokens
+        )
+
+    async def clear_history(self) -> ReconfigureReply:
+        """Refuse a clear still blocked by its plan settlement, else send it."""
+        if self._plan_settlement is not None:
+            refusal = await self._plan_settlement()
+            if refusal is not None:
+                raise RequestFailure(
+                    ProtocolErrorCode.CONFLICT,
+                    f"Clear refused: {refusal} Nothing was cleared; the plan "
+                    "episode keeps its state.",
+                )
+        return await self._process.clear_history()
+
+    async def plan_handoff(self, params: SessionPlanHandoffParams) -> ReconfigureReply:
+        """Send the consented handoff; the agent runs the full fence."""
+        return await self._process.plan_handoff(params)
 
 
 class SessionRuntimeControllerImpl:
@@ -472,16 +579,12 @@ class SessionRuntimeControllerImpl:
             agent_loop = previous.session.agent_loop
             # WP7 [7C]: the old tree is closed in full — the [7B] ordered
             # shutdown — before the new session is opened. A tree that could
-            # not be reaped refuses the switch, so the two trees never overlap.
+            # not be reaped refuses the switch, so the two trees never overlap
+            # and the rebind below is never reached.
             try:
                 await self._sessions.close_tree_for_switch()
-            except TreeNotReapedError as exc:
-                raise RequestFailure(ProtocolErrorCode.CONFLICT, str(exc)) from exc
             except Exception as exc:
-                raise RequestFailure(
-                    ProtocolErrorCode.INTERNAL_ERROR,
-                    f"Failed to close the previous session tree: {exc}",
-                ) from exc
+                raise switch_refusal(exc) from exc
             try:
                 await self._runtime_factory.resume_root(agent_loop, session_id)
             except RuntimeSessionNotFoundError as exc:

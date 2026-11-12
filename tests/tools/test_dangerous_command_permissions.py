@@ -156,7 +156,8 @@ def assert_other_denial(context: PermissionContext | None) -> None:
     """A non-dangerous denial: never the grantable kind, never a proposal."""
     assert context is not None
     assert context.permission is ToolPermission.NEVER
-    assert context.denial_kind is None
+    # The path layer's own grantable kind is not the dangerous-command kind.
+    assert context.denial_kind in (None, "out_of_root")
     assert context.dangerous_command_proposal is None
     assert context.reason
 

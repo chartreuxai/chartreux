@@ -29,6 +29,7 @@ from chartreux.app_server._session_model import (
     restore_session_thinking_overrides,
     set_session_active_model_override,
 )
+from chartreux.app_server.agent_snapshot import RootOpenAccounting
 from chartreux.app_server.client import AppServerClient
 from chartreux.app_server.client_tools import ClientToolHandler
 from chartreux.app_server.models import (
@@ -232,6 +233,10 @@ class LocalHarnessOptions:
     startup_accounting: StartupAccountingContext | None = field(
         default=None, repr=False
     )
+    #: Whether this run is an interactive one. The selection resolver's
+    #: interactive default is the stdio topology, so a harness that names no
+    #: variable resolves the topology from this flag alone.
+    interactive: bool = False
 
 
 class RuntimeSessionNotFoundError(RuntimeError):
@@ -1428,6 +1433,7 @@ class HarnessProcess:
         self._configured = False
         self._staged_roots: dict[str, AgentLoop] = {}
         self._staged_roots_lock = asyncio.Lock()
+        self._last_open_accounting: RootOpenAccounting | None = None
         self._closed = False
         self.host_handler = HostRequestHandler(
             self.harness_files,
@@ -1663,6 +1669,29 @@ class HarnessProcess:
             startup_accounting_owner=self.startup_accounting_owner,
         )
 
+    def create_process_session_backend_host(
+        self, services: SessionBackendServices
+    ) -> SessionBackendHost:
+        """Build the host of a stdio session: it spawns the root agent.
+
+        The shipped env-keyed spawn guards select on ``CHARTREUX_TRANSPORT``,
+        so a config-selected stdio session - one that named no variable - is
+        materialized into the spawn environment here rather than resolved
+        again against an empty environ.
+        """
+        from chartreux.app_server.process_session_backend import (
+            ProcessSessionBackendHost,
+        )
+        from chartreux.app_server.transport import STDIO_TRANSPORT, TransportSelection
+
+        return ProcessSessionBackendHost(
+            services=services,
+            selection=TransportSelection(
+                kind=STDIO_TRANSPORT, selector=STDIO_TRANSPORT, source="environment"
+            ),
+            host_handler=self.host_handler,
+        )
+
     async def stage_root(self, root: AgentLoop) -> None:
         superseded: AgentLoop | None = None
         async with self._staged_roots_lock:
@@ -1793,6 +1822,52 @@ class HarnessProcess:
             process=self,
         )
 
+    @property
+    def last_open_accounting(self) -> RootOpenAccounting | None:
+        """The accounting state the most recent root open adopted, if any."""
+        return self._last_open_accounting
+
+    def _remember_open_accounting(
+        self, agent_loop: AgentLoop, context: StartupAccountingContext | None
+    ) -> None:
+        """Record what the open adopted, for the wire open reply to carry.
+
+        One harness process owns one root, so the record is per process: the
+        open that just succeeded is the only one a reply can describe.
+        """
+        self._last_open_accounting = RootOpenAccounting.from_loop(agent_loop, context)
+
+    async def rebind_root(
+        self,
+        agent_loop: AgentLoop,
+        *,
+        session_id: str | None,
+        continue_latest: bool = False,
+    ) -> None:
+        """Rebind the one root loop this process owns to a stored session.
+
+        The identity replacement runs entirely here -- the transcript load, the
+        lease and the MCP registry all live on this side of the pipe -- and the
+        loop object survives it, so the coordinator keeps one session handle
+        while the identity underneath changes. A named session that does not
+        exist raises the typed not-found failure the caller maps for the wire.
+        """
+        if continue_latest:
+            target = await asyncio.to_thread(
+                _find_session_to_continue, agent_loop.config, cwd=agent_loop.cwd
+            )
+        elif session_id is None:
+            raise RuntimeConfigurationError(
+                "A session replacement names no session to rebind to"
+            )
+        else:
+            target = session_id
+        await self.runtime_factory.resume_root(agent_loop, target)
+        # Readiness is awaited here rather than deferred: the reply that follows
+        # is the replacement's receipt, and a transcript that has not loaded yet
+        # would make it a snapshot of the old identity's half-born successor.
+        await self.runtime_factory.finish_resume_root(agent_loop, agent_loop.session_id)
+
     async def open_root(self, request: RootOpenRequest) -> AgentLoop:
         context = request.startup_accounting
         # Validation makes this exclusively a new-session attempt. Claim before
@@ -1802,6 +1877,7 @@ class HarnessProcess:
             if request.session_id is not None:
                 staged = await self._claim_staged_root(request.session_id)
                 if staged is not None:
+                    self._remember_open_accounting(staged, context)
                     return staged
             blueprint = await self.build_root_blueprint(
                 request.options, request.client_info, request.client_capabilities
@@ -1819,13 +1895,15 @@ class HarnessProcess:
                     _acquire_session_lease, blueprint.config, session_id
                 )
                 try:
-                    return await self.runtime_factory.resume_blueprint(
+                    resumed = await self.runtime_factory.resume_blueprint(
                         blueprint, session_id, lease
                     )
                 except BaseException:
                     if lease is not None:
                         await asyncio.to_thread(lease.release)
                     raise
+                self._remember_open_accounting(resumed, context)
+                return resumed
             session_id = (
                 context.identity.root_session_id
                 if context is not None
@@ -1861,6 +1939,7 @@ class HarnessProcess:
                     for record, result in context.early_settlements:
                         self.usage_service._on_settlement(record, result)
                     context.commit_adoption()
+                self._remember_open_accounting(root, context)
                 return root
             except BaseException:
                 if lease is not None:
@@ -1932,11 +2011,17 @@ async def create_harness_server(
 ) -> HarnessServer:
     """Build a server over ``transport``."""
     from chartreux.app_server.server import AppServer
+    from chartreux.app_server.transport import STDIO_TRANSPORT
 
     owns_process = process is None
     process = process or HarnessProcess()
 
     def create_backend_host(services: SessionBackendServices) -> SessionBackendHost:
+        # The transport kind IS the topology: a stdio session's root lives in
+        # the process this host spawns, while an in-process session keeps its
+        # agent loop here. The coordinator stays the app server either way.
+        if transport_kind == STDIO_TRANSPORT:
+            return process.create_process_session_backend_host(services)
         return process.create_session_backend_host(
             services, startup_accounting=startup_accounting
         )

@@ -536,6 +536,9 @@ def test_ceremony_workflow_carries_all_ceremony(bodies: dict[str, str]) -> None:
         "verify",
         "authorizes its named work packages in sequence",
         'supersedes the "when unsure whether the user accepted, ask" default',
+        # v0.7.8 item 3: step 6's recovery clause names the dispatch ladder.
+        "the dispatch ladder's business in the orchestrator identity",
+        "one same-rung retry, then the chain",
     ):
         _assert_contains(ceremony, anchor)
 
@@ -607,6 +610,42 @@ def test_orchestrator_identity_carries_the_validated_deltas(
         "$dispatch_routing",
     ):
         _assert_contains(orchestrator, placeholder)
+
+
+def test_orchestrator_identity_carries_the_dispatch_escalation_ladder(
+    bodies: dict[str, str],
+) -> None:
+    # v0.7.8 item 3: the ladder is orchestrator dispatch policy — the canonical
+    # chain in order with its terminal fallback, one same-rung retry per rung,
+    # skip-and-continue on declined claims, reconcile-first on unclaimed legs,
+    # the protected-class exception, and the reset-on-completion scope.
+    orchestrator = bodies["identity/orchestrator"]
+    chain = (
+        "`zai-glm-5-3-flash`",
+        "`deepseek-v4-1-flash-1017`",
+        "`mistral-large-4`",
+        "`zai-glm-5-3`",
+        "`gpt-6.1-terra`",
+    )
+    for model in chain:
+        _assert_contains(orchestrator, model)
+    weights = [orchestrator.index(model) for model in chain]
+    assert weights == sorted(weights)
+    _assert_contains(orchestrator, "`zai-glm-5-3` as the terminal fallback")
+    _assert_contains(orchestrator, "receives exactly one deliberate same-rung retry")
+    _assert_contains(orchestrator, "skip it and continue down the chain")
+    _assert_contains(orchestrator, "Unclaimed legs reconcile first")
+    _assert_contains(orchestrator, "a prohibited disposition")
+    _assert_contains(orchestrator, "the typed `budget_stop`")
+    _assert_contains(orchestrator, "equally outside the ladder in any form")
+    _assert_contains(orchestrator, "there is no automatic cross-model fallback")
+    _assert_contains(orchestrator, "releases the ladder")
+    # No other shipped body carries the orchestrator's ladder.
+    for key, body in bodies.items():
+        if key == "identity/orchestrator":
+            continue
+        _assert_lacks(body, "**Escalation ladder.**")
+        _assert_lacks(body, "receives exactly one deliberate same-rung retry")
 
 
 def test_orchestrator_identity_delegates_reading_and_narrows_inline_work(

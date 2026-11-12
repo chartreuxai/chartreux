@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 from unittest.mock import AsyncMock
 
@@ -9,7 +10,11 @@ import pytest
 
 from chartreux.app_server._execution import SessionExecutionKind
 from chartreux.app_server.client import AppServerClient
-from chartreux.app_server.models import PublicEffectEntry
+from chartreux.app_server.models import (
+    CompletedEffectState,
+    PublicEffectEntry,
+    PublicMessageEntry,
+)
 from chartreux.app_server.protocol import (
     SERVER_METHODS,
     AppServerResponseError,
@@ -177,7 +182,42 @@ async def test_history_list_returns_one_rich_public_effect_entry() -> None:
 
 
 @pytest.mark.asyncio
-async def test_shell_command_rejects_cwd_outside_workspace() -> None:
+async def test_shell_command_executes_an_explicit_cwd_outside_the_workspace() -> None:
+    """A.3: an explicit cwd executes wherever the user points.
+
+    The workspace containment gate belongs to model authority; the manual
+    path has none, so only a missing directory is an error.
+    """
+    client, session = await _session_with_history()
+    try:
+        await client.request(
+            "session/shellCommand",
+            SessionShellCommandParams(
+                session_id=session.session_id,
+                command="pwd",
+                cwd="/",
+                operation_id="op-shell-1",
+            ),
+        )
+        result = await client.request(
+            "session/history/list",
+            SessionHistoryListParams(session_id=session.session_id),
+        )
+    finally:
+        await session.close()
+
+    response = SessionHistoryListResponse.model_validate(result)
+    effects = [
+        entry for entry in response.items if isinstance(entry, PublicEffectEntry)
+    ]
+    assert isinstance(effects[-1].state, CompletedEffectState)
+    assert effects[-1].state.output == {"stdout": "/\n", "stderr": "", "output": "/\n"}
+
+
+@pytest.mark.asyncio
+async def test_shell_command_rejects_a_missing_cwd_with_a_plain_error(
+    tmp_path: Path,
+) -> None:
     client, session = await _session_with_history()
     try:
         with pytest.raises(AppServerResponseError) as excinfo:
@@ -186,14 +226,43 @@ async def test_shell_command_rejects_cwd_outside_workspace() -> None:
                 SessionShellCommandParams(
                     session_id=session.session_id,
                     command="printf 'hi'",
-                    cwd="/",
+                    cwd=str(tmp_path / "missing"),
                     operation_id="op-shell-1",
                 ),
             )
     finally:
         await session.close()
 
-    assert excinfo.value.error.code is ProtocolErrorCode.FORBIDDEN
+    assert excinfo.value.error.code is ProtocolErrorCode.INVALID_PARAMS
+    assert "does not exist" in excinfo.value.error.message
+
+
+@pytest.mark.asyncio
+async def test_shell_command_records_the_empty_input_no_op() -> None:
+    """Item 5 B.1: the empty-input no-op is a record, never a request error."""
+    client, session = await _session_with_history()
+    try:
+        result = await client.request(
+            "session/shellCommand",
+            {
+                "sessionId": session.session_id,
+                "command": "   ",
+                "operationId": "op-shell-1",
+            },
+        )
+        async with asyncio.timeout(5):
+            while not any(
+                isinstance(entry, PublicMessageEntry)
+                and entry.role == "user"
+                and "Status: refused" in entry.text
+                for entry in session.history
+            ):
+                await asyncio.sleep(0.01)
+    finally:
+        await session.close()
+
+    response = SessionShellCommandResponse.model_validate(result)
+    assert response.accepted is True
 
 
 @pytest.mark.asyncio

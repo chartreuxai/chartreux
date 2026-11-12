@@ -252,8 +252,29 @@ class TurnUserInputEntry(ProtocolModel):
         return self.content
 
 
+class TurnShellInputEntry(ProtocolModel):
+    """A queued manual ``!`` command — the user's own input, deferred.
+
+    A shell input is user input, so it waits in the same queue a typed prompt
+    uses and keeps its FIFO place beside queued prompts. At idle the session
+    runs the command once and promotes its result record as an ordinary user
+    turn: the entry itself is never turn input the model sees.
+    """
+
+    role: Literal["shell"] = "shell"
+    operation_id: str
+    command: str
+    cwd: str | None = None
+    timeout_seconds: float | None = Field(default=None, gt=0, le=600)
+
+    @property
+    def content(self) -> list[SessionContentBlock]:
+        return []
+
+
 TurnInputEntry = Annotated[
-    TurnContextInputEntry | TurnUserInputEntry, Field(discriminator="role")
+    TurnContextInputEntry | TurnUserInputEntry | TurnShellInputEntry,
+    Field(discriminator="role"),
 ]
 
 
@@ -265,6 +286,13 @@ def validate_turn_input_entries(entries: list[TurnInputEntry]) -> None:
         raise ValueError("Turn input accepts at most one user entry")
     if user_positions and user_positions[0] != len(entries) - 1:
         raise ValueError("The user entry must be the final turn input entry")
+    shell_positions = [
+        index for index, entry in enumerate(entries) if entry.role == "shell"
+    ]
+    if len(shell_positions) > 1:
+        raise ValueError("Turn input accepts at most one shell entry")
+    if shell_positions and len(entries) > 1:
+        raise ValueError("A shell input is a turn queue item of its own")
 
 
 class UserInputCallbackExpiry(ProtocolModel):
@@ -1287,6 +1315,10 @@ TURN_QUEUE_MAX_ITEMS = 32
 
 class PublicTurnQueue(ProtocolModel):
     items: list[PublicQueuedTurn] = Field(default_factory=list)
+    # Item 5 B.2a: ready records the queue could not take a place for yet
+    # (its capacity is the client's, not the outcome's). They are pending user
+    # turns the next admission promotes, so the public state names them.
+    retained: list[PublicQueuedTurn] = Field(default_factory=list)
     paused: bool = False
     max_items: int = Field(default=TURN_QUEUE_MAX_ITEMS, ge=1, strict=True)
 

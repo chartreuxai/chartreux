@@ -2,6 +2,106 @@
 
 All notable changes to Chartreux are documented in this file.
 
+## 0.7.8 (2026-11-12)
+
+The multi-process contract designed in v0.7.7 becomes the interactive default
+on the additive wire extension: a stdio session binds to a spawned root agent
+process, and turns, the queue, callbacks, policy, settings and child publication
+cross the process wire. A bare 429 now classifies as a rate limit, a truncated
+stream settles the tool effect it interrupted instead of stranding the turn, the
+orchestrator carries a coordinated dispatch ladder with notification-first wait
+guidance, and shell policy stops over-denying ordinary work — the manual `!`
+command included, which is now an ordinary queued user turn.
+
+### Added
+
+- **The stdio topology reaches the production path.** The v0.7.7 contract lands
+  on the additive wire extension, so an interactive run reaches the shipped
+  components: the spawned root agent process owns the turn, and the
+  coordinator-owned turn queue, session list, config reload, plan record, policy
+  read and replacement, session settings, history clear, steering, injection,
+  compaction, host port requests, callback answers and child publication travel
+  the wire. A stored session resumes in a fresh root process behind the
+  coordinator reap and refuses a held lease, and a live root rebinds to another
+  stored session; children spawn from the root agent process through the
+  subagent runner offered on the process turn. With no selector set the
+  production default spawns, `in_process` stays the escape, and the entrypoint
+  pins the precedence, the spawn cwd, the config write and the deferred
+  refusals.
+- **Manual `!` commands are ordinary queued user turns.** A shell command is
+  user input, so it enters the user-input turn queue as a shell-input kind
+  rather than a separate busy path: it is claimed once at idle, its effect runs
+  once, and the resulting record is promoted as a normal user turn. The
+  projection rebuilds that record through the ordinary user-message branch, so a
+  resumed session shows the command with its output, and the delivery adapter
+  submits bash text to the same queue, so neither an agent turn nor a running
+  command rejects an input kind the other accepts. Interrupting before execution
+  drops the queued item; an admission or provider failure retains the record
+  without rerunning the effect.
+- **A coordinated orchestrator dispatch ladder.** The orchestrator identity
+  carries the canonical retry-then-escalate chain, protected-class parks,
+  reconcile-first unclaimed legs and the terminal `glm-5.3` fallback. The
+  ceremony verify step and the `wait_for_agent` guidance follow
+  notification-first waits, and the active dispatch goldens were regenerated.
+
+### Changed
+
+- **A bare 429 is a rate limit.** A 429 with no recognized body code now
+  classifies `RATE_LIMIT`, so it retries inside the budget, fails over, records
+  endpoint evidence and derives a `PROVIDER_RATE_LIMIT` envelope instead of an
+  `UNKNOWN` report-and-park, while the quota and billing tokens that precede the
+  status branch keep their protection. In-call, the completion coordinator skips
+  the remaining candidates that share the failed attempt's endpoint — the
+  same-endpoint exclusion the replacement guard already applies.
+- **Environment assignments are policy, not posture.** The uppercase-only name
+  rule is dropped from the assignment analysis, the `env` operand twin and the
+  `export`/`declare` re-encodings; `TMPDIR`, `TMP`, `TEMP`, `UV_CACHE_DIR` and
+  `UV_PROJECT_ENVIRONMENT` leave the protected name table; and absolute
+  `PYTHONPATH` entries are admitted for the documented worktree recipe. The
+  literal-value, no-substitution and code-injection name protections stay, and
+  the resolver's relocation checks are untouched.
+- **The shell executor is resolved once.** The chain is config > `bash` >
+  `$SHELL` > the kernel default, resolved at startup and published to the
+  spawned root agent, so the equals-expansion rules fire only under the zsh
+  family and the analysis cache is keyed by family.
+- **More of the ordinary shell work is admitted.** `ls` operands, `find
+  -name`/`-iname` patterns, the `sort` and `uniq` input positions and one
+  `EXIT:$?` status probe gain expansion positions while the write positions stay
+  refused; a heredoc whose delimiter carries any quoting is admitted on the same
+  equivalence as a script written with `write_file`, and an unquoted delimiter's
+  syntax denial now names the quoting remediation; the glob plan tests for an
+  expanded word before the option-token raise; `git checkout -b` is routine
+  again with the injected flag and hooks check kept; and a recursive `rm`
+  resolving strictly inside the scratchpad, or a modeled read-only `xargs` leg,
+  is admitted. A shell path denial stays grantable only as the sole missing
+  authority, the shape-conservatism denials are retagged, and the bash root
+  grant lands.
+
+### Fixed
+
+- **Stream truncation recovers instead of stranding the turn.** A truncation
+  cancels the turn's in-flight tool task and gives it a bounded grace to reach a
+  terminal state before the root recovery gate decides settlement: a settled
+  effect admits the automatic retry, and a task that suppresses cancellation
+  past the grace keeps the unsettled-effects decline. Other failure classes keep
+  the cliff, and the verdict is remembered per turn so the terminalize-time
+  capture cannot overwrite it. The child path is pinned through the in-process
+  recovery pipeline.
+- **Deep-review fixes across the process session and the shell-record queue.** A
+  stdio promotion peeks, commits its record message and pops its item under the
+  queue lock, and the pop-mismatch path restores the item it popped; a record
+  the queue cannot take yet is named as retained pending work in the public
+  queue state on both topologies, and an explicit resume promotes it out of an
+  otherwise empty queue; a committed record promoted again after other turns ran
+  carries its own text rather than running on no new input; a failure after a
+  promoted shell-record turn re-queues the record text as a ready entry on both
+  routes without rerunning the effect; a bare `!` is refused through the shell
+  resource on both routes, and an in-process refusal record takes the
+  queue-full-safe retention path; the manual-shell context rides the shell run
+  reply so the stdio timeline restores the record tile; an edited retained
+  record stays visible in the TUI queue; and child publication attempts are
+  recorded durably with tombstones honored.
+
 ## 0.7.7 (2026-11-11)
 
 Agent work moves into separate processes: a thin app-server coordinator relays

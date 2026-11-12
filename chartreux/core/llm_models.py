@@ -122,6 +122,9 @@ class PersistedToolResult(BaseModel):
     presentation: ToolResultPresentation | None = None
 
 
+type ManualShellStatus = Literal["ok", "refused", "failed", "timed_out", "interrupted"]
+
+
 class ManualShellContext(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -131,11 +134,31 @@ class ManualShellContext(BaseModel):
     stdout: str = ""
     stderr: str = ""
     output_text: str = ""
-    exit_code: int
+    status: ManualShellStatus = "ok"
+    exit_code: int | None = None
     timed_out: bool = False
     interrupted: bool = False
     duration_ms: float = Field(default=0.0, ge=0)
     created_at: int
+
+    @model_validator(mode="before")
+    @classmethod
+    def _derive_legacy_status(cls, data: Any) -> Any:
+        """Keep records written before ``status`` existed showing their outcome.
+
+        Display metadata only: the record text stays the source of truth.
+        """
+        if not isinstance(data, dict) or "status" in data:
+            return data
+        if data.get("interrupted"):
+            status = "interrupted"
+        elif data.get("timed_out"):
+            status = "timed_out"
+        elif data.get("exit_code") in {None, 0}:
+            status = "ok"
+        else:
+            status = "failed"
+        return {**data, "status": status}
 
 
 _posting_clock: ContextVar[Callable[[], datetime] | None] = ContextVar(

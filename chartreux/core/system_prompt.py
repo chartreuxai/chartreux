@@ -34,6 +34,7 @@ from chartreux.core.policy.composition import (
 from chartreux.core.prompts import UtilityPrompt
 from chartreux.core.tools.secret_redaction import scrub_child_env
 from chartreux.core.utils import get_platform_display_name
+from chartreux.core.utils.shell import shell_executor
 from chartreux.utils.paths import is_dangerous_directory
 from chartreux.utils.platform import resolve_git_executable
 
@@ -232,7 +233,9 @@ class ProjectContextProvider:
 
 def _get_os_system_prompt() -> str:
     platform_name = get_platform_display_name()
-    shell = os.environ.get("SHELL", "sh")
+    # The resolved executor, never raw $SHELL: the shipped default outranks an
+    # ambient zsh, so the reported shell is the one shell text executes under.
+    shell = shell_executor() or "sh"
     return f"The operating system is {platform_name} with shell `{shell}`"
 
 

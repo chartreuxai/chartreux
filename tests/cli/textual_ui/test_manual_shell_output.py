@@ -8,6 +8,7 @@ from textual.containers import Vertical
 from textual.content import Content
 from textual.widgets import Static
 
+from chartreux.app_server._projection import project_message_history
 from chartreux.app_server._shell import restored_shell_effect_state, shell_effect_state
 from chartreux.app_server.models import (
     CancelledEffectState,
@@ -17,6 +18,7 @@ from chartreux.app_server.models import (
     FailedEffectState,
     PublicEffectEntry,
     PublicEntryGenerationStatus,
+    PublicMessageEntry,
     ShellEffectDetail,
     ShellEffectInput,
 )
@@ -24,7 +26,7 @@ from chartreux.app_server.protocol import ShellRunResponse
 from chartreux.cli.textual_ui.widgets.collapsible import CollapsibleSection
 from chartreux.cli.textual_ui.widgets.tools import ToolResultMessage
 from chartreux.cli.textual_ui.widgets.virtual_output import VirtualOutputText
-from chartreux.core.llm_models import ManualShellContext
+from chartreux.core.llm_models import LLMMessage, ManualShellContext, Role
 
 
 class _ShellResultApp(App[None]):
@@ -265,3 +267,77 @@ async def test_successful_manual_shell_output_is_expanded_once() -> None:
 
     assert live_rendered == restored_rendered
     assert live_rendered.count("[bold]literal[/bold]") == 1
+
+
+def _shell_context(
+    command: str = "echo hi", *, status: str = "ok", exit_code: int | None = 0
+) -> ManualShellContext:
+    return ManualShellContext(
+        operation_id="op-1",
+        command=command,
+        cwd="/workspace",
+        stdout="hi\n",
+        exit_code=exit_code,
+        output_text="hi\n",
+        status=status,  # type: ignore[arg-type]
+        duration_ms=1,
+        created_at=1,
+    )
+
+
+def _record_message(
+    *, injected: bool = False, status: str = "ok", exit_code: int | None = 0
+) -> LLMMessage:
+    return LLMMessage(
+        role=Role.user,
+        content="Manual `!` command result from the user.\n\nCommand: `echo hi`",
+        message_id="op-1",
+        injected=injected,
+        manual_shell=_shell_context(status=status, exit_code=exit_code),
+    )
+
+
+def test_rebuild_projects_the_record_as_a_normal_user_message() -> None:
+    """Item-5 B.2: rebuild restores the message, plus the effect tile."""
+    entries = project_message_history("session-1", [_record_message()], None)
+
+    assert [type(entry).__name__ for entry in entries] == [
+        "PublicEffectEntry",
+        "PublicMessageEntry",
+    ]
+    effect, message = entries
+    assert isinstance(effect, PublicEffectEntry)
+    assert effect.title == "shell"
+    assert isinstance(message, PublicMessageEntry)
+    assert message.role == "user"
+    assert message.text.startswith("Manual `!` command result from the user.")
+    assert isinstance(effect.state, CompletedEffectState)
+
+
+@pytest.mark.parametrize(
+    ("status", "exit_code", "expected"),
+    [
+        ("failed", 7, FailedEffectState),
+        ("timed_out", None, FailedEffectState),
+        ("refused", None, FailedEffectState),
+    ],
+)
+def test_rebuild_restores_a_failed_record_effect(
+    status: str, exit_code: int | None, expected: type
+) -> None:
+    entries = project_message_history(
+        "session-1", [_record_message(status=status, exit_code=exit_code)], None
+    )
+
+    effect = entries[0]
+    assert isinstance(effect, PublicEffectEntry)
+    assert isinstance(effect.state, expected)
+    assert isinstance(entries[1], PublicMessageEntry)
+
+
+def test_a_legacy_injected_record_still_projects_only_its_effect() -> None:
+    entries = project_message_history(
+        "session-1", [_record_message(injected=True)], None
+    )
+
+    assert [type(entry).__name__ for entry in entries] == ["PublicEffectEntry"]

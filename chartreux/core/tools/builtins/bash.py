@@ -87,6 +87,14 @@ class BashToolConfig(BaseToolConfig):
         description="Removed legacy field; excluded so internal defaults cannot reintroduce it.",
     )
     permission: ToolPermission = ToolPermission.ALWAYS
+    executor: str | None = Field(
+        default=None,
+        description=(
+            "Shell binary shell-text commands execute under. Unset selects the "
+            "shipped default: bash when the host has it, otherwise $SHELL; set "
+            "it (for example 'zsh') to run shell text under that executor."
+        ),
+    )
     max_output_bytes: int = Field(
         default=16_000, description="Maximum bytes to capture from stdout and stderr."
     )

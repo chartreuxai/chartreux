@@ -7,6 +7,7 @@ import shlex
 
 from chartreux.core.hooks.config import HookConfig
 from chartreux.core.hooks.models import HookExecutionResult, HookInvocation
+from chartreux.core.job_launcher import JobLaunchPlan
 from chartreux.core.tools.secret_redaction import scrub_child_env
 from chartreux.core.utils import kill_async_subprocess
 from chartreux.core.utils.async_subprocess import spawn_registered_process
@@ -36,10 +37,16 @@ async def _read_capped(
 
 
 class HookExecutor:
-    def __init__(self, *, cwd: Path | None = None) -> None:
+    def __init__(
+        self, *, cwd: Path | None = None, launch: JobLaunchPlan | None = None
+    ) -> None:
         self._cwd = (cwd or Path.cwd()).resolve()
+        # A hook may outlive the root, so a session that runs jobs under the
+        # launcher binds its plan here: the hook argv keeps its stdin=PIPE
+        # contract because the shim only prefixes the argv and execs into it.
+        self._launch = launch
 
-    async def run(
+    async def run(  # noqa: PLR0911 - one refusal per hook-spawn failure mode
         self, hook: HookConfig, invocation: HookInvocation
     ) -> HookExecutionResult:
         stdin_data = invocation.model_dump_json().encode()
@@ -64,18 +71,36 @@ class HookExecutor:
                 timed_out=False,
             )
 
+        # Hooks load from project-writable config, so an injected hook must not
+        # inherit chartreux's credential variables.
+        env = scrub_child_env(os.environ)
+        spawn_argv: list[str] = list(argv)
+        if self._launch is not None:
+            # The launcher records the hook's group identity and covers its
+            # leader with the kernel before the hook runs; the hook's own stdin
+            # pipe survives because the shim execs into the same argv.
+            env.update(self._launch.owner_marker)
+            try:
+                spawn_argv = self._launch.wrap(argv)
+            except OSError as e:
+                return HookExecutionResult(
+                    hook_name=hook.name,
+                    exit_code=1,
+                    stdout="",
+                    stderr=f"Failed to start: {e}",
+                    timed_out=False,
+                )
+
         try:
             process = await spawn_registered_process(
                 asyncio.create_subprocess_exec(
-                    *argv,
+                    *spawn_argv,
                     stdin=asyncio.subprocess.PIPE,
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,
                     start_new_session=True,
                     cwd=self._cwd,
-                    # Hooks load from project-writable config, so an injected hook
-                    # must not inherit chartreux's credential variables.
-                    env=scrub_child_env(os.environ),
+                    env=env,
                 )
             )
         except (OSError, ValueError) as e:

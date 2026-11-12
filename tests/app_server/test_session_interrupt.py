@@ -460,14 +460,14 @@ async def test_enqueue_during_turn_finalization_waits_for_finishing_task(
         yield AssistantEvent(content=f"response {msg}", message_id=f"assistant-{msg}")
 
     async def gate_first_finalizer(
-        self: TurnController, status: PublicTurnStatus
+        self: TurnController, status: PublicTurnStatus, turn_id: str
     ) -> None:
         nonlocal gated
         if not gated:
             gated = True
             finalizing.set()
             await release_finalizer.wait()
-        await original_after_turn_terminal(self, status)
+        await original_after_turn_terminal(self, status, turn_id)
 
     async def observe_promotion(self: TurnController) -> None:
         if asyncio.current_task() is not self._active_task:

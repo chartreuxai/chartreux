@@ -14,6 +14,7 @@ from chartreux.app_server.models import (
     PreparedPrompt,
     PublicEntryGenerationStatus,
     PublicMessageEntry,
+    PublicQueuedTurn,
     PublicTurnQueue,
     TextContentBlock,
 )
@@ -35,6 +36,7 @@ from chartreux.cli.textual_ui.widgets.messages import (
     SlashCommandMessage,
     UserMessage,
 )
+from chartreux.cli.textual_ui.widgets.tools import ToolResultMessage
 from chartreux.observability.logging import set_config_log_level, set_session_override
 from chartreux.ui.widgets.theme_picker import ThemePickerApp, sorted_theme_names
 from tests.cli.textual_ui.test_message_queue import _queue_controller, _server_turn
@@ -102,6 +104,12 @@ def _blocked_app() -> tuple[ChartreuxApp, _BlockingBackend]:
     backend = _BlockingBackend()
     agent_loop = build_test_agent_loop(backend=backend)
     return build_test_chartreux_app(agent_loop=agent_loop), backend
+
+
+def _shell_result_output(widget: ToolResultMessage) -> str:
+    entry = widget._entry
+    state = getattr(entry, "state", None)
+    return getattr(state, "output_text", "") or ""
 
 
 def _queued_texts(app: ChartreuxApp) -> list[str]:
@@ -226,6 +234,132 @@ async def test_restored_queue_reconciles_by_id_across_orderings(ordering: str) -
         await app.mount(restored)
         await pilot.pause()
         assert restored.header.posted_at == posted
+
+
+@pytest.mark.asyncio
+async def test_retained_records_render_as_pending_queue_items() -> None:
+    """C2: B.2a's pending state reaches the TUI, not only the wire.
+
+    A retained record is a ready user turn the server holds beside the FIFO. The
+    CLI renders it as a pending queued prompt so the user sees the work that
+    waits, and when an admission gives it a queue place the same block follows
+    the entry instead of being shown twice.
+    """
+    app = App()
+    async with app.run_test():
+
+        async def mount(widget, **_kwargs) -> None:
+            await app.mount(widget)
+
+        controller = _queue_controller(mount_and_scroll=mount)
+        await controller.sync_server_queue(
+            PublicTurnQueue(retained=[_server_turn("op-1", "record text", "op-1")])
+        )
+        assert [widget.get_content() for widget in controller.widgets] == [
+            "record text"
+        ]
+        widget = controller.widgets[0]
+        assert widget.pending
+        assert isinstance(controller.header, QueueHeaderMessage)
+        assert len(controller) == 1
+
+        # The record takes the place an admission freed: one queue identity, one
+        # rendered prompt -- the block follows the entry, it is not duplicated.
+        await controller.sync_server_queue(
+            PublicTurnQueue(items=[_server_turn("queued-1", "record text", "op-1")])
+        )
+        assert [widget.get_content() for widget in controller.widgets] == [
+            "record text"
+        ]
+        assert controller.widgets[0] is widget
+        await controller.turn_started("queued-1")
+        assert controller.widgets == []
+        assert controller.header is None
+
+
+@pytest.mark.asyncio
+async def test_editing_a_retained_record_keeps_the_pending_record_visible(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """RV-FIX-6: an edit must not hide a retained record that is still pending.
+
+    A retained record waits beside the FIFO, so ``queue/replace`` has no queue
+    item to rewrite and answers not_found. The edit therefore becomes its own
+    queued prompt: the pending record keeps its visible place instead of being
+    discarded while the server still holds it as ready user work.
+    """
+    app = build_test_chartreux_app()
+    record = _server_turn("op-1", "record text", "op-1")
+    queue = PublicTurnQueue(retained=[record])
+    replace_calls: list[tuple[str, str]] = []
+
+    async def enqueue_turn(
+        content: str, *, message_entry_id: str | None = None, **_kwargs: object
+    ) -> PublicQueuedTurn:
+        nonlocal queue
+        turn = _server_turn(f"queued-{len(queue.items) + 1}", content, message_entry_id)
+        queue = PublicTurnQueue(items=[*queue.items, turn], retained=queue.retained)
+        return turn
+
+    async def replace_queued_turn(
+        queue_item_id: str, content: str, **_kwargs: object
+    ) -> PublicQueuedTurn | None:
+        replace_calls.append((queue_item_id, content))
+        # A retained record owns no queue item: the server answers not_found.
+        return None
+
+    # Queue selection is only offered while an agent job runs, which is exactly
+    # when a retained record waits beside a full queue.
+    monkeypatch.setattr(app, "_agent_job_active", lambda: True)
+
+    async with app.run_test() as pilot:
+        await app._session_ready.wait()
+        app._queue._ports = replace(
+            app._queue._ports,
+            enqueue_turn=enqueue_turn,
+            replace_queued_turn=replace_queued_turn,
+            current_turn_queue=lambda: queue,
+        )
+        await app._queue.sync_server_queue(PublicTurnQueue(retained=[record]))
+        assert await _wait_until(pilot, lambda: len(app._queue) == 1)
+        record_widget = app._queue.widgets[0]
+        assert record_widget.get_content() == "record text"
+        assert record_widget.pending
+
+        app.query_one(ChatTextArea).focus()
+        await pilot.press("up")
+        assert await _wait_until(
+            pilot, lambda: app._queue_selected_widget is record_widget
+        )
+        app.query_one(ChatInputContainer).post_message(
+            ChatInputContainer.QueueEditSubmitted("edited")
+        )
+
+        # The TUI queue keeps both prompts pending: the record is not discarded
+        # and its widget is the same block, not a re-created copy.
+        assert await _wait_until(
+            pilot,
+            lambda: (
+                app._queue.queue_item_texts() == [(0, "edited"), (1, "record text")]
+            ),
+        )
+        assert record_widget in app._queue.widgets
+        assert record_widget.pending
+        assert record_widget.get_content() == "record text"
+        assert not list(app.query(ErrorMessage))
+
+        # The backend read agrees: the record still waits beside the FIFO with
+        # its original text, and the edited text took a queue place of its own.
+        backend_queue = app._queue._ports.current_turn_queue()
+        assert [item.id for item in backend_queue.retained] == ["op-1"]
+        assert backend_queue.retained[0].entries[0].content == [
+            SessionTextContentBlock(text="record text")
+        ]
+        assert [
+            entry.content for item in backend_queue.items for entry in item.entries
+        ] == [[SessionTextContentBlock(text="edited")]]
+        # The record was never offered to a replace that cannot land.
+        assert replace_calls == []
 
 
 @pytest.mark.asyncio
@@ -453,9 +587,10 @@ async def test_ctrl_c_removes_newest_server_prompt() -> None:
 
 
 @pytest.mark.asyncio
-async def test_prompt_submitted_while_shell_runs_is_rejected(
+async def test_prompt_submitted_while_shell_runs_is_queued(
     chartreux_app: ChartreuxApp,
 ) -> None:
+    """Item-5 A.4: prompts and shell inputs share one FIFO queue."""
     async with chartreux_app.run_test() as pilot:
         chat_input = chartreux_app.query_one(ChatInputContainer)
         chat_input.value = "!sleep 2"
@@ -467,10 +602,10 @@ async def test_prompt_submitted_while_shell_runs_is_rejected(
         chat_input.value = "after shell"
         await pilot.press("enter")
 
-        assert chat_input.value == "after shell"
-        assert not chartreux_app.app_server.turn_queue.items
-        assert any(
-            "cannot be queued while a shell command is running" in notification.message
+        assert chat_input.value == ""
+        await _wait_for_queued(pilot, chartreux_app, ["after shell"])
+        assert not any(
+            "cannot be queued" in notification.message
             for notification in chartreux_app._notifications
         )
 
@@ -599,7 +734,7 @@ async def test_empty_enter_resumes_server_prompts_after_interrupt() -> None:
 async def test_empty_bash_does_not_resume_server_prompts_after_interrupt() -> None:
     """*Prepare*: An interrupted turn with one queued prompt left paused.
     *Do*: Submit a bare shell prefix while the queue is paused.
-    *Assert*: The error is shown and the queued prompt remains paused.
+    *Assert*: The refused record is queued and the queued prompt stays paused.
     """
     # Prepare
     app, backend = _blocked_app()
@@ -618,20 +753,69 @@ async def test_empty_bash_does_not_resume_server_prompts_after_interrupt() -> No
         # Do
         chat_input.value = "!"
         await pilot.press("enter")
+        # Item 5 B.1: the bare `!` still reaches the shell resource, so its
+        # refused record exists -- but it executes nothing and is not the
+        # user's queued work, so it does not resume the paused queue.
         assert await _wait_until(
             pilot,
-            lambda: any(
-                "No command provided after '!'" in str(error._error)
-                for error in app.query(ErrorMessage)
+            lambda: (
+                len(_queued_texts(app)) == 2
+                and "Manual `!` command result from the user." in _queued_texts(app)[1]
             ),
         )
         await pilot.pause(0.1)
 
         # Assert
         assert app.app_server.turn_queue.paused
-        assert _queued_texts(app) == ["queued prompt"]
+        assert _queued_texts(app)[0] == "queued prompt"
+        assert "Shell command cannot be empty" in _queued_texts(app)[1]
         assert backend.calls == 1
-        assert chat_input.value == "!"
+        # The submission is consumed: the record is the command's whole effect,
+        # so a restored input would let a re-submit mint a second one.
+        assert chat_input.value == ""
+        assert len(_queued_texts(app)) == 2
+
+
+@pytest.mark.asyncio
+async def test_empty_bash_consumes_the_submission_while_agent_busy() -> None:
+    """*Prepare*: A blocked turn, so the epoch is busy.
+    *Do*: Submit a bare shell prefix while the agent is busy.
+    *Assert*: The submission is consumed and exactly one refusal record is queued.
+    """
+    app, backend = _blocked_app()
+    async with app.run_test() as pilot:
+        chat_input = app.query_one(ChatInputContainer)
+        chat_input.post_message(ChatInputContainer.Submitted("block queue"))
+        assert await _wait_until(pilot, backend.started.is_set)
+        assert await _wait_until(
+            pilot, lambda: app.app_server.turn_active and not app._queue
+        )
+
+        chat_input.value = "!"
+        await pilot.press("enter")
+        # The refused record is the whole effect of the bare `!`; the input is
+        # not handed back, so the record cannot be produced twice.
+        assert await _wait_until(
+            pilot,
+            lambda: any(
+                "Manual `!` command result from the user." in text
+                for text in _queued_texts(app)
+            ),
+        )
+        assert chat_input.value == ""
+        assert not any(
+            "cannot be queued" in notification.message
+            for notification in app._notifications
+        )
+        assert (
+            len([
+                text
+                for text in _queued_texts(app)
+                if "Manual `!` command result from the user." in text
+            ])
+            == 1
+        )
+        backend.release.set()
 
 
 @pytest.mark.asyncio
@@ -658,12 +842,12 @@ async def test_rewind_skips_paused_server_prompt() -> None:
 
 
 @pytest.mark.asyncio
-async def test_bash_submitted_during_running_bash_is_rejected(
+async def test_bash_submitted_during_running_bash_is_queued(
     chartreux_app: ChartreuxApp,
 ) -> None:
     async with chartreux_app.run_test() as pilot:
         chat_input = chartreux_app.query_one(ChatInputContainer)
-        chat_input.value = "!sleep 1"
+        chat_input.value = "!sleep 2"
         await pilot.press("enter")
 
         assert await _wait_until(
@@ -673,11 +857,21 @@ async def test_bash_submitted_during_running_bash_is_rejected(
         chat_input.value = "!echo queued"
         await pilot.press("enter")
 
-        assert chat_input.value == "!echo queued"
-        assert not chartreux_app._queue
-        assert any(
-            "cannot be queued while a shell command is running" in notification.message
+        assert chat_input.value == ""
+        assert not any(
+            "cannot be queued" in notification.message
             for notification in chartreux_app._notifications
+        )
+        # Accepted as user input: it runs after the first command instead of
+        # being refused, whether it is still queued or already executed.
+        assert await _wait_until(
+            pilot,
+            lambda: any(
+                "queued" in str(_shell_result_output(widget))
+                for widget in chartreux_app.query(ToolResultMessage)
+                if widget.tool_name == "shell"
+            ),
+            timeout=5.0,
         )
         await pilot.press("escape")
         assert await _wait_until(
@@ -686,7 +880,7 @@ async def test_bash_submitted_during_running_bash_is_rejected(
 
 
 @pytest.mark.asyncio
-async def test_bash_command_rejected_while_agent_busy() -> None:
+async def test_bash_command_queued_while_agent_busy() -> None:
     app, backend = _blocked_app()
     async with app.run_test() as pilot:
         chat_input = app.query_one(ChatInputContainer)
@@ -696,17 +890,25 @@ async def test_bash_command_rejected_while_agent_busy() -> None:
             pilot, lambda: app.app_server.turn_active and not app._queue
         )
 
-        chat_input.post_message(ChatInputContainer.Submitted("!echo not queued"))
+        chat_input.post_message(ChatInputContainer.Submitted("!echo queued"))
 
         assert await _wait_until(
             pilot,
-            lambda: any(
-                "Shell commands cannot be queued" in notification.message
-                for notification in app._notifications
+            lambda: (
+                [
+                    entry.command
+                    for item in app.app_server.turn_queue.items
+                    for entry in item.entries
+                    if entry.role == "shell"
+                ]
+                == ["echo queued"]
             ),
         )
-        assert chat_input.value == "!echo not queued"
-        assert not app._queue
+        assert chat_input.value == ""
+        assert not any(
+            "cannot be queued" in notification.message
+            for notification in app._notifications
+        )
         backend.release.set()
 
 

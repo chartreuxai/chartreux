@@ -38,6 +38,7 @@ from chartreux.core.tools.utils import (
     is_canonical_scratch_path,
     resolve_tool_path,
 )
+from chartreux.core.utils.shell import current_executor_contract
 
 logger = logging.getLogger(__name__)
 
@@ -50,7 +51,7 @@ _SUPPORTED_COMMAND_PARTS = {
     "concatenation",
 }
 
-_REDIRECTION_NODES = {"heredoc_redirect", "herestring_redirect"}
+_REDIRECTION_NODES = frozenset({"herestring_redirect"})
 
 # Standard-device sinks are not filesystem targets: a redirect to one never
 # opens a file, so it never counts as a file redirect for policy purposes.
@@ -62,6 +63,8 @@ _REDIRECTION_DEVICES = frozenset({"/dev/null", "/dev/stdout", "/dev/stderr"})
 # discovery — curl reads "$CURL_HOME/.curlrc" first, wget reads the
 # WGETRC startup file — so an agent-set value points the client at an
 # uninspected config whose proxy/output lines control egress and writes.
+# Temp-file (TMPDIR/TMP/TEMP) and uv cache/project-environment destinations
+# stay admitted: they relocate where files land, never what code runs.
 DANGEROUS_ENV_NAMES = frozenset({
     "SSH_ASKPASS",
     "SSH_ASKPASS_REQUIRE",
@@ -137,17 +140,12 @@ DANGEROUS_ENV_NAMES = frozenset({
     "XDG_CONFIG_DIRS",
     "XDG_DATA_HOME",
     "XDG_STATE_HOME",
-    "TMPDIR",
-    "TMP",
-    "TEMP",
     "SYSTEMDRIVE",
     "UV_PYTHON_DOWNLOADS_JSON_URL",
     "APPDATA",
     "LOCALAPPDATA",
     "USERPROFILE",
     "UV_TARGET",
-    "UV_CACHE_DIR",
-    "UV_PROJECT_ENVIRONMENT",
     "UV_PYTHON_INSTALL_DIR",
     "UV_TOOL_DIR",
     "UV_TOOL_BIN_DIR",
@@ -231,11 +229,52 @@ _STEPWISE_ALTERNATIVE = (
     "split the work into separate simple commands, or use read_file with "
     "offset and limit, grep, and the edit tool for file work"
 )
-_HEREDOC_ALTERNATIVE = (
-    "use write_file to create the content, or use read_file with offset and "
-    "limit, grep, and the edit tool for existing files"
+_UNQUOTED_HEREDOC_ALTERNATIVE = (
+    "quote the delimiter (`<<'EOF'`) so the body stays literal, or use "
+    "write_file to create the content"
+)
+_FOREIGN_HEREDOC_ALTERNATIVE = (
+    "write the body with write_file and pass the file path, or feed it to a "
+    "reader (cat/wc/head/tail/grep/cut/sort/uniq) or to an interpreter "
+    "reading its program from stdin (`python3 -`)"
 )
 _LITERAL_VALUE_ALTERNATIVE = "write the literal value directly as the argument"
+_LITERAL_ASSIGNMENT_ALTERNATIVE = (
+    "write the assignment as NAME=value with a literal value"
+)
+_LITERAL_REDIRECT_ALTERNATIVE = "write the redirection destination as a literal path"
+_UNSET_ALTERNATIVE = "run the command without unsetting environment variables"
+
+# The invocations a quoted heredoc body may feed. A quoted delimiter stops
+# expansion, so the body is literal data already visible in the command
+# string: feeding it to a reader is the same read a file operand performs,
+# and feeding it to an interpreter is effect-equivalent to `python3 script.py`
+# after write_file — the equivalence the harness already admits.
+_HEREDOC_STDIN_READERS = frozenset({
+    "cat",
+    "wc",
+    "head",
+    "tail",
+    "grep",
+    "cut",
+    "sort",
+    "uniq",
+})
+_HEREDOC_SCRIPT_INTERPRETERS = frozenset({
+    "bun",
+    "deno",
+    "lua",
+    "node",
+    "nodejs",
+    "perl",
+    "php",
+    "ruby",
+    "Rscript",
+})
+_HEREDOC_PYTHON_INTERPRETER = re.compile(r"python(\d+(\.\d+)?)?")
+# Any quoting in the delimiter word (a quote or a backslash escape) makes the
+# body literal; only a wholly unquoted delimiter leaves it open to expansion.
+_HEREDOC_QUOTING_CHARACTERS = frozenset({'"', "'", "\\"})
 
 # Reasons are noun phrases so they read as a list in the approval prompt.
 # Each entry is created with its denial class: unmodeled v0.1 constructs are
@@ -266,8 +305,8 @@ _DYNAMIC_NODES: dict[str, Diagnostic] = {
 }
 
 # Compound statements (SYNTAX) name the stepwise alternative. Unsetting
-# environment variables is a policy decision (POLICY), not a vocabulary gap:
-# the denial states the requirement and names no alternative.
+# environment variables is a parser-vocabulary gap too: the analysis models no
+# such statement, so the denial names the compliant form.
 _COMPOUND_NODES: dict[str, Diagnostic] = {
     "case_statement": _syntax_reason("case statement", _STEPWISE_ALTERNATIVE),
     "compound_statement": _syntax_reason("command group", _STEPWISE_ALTERNATIVE),
@@ -278,8 +317,9 @@ _COMPOUND_NODES: dict[str, Diagnostic] = {
     "subshell": _syntax_reason("subshell", _STEPWISE_ALTERNATIVE),
     "test_command": _syntax_reason("test expression", _STEPWISE_ALTERNATIVE),
     # The parser does not emit a regular command node for this builtin.
-    "unset_command": _policy_reason(
-        "unsetting shell environment variables cannot be safely inspected"
+    "unset_command": _syntax_reason(
+        "unsetting shell environment variables cannot be safely inspected",
+        _UNSET_ALTERNATIVE,
     ),
     "while_statement": _syntax_reason("while loop", _STEPWISE_ALTERNATIVE),
 }
@@ -314,20 +354,43 @@ def _equals_marker_proof(value: bytes) -> bool | None:
     return not (isinstance(token, ShellToken) and token.meta_unquoted)
 
 
-def _zsh_sensitive_word_reason(value: bytes) -> Diagnostic | None:  # noqa: PLR0911
-    """Name Zsh word expansions that the Bash grammar treats as literals."""
-    if value.startswith(b"="):
-        return _syntax_reason("Zsh equals expansion", _EQUALS_MARKER_ALTERNATIVE)
-    marker_proof = _equals_marker_proof(value)
-    if marker_proof is True:
-        return None
-    if marker_proof is False:
-        return _syntax_reason(
-            "an equals-marker word the shell can still expand",
-            "quote the whole word so it stays one literal argument",
-        )
-    if b"==" in value:
-        return _syntax_reason("Zsh magic-equals expansion", _EQUALS_MARKER_ALTERNATIVE)
+def _executor_family() -> str | None:
+    """The executing shell's contract family, read live at the analysis.
+
+    The resolver's own pattern (never a prior probe): the family answered here
+    is the family the spawn uses. An unknown executor has no family, which
+    keeps the family-gated equals rules denied.
+    """
+    contract = current_executor_contract()
+    return None if contract is None else contract.family
+
+
+def _zsh_sensitive_word_reason(  # noqa: PLR0911
+    value: bytes, *, family: str | None
+) -> Diagnostic | None:
+    """Name word expansions that the Bash grammar treats as literals.
+
+    Only the equals-expansion family is zsh-specific: under bash an unquoted
+    `=word` is one literal argument, so those rules apply only when the
+    resolved executor family is zsh. The named-directory and symlink-following
+    star checks are not equals rules: they keep their existing handling under
+    every family.
+    """
+    if family == "zsh":
+        if value.startswith(b"="):
+            return _syntax_reason("Zsh equals expansion", _EQUALS_MARKER_ALTERNATIVE)
+        marker_proof = _equals_marker_proof(value)
+        if marker_proof is True:
+            return None
+        if marker_proof is False:
+            return _syntax_reason(
+                "an equals-marker word the shell can still expand",
+                "quote the whole word so it stays one literal argument",
+            )
+        if b"==" in value:
+            return _syntax_reason(
+                "Zsh magic-equals expansion", _EQUALS_MARKER_ALTERNATIVE
+            )
     if value.startswith(b"~") and not (value == b"~" or value.startswith(b"~/")):
         return _syntax_reason(
             "shell-specific named-directory expansion",
@@ -341,38 +404,44 @@ def _zsh_sensitive_word_reason(value: bytes) -> Diagnostic | None:  # noqa: PLR0
     return None
 
 
-def _zsh_sensitive_node_reason(node: Node) -> Diagnostic | None:
+def _zsh_sensitive_node_reason(node: Node, *, family: str | None) -> Diagnostic | None:
     if node.text is None:
         return None
     if node.type in {"command_name", "word"}:
-        return _zsh_sensitive_word_reason(node.text)
+        return _zsh_sensitive_word_reason(node.text, family=family)
     if node.type in {"string", "raw_string", "concatenation"}:
         # Quoted and concatenated words carry only the equals-marker rule:
         # a leading marker that is no longer one literal word keeps the
         # expansion denial, and every other Zsh word expansion keeps its
         # existing handling.
         if _equals_marker_proof(node.text) is False:
-            return _zsh_sensitive_word_reason(node.text)
+            return _zsh_sensitive_word_reason(node.text, family=family)
     return None
 
 
 # --- same-invocation `$?` status probe ----------------------------------------
 #
-# A `$?` expansion is admitted only as the entire argument of a narrowly
+# A `$?` expansion is admitted only as the whole argument of a narrowly
 # recognized status-printing command that is the LAST statement of an
-# invocation of exactly the shape ``<simple-command>; <status-command> $?``.
-# The preceding statement must be one plain simple command (not a pipeline,
-# a conditional list, an assignment-only statement, a redirect, or a wrapper
-# whose own status the probe would report), the separator must be `;`, and no
-# statement may follow. The `$?` keeps its own source text as the emitted
-# argument: the shell substitutes the status number, so the analysis never
-# fabricates a literal that could diverge from what executes.
+# invocation of exactly the shape ``<simple-command>; <status-command> WORD``,
+# where WORD is the bare ``$?`` or one double-quoted word whose literal prefix
+# precedes it (the ``"EXIT:$?"`` spelling). The preceding statement must be
+# one plain simple command (not a pipeline, a conditional list, an
+# assignment-only statement, a redirect, or a wrapper whose own status the
+# probe would report), the separator must be `;`, and no statement may
+# follow. The `$?` keeps its own source text as the emitted argument: the
+# shell substitutes the status number, so the analysis never fabricates a
+# literal that could diverge from what executes.
 
 _STATUS_PROBE_COMMANDS = frozenset({"echo", "printf"})
 # The admitted invocation's exact child count (command, `;`, probe command)
 # and the probe command's exact child count (command name, `$?` argument).
 _STATUS_PROBE_PROGRAM_CHILDREN = 3
 _STATUS_PROBE_COMMAND_CHILDREN = 2
+# One double-quoted word whose only expansion is a trailing `$?` after a
+# literal prefix (``"EXIT:$?"``, ``"$?"``). The prefix admits no `$`, quote,
+# backtick, or backslash, so the word cannot expand into more than itself.
+_STATUS_PROBE_QUOTED_WORD_RE = re.compile(r'"[^"$`\\]*\$\?"')
 # Wrappers whose own invocation owns the exit status a probe would print.
 _STATUS_PROBE_WRAPPER_COMMANDS = frozenset({
     "bash",
@@ -400,8 +469,10 @@ def _status_probe_replacements(  # noqa: PLR0911
 ) -> dict[tuple[int, int], str]:
     """The `$?` argument nodes the same-invocation status probe admits.
 
-    Maps each admitted argument node's byte range to its source text. Any
-    other shape yields no entry and keeps the ordinary expansion denial.
+    Maps each admitted argument node's byte range to its source text: the bare
+    ``$?`` word, or one double-quoted word whose literal prefix precedes a
+    trailing ``$?``. Any other shape yields no entry and keeps the ordinary
+    expansion denial.
     """
     if root.type != "program" or len(root.children) != _STATUS_PROBE_PROGRAM_CHILDREN:
         return {}
@@ -415,7 +486,20 @@ def _status_probe_replacements(  # noqa: PLR0911
         return {}
     if name.text.decode("utf-8", errors="replace") not in _STATUS_PROBE_COMMANDS:
         return {}
-    if argument.type != "simple_expansion" or argument.text != b"$?":
+    if argument.text is None:
+        return {}
+    if argument.type == "simple_expansion":
+        if argument.text != b"$?":
+            return {}
+    elif argument.type == "string":
+        if (
+            _STATUS_PROBE_QUOTED_WORD_RE.fullmatch(
+                argument.text.decode("utf-8", errors="replace")
+            )
+            is None
+        ):
+            return {}
+    else:
         return {}
     executable = previous.children[0] if previous.children else None
     token = _literal_token(executable) if executable is not None else None
@@ -780,8 +864,11 @@ def _argument_position_key(argument_tokens: list[str]) -> str:
     """The position key of the next argument element (conservative).
 
     An element following an option token is classified as that option's value;
-    otherwise it is the next positional. Miscounts are safe: the table's
-    read-only positions belong exclusively to pure readers, and every unknown
+    otherwise it is the next positional. Miscounts are safe: an attached
+    option value in the first element reads as ``positional:1``, and the
+    commands whose positional positions are read-only keep every
+    output-naming option guarded by the command policy's own approval (sort's
+    ``-o``, uniq's second positional, find's action operands). Every unknown
     or unclassified position fails closed in classify_argument_position.
     """
     if not argument_tokens:
@@ -877,6 +964,7 @@ def _static_expansion_replacements(
     status_probes: dict[tuple[int, int], str] | None,
     quoted_word_scope: tuple[int, int] | None,
     admitted_quoted_words: list[int],
+    family: str | None,
 ) -> dict[tuple[int, int], str]:
     """Literal replacements for this command's statically expanded constructs.
 
@@ -891,7 +979,8 @@ def _static_expansion_replacements(
     literal argv plan; only inside it does a whole double-quoted ``"$NAME"`` /
     ``"${NAME}"`` argument resolve, and each such admission increments
     ``admitted_quoted_words`` so the execution transport can re-derive the
-    same plan.
+    same plan. ``family`` is the resolved executor family the word analysis
+    gates its equals rules on.
     """
     text = (node.text or b"").decode("utf-8", errors="replace")
     replacements: dict[tuple[int, int], str] = dict(status_probes or {})
@@ -954,7 +1043,7 @@ def _static_expansion_replacements(
                 argument_tokens.append(quoted_value)
                 admitted_quoted_words[0] += 1
                 continue
-            token = _supported_command_part(child)
+            token = _supported_command_part(child, family=family)
             if token is not None:
                 argument_tokens.append(token)
             continue
@@ -977,25 +1066,20 @@ def _static_expansion_replacements(
     return replacements
 
 
-def _supported_command_part(node: Node) -> str | None:
+def _supported_command_part(node: Node, *, family: str | None) -> str | None:
     if node.type not in _SUPPORTED_COMMAND_PARTS or node.text is None:
         return None
-    if _zsh_sensitive_node_reason(node):
+    if _zsh_sensitive_node_reason(node, family=family):
         return None
     return node.text.decode("utf-8")
 
 
-def _node_approval_reason(node: Node) -> Diagnostic | None:
-    if node.type in _REDIRECTION_NODES:
-        detail, alternative = (
-            ("heredocs are unsupported in v0.1", _HEREDOC_ALTERNATIVE)
-            if node.type == "heredoc_redirect"
-            else ("redirection", "pass the value as a literal argument")
-        )
-        return _syntax_reason(detail, alternative)
+def _node_approval_reason(node: Node, *, family: str | None) -> Diagnostic | None:
+    if node.type == "herestring_redirect":
+        return _syntax_reason("redirection", "pass the value as a literal argument")
     if reason := _DYNAMIC_NODES.get(node.type):
         return reason
-    if reason := _zsh_sensitive_node_reason(node):
+    if reason := _zsh_sensitive_node_reason(node, family=family):
         return reason
     if node.type == "concatenation" and any(
         child.type == "word" and child.text in {b"{", b"}"} for child in node.children
@@ -1059,14 +1143,21 @@ def _literal_shell_token(node: Node) -> ShellToken | None:
 
 
 def _assignment_reason(node: Node) -> Diagnostic | None:  # noqa: PLR0911
-    # Environment-assignment restrictions are policy decisions: the denial
-    # states the blocked requirement and names no alternative.
+    # A dangerous name or value is a policy decision; an assignment the
+    # analysis cannot read is a vocabulary gap, so its denial names the
+    # literal form it can model.
     if node.text is None:
-        return _policy_reason("an environment assignment that cannot be inspected")
+        return _syntax_reason(
+            "an environment assignment that cannot be inspected",
+            _LITERAL_ASSIGNMENT_ALTERNATIVE,
+        )
     raw = node.text.decode("utf-8")
     name, separator, _ = raw.partition("=")
-    if not separator or re.fullmatch(r"[A-Z_][A-Z0-9_]*", name) is None:
-        return _policy_reason("an environment assignment with a non-uppercase name")
+    if not separator:
+        return _syntax_reason(
+            "an environment assignment that cannot be inspected",
+            _LITERAL_ASSIGNMENT_ALTERNATIVE,
+        )
     if name in DANGEROUS_ENV_NAMES or name.startswith(_DANGEROUS_ENV_PREFIXES):
         return _policy_reason(f"dangerous environment assignment ({name})")
     value = node.child_by_field_name("value")
@@ -1075,7 +1166,9 @@ def _assignment_reason(node: Node) -> Diagnostic | None:  # noqa: PLR0911
     else:
         literal_value = _literal_token(value)
         if literal_value is None:
-            return _policy_reason("a non-literal environment assignment")
+            return _syntax_reason(
+                "a non-literal environment assignment", _LITERAL_ASSIGNMENT_ALTERNATIVE
+            )
         if value.type not in {"string", "raw_string"} and any(
             syntax in literal_value for syntax in ("|", "`", "$(")
         ):
@@ -1087,10 +1180,7 @@ def _assignment_reason(node: Node) -> Diagnostic | None:  # noqa: PLR0911
 
         paths = literal_value.split(":")
         if any(
-            not entry
-            or PurePosixPath(entry).is_absolute()
-            or entry.startswith("~")
-            or ".." in PurePosixPath(entry).parts
+            not entry or entry.startswith("~") or ".." in PurePosixPath(entry).parts
             for entry in paths
         ):
             return _policy_reason("dangerous environment assignment (PYTHONPATH)")
@@ -1147,10 +1237,13 @@ def _redirect_reason(  # noqa: PLR0911
             "stderr, or combined stderr to stdout",
         )
     if destination_text is None:
-        # A non-literal target cannot be inspected: fail closed (POLICY).
-        return _policy_reason("a non-literal redirection target")
+        return _syntax_reason(
+            "a non-literal redirection target", _LITERAL_REDIRECT_ALTERNATIVE
+        )
     if destination_text.startswith("-") or destination_text.isdigit():
-        return _policy_reason("an invalid redirection path target")
+        return _syntax_reason(
+            "an invalid redirection path target", _LITERAL_REDIRECT_ALTERNATIVE
+        )
     if destination_text in _REDIRECTION_DEVICES:
         # Device sinks are not filesystem targets (ADR 0021).
         return None
@@ -1227,6 +1320,11 @@ def _executable_parts(node: Node) -> list[str]:
     parts = [
         token for child in node.children if (token := _literal_token(child)) is not None
     ]
+    return _wrapped_executable_parts(parts)
+
+
+def _wrapped_executable_parts(parts: list[str]) -> list[str]:
+    """Follow registry-owned argv positions to the wrapped command, or []."""
     # Follow registry-owned argv positions only, with the same depth bound as
     # Bash. env stays visible so its original assignment spelling is checked.
     for _ in range(8):
@@ -1241,6 +1339,83 @@ def _executable_parts(node: Node) -> list[str]:
         start, end = boundary.inner_command_range
         parts = parts[start:end]
     return parts
+
+
+def _heredoc_consumer_parts(node: Node) -> list[str]:
+    """The argv of the command a heredoc feeds, or [] when it cannot be read.
+
+    The statement slice from the anchored command up to the heredoc operator
+    is the shell's own argv prefix: tree-sitter-bash drops a bare ``-``
+    operand from the command node once a heredoc follows it, so the node's
+    children alone would misreport ``python3 -`` as ``python3``.
+    """
+    anchor = _redirect_anchor(node)
+    if anchor is None:
+        return []
+    statement = anchor.parent
+    while statement is not None and not (
+        statement.start_byte <= node.start_byte < statement.end_byte
+    ):
+        statement = statement.parent
+    if statement is None or statement.text is None:
+        return []
+    start = anchor.start_byte - statement.start_byte
+    end = node.start_byte - statement.start_byte
+    if start < 0 or end <= start:
+        return []
+    try:
+        tokens = split_shell_tokens(statement.text[start:end].decode("utf-8"))
+    except (UnicodeDecodeError, ValueError):
+        return []
+    return _wrapped_executable_parts([str(token) for token in tokens])
+
+
+def _heredoc_consumer_reads_stdin(parts: list[str]) -> bool:
+    """Whether a heredoc body reaches stdin of a modeled stdin consumer."""
+    if not parts:
+        return False
+    name = parts[0].rsplit("/", 1)[-1]
+    return (
+        name in _HEREDOC_STDIN_READERS
+        or name in _HEREDOC_SCRIPT_INTERPRETERS
+        or _HEREDOC_PYTHON_INTERPRETER.fullmatch(name) is not None
+    )
+
+
+def _heredoc_reason(node: Node) -> Diagnostic | None:
+    """The denial for one heredoc redirect, or None when it is admitted.
+
+    A heredoc body is data already in the command string. Bash expands it
+    unless the delimiter word is quoted, so a quoted delimiter feeds exactly
+    the bytes written here to the consuming invocation's stdin — the same
+    literal argument a file created with write_file would supply — and is
+    admitted when that invocation reads stdin as data. An unquoted body
+    undergoes expansion, and a body fed to an invocation outside the modeled
+    consumers, stay denied.
+    """
+    delimiter = next(
+        (child for child in node.children if child.type == "heredoc_start"), None
+    )
+    if delimiter is None or delimiter.text is None:
+        return _syntax_reason(
+            "a heredoc whose delimiter cannot be inspected",
+            _UNQUOTED_HEREDOC_ALTERNATIVE,
+        )
+    if not any(
+        character in delimiter.text.decode("utf-8", errors="replace")
+        for character in _HEREDOC_QUOTING_CHARACTERS
+    ):
+        return _syntax_reason(
+            "an unquoted heredoc delimiter (the body would be expanded)",
+            _UNQUOTED_HEREDOC_ALTERNATIVE,
+        )
+    parts = _heredoc_consumer_parts(node)
+    if not _heredoc_consumer_reads_stdin(parts):
+        consumer = parts[0].rsplit("/", 1)[-1] if parts else "an unlocated command"
+        return _syntax_reason(
+            f"a heredoc feeding {consumer}", _FOREIGN_HEREDOC_ALTERNATIVE
+        )
+    return None
 
 
 def _has_active_bracket_glob(value: bytes) -> bool:
@@ -1410,18 +1585,12 @@ def argv_permission_diagnostics(
             key, separator, value = assignment.partition("=")
             if not separator:
                 continue
-            if re.fullmatch(r"[A-Z_][A-Z0-9_]*", key) is None:
-                reasons.append(
-                    _policy_reason(
-                        "an environment assignment with a non-uppercase name"
-                    )
-                )
-            elif key in DANGEROUS_ENV_NAMES or key.startswith(_DANGEROUS_ENV_PREFIXES):
+            if key in DANGEROUS_ENV_NAMES or key.startswith(_DANGEROUS_ENV_PREFIXES):
                 reasons.append(
                     _policy_reason(f"dangerous environment assignment ({key})")
                 )
             elif key == "PYTHONPATH" and any(
-                not entry or entry.startswith(("/", "~")) or ".." in entry.split("/")
+                not entry or entry.startswith("~") or ".." in entry.split("/")
                 for entry in value.split(":")
             ):
                 reasons.append(
@@ -1561,6 +1730,10 @@ def _analyze_shell_command(  # noqa: PLR0915, PLR0914
         raise ValueError("shell command contains a NUL byte")
     command = re.sub(r"(?<!\\)\\\n", "", command)
     tree = _get_parser().parse(command.encode("utf-8"))
+    # One executor read per analysis: the equals-expansion rules are gated on
+    # the family the spawn resolves, and the resolver's analysis cache keys the
+    # family alongside the source so a zsh answer never serves a bash call.
+    family = _executor_family()
     commands: list[str] = []
     # Literal redirect targets grouped by the command part they precede; the
     # trailing group collects targets that follow the last part (redirect-only
@@ -1763,7 +1936,10 @@ def _analyze_shell_command(  # noqa: PLR0915, PLR0914
                     pending_targets.append(target)
                 else:
                     redirect_groups[index].append(target)
-        elif reason := _node_approval_reason(node):
+        elif node.type == "heredoc_redirect":
+            if reason := _heredoc_reason(node):
+                add_reason(reason)
+        elif reason := _node_approval_reason(node, family=family):
             if not _consumed_by_static_expansion(node):
                 add_reason(reason)
 
@@ -1794,6 +1970,7 @@ def _analyze_shell_command(  # noqa: PLR0915, PLR0914
                 status_probes,
                 quoted_word_scope,
                 admitted_quoted_words,
+                family,
             )
             parts: list[str] = []
             prefix_assignments: list[tuple[str, str]] = []
@@ -1805,7 +1982,7 @@ def _analyze_shell_command(  # noqa: PLR0915, PLR0914
                     # dynamic-syntax denial is consumed.
                     parts.append(replacement)
                     continue
-                if part := _supported_command_part(child):
+                if part := _supported_command_part(child, family=family):
                     parts.append(part)
                 elif child.type == "ansi_c_string":
                     # Preserve the token for guardrails such as find's execution
@@ -1822,7 +1999,7 @@ def _analyze_shell_command(  # noqa: PLR0915, PLR0914
                         prefix_assignments.append(binding)
                 elif (
                     child.type not in _DYNAMIC_NODES
-                    and not _zsh_sensitive_node_reason(child)
+                    and not _zsh_sensitive_node_reason(child, family=family)
                 ):
                     # The executor receives the original shell string. If policy
                     # extraction omits a semantic command child, the two views can

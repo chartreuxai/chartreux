@@ -7,7 +7,6 @@ from pydantic import JsonValue
 import pytest
 
 from chartreux.app_server.models import (
-    CancelledEffectState,
     CompletedEffectState,
     FailedEffectState,
     RunningEffectState,
@@ -37,6 +36,15 @@ def _shell_results(chartreux_app: ChartreuxApp) -> list[ToolResultMessage]:
         for message in chartreux_app.query(ToolResultMessage)
         if message.tool_name == "shell"
     ]
+
+
+async def _wait_until(pilot, predicate, timeout: float = 2.0) -> bool:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        await pilot.pause(0.05)
+    return False
 
 
 async def _wait_for_shell_result(
@@ -193,7 +201,8 @@ async def test_ui_handles_non_utf8_stderr(chartreux_app: ChartreuxApp) -> None:
 
 
 @pytest.mark.asyncio
-async def test_ui_sends_manual_command_output_to_next_agent_turn() -> None:
+async def test_ui_manual_command_result_is_a_normal_user_turn() -> None:
+    """Item-5 B.2: the record is the turn's user message, not an injection."""
     backend = FakeBackend(mock_llm_chunk(content="I saw it."))
     agent_loop = build_test_agent_loop(backend=backend)
     chartreux_app = build_test_chartreux_app(agent_loop=agent_loop)
@@ -205,31 +214,30 @@ async def test_ui_sends_manual_command_output_to_next_agent_turn() -> None:
         await pilot.press("enter")
         await _wait_for_shell_result(chartreux_app, pilot)
 
-        injected_message = agent_loop.messages[-1]
-        assert injected_message.role == Role.user
-        assert injected_message.injected is True
-        assert injected_message.content is not None
-        assert "Manual `!` command result from the user." in injected_message.content
-        assert "Command: `echo hello`" in injected_message.content
-        assert "Exit code: 0" in injected_message.content
-        assert "Stdout:\n```text\nhello\n```" in injected_message.content
-
-        chat_input.value = "what did the command print?"
-        await pilot.press("enter")
-        deadline = time.monotonic() + 2
-        while len(backend.requests_messages) != 1 or chartreux_app._agent_job_active():
+        deadline = time.monotonic() + 3
+        while not backend.requests_messages:
             if time.monotonic() >= deadline:
-                raise AssertionError("Timed out waiting for the agent turn")
+                raise AssertionError("Timed out waiting for the record turn")
             await pilot.pause(0.01)
 
-        assert len(backend.requests_messages) == 1
-        user_messages = [
-            msg for msg in backend.requests_messages[0] if msg.role == Role.user
-        ]
-        assert len(user_messages) >= 2
-        assert user_messages[-2].content == injected_message.content
-        assert user_messages[-2].injected is True
-        assert user_messages[-1].content == "what did the command print?"
+        record = next(
+            message
+            for message in agent_loop.messages
+            if message.role == Role.user
+            and "Manual `!` command result from the user." in (message.content or "")
+        )
+        assert record.injected is False
+        assert record.manual_shell is not None
+        assert "Command: `echo hello`" in (record.content or "")
+        assert "Exit code: 0" in (record.content or "")
+        assert "Stdout:\n```text\nhello\n```" in (record.content or "")
+
+        # The command started its own turn: the model received the record as
+        # ordinary user input, with no typed prompt in between.
+        first_request = backend.requests_messages[0]
+        assert first_request[-1].role == Role.user
+        assert first_request[-1].content == record.content
+        assert first_request[-1].injected is False
 
 
 @pytest.mark.asyncio
@@ -272,13 +280,13 @@ async def test_ui_streams_output_incrementally(chartreux_app: ChartreuxApp) -> N
 
 
 @pytest.mark.asyncio
-async def test_ui_rejects_bash_submitted_while_command_running(
+async def test_ui_queues_bash_submitted_while_command_running(
     chartreux_app: ChartreuxApp,
 ) -> None:
-    """Submitting new bash while a bang command is running preserves the input."""
+    """Item-5 A.4: shell inputs share the queue, so neither family is refused."""
     async with chartreux_app.run_test() as pilot:
         chat_input = chartreux_app.query_one(ChatInputContainer)
-        chat_input.value = "!sleep 2"
+        chat_input.value = "!sleep 1"
 
         await pilot.press("enter")
         await _wait_for_running_shell(chartreux_app, pilot)
@@ -288,30 +296,61 @@ async def test_ui_rejects_bash_submitted_while_command_running(
         chat_input.value = "!echo done"
         await pilot.press("enter")
 
-        assert chat_input.value == "!echo done"
-        assert not chartreux_app._queue
-        assert any(
-            "cannot be queued while a shell command is running" in notification.message
+        assert chat_input.value == ""
+        assert not any(
+            "cannot be queued" in notification.message
             for notification in chartreux_app._notifications
         )
 
-        await pilot.press("escape")
-        deadline = time.monotonic() + 1
-        while chartreux_app._bash_task is not None:
-            if time.monotonic() >= deadline:
-                raise AssertionError("Timed out waiting for the shell task to stop")
-            await pilot.pause(0.05)
+        # FIFO: the second command was accepted rather than refused, and it runs
+        # once the first finishes — whether it was observed queued or already
+        # executed by then, its own shell effect arrives.
+        assert await _wait_until(
+            pilot,
+            lambda: any(
+                isinstance(message._entry.state, CompletedEffectState)
+                and message._entry.state.output
+                == {"stdout": "done\n", "stderr": "", "output": "done\n"}
+                for message in _shell_results(chartreux_app)
+                if message._entry is not None
+            ),
+            timeout=5.0,
+        )
 
-        # Cancellation settles the original effect, not the rejected command.
-        results = _shell_results(chartreux_app)
-        assert len(results) == 1
-        result = results[0]
-        assert result._entry is not None
-        assert isinstance(result._entry.state, CancelledEffectState)
-        assert result._entry.state.reason == "Command interrupted"
-        assert result.has_class("warning-text")
-        calls = _shell_calls(chartreux_app)
-        assert len(calls) == 1
-        assert calls[0]._entry is not None
-        assert result._entry.id == calls[0]._entry.id
-        assert chat_input.value == "!echo done"
+
+@pytest.mark.asyncio
+async def test_ui_empty_bash_produces_the_refused_record() -> None:
+    """Item 5 B.1: a bare `!` is a record, never a client-side error."""
+    backend = FakeBackend(mock_llm_chunk(content="Bad request."))
+    agent_loop = build_test_agent_loop(backend=backend)
+    chartreux_app = build_test_chartreux_app(agent_loop=agent_loop)
+
+    async with chartreux_app.run_test() as pilot:
+        chat_input = chartreux_app.query_one(ChatInputContainer)
+        chat_input.value = "!"
+
+        await pilot.press("enter")
+        message = await _wait_for_shell_result(chartreux_app, pilot)
+
+        deadline = time.monotonic() + 3
+        while not backend.requests_messages:
+            if time.monotonic() >= deadline:
+                raise AssertionError("Timed out waiting for the refused record turn")
+            await pilot.pause(0.01)
+
+        record = next(
+            message
+            for message in agent_loop.messages
+            if message.role == Role.user
+            and "Manual `!` command result from the user." in (message.content or "")
+        )
+        assert record.injected is False
+        assert record.manual_shell is not None
+        assert record.manual_shell.status == "refused"
+        assert "Status: refused" in (record.content or "")
+        assert "Shell command cannot be empty" in (record.content or "")
+
+        # The refusal still shows its own effect tile and mounts no error.
+        assert message._entry is not None
+        assert isinstance(message._entry.state, FailedEffectState)
+        assert_no_command_error(chartreux_app)

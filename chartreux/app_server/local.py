@@ -67,7 +67,7 @@ class LocalHarnessHost:
             raise
 
     async def connect(self, options: LocalHarnessOptions) -> AppServerHost:
-        selection = resolve_transport_selection()
+        selection = resolve_transport_selection(interactive=options.interactive)
         process = self._process_for()
         client_transport, server_transport = memory_transport_pair()
         harness = await create_harness_server(

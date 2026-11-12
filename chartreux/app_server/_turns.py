@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Awaitable, Callable, Coroutine
+from collections.abc import Awaitable, Callable, Collection, Coroutine
 from contextlib import aclosing, suppress
 from contextvars import ContextVar
 from dataclasses import dataclass, field
@@ -28,9 +28,16 @@ from chartreux.app_server._root_recovery import (
     RootRecoverySessionView,
 )
 from chartreux.app_server._root_session import SessionCoordinator, rebind_history
+from chartreux.app_server._shell_record import ManualShellRecord
 from chartreux.app_server._state import session_preview
 from chartreux.app_server._turn_input import vibe_content_blocks
-from chartreux.app_server._turn_queue import TurnQueue, TurnQueueEnqueueResult
+from chartreux.app_server._turn_queue import (
+    QueuedTurnRecord,
+    TurnQueue,
+    TurnQueueEnqueueResult,
+    TurnQueueFullError,
+    TurnQueueItemNotFoundError,
+)
 from chartreux.app_server._utils import (
     DecodedInput,
     decode_content_blocks,
@@ -49,6 +56,7 @@ from chartreux.app_server.models import (
     PublicError,
     PublicHistoryEntry,
     PublicMessageSource,
+    PublicQueuedTurn,
     PublicRetryCategory,
     PublicRetryState,
     PublicSessionState,
@@ -73,6 +81,7 @@ from chartreux.app_server.protocol import (
     SessionCompactedParams,
     SessionContentBlock,
     SessionSnapshotParams,
+    SessionTextContentBlock,
     SessionUpdatedParams,
     StatsUpdatedParams,
     TurnCompletedParams,
@@ -82,12 +91,14 @@ from chartreux.app_server.protocol import (
     TurnInterruptResponse,
     TurnQueueUpdatedParams,
     TurnRetryingParams,
+    TurnShellInputEntry,
     TurnStartedParams,
     TurnStartParams,
     TurnStartResponse,
     TurnSteerParams,
     TurnSteerResponse,
     TurnUpdatedParams,
+    TurnUserInputEntry,
 )
 from chartreux.core.agent_loop import AgentLoop, AgentTurnOptions
 from chartreux.core.agent_loop._execution_port import ExecutionTurnRequest
@@ -120,7 +131,7 @@ from chartreux.core.model_catalog.availability import (
     AvailabilitySnapshot,
     availability_snapshot,
 )
-from chartreux.core.recovery_models import build_root_turn_failure
+from chartreux.core.recovery_models import FailureClass, build_root_turn_failure
 from chartreux.core.recovery_observation import (
     observe_exception,
     record_observation,
@@ -140,6 +151,11 @@ type BackgroundWorkSink = Callable[
     [BackgroundWorkEvent | BackgroundJobsChangedEvent], Awaitable[None]
 ]
 type SnapshotState = Callable[[], PublicSessionState]
+#: Item 5 A.4: runs one queued shell input's effect exactly once and returns the
+#: record its user turn is built from. Bound by the shell request handler.
+type ShellInputExecutor = Callable[
+    [TurnShellInputEntry, str], Awaitable[ManualShellRecord]
+]
 
 # Retry hooks may cross a worker thread. Context keeps each notice tied to the
 # turn whose model request produced it, even if delivery happens later.
@@ -151,6 +167,14 @@ _retry_turn_id: ContextVar[str | None] = ContextVar(
 #: recovery milestone notices (deterministic ids; readable via the normal
 #: history across a reconnect; never injected as fresh instructions).
 _ROOT_RECOVERY_EFFECT_ID = "root-recovery"
+
+#: Item 2 B.1: the bounded grace a stream-truncated turn's in-flight tool
+#: effect gets to reach a terminal state before the root recovery gate keeps
+#: its unsettled-effects decline. A suppression case stays declined.
+_ROOT_EFFECT_SETTLE_GRACE_SECONDS = 1.0
+
+#: Bounded FIFO capacity of the per-turn truncation effect-settlement memory.
+_ROOT_EFFECT_SETTLEMENT_CAPACITY = 16
 
 
 class TurnConflictError(RuntimeError):
@@ -219,6 +243,73 @@ class SteerReceipt:
     events: list[BaseEvent] = field(default_factory=list)
     pending_updates: list[ProjectedUpdate] = field(default_factory=list)
     recovery_error: BaseException | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _QueuedShellRecord:
+    """A queued manual ``!`` record waiting for its turn.
+
+    ``committed`` marks a retained record whose text already reached the
+    transcript: its turn then runs without committing the record twice.
+    ``starts_at`` is how many turns had started when the record was retained:
+    a later admission that finds more means intervening turns ran, and the
+    record text is then the retried turn's own input.
+    """
+
+    record: ManualShellRecord
+    committed: bool = False
+    starts_at: int = 0
+
+
+@dataclass(frozen=True, slots=True)
+class _PromotedShellRecord:
+    """A promoted record turn, remembered until that turn terminalizes."""
+
+    session_id: str
+    entry_id: str
+    record: ManualShellRecord
+
+
+@dataclass(frozen=True, slots=True)
+class _RetainedShellRecord:
+    """A record kept for the queue's next admission, in or beside the queue.
+
+    ``committed`` marks a record whose text already reached the transcript: its
+    turn then runs on that message instead of committing it twice.
+    ``created_at`` and ``starts_at`` keep the pending entry it shows in the
+    public queue state and the admission its retained turn was waiting for.
+    """
+
+    session_id: str
+    entry_id: str
+    record: ManualShellRecord
+    committed: bool
+    created_at: int
+    starts_at: int
+
+
+def _retained_public_turn(retained: _RetainedShellRecord) -> PublicQueuedTurn:
+    """The pending queue entry a retained record is publicly visible as."""
+    return PublicQueuedTurn(
+        id=retained.entry_id,
+        created_at=retained.created_at,
+        entries=[
+            TurnUserInputEntry(
+                entry_id=retained.entry_id,
+                content=[SessionTextContentBlock(text=retained.record.text)],
+            )
+        ],
+    )
+
+
+def _record_retry_message_id(turn_id: str) -> str:
+    """A fresh message id for a committed record re-delivered as turn input.
+
+    The record's own commit already carries the entry id; re-delivering the
+    text as the retried turn's input mints a new id so the transcript never
+    holds two messages under one id.
+    """
+    return f"manual-shell-retry:{turn_id}"
 
 
 def _public_retry_category(category: RetryCategory) -> PublicRetryCategory:
@@ -313,6 +404,10 @@ class TurnController:  # noqa: PLR0904
         self._projector: EventProjector | None = None
         self._harness_effects: dict[str, EventProjector] = {}
         self._history: list[PublicHistoryEntry] = []
+        # Item 2 B.1: per-turn truncation effect-settlement verdicts, so a
+        # later terminalize-time capture can never overwrite a settled verdict
+        # with a pre-finalize read (the gate reads the LAST capture).
+        self._root_effect_settlements: dict[str, bool] = {}
         # Monotonic clock / wakeup seams for the agent-side unattended-expiry
         # timer (plan U/OD1): tests override these per instance; the broker
         # reads them through the bound getters at arm/fire time.
@@ -330,6 +425,29 @@ class TurnController:  # noqa: PLR0904
         self._scheduled_loop_id: str | None = None
         self._turn_queue = TurnQueue()
         self._queue_lock = asyncio.Lock()
+        # Item 5 A.4: a manual `!` command is user input, so it waits in the
+        # same queue as a typed prompt. The controller owns the one runner that
+        # executes a queued shell input, the item ids already executing (so a
+        # promote pass can never run an effect twice), the completed records
+        # keyed by queue item, the record turn each promotion started (so a
+        # failed turn can retain its record), and one completion future per
+        # operation so the shell request can await its own execution.
+        self._shell_executor: ShellInputExecutor | None = None
+        self._shell_claimed: set[str] = set()
+        self._shell_records: dict[str, _QueuedShellRecord] = {}
+        self._promoted_shell_records: dict[str, _PromotedShellRecord] = {}
+        # Item 5 B.2a: records retained after a failed turn wait for the
+        # queue's next admission instead of retrying themselves immediately.
+        self._shell_held: set[str] = set()
+        # A retained record the queue could not take yet stays here, so a full
+        # queue can never drop the record of a command that already ran.
+        self._shell_retained: dict[str, _RetainedShellRecord] = {}
+        # How many turns this session has started. A retained record remembers
+        # the count at retention, so a later admission can tell whether other
+        # turns ran in between (R3-A2): the record text then becomes the retried
+        # turn's own user input instead of running on the later transcript.
+        self._turn_starts = 0
+        self._shell_completions: dict[str, asyncio.Future[None]] = {}
         self._steer_lock = asyncio.Lock()
         self._steer_receipts: dict[str, SteerReceipt] = {}
         self._steer_replay_floor = 0
@@ -383,7 +501,28 @@ class TurnController:  # noqa: PLR0904
 
     @property
     def queue_state(self) -> PublicTurnQueue:
-        return self._turn_queue.state
+        return self._public_queue_state()
+
+    def _public_queue_state(
+        self, queue: PublicTurnQueue | None = None
+    ) -> PublicTurnQueue:
+        """The queue the client reads, with the records the queue could not take.
+
+        A retained record is ready pending user work even while the queue has
+        no room for it, so the public state names it instead of leaving it in
+        controller-private state.
+        """
+        state = queue if queue is not None else self._turn_queue.state
+        if not self._shell_retained:
+            return state
+        return state.model_copy(
+            update={
+                "retained": [
+                    _retained_public_turn(retained)
+                    for retained in self._shell_retained.values()
+                ]
+            }
+        )
 
     def require_policy_idle(self) -> None:
         active_task = self._active_task is not None and not self._active_task.done()
@@ -453,6 +592,9 @@ class TurnController:  # noqa: PLR0904
         scheduled_loop_id: str | None = None,
         queue_item_id: str | None = None,
         queued_contexts: tuple[DecodedInput, ...] = (),
+        manual_shell: ManualShellContext | None = None,
+        manual_shell_committed: bool = False,
+        manual_shell_redeliver: bool = False,
     ) -> tuple[TurnStartResponse, TurnStartAction]:
         self._require_policy_unreserved()
         self.require_model_choice()
@@ -517,6 +659,9 @@ class TurnController:  # noqa: PLR0904
                 input_text=(decoded.input_text if decoded.resources else None),
                 resources=decoded.resources,
                 queued_contexts=queued_contexts,
+                manual_shell=manual_shell,
+                manual_shell_committed=manual_shell_committed,
+                manual_shell_redeliver=manual_shell_redeliver,
             )
             try:
                 self._unstarted_turn_id = turn.id
@@ -534,6 +679,7 @@ class TurnController:  # noqa: PLR0904
 
         action = TurnStartAction(self, turn, session_execution, start_turn)
         self._pending_start = action
+        self._turn_starts += 1
         return TurnStartResponse(turn=turn), action
 
     def _abort_unstarted_turn(
@@ -576,7 +722,112 @@ class TurnController:  # noqa: PLR0904
 
     def _validate_queued_input(self, params: TurnEnqueueParams) -> None:
         for entry in params.entries:
+            if isinstance(entry, TurnShellInputEntry):
+                # A shell input carries no turn content: it reaches the queue
+                # only through the shell command request that also owns its
+                # execution and its record.
+                raise TurnConflictError(
+                    "Shell inputs enter the queue through session/shellCommand"
+                )
             self._decode_queued_content(entry.content)
+
+    def bind_shell_executor(self, executor: ShellInputExecutor) -> None:
+        """Bind the one runner that executes a queued shell input."""
+        self._shell_executor = executor
+
+    def enqueue_shell_input(
+        self,
+        *,
+        session_id: str,
+        operation_id: str,
+        command: str,
+        cwd: str,
+        timeout_seconds: float,
+    ) -> asyncio.Future[None]:
+        """Queue a manual ``!`` command and settle when its record is ready.
+
+        The command is user input, so it takes its FIFO place beside queued
+        prompts instead of being refused while an epoch runs. The returned
+        future settles once the effect finished and its record either became a
+        user turn or was retained in the queue for the next admission; it never
+        reports a settled effect as lost.
+        """
+        params = TurnEnqueueParams(
+            session_id=session_id,
+            entries=[
+                TurnShellInputEntry(
+                    operation_id=operation_id,
+                    command=command,
+                    cwd=cwd,
+                    timeout_seconds=timeout_seconds,
+                )
+            ],
+        )
+        self._turn_queue.enqueue(params)
+        completion: asyncio.Future[None] = asyncio.get_running_loop().create_future()
+        self._shell_completions[operation_id] = completion
+        self._spawn_queue_task(self._after_queue_mutation(promote=True))
+        return completion
+
+    def enqueue_shell_record(
+        self, *, session_id: str, operation_id: str, record: ManualShellRecord
+    ) -> None:
+        """Queue a record whose effect already settled before the queue saw it.
+
+        A pre-effect refusal (item 5 B.1) executes nothing, so its record is
+        ready at once and takes the FIFO place a queued shell input would have.
+        A full queue cannot give it that place, so the record is retained
+        exactly as an executed one is: the refusal lane never drops its record.
+        """
+        ready = TurnEnqueueParams(
+            session_id=session_id,
+            entries=[
+                TurnUserInputEntry(
+                    entry_id=operation_id,
+                    content=[SessionTextContentBlock(text=record.text)],
+                )
+            ],
+        )
+        try:
+            queued_item_id = self._turn_queue.enqueue(ready).record.queued_turn.id
+        except TurnQueueFullError:
+            self._shell_retained[operation_id] = _RetainedShellRecord(
+                session_id=session_id,
+                entry_id=operation_id,
+                record=record,
+                committed=False,
+                created_at=now_ms(),
+                starts_at=self._turn_starts,
+            )
+        else:
+            self._shell_records[queued_item_id] = _QueuedShellRecord(record=record)
+        self._spawn_queue_task(self._after_queue_mutation(promote=True))
+
+    def discard_queued_shell_input(self, operation_id: str) -> bool:
+        """Drop a queued shell input that has not started; interrupt semantics.
+
+        An interrupt before execution removes the queued command unexecuted and
+        releases the waiting shell request. An already-running command is left
+        alone: the interrupt belongs to the shell controller, which turns it
+        into the interrupted record the user's turn carries.
+        """
+        record = next(
+            (
+                item
+                for item in self._turn_queue.items
+                if (entry := _shell_entry(item)) is not None
+                and entry.operation_id == operation_id
+            ),
+            None,
+        )
+        if record is None or record.queued_turn.id in self._shell_claimed:
+            return False
+        self._turn_queue.remove(record.queued_turn.id)
+        completion = self._shell_completions.pop(operation_id, None)
+        if completion is not None and not completion.done():
+            completion.set_result(None)
+        self._spawn_queue_task(self._after_queue_mutation(promote=True))
+        return True
 
     def remove_queued_turn(
         self, queue_item_id: str
@@ -591,8 +842,9 @@ class TurnController:  # noqa: PLR0904
         self._require_policy_unreserved()
         resumed = self._turn_queue.resume()
         # Explicit resume also kicks promotion for pending work in an
-        # already-unpaused queue.
-        if not resumed and not self._turn_queue:
+        # already-unpaused queue, and offers a retained record the admission
+        # an empty queue would otherwise never trigger.
+        if not resumed and not self._turn_queue and not self._shell_retained:
             return None
         return self._after_queue_response(promote=True)
 
@@ -706,7 +958,9 @@ class TurnController:  # noqa: PLR0904
                 self._scheduled_loop_id = None
                 self._unstarted_turn_id = None
                 try:
-                    await self._after_turn_terminal(PublicTurnStatus.INTERRUPTED)
+                    await self._after_turn_terminal(
+                        PublicTurnStatus.INTERRUPTED, turn.id
+                    )
                 finally:
                     if self._active_task is asyncio.current_task():
                         self._active_task = None
@@ -1123,6 +1377,9 @@ class TurnController:  # noqa: PLR0904
             tasks.append(self._active_task)
         if tasks:
             errors.extend(await cancel_tasks(tasks, label="turn controller"))
+        # A queued shell input whose execution never settled cannot answer its
+        # request any more; the waiting handler shares this teardown.
+        self._cancel_shell_completions()
         try:
             await self._clear_retrying()
         except BaseException as exc:
@@ -1138,7 +1395,11 @@ class TurnController:  # noqa: PLR0904
             raise BaseExceptionGroup("Failed to close turn controller", errors)
 
     async def reset(self) -> Callable[[], None] | None:
-        queue_changed = bool(self._turn_queue) or self._turn_queue.paused
+        queue_changed = (
+            bool(self._turn_queue)
+            or self._turn_queue.paused
+            or bool(self._shell_retained)
+        )
         await self.close()
         self._active_turn = None
         self._completed_turns.clear()
@@ -1148,6 +1409,7 @@ class TurnController:  # noqa: PLR0904
         self._projector = None
         self._harness_effects.clear()
         self._history.clear()
+        self._root_effect_settlements.clear()
         self._callbacks.clear()
         self._steer_receipts.clear()
         self._steer_replay_floor = 0
@@ -1156,11 +1418,17 @@ class TurnController:  # noqa: PLR0904
         self._steer_evidence_lost = True
         self._closing = False
         self._turn_queue.reset()
+        self._shell_claimed.clear()
+        self._shell_records.clear()
+        self._promoted_shell_records.clear()
+        self._shell_held.clear()
+        self._shell_retained.clear()
+        self._cancel_shell_completions()
         if not queue_changed:
             return None
         return self._after_queue_reset_response(self._agent_loop.session_id)
 
-    async def _run_turn(
+    async def _run_turn(  # noqa: PLR0913 - the controller's turn parameters
         self,
         turn: PublicTurn,
         prompt: str | None,
@@ -1171,6 +1439,9 @@ class TurnController:  # noqa: PLR0904
         input_text: str | None,
         resources: list[UserResource],
         queued_contexts: tuple[DecodedInput, ...],
+        manual_shell: ManualShellContext | None = None,
+        manual_shell_committed: bool = False,
+        manual_shell_redeliver: bool = False,
     ) -> None:
         """Drive both public phases in one operation task, ahead of queued work."""
         self._unstarted_turn_id = None
@@ -1185,6 +1456,9 @@ class TurnController:  # noqa: PLR0904
                 input_text=input_text,
                 resources=resources,
                 queued_contexts=queued_contexts,
+                manual_shell=manual_shell,
+                manual_shell_committed=manual_shell_committed,
+                manual_shell_redeliver=manual_shell_redeliver,
             )
             await self._finalize_turn(
                 turn, status, error, stop_reason, session_execution
@@ -1231,7 +1505,7 @@ class TurnController:  # noqa: PLR0904
             self._scheduled_loop_id = None
             self._handoff_pending = False
             try:
-                await self._after_turn_terminal(status)
+                await self._after_turn_terminal(status, turn.id)
             finally:
                 if self._active_task is asyncio.current_task():
                     self._active_task = None
@@ -1300,7 +1574,7 @@ class TurnController:  # noqa: PLR0904
         # transition BEFORE _cancel_callbacks — the interaction/effect
         # barriers are read while the callbacks are still open (their
         # absence afterwards proves nothing).
-        self._capture_root_turn_failure(
+        await self._capture_root_turn_failure(
             turn,
             stop_reason=(
                 "user_cancelled" if status is PublicTurnStatus.INTERRUPTED else None
@@ -1371,6 +1645,9 @@ class TurnController:  # noqa: PLR0904
         input_text: str | None,
         resources: list[UserResource],
         queued_contexts: tuple[DecodedInput, ...],
+        manual_shell: ManualShellContext | None = None,
+        manual_shell_committed: bool = False,
+        manual_shell_redeliver: bool = False,
     ) -> tuple[PublicTurnStatus, PublicError | None, PublicTurnStopReason | None]:
         status = PublicTurnStatus.COMPLETED
         error: PublicError | None = None
@@ -1378,9 +1655,34 @@ class TurnController:  # noqa: PLR0904
         try:
             last_context_tokens = await self._announce_turn_started(turn)
             await self._inject_queued_contexts(queued_contexts)
+            if manual_shell is not None and not manual_shell_committed:
+                # Item 5 B.2: a manual `!` command's record IS the user message.
+                # It commits exactly as a typed prompt does — one ordinary user
+                # message carrying the record metadata for the timeline — so
+                # rebuild projects it on the normal user-message branch. A
+                # retained record (B.2a) already reached the transcript with the
+                # turn that failed, so its turn runs on that message instead of
+                # committing it twice.
+                commit_events = await self._agent_loop.inject_user_context(
+                    prompt or "",
+                    as_message=True,
+                    client_message_id=params.client_user_message_id,
+                    manual_shell=manual_shell,
+                )
+                await self._project_events(commit_events)
+            # R3-A2: a committed record that was retained waits for a later
+            # admission. When other turns ran in between, its message is no
+            # longer the latest user input, so the record text itself becomes
+            # this turn's input (under a fresh message id) instead of the turn
+            # running on whatever the later transcript ends with.
+            redelivered = manual_shell is not None and manual_shell_redeliver
             request = ExecutionTurnRequest(
-                message=prompt,
-                client_message_id=params.client_user_message_id,
+                message=prompt if manual_shell is None or redelivered else None,
+                client_message_id=(
+                    _record_retry_message_id(turn.id)
+                    if redelivered
+                    else params.client_user_message_id
+                ),
                 auto_title=params.auto_title,
                 images=images or None,
                 input_text=input_text,
@@ -1444,7 +1746,7 @@ class TurnController:  # noqa: PLR0904
             record_observation(observe_exception(exc, phase="turn", turn_id=turn.id))
             # R2: capture the typed terminal projection for the recovery
             # gate BEFORE public_error() discards the exception context.
-            self._capture_root_turn_failure(turn, stop_reason=None)
+            await self._capture_root_turn_failure(turn, stop_reason=None)
             error = public_error(exc)
         return status, error, stop_reason
 
@@ -1654,7 +1956,29 @@ class TurnController:  # noqa: PLR0904
             for entry in projector.history
         )
 
-    def _capture_root_turn_failure(
+    async def _settle_truncated_turn_effects(self, turn_id: str) -> bool:
+        """Settle a stream-truncated turn's in-flight tool effects (item 2 B.1).
+
+        The truncation's effect is cancelled and given the bounded grace to
+        reach a terminal state: a call that never ran settles as the recorded
+        terminalization failure, a live call as its own terminal state. The
+        verdict is remembered per turn, so the later terminalize-time capture
+        can never overwrite it with a pre-finalize read.
+        """
+        remembered = self._root_effect_settlements.get(turn_id)
+        if remembered is not None:
+            return remembered
+        if self._root_effects_settled():
+            return True
+        settled = await self._agent_loop.settle_turn_tool_effects(
+            turn_id, grace=_ROOT_EFFECT_SETTLE_GRACE_SECONDS
+        )
+        self._root_effect_settlements[turn_id] = settled
+        while len(self._root_effect_settlements) > _ROOT_EFFECT_SETTLEMENT_CAPACITY:
+            self._root_effect_settlements.pop(next(iter(self._root_effect_settlements)))
+        return settled
+
+    async def _capture_root_turn_failure(
         self, turn: PublicTurn, *, stop_reason: str | None
     ) -> None:
         """Stash the typed terminal projection for the recovery gate (R2).
@@ -1662,8 +1986,11 @@ class TurnController:  # noqa: PLR0904
         Captured at ``_run_turn_phase``'s except — BEFORE ``public_error()``
         destroys the exception context — and at the top of
         ``_terminalize_failed_turn`` — BEFORE ``_cancel_callbacks`` — so the
-        eligibility decision never depends on post-cancellation state. Total
-        by contract: a capture failure must never mask the primary failure.
+        eligibility decision never depends on post-cancellation state. Only a
+        stream truncation settles its in-flight tool effects within the bounded
+        grace (item 2 B.1); every other class keeps the unsettled-effects
+        decline. Total by contract: a capture failure must never mask the
+        primary failure.
         """
         try:
             barrier, barrier_detail = self._root_interaction_barrier()
@@ -1676,6 +2003,12 @@ class TurnController:  # noqa: PLR0904
                 interaction_barrier=barrier,
                 barrier_detail=barrier_detail,
             )
+            if (
+                failure.failure_class is FailureClass.INCOMPLETE_STREAM
+                and not failure.effects_settled
+                and await self._settle_truncated_turn_effects(turn.id)
+            ):
+                failure = failure.model_copy(update={"effects_settled": True})
             self._root_recovery_gate.capture_terminal(failure)
         except Exception:
             logger.exception("root recovery projection capture failed")
@@ -1763,6 +2096,10 @@ class TurnController:  # noqa: PLR0904
 
     async def _after_queue_mutation(self, *, promote: bool) -> None:
         async with self._queue_lock:
+            # A queue mutation is an admission: no hold outlives it, and every
+            # retained record is offered the place the mutation may have freed.
+            self._shell_held.clear()
+            self._flush_retained_shell_records()
             await self._emit_queue_updated()
             if promote:
                 await self._promote_next()
@@ -1773,30 +2110,135 @@ class TurnController:  # noqa: PLR0904
         async with self._queue_lock:
             await self._emit_queue_updated(session_id=session_id, queue=queue)
 
-    async def _after_turn_terminal(self, status: PublicTurnStatus) -> None:
+    async def _after_turn_terminal(
+        self, status: PublicTurnStatus, turn_id: str
+    ) -> None:
         async with self._queue_lock:
+            # A terminal turn is the next admission: a record held for its own
+            # failed turn's pass is promotable again, and a record retained
+            # beside a full queue takes the place this turn left behind, so a
+            # draining queue can never strand it.
+            self._shell_held.clear()
             if status is PublicTurnStatus.INTERRUPTED:
+                self._promoted_shell_records.pop(turn_id, None)
                 if self._turn_queue.pause():
                     await self._emit_queue_updated()
                 return
+            if status is PublicTurnStatus.FAILED:
+                retained = await self._retain_failed_shell_record(turn_id)
+                # This terminal is the next admission. The record the failed
+                # turn itself owned waits for a later one, but a record an
+                # earlier failure left waiting takes the place this turn freed,
+                # so a failed intervening turn can never strand it.
+                admitted = self._flush_retained_shell_records(
+                    hold=() if retained is None else (retained,)
+                )
+                if retained is not None or admitted:
+                    await self._emit_queue_updated()
+            else:
+                self._promoted_shell_records.pop(turn_id, None)
+                self._flush_retained_shell_records()
             await self._promote_next()
 
+    async def _retain_failed_shell_record(self, turn_id: str) -> str | None:
+        """Keep a failed record turn's record as a ready user turn (B.2a).
+
+        The effect already ran and its record is the user's message, so
+        retention re-queues the record TEXT as an ordinary user entry and never
+        the command: the effect is never rerun to recover its record. A record
+        whose message already reached the transcript is promoted next time
+        without committing it twice.
+
+        Returns the entry id of the record it retained, so the calling pass can
+        hold exactly that record back.
+        """
+        pending = self._promoted_shell_records.pop(turn_id, None)
+        if pending is None:
+            return None
+        committed = any(
+            message.message_id == pending.entry_id
+            for message in self._agent_loop.messages
+        )
+        self._shell_retained[pending.entry_id] = _RetainedShellRecord(
+            session_id=pending.session_id,
+            entry_id=pending.entry_id,
+            record=pending.record,
+            committed=committed,
+            created_at=now_ms(),
+            starts_at=self._turn_starts,
+        )
+        return pending.entry_id
+
+    def _flush_retained_shell_records(
+        self, *, hold: Collection[str] = frozenset()
+    ) -> bool:
+        """Offer every retained record the queue's next admission.
+
+        Retention never depends on the queue having room: a record that cannot
+        take a place yet stays retained here, and the next admission offers it
+        again. An executed command's record is therefore never dropped, and it
+        waits for admission rather than for a retry — the promote pass right
+        after the failure would repeat the turn that just failed.
+
+        ``hold`` names the records that must not run in the calling pass: they
+        are admitted so they keep a visible place, but the promote pass that
+        follows admits them to wait rather than repeat a failed turn. Every
+        other admitted record is ready to run.
+
+        Returns whether any record was admitted.
+        """
+        admitted = False
+        for retained in tuple(self._shell_retained.values()):
+            ready = TurnEnqueueParams(
+                session_id=retained.session_id,
+                entries=[
+                    TurnUserInputEntry(
+                        entry_id=retained.entry_id,
+                        content=[SessionTextContentBlock(text=retained.record.text)],
+                    )
+                ],
+            )
+            try:
+                queued_item_id = self._turn_queue.enqueue(ready).record.queued_turn.id
+            except TurnQueueFullError:
+                return admitted
+            del self._shell_retained[retained.entry_id]
+            self._shell_records[queued_item_id] = _QueuedShellRecord(
+                record=retained.record,
+                committed=retained.committed,
+                starts_at=retained.starts_at,
+            )
+            admitted = True
+            if retained.entry_id in hold:
+                self._shell_held.add(queued_item_id)
+        return admitted
+
     async def _promote_next(self) -> None:
+        active_task = self._active_task
+        task_busy = (
+            active_task is not None
+            and not active_task.done()
+            and active_task is not asyncio.current_task()
+        )
         if (
             self._handoff_pending
             or self._active_turn is not None
             or self._execution.active is not None
+            or task_busy
         ):
             return
-        active_task = self._active_task
-        if (
-            active_task is not None
-            and not active_task.done()
-            and active_task is not asyncio.current_task()
-        ):
-            return
-        record = self._turn_queue.peek_next()
+        record = self._turn_queue.peek_next(skip=self._shell_held)
         if record is None:
+            return
+        shell_entry = _shell_entry(record)
+        if shell_entry is not None:
+            # A shell input runs its effect at idle, exactly once, and only
+            # then becomes the user turn its record is. The claim is what makes
+            # a second promote pass (an enqueue landing mid-effect) a no-op.
+            if record.queued_turn.id in self._shell_claimed:
+                return
+            self._shell_claimed.add(record.queued_turn.id)
+            self._spawn_queue_task(self._run_queued_shell_input(record, shell_entry))
             return
         queued = record.params
         queued_contexts = tuple(
@@ -1806,14 +2248,30 @@ class TurnController:  # noqa: PLR0904
         )
         user_entry = queued.user_entry
         if user_entry is None:
-            promoted = self._turn_queue.pop_next()
+            promoted = self._turn_queue.pop_next(skip=self._shell_held)
             if promoted is not record:
-                raise RuntimeError("Turn queue changed while promoting its next item")
+                # A concurrent mutation changed the head between the peek and
+                # the pop. The popped item goes back to its place: a context-only
+                # item's delivery must never cost another item its work.
+                if promoted is not None:
+                    self._turn_queue.restore(promoted)
+                return
+            self._shell_held.discard(record.queued_turn.id)
             await self._emit_queue_updated()
             await self._inject_queued_contexts(queued_contexts)
             await self._promote_next()
             return
-        _, start_turn = self.start(
+        shell_input = self._shell_records.get(record.queued_turn.id)
+        # R3-A2: a committed record whose text already reached the transcript
+        # runs on that message only while it is still the latest user input.
+        # When other turns ran after the failure, the record text itself is
+        # this turn's user input instead of the later transcript's tail.
+        redeliver = (
+            shell_input is not None
+            and shell_input.committed
+            and self._turn_starts > shell_input.starts_at
+        )
+        response, start_turn = self.start(
             TurnStartParams(
                 session_id=self._agent_loop.session_id,
                 message=vibe_content_blocks(user_entry.content),
@@ -1824,16 +2282,110 @@ class TurnController:  # noqa: PLR0904
             ),
             queue_item_id=record.queued_turn.id,
             queued_contexts=queued_contexts,
+            manual_shell=(
+                shell_input.record.context if shell_input is not None else None
+            ),
+            manual_shell_committed=(
+                shell_input.committed if shell_input is not None else False
+            ),
+            manual_shell_redeliver=redeliver,
         )
         try:
-            promoted = self._turn_queue.pop_next()
+            promoted = self._turn_queue.pop_next(skip=self._shell_held)
             if promoted is not record:
-                raise RuntimeError("Turn queue changed while promoting its next item")
+                # Same last-resort path as above: the item just popped goes
+                # back to the front, and the turn this pass started keeps the
+                # record its failure would retain.
+                if promoted is not None:
+                    self._turn_queue.restore(promoted)
+            else:
+                self._shell_held.discard(record.queued_turn.id)
+                self._shell_records.pop(record.queued_turn.id, None)
+            if shell_input is not None:
+                # Item 5 B.2a: the promoted record turn's failure must be able
+                # to retain the record it cannot publish.
+                self._promoted_shell_records[response.turn.id] = _PromotedShellRecord(
+                    session_id=record.params.session_id,
+                    entry_id=user_entry.entry_id or record.queued_turn.id,
+                    record=shell_input.record,
+                )
             await self._emit_queue_updated()
         except BaseException:
+            self._promoted_shell_records.pop(response.turn.id, None)
             start_turn.abort()
             raise
         start_turn()
+
+    async def _run_queued_shell_input(
+        self, record: QueuedTurnRecord, entry: TurnShellInputEntry
+    ) -> None:
+        """Run one queued shell input's effect, then turn its record into input.
+
+        The effect completes before the record is offered to admission, so an
+        admission that fails can only retain the record — it can never rerun
+        the user's command. The record takes the item's own queue place as an
+        ordinary user entry, which is why a retained record is visible work and
+        the next promote pass starts it like any queued prompt.
+        """
+        completion = self._shell_completions.pop(entry.operation_id, None)
+        try:
+            executor = self._shell_executor
+            if executor is None:
+                raise TurnConflictError(
+                    "Shell inputs enter the queue through session/shellCommand"
+                )
+            shell_record = await executor(entry, record.params.session_id)
+        except Exception as exc:
+            self._turn_queue.remove(record.queued_turn.id)
+            if completion is not None and not completion.done():
+                completion.set_exception(exc)
+            self._spawn_queue_task(self._after_queue_mutation(promote=True))
+            return
+        finally:
+            self._shell_claimed.discard(record.queued_turn.id)
+
+        ready = TurnEnqueueParams(
+            session_id=record.params.session_id,
+            entries=[
+                TurnUserInputEntry(
+                    entry_id=entry.operation_id,
+                    content=[SessionTextContentBlock(text=shell_record.text)],
+                )
+            ],
+        )
+        async with self._queue_lock:
+            queued_item_id: str | None = record.queued_turn.id
+            try:
+                self._turn_queue.replace(record.queued_turn.id, ready)
+            except TurnQueueItemNotFoundError:
+                # The user removed the queued command while its effect ran. The
+                # effect is already the record's, so retain the record instead
+                # of discarding an outcome that happened.
+                try:
+                    queued_item_id = self._turn_queue.enqueue(
+                        ready
+                    ).record.queued_turn.id
+                except TurnQueueFullError:
+                    # A full queue cannot take the place yet; the record stays
+                    # retained for the next admission instead of being lost.
+                    queued_item_id = None
+            if queued_item_id is None:
+                self._shell_retained[entry.operation_id] = _RetainedShellRecord(
+                    session_id=record.params.session_id,
+                    entry_id=entry.operation_id,
+                    record=shell_record,
+                    committed=False,
+                    created_at=now_ms(),
+                    starts_at=self._turn_starts,
+                )
+            else:
+                self._shell_records[queued_item_id] = _QueuedShellRecord(
+                    record=shell_record
+                )
+            if completion is not None and not completion.done():
+                completion.set_result(None)
+            await self._emit_queue_updated()
+            await self._promote_next()
 
     def _decode_queued_content(
         self, content: list[SessionContentBlock]
@@ -2287,3 +2839,18 @@ class TurnController:  # noqa: PLR0904
         self._agent_loop.execution_port.reject_user_input(
             record.event.request_id, error
         )
+
+    def _cancel_shell_completions(self) -> None:
+        """Release every shell request still waiting on a queued execution."""
+        for completion in self._shell_completions.values():
+            if not completion.done():
+                completion.cancel()
+        self._shell_completions.clear()
+
+
+def _shell_entry(record: QueuedTurnRecord) -> TurnShellInputEntry | None:
+    """The shell input a queue item carries, if it is one."""
+    for entry in record.params.entries:
+        if isinstance(entry, TurnShellInputEntry):
+            return entry
+    return None

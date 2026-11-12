@@ -338,8 +338,9 @@ class SessionShellCommandParams(ProtocolModel):
 
     @model_validator(mode="after")
     def validate_action(self) -> SessionShellCommandParams:
-        if self.action == "run" and (self.command is None or not self.command.strip()):
-            raise ValueError("command is required for action='run'")
+        # A blank command is the manual `!` path's one refusal, and it still has
+        # to reach the handler: item 5 B.1 turns it into the user-visible
+        # record instead of a request error.
         if self.action == "interrupt" and self.operation_id is None:
             raise ValueError("operation_id is required for action='interrupt'")
         return self

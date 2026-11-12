@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import asyncio
 from unittest.mock import AsyncMock
 
 import pytest
 
+from chartreux.core.agent_loop._tool_batch_runner import _ToolInvocation
 from chartreux.core.agent_loop.errors import EmptyLLMResponseError
 from chartreux.core.config import ChartreuxConfigSchema, ModelConfig, ProviderConfig
 from chartreux.core.errors import RefusalError
@@ -517,3 +519,59 @@ async def test_refusal_error_carries_category_and_explanation_streaming(
     assert err.explanation == "This request was declined for safety reasons."
     assert "This request was declined for safety reasons." in str(err)
     assert "cyber" in str(err)
+
+
+@pytest.mark.asyncio
+async def test_turn_effect_settlement_is_bounded_by_the_grace(
+    vibe_config: ChartreuxConfigSchema,
+):
+    """Item 2 B.1: a truncation's in-flight tool task settles only within the
+    bounded grace.
+
+    A cooperative task is cancelled and joins inside the grace; a task that
+    SUPPRESSES cancellation stays live past it, so its effect is never claimed
+    settled (the root gate keeps its unsettled-effects decline). With no live
+    task at all the settlement is immediate — the call the truncation never
+    executed.
+    """
+    agent = build_test_agent_loop(
+        config=vibe_config, backend=FakeBackend([mock_llm_chunk()])
+    )
+    release = asyncio.Event()
+
+    async def suppressing() -> None:
+        while True:
+            try:
+                await asyncio.wait_for(release.wait(), timeout=60)
+                return
+            except (asyncio.CancelledError, TimeoutError):
+                continue
+
+    stubborn = asyncio.create_task(suppressing())
+    # Let the task start so the cancellation meets its own try block.
+    await asyncio.sleep(0)
+    agent._tool_batch_runner._tool_invocations[("turn-stubborn", "call-1")] = (
+        _ToolInvocation(task=stubborn, is_wait=False)
+    )
+
+    assert await agent.settle_turn_tool_effects("turn-stubborn", grace=0.05) is False
+    assert stubborn.done() is False
+
+    release.set()
+    await asyncio.wait_for(stubborn, timeout=5)
+    assert await agent.settle_turn_tool_effects("turn-stubborn", grace=0.05) is True
+
+    async def cooperative() -> None:
+        await asyncio.sleep(5)
+
+    calm = asyncio.create_task(cooperative())
+    agent._tool_batch_runner._tool_invocations[("turn-cooperative", "call-1")] = (
+        _ToolInvocation(task=calm, is_wait=False)
+    )
+
+    assert await agent.settle_turn_tool_effects("turn-cooperative", grace=1.0) is True
+    assert calm.cancelled() is True
+
+    assert await agent.settle_turn_tool_effects("turn-unexecuted", grace=0.05) is True
+
+    await agent.aclose()
