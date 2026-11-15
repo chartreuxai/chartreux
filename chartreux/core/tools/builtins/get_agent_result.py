@@ -151,7 +151,15 @@ class GetAgentResult(
             if outcome is None:
                 yield GetAgentResultResult(
                     result=None,
-                    message="Agent is still running; use wait_for_agent or try again later.",
+                    message=(
+                        "Agent is still running; fetch the result when the "
+                        "completion notification arrives, or collect it by "
+                        "run_id from check_agents' uncollected_run_ids. Use "
+                        "wait_for_agent only if the result is a hard dependency "
+                        "of your next action, no independent work can proceed, "
+                        "and that action must occur in this turn rather than "
+                        "after notification; if uncertain, end your turn."
+                    ),
                 )
                 return
             yield GetAgentResultResult(
@@ -166,8 +174,13 @@ class GetAgentResult(
                 message=(
                     "Agent is still running; a completion notification arrives "
                     "when the run finishes — fetch the result then with "
-                    'mode="digest" (default) or mode="full", or block with '
-                    "wait_for_agent (same modes)."
+                    'mode="digest" (default) or mode="full", or collect a '
+                    "published run by its run_id from check_agents' "
+                    "uncollected_run_ids. Use wait_for_agent (same modes) only "
+                    "if the result is a hard dependency of your next action, no "
+                    "independent work can proceed, and that action must occur in "
+                    "this turn rather than after notification; if uncertain, "
+                    "end your turn."
                 ),
             )
             return

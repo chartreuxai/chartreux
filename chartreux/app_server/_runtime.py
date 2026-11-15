@@ -77,6 +77,7 @@ from chartreux.core.config import (
     SessionLoggingConfig,
     build_default_orchestrator,
 )
+from chartreux.core.config._restrictions import SourceRestrictions
 from chartreux.core.config.harness_files import HarnessFilesManager
 from chartreux.core.config.layers.overrides import OverridesLayer
 from chartreux.core.config.orchestrator import ConfigOrchestrator
@@ -115,6 +116,7 @@ from chartreux.core.subagents import (
 )
 from chartreux.core.usage import AsyncUsageWriter, UsageReader, UsageService
 from chartreux.core.usage_project import resolve_project_key_async
+from chartreux.core.workspace import Workspace
 from chartreux.observability.logging import logger, set_config_log_level
 from chartreux.utils.cache_store import FileSystemCacheStore
 
@@ -294,6 +296,18 @@ class RootOpenRequest:
     session_logging: SessionLoggingConfig | None = None
     is_subagent: bool = False
     parent_session_id: str | None = None
+    # The parent workspace a child loop is constructed with (the process-spawn
+    # counterpart of the in-process route's child_runtime_policy handover):
+    # None for roots and resumes, and a subagent open without it fails loudly.
+    inherited_workspace: Workspace | None = None
+    # The parent's accepted policy a child loop is constructed with (the F11
+    # process-spawn counterpart of the same handover): its inherited source
+    # restrictions, mode restrictions and dispatch root grants. None for
+    # roots and resumes; a subagent open that never received them has already
+    # failed loudly at the child factory's payload gate.
+    inherited_restrictions: tuple[SourceRestrictions, ...] | None = None
+    inherited_mode_restrictions: tuple[SourceRestrictions, ...] | None = None
+    inherited_root_grants: tuple[Path, ...] | None = None
 
     def __post_init__(self) -> None:
         if self.startup_accounting is not None and (
@@ -431,7 +445,7 @@ class _RootRuntimeBlueprint:
     def config(self) -> ChartreuxConfigSchema:
         return self.config_orchestrator.config
 
-    def build(
+    def build(  # noqa: PLR0913
         self,
         *,
         parent_session_id: str | None = None,
@@ -442,14 +456,36 @@ class _RootRuntimeBlueprint:
         bound_policy: ActivatedPolicy | None = None,
         accounting_owner: RootAccountingOwner | None = None,
         is_subagent: bool = False,
+        inherited_workspace: Workspace | None = None,
+        inherited_restrictions: tuple[SourceRestrictions, ...] = (),
+        inherited_mode_restrictions: tuple[SourceRestrictions, ...] = (),
+        inherited_root_grants: tuple[Path, ...] = (),
     ) -> AgentLoop:
+        # B2c, process-spawn counterpart: a subagent's run-budget default arms
+        # every process-child loop the same way ``_create_like`` arms an
+        # in-process child. An explicit session-options value (the parent's
+        # own budget, carried by the spawn payload's agent config) rides the
+        # policy and wins when set; the [subagents] config default fills a
+        # None.
+        run_max_price = self.options.run_max_price
+        run_max_session_tokens = self.options.run_max_session_tokens
+        if is_subagent:
+            subagents = self.config.subagents
+            run_max_price = (
+                run_max_price if run_max_price is not None else subagents.run_max_price
+            )
+            run_max_session_tokens = (
+                run_max_session_tokens
+                if run_max_session_tokens is not None
+                else subagents.run_max_session_tokens
+            )
         policy = AgentRuntimePolicy(
             max_turns=self.options.max_turns,
             max_price=self.options.max_price,
             max_tokens=None,
             max_session_tokens=self.options.max_session_tokens,
-            run_max_price=self.options.run_max_price,
-            run_max_session_tokens=self.options.run_max_session_tokens,
+            run_max_price=run_max_price,
+            run_max_session_tokens=run_max_session_tokens,
             enable_streaming=not is_subagent,
             launch_context={
                 "agent_entrypoint": self.client_info.entrypoint,
@@ -472,6 +508,10 @@ class _RootRuntimeBlueprint:
                 self.client_info.entrypoint in {"cli", "desktop"}
                 and self.config.session_logging.generate_titles
             ),
+            inherited_workspace=inherited_workspace,
+            inherited_restrictions=inherited_restrictions,
+            inherited_mode_restrictions=inherited_mode_restrictions,
+            inherited_root_grants=inherited_root_grants,
         )
         return _AgentLoopBlueprint(
             config_orchestrator=self.config_orchestrator.copy(),
@@ -1932,6 +1972,12 @@ class HarnessProcess:
                     session_lease=lease,
                     accounting_owner=owner,
                     is_subagent=request.is_subagent,
+                    inherited_workspace=request.inherited_workspace,
+                    inherited_restrictions=request.inherited_restrictions or (),
+                    inherited_mode_restrictions=(
+                        request.inherited_mode_restrictions or ()
+                    ),
+                    inherited_root_grants=request.inherited_root_grants or (),
                 )
                 if context is not None:
                     # Replay content-free outcomes, not just bytes: a cold scan

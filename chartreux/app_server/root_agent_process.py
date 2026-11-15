@@ -16,7 +16,14 @@ process.
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncGenerator, Awaitable, Callable, Mapping, Sequence
+from collections.abc import (
+    AsyncGenerator,
+    Awaitable,
+    Callable,
+    Coroutine,
+    Mapping,
+    Sequence,
+)
 from contextlib import aclosing, suppress
 from dataclasses import dataclass, replace
 from enum import StrEnum
@@ -31,6 +38,7 @@ from uuid import uuid4
 
 from pydantic import BaseModel
 
+from chartreux.app_server._model import ProtocolModel
 from chartreux.app_server.agent_admission import OP_OUTCOME_COMPLETED
 from chartreux.app_server.agent_snapshot import (
     MARKER_ABSENT,
@@ -43,15 +51,56 @@ from chartreux.app_server.agent_snapshot import (
     marker_verdict,
 )
 from chartreux.app_server.agent_wire import (
+    AGENT_AGENTS_CANCEL_METHOD,
+    AGENT_AGENTS_INVENTORY_READ_METHOD,
+    AGENT_AGENTS_RECONCILE_METHOD,
+    AGENT_AGENTS_RELEASE_METHOD,
+    AGENT_AGENTS_RESUME_METHOD,
+    AGENT_AGENTS_UPDATE_METHOD,
+    AGENT_AUTHORITY_CHANGED_METHOD,
+    AGENT_CATALOG_WIRE_METHODS,
     AGENT_CHILD_TEARDOWN_METHOD,
+    AGENT_CHILD_TRANSCRIPT_PAGE_METHOD,
     AGENT_COMPACT_METHOD,
+    AGENT_CONFIG_FIELDS_READ_METHOD,
+    AGENT_CONFIG_PROXY_READ_METHOD,
+    AGENT_CONFIG_PROXY_WRITE_METHOD,
+    AGENT_CONFIG_SETTINGS_READ_METHOD,
+    AGENT_DIAGNOSTICS_LIST_METHOD,
+    AGENT_DIAGNOSTICS_LOGS_READ_METHOD,
     AGENT_INJECT_METHOD,
+    AGENT_LOOPS_CLEAR_METHOD,
+    AGENT_LOOPS_CREATE_METHOD,
+    AGENT_LOOPS_DELETE_METHOD,
+    AGENT_LOOPS_LIST_METHOD,
+    AGENT_MCP_AUTH_REQUIRED_METHOD,
+    AGENT_MCP_AUTH_URL_METHOD,
+    AGENT_MCP_CATALOG_ADD_METHOD,
+    AGENT_MCP_CATALOG_LOGIN_METHOD,
+    AGENT_MCP_CATALOG_LOGOUT_METHOD,
+    AGENT_MCP_CATALOG_READ_METHOD,
+    AGENT_MCP_CATALOG_REFRESH_METHOD,
+    AGENT_MCP_CATALOG_REMOVE_METHOD,
+    AGENT_MCP_CATALOG_TOGGLE_METHOD,
+    AGENT_MCP_OWNER_REKEY_METHOD,
+    AGENT_MCP_OWNER_RELEASE_METHOD,
+    AGENT_MCP_RELOAD_FAIL_METHOD,
+    AGENT_MCP_RELOAD_FINISH_METHOD,
+    AGENT_MCP_RELOAD_PREPARE_METHOD,
     AGENT_NOTICE_METHOD,
     AGENT_OP_ADMISSION_METHOD,
     AGENT_OP_CANCEL_METHOD,
     AGENT_OPEN_METHOD,
     AGENT_ORIGIN,
+    AGENT_POLICY_DANGEROUS_COMMANDS_READ_METHOD,
+    AGENT_POLICY_DANGEROUS_COMMANDS_REVOKE_METHOD,
+    AGENT_RECOVERY_EVIDENCE_METHOD,
+    AGENT_REVIEW_WIRE_METHODS,
+    AGENT_RUN_COMPLETED_METHOD,
+    AGENT_RUN_COMPLETIONS_READ_METHOD,
+    AGENT_SEQUENCE_FIELD,
     AGENT_SESSION_CONFIG_RELOAD_METHOD,
+    AGENT_SESSION_HISTORY_LIST_METHOD,
     AGENT_SESSION_LIST_METHOD,
     AGENT_SESSION_NOT_FOUND_ERROR,
     AGENT_SESSION_PLAN_RECORD_READ_METHOD,
@@ -80,6 +129,8 @@ from chartreux.app_server.agent_wire import (
     AGENT_TURN_RETRYING_METHOD,
     AGENT_TURN_START_METHOD,
     AGENT_TURN_STEER_METHOD,
+    AGENT_WORKSPACE_PROMPT_PREPARE_METHOD,
+    CHILD_ORIGIN_REQUESTS,
     COMPACT_AGENT_SETTLEMENTS,
     COMPACT_SETTLEMENT_CANCELLED_UNPUBLISHED,
     COMPACT_SETTLEMENT_PUBLISHED_SETTLED,
@@ -98,16 +149,24 @@ from chartreux.app_server.agent_wire import (
     TURN_OUTCOME_COMPLETED,
     TURN_OUTCOME_FAILED,
     TURN_OUTCOME_INTERRUPTED,
+    AgentAuthorityChanged,
+    AgentRecoveryEvidence,
+    AgentRunCompletion,
     AgentWireError,
     CompactSettlementReply,
+    MCPCatalogReloadFinish,
+    MCPCatalogReloadPlan,
+    MCPOwnerKeyReceipt,
     ReconfigureReply,
     RenameReply,
     ReplaceReply,
     ShellRunRequest,
     SteerSettlement,
+    UnsupportedAgentRequestError,
     WireDiagnostic,
     WireMethodNotSupportedError,
     coordinator_request_id,
+    decode_authority_changed,
     decode_compact_reply,
     decode_event,
     decode_inject_reply,
@@ -118,6 +177,8 @@ from chartreux.app_server.agent_wire import (
     decode_rename_reply,
     decode_replace_reply,
     decode_retry_reason,
+    decode_run_completion,
+    decode_run_completions,
     decode_session_snapshot,
     decode_shell_command_request,
     decode_shell_interrupt_reply,
@@ -146,6 +207,7 @@ from chartreux.app_server.agent_wire import (
     encode_turn_request,
     encode_user_input_result,
     request_id_origin,
+    required_agent_capabilities,
 )
 from chartreux.app_server.models import SessionLogSummary
 from chartreux.app_server.process_bootstrap import (
@@ -155,24 +217,82 @@ from chartreux.app_server.process_bootstrap import (
     spawn_process,
 )
 from chartreux.app_server.protocol import (
+    AgentsCancelParams,
+    AgentsCancelResponse,
+    AgentsInventoryReadParams,
+    AgentsInventoryReadResponse,
+    AgentsReconcileParams,
+    AgentsReconcileResponse,
+    AgentsReleaseParams,
+    AgentsReleaseResponse,
+    AgentsResumeParams,
+    AgentsResumeResponse,
     AgentTranscriptGetResponse,
+    ConfigFieldsReadParams,
+    ConfigFieldsReadResponse,
     ConfigMutationResponse,
+    ConfigProxyReadParams,
+    ConfigProxyReadResponse,
+    ConfigProxyWriteParams,
     ConfigReloadParams,
     ConfigWriteParams,
     ContextInjectParams,
+    DangerousCommandAuthorityReadParams,
+    DangerousCommandAuthorityReadResponse,
+    DangerousCommandRevokeParams,
+    DangerousCommandRevokeResponse,
+    DiagnosticsListParams,
+    DiagnosticsListResponse,
+    DiagnosticsLogsReadParams,
+    DiagnosticsLogsReadResponse,
+    EmptyResponse,
+    IdentityReadResponse,
+    LoopsClearParams,
+    LoopsClearResponse,
+    LoopsCreateParams,
+    LoopsCreateResponse,
+    LoopsDeleteParams,
+    LoopsDeleteResponse,
+    LoopsListParams,
+    LoopsListResponse,
+    MCPAddParams,
+    MCPAddResponse,
+    MCPCatalogMutationResponse,
+    MCPLoginParams,
+    MCPLogoutParams,
+    MCPReadParams,
+    MCPReadResponse,
+    MCPRefreshParams,
+    MCPRemoveParams,
+    MCPRemoveResponse,
+    MCPToggleParams,
     PolicyReadParams,
     PolicyReadResponse,
+    ReviewBaselineResponse,
+    ReviewHunksResponse,
+    ReviewStateResponse,
+    ReviewTurnDiffResponse,
     RootsReadParams,
     RootsReadResponse,
     RootsSaveParams,
     RootsSaveResponse,
+    SessionHistoryListParams,
+    SessionHistoryListResponse,
     SessionListParams,
     SessionListResponse,
     SessionPlanHandoffParams,
     SessionPlanRecord,
     SessionPlanRecordWriteParams,
     SessionPlanRecordWriteResponse,
+    SettingsReadParams,
+    SettingsReadResponse,
+    SkillsInstalledResponse,
+    SkillsListResponse,
+    StatsReadResponse,
+    ToolsListResponse,
     TurnSteerParams,
+    WorkspacePromptPrepareParams,
+    WorkspacePromptPrepareResponse,
 )
 from chartreux.app_server.registry_manifest import AgentRoute, RegistryManifest
 from chartreux.app_server.root_agent import ROOT_AGENT_MODULE
@@ -280,6 +400,25 @@ COMPACT_PUBLISHED_SETTLEMENTS = frozenset({
 })
 """The agent-minted classes that claim a published boundary."""
 
+_REVIEW_RESPONSES: Mapping[str, type[ProtocolModel]] = {
+    "review/state": ReviewStateResponse,
+    "review/baseline": ReviewBaselineResponse,
+    "review/turnDiff": ReviewTurnDiffResponse,
+    "review/hunks": ReviewHunksResponse,
+    "review/approve": EmptyResponse,
+    "review/revert": EmptyResponse,
+}
+"""The response type each carried review call is validated as on this end."""
+
+_CATALOG_RESPONSES: Mapping[str, type[ProtocolModel]] = {
+    "skills/list": SkillsListResponse,
+    "skills/installed": SkillsInstalledResponse,
+    "tools/list": ToolsListResponse,
+    "stats/read": StatsReadResponse,
+    "identity/read": IdentityReadResponse,
+}
+"""The response type each carried catalog read is validated as on this end."""
+
 PLAN_HANDOFF_DEADLINE = 300.0
 """The agent-side absolute deadline of one plan handoff.
 
@@ -346,9 +485,24 @@ class RootDeath:
     signature: RootFailureSignature = RootFailureSignature.DEATH_RECEIPT
 
     @property
+    def disclosure(self) -> str:
+        """The terminal-disconnect disclosure the receipt carries.
+
+        A stdio disconnect stays terminal: in-flight work on the dead
+        generation can be lost, and the explicit ``session/resume`` is the
+        recovery path — there is no transparent reconnect and no replay.
+        """
+        return (
+            "the stdio connection to the root agent is terminal and in-flight "
+            "work on this generation can be lost; resume explicitly with "
+            "session/resume — turns, callbacks, grants and uncertain mutations "
+            "are never replayed"
+        )
+
+    @property
     def diagnostic(self) -> str:
         """The failure text, naming the signature that was observed."""
-        return f"{self.signature.value}: {self.reason}"
+        return f"{self.signature.value}: {self.reason} — {self.disclosure}"
 
 
 class RootAgentExitedError(RootAgentProcessError):
@@ -366,7 +520,13 @@ class RootAgentExitedError(RootAgentProcessError):
         exit_code: int | None = None,
         signature: RootFailureSignature = RootFailureSignature.DEATH_RECEIPT,
     ) -> None:
-        super().__init__(f"{signature.value}: {reason}")
+        disclosure = (
+            "the stdio connection to the root agent is terminal and in-flight "
+            "work on this generation can be lost; resume explicitly with "
+            "session/resume — turns, callbacks, grants and uncertain mutations "
+            "are never replayed"
+        )
+        super().__init__(f"{signature.value}: {reason} — {disclosure}")
         self.reason = reason
         self.exit_code = exit_code
         self.signature = signature
@@ -450,6 +610,26 @@ class RootAgentDeferredOperation(RootAgentProcessError):
     The refusal is minted coordinator-side, before a frame would be sent, and
     names the same in_process escape the agent would name.
     """
+
+
+class RootAgentCapabilitySkewError(RootAgentProcessError):
+    """The child's ready frame announced no capability a request depends on.
+
+    Typed version skew, raised before any frame is sent: an older live agent
+    is never asked something it would misread, never answered from stale
+    coordinator state, and never replayed. The message names the missing
+    capability and the actionable restart instruction.
+    """
+
+    def __init__(self, method: str, capabilities: Sequence[str]) -> None:
+        self.method = method
+        self.capabilities = tuple(capabilities)
+        super().__init__(
+            f"{method} needs the agent-wire capabilities "
+            f"{', '.join(self.capabilities)} the child did not announce; "
+            "restart both ends on the same chartreux version — "
+            "the request was not sent"
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -574,6 +754,10 @@ class RootAgentProcess:  # noqa: PLR0904 - the coordinator-side port surface
         self._replace_request: str | None = None
         self._request_ids = itertools.count(1)
         self._last_request_id: str | None = None
+        # The highest agent-event sequence relayed on any frame so far: the
+        # shared agent-sequence cursor's coordinator end, which orders an
+        # adopted snapshot against the events already relayed.
+        self._last_agent_sequence = 0
         # The long operations this end is waiting on: a short reconfigure mode
         # is refused while one is in flight, because the agent's fence would
         # refuse it there anyway.
@@ -594,6 +778,34 @@ class RootAgentProcess:  # noqa: PLR0904 - the coordinator-side port surface
         # publish, served from the sink the live backend binds.
         self._callback_settlement_sink: (
             Callable[[str, UserInputSettlement], Awaitable[bool]] | None
+        ) = None
+        # The agent-emitted MCP auth notifications (authUrl, authRequired) are
+        # relayed through the sink the live backend binds.
+        self._mcp_notification_sink: (
+            Callable[[str, Mapping[str, Any]], Coroutine[Any, None, None]] | None
+        ) = None
+        # The owner's child-inventory snapshots (F10) are relayed through the
+        # sink the live backend binds, exactly like the MCP auth notifications.
+        self._agents_update_sink: (
+            Callable[[str, Mapping[str, Any]], Coroutine[Any, None, None]] | None
+        ) = None
+        # The owner's settled background child runs (G1b) are handed to the
+        # sink the live backend binds, which is the parent's wake path.
+        self._run_completion_sink: (
+            Callable[[AgentRunCompletion], Coroutine[Any, None, None]] | None
+        ) = None
+        # The owner's authority-change snapshots (G5) are handed to the sink the
+        # live backend binds. It is an OBSERVABILITY path only: no decision and
+        # no enforcement rides it, and an unbound sink simply drops the frame.
+        self._authority_changed_sink: (
+            Callable[[AgentAuthorityChanged], Coroutine[Any, None, None]] | None
+        ) = None
+        # G5b: the endpoint this client serves its SPAWNED child's authority
+        # questions from, bound by the owner that published the child. An
+        # unbound endpoint answers the question typed, so a child whose owner
+        # never bound one is denied instead of deciding unfenced.
+        self._child_authority_responder: (
+            Callable[[Mapping[str, Any]], dict[str, Any]] | None
         ) = None
         self._routes: list[tuple[RegistryManifest, str]] = []
         self._active_turn_id: str | None = None
@@ -632,6 +844,11 @@ class RootAgentProcess:  # noqa: PLR0904 - the coordinator-side port surface
         return self._death
 
     @property
+    def advertised_capabilities(self) -> frozenset[str]:
+        """The additive capabilities the child announced in its ready frame."""
+        return self._spawned.ready.capabilities
+
+    @property
     def diagnostics(self) -> tuple[WireDiagnostic, ...]:
         """The wire-compat diagnostics this end recorded, oldest first."""
         return tuple(self._diagnostics)
@@ -657,6 +874,11 @@ class RootAgentProcess:  # noqa: PLR0904 - the coordinator-side port surface
     def last_request_id(self) -> str | None:
         """The id of the most recent coordinator-origin request, or ``None``."""
         return self._last_request_id
+
+    @property
+    def last_agent_sequence(self) -> int:
+        """The highest agent-event sequence relayed so far (shared cursor)."""
+        return self._last_agent_sequence
 
     def admitted_operation(self, request_id: str) -> AdmittedOperation | None:
         """The admission one request announced, when this end learned it."""
@@ -706,7 +928,9 @@ class RootAgentProcess:  # noqa: PLR0904 - the coordinator-side port surface
         """
         deadline = time.monotonic() + self._compact_deadline
         params = encode_compact_request(extra_instructions, deadline=deadline)
-        request_id = self._begin_request(params, long_method=AGENT_COMPACT_METHOD)
+        request_id = self._begin_request(
+            AGENT_COMPACT_METHOD, params, long_method=AGENT_COMPACT_METHOD
+        )
         try:
             payload = await self._await_request(
                 request_id,
@@ -1163,7 +1387,9 @@ class RootAgentProcess:  # noqa: PLR0904 - the coordinator-side port surface
             session_id=session_id, continue_latest=continue_latest, deadline=deadline
         )
         request_id = self._begin_request(
-            params, long_method=AGENT_SESSION_REPLACE_METHOD
+            AGENT_SESSION_REPLACE_METHOD,
+            params,
+            long_method=AGENT_SESSION_REPLACE_METHOD,
         )
         self._replace_request = request_id
         try:
@@ -1324,7 +1550,9 @@ class RootAgentProcess:  # noqa: PLR0904 - the coordinator-side port surface
             config_write=candidate,
         )
         request_id = self._begin_request(
-            request, long_method=RECONFIGURE_MODE_CONFIG_WRITE
+            AGENT_SESSION_RECONFIGURE_METHOD,
+            request,
+            long_method=RECONFIGURE_MODE_CONFIG_WRITE,
         )
         try:
             payload = await self._await_request(
@@ -1361,7 +1589,9 @@ class RootAgentProcess:  # noqa: PLR0904 - the coordinator-side port surface
             mode=RECONFIGURE_MODE_PLAN_HANDOFF, deadline=deadline, handoff=params
         )
         request_id = self._begin_request(
-            request, long_method=RECONFIGURE_MODE_PLAN_HANDOFF
+            AGENT_SESSION_RECONFIGURE_METHOD,
+            request,
+            long_method=RECONFIGURE_MODE_PLAN_HANDOFF,
         )
         try:
             payload = await self._await_request(
@@ -1438,6 +1668,534 @@ class RootAgentProcess:  # noqa: PLR0904 - the coordinator-side port surface
             AGENT_SESSION_ROOTS_SAVE_METHOD, params.model_dump(mode="json")
         )
         return RootsSaveResponse.model_validate(payload)
+
+    async def read_dangerous_command_authority(
+        self, params: DangerousCommandAuthorityReadParams
+    ) -> DangerousCommandAuthorityReadResponse:
+        """Read the authority view where the session's grant store lives.
+
+        The live grants, the accepted saved grants, the fresh disk read and
+        the authority generation all belong to the agent's own loop, so the
+        read is answered there and this end only carries the reply. The
+        request is sent exactly once.
+        """
+        payload = await self._request(
+            AGENT_POLICY_DANGEROUS_COMMANDS_READ_METHOD, params.model_dump(mode="json")
+        )
+        return DangerousCommandAuthorityReadResponse.model_validate(payload)
+
+    async def revoke_dangerous_command_grant(
+        self, params: DangerousCommandRevokeParams
+    ) -> DangerousCommandRevokeResponse:
+        """Revoke live and saved authority where the CAS judge lives.
+
+        The revoke names the authority generation the read observed; the
+        agent checks it against its own store, so a superseded generation
+        answers the conflict outcome in the reply — never a false ack from
+        a coordinator copy. The request is sent exactly once: a revocation
+        that times out is an unknown outcome and is never resent.
+        """
+        payload = await self._request(
+            AGENT_POLICY_DANGEROUS_COMMANDS_REVOKE_METHOD,
+            params.model_dump(mode="json"),
+        )
+        return DangerousCommandRevokeResponse.model_validate(payload)
+
+    async def prepare_prompt(
+        self, params: WorkspacePromptPrepareParams
+    ) -> WorkspacePromptPrepareResponse:
+        """Prepare one prompt in the agent process that owns the loop.
+
+        The preparation reads the live model, the session's cwd and session
+        directory and writes attachment snapshots, so the fs work crosses to
+        the agent and the reply carries the prompt it built. The request is
+        sent exactly once: a preparation that times out is an unknown outcome
+        (``RootAgentOpTimeoutError``) and is never resent.
+        """
+        payload = await self._request(
+            AGENT_WORKSPACE_PROMPT_PREPARE_METHOD, params.model_dump(mode="json")
+        )
+        return WorkspacePromptPrepareResponse.model_validate(payload)
+
+    async def read_config_fields(
+        self, params: ConfigFieldsReadParams
+    ) -> ConfigFieldsReadResponse:
+        """Read the configuration fields the agent's own orchestrator composes.
+
+        The field wires pair the agent's effective config with its layered
+        sources and their save revisions, so a coordinator copy could answer
+        with a config this session is not running on. The request is sent
+        exactly once and its reply is the shipped response.
+        """
+        payload = await self._request(
+            AGENT_CONFIG_FIELDS_READ_METHOD, params.model_dump(mode="json")
+        )
+        return ConfigFieldsReadResponse.model_validate(payload)
+
+    async def read_settings(self, params: SettingsReadParams) -> SettingsReadResponse:
+        """Read the settings leaves the agent's own layers and revision carry."""
+        payload = await self._request(
+            AGENT_CONFIG_SETTINGS_READ_METHOD, params.model_dump(mode="json")
+        )
+        return SettingsReadResponse.model_validate(payload)
+
+    async def read_proxy_settings(
+        self, params: ConfigProxyReadParams
+    ) -> ConfigProxyReadResponse:
+        """Read the proxy settings from the env file the agent resolves."""
+        payload = await self._request(
+            AGENT_CONFIG_PROXY_READ_METHOD, params.model_dump(mode="json")
+        )
+        return ConfigProxyReadResponse.model_validate(payload)
+
+    async def write_proxy_settings(
+        self, params: ConfigProxyWriteParams
+    ) -> EmptyResponse:
+        """Apply one proxy change where the env file is read and written."""
+        payload = await self._request(
+            AGENT_CONFIG_PROXY_WRITE_METHOD, params.model_dump(mode="json")
+        )
+        return EmptyResponse.model_validate(payload)
+
+    async def cancel_agent_run(
+        self, session_id: str, params: AgentsCancelParams
+    ) -> AgentsCancelResponse:
+        """Stop-request one subagent run where the child records live.
+
+        The owner holds the handles it spawned, so the stop pins to the run
+        those handles recorded and the reply carries the registry's typed
+        disposition. The request is sent exactly once: a cancel that times out
+        is an unknown outcome and is never resent.
+        """
+        payload = await self._request(
+            AGENT_AGENTS_CANCEL_METHOD,
+            {**params.model_dump(mode="json"), "session_id": session_id},
+        )
+        return AgentsCancelResponse.model_validate(payload)
+
+    async def release_agent(
+        self, session_id: str, params: AgentsReleaseParams
+    ) -> AgentsReleaseResponse:
+        """Release a retained child under the owner's guarded-release rails."""
+        payload = await self._request(
+            AGENT_AGENTS_RELEASE_METHOD,
+            {**params.model_dump(mode="json"), "session_id": session_id},
+        )
+        return AgentsReleaseResponse.model_validate(payload)
+
+    async def resume_agent(
+        self, session_id: str, params: AgentsResumeParams
+    ) -> AgentsResumeResponse:
+        """Ask the owner for its typed warm-resume disposition."""
+        payload = await self._request(
+            AGENT_AGENTS_RESUME_METHOD,
+            {**params.model_dump(mode="json"), "session_id": session_id},
+        )
+        return AgentsResumeResponse.model_validate(payload)
+
+    async def reconcile_agent_result(
+        self, session_id: str, params: AgentsReconcileParams
+    ) -> AgentsReconcileResponse:
+        """Submit reconcile evidence to the owner of the failed run."""
+        payload = await self._request(
+            AGENT_AGENTS_RECONCILE_METHOD,
+            {**params.model_dump(mode="json"), "session_id": session_id},
+        )
+        return AgentsReconcileResponse.model_validate(payload)
+
+    async def read_agent_inventory(
+        self, session_id: str, params: AgentsInventoryReadParams
+    ) -> AgentsInventoryReadResponse:
+        """Read the live agent inventory from the process that owns the children.
+
+        The revised snapshot is projected where the children live, so the
+        reply carries the owner's own inventory and the revision it sampled --
+        never a coordinator copy. The request is sent exactly once; a dead
+        root answers the death receipt before any frame is sent, and a peer
+        that did not announce the live-inventory capability is a typed
+        version skew, never a stale fallback.
+        """
+        payload = await self._request(
+            AGENT_AGENTS_INVENTORY_READ_METHOD,
+            {**params.model_dump(mode="json"), "session_id": session_id},
+        )
+        return AgentsInventoryReadResponse.model_validate(payload)
+
+    async def read_run_completions(self, session_id: str) -> list[AgentRunCompletion]:
+        """Read the owner's settled-run ledger (G1b).
+
+        The ledger is the completion notification's recovery source: a wake
+        frame lost between the owner and this end is re-read here and delivered
+        for the runs this generation has not woken yet. The request is sent
+        exactly once, and a dead root answers the death receipt before any
+        frame is sent.
+        """
+        payload = await self._request(
+            AGENT_RUN_COMPLETIONS_READ_METHOD, {"session_id": session_id}
+        )
+        return decode_run_completions(payload)
+
+    async def read_child_transcript_page(
+        self, session_id: str, agent_id: str, *, before: str | None, limit: int
+    ) -> AgentTranscriptGetResponse:
+        """Read one page of a child transcript from where the child lives.
+
+        A live child answers through its own reader; a dead one through its
+        saved transcript. The owner is the process that spawned the child, so
+        the request crosses to it rather than reading a coordinator copy.
+        """
+        payload = await self._request(
+            AGENT_CHILD_TRANSCRIPT_PAGE_METHOD,
+            {
+                "session_id": session_id,
+                "agent_id": agent_id,
+                "before": before,
+                "limit": limit,
+            },
+        )
+        return decode_transcript_page(payload)
+
+    async def history_list(
+        self, session_id: str, params: SessionHistoryListParams
+    ) -> SessionHistoryListResponse:
+        """Read one page of the attached session's live history from its owner.
+
+        The loop this root serves holds the authoritative projection, so the
+        page crosses to that process rather than being answered from the
+        host's persisted messages. The request is sent exactly once: a read
+        that times out is an unknown outcome, never a blind resend, and a
+        dead root answers the death receipt before any frame is sent.
+        """
+        payload = await self._request(
+            AGENT_SESSION_HISTORY_LIST_METHOD,
+            {**params.model_dump(mode="json"), "session_id": session_id},
+        )
+        return SessionHistoryListResponse.model_validate(payload)
+
+    async def list_loops(
+        self, session_id: str, params: LoopsListParams
+    ) -> LoopsListResponse:
+        """Read the schedule from the loop manager of the agent that owns it.
+
+        The schedule's fire times live in that process, so listing them here
+        would be a second copy that drifts. The request is sent exactly once,
+        and a dead root answers the death receipt before any frame is sent.
+        """
+        payload = await self._request(
+            AGENT_LOOPS_LIST_METHOD,
+            {**params.model_dump(mode="json"), "session_id": session_id},
+        )
+        return LoopsListResponse.model_validate(payload)
+
+    async def create_loop(
+        self, session_id: str, params: LoopsCreateParams
+    ) -> LoopsCreateResponse:
+        """Create one loop where the schedule is kept and persisted.
+
+        The owner parses the interval, applies the per-session limit and writes
+        the new fire time to the session metadata, so the reply is the loop it
+        recorded. A create that times out is an unknown outcome and is never
+        resent: a blind retry would schedule the same prompt twice.
+        """
+        payload = await self._request(
+            AGENT_LOOPS_CREATE_METHOD,
+            {**params.model_dump(mode="json"), "session_id": session_id},
+        )
+        return LoopsCreateResponse.model_validate(payload)
+
+    async def delete_loop(
+        self, session_id: str, params: LoopsDeleteParams
+    ) -> LoopsDeleteResponse:
+        """Remove one loop from the schedule that holds it.
+
+        An id the schedule does not carry is the owner's param refusal, and a
+        delete that times out is an unknown outcome, never a blind resend.
+        """
+        payload = await self._request(
+            AGENT_LOOPS_DELETE_METHOD,
+            {**params.model_dump(mode="json"), "session_id": session_id},
+        )
+        return LoopsDeleteResponse.model_validate(payload)
+
+    async def clear_loops(
+        self, session_id: str, params: LoopsClearParams
+    ) -> LoopsClearResponse:
+        """Clear the schedule where it is kept, answering how many it held."""
+        payload = await self._request(
+            AGENT_LOOPS_CLEAR_METHOD,
+            {**params.model_dump(mode="json"), "session_id": session_id},
+        )
+        return LoopsClearResponse.model_validate(payload)
+
+    async def read_diagnostics(
+        self, session_id: str, params: DiagnosticsListParams
+    ) -> DiagnosticsListResponse:
+        """Read the issues projection from the loop that owns it.
+
+        The config issues and hook count are projected from the agent's own
+        loop and hooks, so assembling them here would be a coordinator copy
+        that drifts. A dead root answers the death receipt before any frame is
+        sent.
+        """
+        payload = await self._request(
+            AGENT_DIAGNOSTICS_LIST_METHOD,
+            {**params.model_dump(mode="json"), "session_id": session_id},
+        )
+        return DiagnosticsListResponse.model_validate(payload)
+
+    async def read_diagnostics_logs(
+        self, session_id: str, params: DiagnosticsLogsReadParams
+    ) -> DiagnosticsLogsReadResponse:
+        """Read one debug log page where the owner's reader bounds it.
+
+        The page keeps the request's own limit and offset and the shipped
+        projection's redaction; this end only carries it back.
+        """
+        payload = await self._request(
+            AGENT_DIAGNOSTICS_LOGS_READ_METHOD,
+            {**params.model_dump(mode="json"), "session_id": session_id},
+        )
+        return DiagnosticsLogsReadResponse.model_validate(payload)
+
+    async def review(self, method: str, params: ProtocolModel) -> ProtocolModel:
+        """Carry one review request to the loop that owns the checkpoints.
+
+        Review state is session-local, memory-only state of the agent's own
+        checkpoint recorder, so the request crosses and the owner's projection
+        comes back: this end validates the reply as the response its public
+        method declares, exactly as the in-process route would have produced it.
+        A mutation the owner refuses for a busy session is its typed conflict.
+        """
+        payload = await self._request(
+            AGENT_REVIEW_WIRE_METHODS[method],
+            {**params.model_dump(mode="json"), "session_id": self.session_id},
+        )
+        return _REVIEW_RESPONSES[method].model_validate(payload)
+
+    async def catalog_read(self, method: str, params: ProtocolModel) -> ProtocolModel:
+        """Carry one latent catalog read to the process that resolves it.
+
+        The skills and tool inventories, the live counters and the session's
+        identity are all resolved against the agent's own config, tool manager
+        and loop, so the read crosses and the owner's projection comes back.
+        """
+        payload = await self._request(
+            AGENT_CATALOG_WIRE_METHODS[method],
+            {**params.model_dump(mode="json"), "session_id": self.session_id},
+        )
+        return _CATALOG_RESPONSES[method].model_validate(payload)
+
+    def _mcp_payload(
+        self, session_id: str, owner_key: str, params: ProtocolModel | Mapping[str, Any]
+    ) -> dict[str, Any]:
+        body = (
+            params.model_dump(mode="json")
+            if isinstance(params, ProtocolModel)
+            else dict(params)
+        )
+        # The typed owner key travels in place of object identity: it files
+        # the auth bindings agent-side under a handle held for exactly as long
+        # as the key lives.
+        # The param models serialize by alias, so the shipped session key can
+        # arrive under either spelling; both leave before the wire's own
+        # session key and owner key go back in.
+        body.pop("session_id", None)
+        body.pop("sessionId", None)
+        return {**body, "session_id": session_id, "owner_key": owner_key}
+
+    async def mcp_catalog_read(
+        self, session_id: str, owner_key: str, params: MCPReadParams
+    ) -> MCPReadResponse:
+        """Read the catalog projection from the agent that owns the orchestrator."""
+        payload = await self._request(
+            AGENT_MCP_CATALOG_READ_METHOD,
+            self._mcp_payload(session_id, owner_key, params),
+        )
+        return MCPReadResponse.model_validate(payload)
+
+    async def mcp_catalog_refresh(
+        self, session_id: str, owner_key: str, params: MCPRefreshParams
+    ) -> MCPCatalogMutationResponse:
+        """Refresh through the agent's own orchestrator and tool manager."""
+        payload = await self._request(
+            AGENT_MCP_CATALOG_REFRESH_METHOD,
+            self._mcp_payload(session_id, owner_key, params),
+        )
+        return MCPCatalogMutationResponse.model_validate(payload)
+
+    async def mcp_catalog_add(
+        self, session_id: str, owner_key: str, params: MCPAddParams
+    ) -> MCPAddResponse:
+        """Persist one server add through the agent's own orchestrator."""
+        payload = await self._request(
+            AGENT_MCP_CATALOG_ADD_METHOD,
+            self._mcp_payload(session_id, owner_key, params),
+        )
+        return MCPAddResponse.model_validate(payload)
+
+    async def mcp_catalog_toggle(
+        self, session_id: str, owner_key: str, params: MCPToggleParams
+    ) -> MCPCatalogMutationResponse:
+        """Persist one toggle through the agent's own orchestrator."""
+        payload = await self._request(
+            AGENT_MCP_CATALOG_TOGGLE_METHOD,
+            self._mcp_payload(session_id, owner_key, params),
+        )
+        return MCPCatalogMutationResponse.model_validate(payload)
+
+    async def mcp_catalog_remove(
+        self, session_id: str, owner_key: str, params: MCPRemoveParams
+    ) -> MCPRemoveResponse:
+        """Persist one removal (and its credentials) agent-side."""
+        payload = await self._request(
+            AGENT_MCP_CATALOG_REMOVE_METHOD,
+            self._mcp_payload(session_id, owner_key, params),
+        )
+        return MCPRemoveResponse.model_validate(payload)
+
+    async def mcp_catalog_login(
+        self, session_id: str, owner_key: str, params: MCPLoginParams
+    ) -> MCPCatalogMutationResponse:
+        """Run one OAuth login where the binding lives; the authUrl the login
+        emits crosses as an agent notification and is relayed to the client.
+        """
+        payload = await self._request(
+            AGENT_MCP_CATALOG_LOGIN_METHOD,
+            self._mcp_payload(session_id, owner_key, params),
+        )
+        return MCPCatalogMutationResponse.model_validate(payload)
+
+    async def mcp_catalog_logout(
+        self, session_id: str, owner_key: str, params: MCPLogoutParams
+    ) -> MCPCatalogMutationResponse:
+        """Run one logout where the binding lives."""
+        payload = await self._request(
+            AGENT_MCP_CATALOG_LOGOUT_METHOD,
+            self._mcp_payload(session_id, owner_key, params),
+        )
+        return MCPCatalogMutationResponse.model_validate(payload)
+
+    async def release_mcp_owner_key(
+        self, session_id: str, owner_key: str
+    ) -> MCPOwnerKeyReceipt:
+        """Explicitly release one typed owner key on session end.
+
+        The release replaces the GC weak-drop: the agent-side bindings filed
+        under the key are removed deterministically, never mid-session.
+        """
+        payload = await self._request(
+            AGENT_MCP_OWNER_RELEASE_METHOD,
+            {"session_id": session_id, "owner_key": owner_key},
+        )
+        return MCPOwnerKeyReceipt.model_validate(payload)
+
+    async def rekey_mcp_owner_key(
+        self, session_id: str, old_owner_key: str, new_owner_key: str
+    ) -> MCPOwnerKeyReceipt:
+        """Atomically re-key across a plan-handoff rotation.
+
+        The handle is unchanged, so the auth bindings survive the rotation;
+        a naive session-id-derived key would silently drop them mid-session.
+        """
+        payload = await self._request(
+            AGENT_MCP_OWNER_REKEY_METHOD,
+            {
+                "session_id": session_id,
+                "old_owner_key": old_owner_key,
+                "new_owner_key": new_owner_key,
+            },
+        )
+        return MCPOwnerKeyReceipt.model_validate(payload)
+
+    async def mcp_reload_prepare(
+        self, session_id: str, owner_key: str
+    ) -> MCPCatalogReloadPlan:
+        """Run the reload's prepare leg (orchestrator reload + restrictive suspensions)."""
+        payload = await self._request(
+            AGENT_MCP_RELOAD_PREPARE_METHOD,
+            {"session_id": session_id, "owner_key": owner_key},
+        )
+        return MCPCatalogReloadPlan.model_validate(payload)
+
+    async def mcp_reload_finish(
+        self, session_id: str, owner_key: str
+    ) -> MCPCatalogReloadFinish:
+        """Run the reload's finish leg and answer the converged/partial receipt."""
+        payload = await self._request(
+            AGENT_MCP_RELOAD_FINISH_METHOD,
+            {"session_id": session_id, "owner_key": owner_key},
+        )
+        return MCPCatalogReloadFinish.model_validate(payload)
+
+    async def mcp_reload_fail(self, session_id: str, owner_key: str) -> None:
+        """Run the reload's failure-restoration leg (restrictive suspensions)."""
+        await self._request(
+            AGENT_MCP_RELOAD_FAIL_METHOD,
+            {"session_id": session_id, "owner_key": owner_key},
+        )
+
+    def bind_mcp_notification_sink(
+        self, sink: Callable[[str, Mapping[str, Any]], Coroutine[Any, None, None]]
+    ) -> None:
+        """Serve the agent's MCP auth notifications (authUrl, authRequired).
+
+        The sink is the coordinator backend's relay onto its notification pump,
+        so the client-facing ``mcp_catalog/*`` notifications keep their
+        in-process shape on the stdio topology.
+        """
+        self._mcp_notification_sink = sink
+
+    def bind_agents_update_sink(
+        self, sink: Callable[[str, Mapping[str, Any]], Coroutine[Any, None, None]]
+    ) -> None:
+        """Serve the owner's child-inventory notifications (F10).
+
+        The sink is the coordinator backend's relay onto its notification pump,
+        so the client-facing ``agents/update`` keeps its in-process shape on
+        the stdio topology: the live backend binds it when the root's ready
+        frame advertised the capability, and an unbound sink drops the frame
+        like any other unroutable one.
+        """
+        self._agents_update_sink = sink
+
+    def bind_run_completion_sink(
+        self, sink: Callable[[AgentRunCompletion], Coroutine[Any, None, None]]
+    ) -> None:
+        """Serve the owner's settled child-run completions (G1b).
+
+        The sink is the coordinator backend's wake path: the live backend
+        binds it when the root's ready frame advertised the completion
+        capability, so a peer that cannot vouch for the carrier never wakes a
+        parent from a frame it does not understand.
+        """
+        self._run_completion_sink = sink
+
+    def bind_authority_changed_sink(
+        self, sink: Callable[[AgentAuthorityChanged], Coroutine[Any, None, None]]
+    ) -> None:
+        """Serve the owner's authority-change snapshots (G5, observability).
+
+        The sink is the coordinator backend's own record of the owner's policy
+        revisions. Nothing is enforced through it: the decision itself is the
+        typed ``agent/authority/check`` request the owner answers for its
+        children, and this frame only tells the coordinator that the vector it
+        last saw is stale.
+        """
+        self._authority_changed_sink = sink
+
+    async def recovery_evidence(self, session_id: str) -> AgentRecoveryEvidence:
+        """Fetch one gate-eligibility evidence bundle from the owned loop.
+
+        The coordinator-local root-recovery gate re-reads its loop-owned
+        predicate inputs (live [recovery.root] config, transcript-integrity
+        verdict, non-mutating availability snapshot) once per decision, so
+        this request is sent per decision and never cached. A dead root
+        answers the death receipt before any frame is sent.
+        """
+        payload = await self._request(
+            AGENT_RECOVERY_EVIDENCE_METHOD, {"session_id": session_id}
+        )
+        return AgentRecoveryEvidence.model_validate(payload)
 
     async def policy_request(
         self, method: str, params: dict[str, Any]
@@ -1677,6 +2435,21 @@ class RootAgentProcess:  # noqa: PLR0904 - the coordinator-side port surface
                 )
                 return
 
+    def recheck_liveness(self) -> None:
+        """Declare root death once, now, if the process is gone but the pipe is open.
+
+        The stop carrier calls this before anything crosses the wire, so a
+        dead-but-undetected root (the watcher has not fired yet) answers the
+        typed death receipt instead of hanging to the request timeout.
+        """
+        if self._closed or self._death is not None:
+            return
+        if self._spawned.process.poll() is not None:
+            self._declare_death(
+                "the root agent process exited",
+                signature=RootFailureSignature.DEATH_RECEIPT,
+            )
+
     def _declare_death(
         self,
         reason: str,
@@ -1713,22 +2486,53 @@ class RootAgentProcess:  # noqa: PLR0904 - the coordinator-side port surface
                     "error": death.diagnostic,
                 },
             ))
+        self._enqueue_worker_death_reap()
+
+    def _enqueue_worker_death_reap(self) -> None:
+        """Session-observed worker death: enqueue the worker-scoped reap
+        candidate from the run contract (C4 chunk iii).
+
+        The dead root agent's recorded invocation dirs go through the
+        worker-scoped gates; only a passing candidate subtree is removed, never
+        the enclosing live session allocation. Retain-on-ambiguity: this hook
+        never raises into death handling.
+        """
+        worker_pid = getattr(self._spawned.process, "pid", None)
+        if not isinstance(worker_pid, int):
+            return
+        try:
+            from chartreux.core.background_jobs import enqueue_worker_death_reap
+
+            enqueue_worker_death_reap(worker_pid)
+        except BaseException as exc:
+            if isinstance(exc, (asyncio.CancelledError, KeyboardInterrupt, SystemExit)):
+                raise
+            self._record_diagnostic(
+                f"worker-death reap skipped; retained on ambiguity: {exc!r}", None
+            )
 
     def _dispatch(self, message: Mapping[str, Any]) -> None:
         """Route one agent frame by method presence and the closed tables.
 
         A method-bearing frame with an id is an agent-origin request: the two
         op-9 host-service methods are served from the turn's host ports, and
-        everything else is answered with the typed compat rejection. A
-        method-bearing frame without an id is a notification; a frame with no
-        method answers a coordinator-origin request. An unlisted notification is
-        a recorded diagnostic, never a root-death claim: the loop keeps serving.
+        everything else is answered with the typed compat rejection. One
+        further direction exists on a SPAWNED child's pipe (G5b): the child's
+        authority question is admitted by ``CHILD_ORIGIN_REQUESTS`` and served
+        from the endpoint the owner bound into this client, so the frame routes
+        instead of answering ``WireMethodNotSupported``. A method-bearing frame
+        without an id is a notification; a frame with no method answers a
+        coordinator-origin request. An unlisted notification is a recorded
+        diagnostic, never a root-death claim: the loop keeps serving.
         """
         method = message.get("method")
         if isinstance(method, str):
             if "id" in message:
                 if method in COORDINATOR_RECEIVING_REQUESTS:
                     self._serve_agent_request(message, method)
+                    return
+                if method in CHILD_ORIGIN_REQUESTS:
+                    self._serve_child_request(message, method)
                     return
                 self._reject_agent_request(message, method)
                 return
@@ -1747,6 +2551,75 @@ class RootAgentProcess:  # noqa: PLR0904 - the coordinator-side port surface
         self._record_diagnostic(
             "the frame carries no method and answers no request", None
         )
+
+    def bind_child_authority_endpoint(
+        self, responder: Callable[[Mapping[str, Any]], dict[str, Any]]
+    ) -> None:
+        """Serve this child's authority questions from *responder* (G5b).
+
+        The owner binds the endpoint into the wire client of every child it
+        publishes, so the child's question reaches the process that holds the
+        live policy. A client with no endpoint answers the request typed
+        instead of defaulting to an allow, which is what makes a missing hop
+        fail closed.
+        """
+        self._child_authority_responder = responder
+
+    def _serve_child_request(self, message: Mapping[str, Any], method: str) -> None:
+        """Serve one child-origin request on its own task (G5b).
+
+        The id must be agent-origin: the child mints its request ids from that
+        namespace, so a foreign id would answer a future this end never minted.
+        """
+        if request_id_origin(message["id"]) != AGENT_ORIGIN:
+            error = WireMethodNotSupportedError(method, direction=AGENT_ORIGIN)
+            self._record_diagnostic(
+                "the request id is not in the agent-origin namespace",
+                message["id"],
+                method=method,
+            )
+            self._send_soon({
+                "jsonrpc": "2.0",
+                "id": message["id"],
+                "error": {"code": type(error).__name__, "message": str(error)},
+            })
+            return
+        task = asyncio.create_task(
+            self._serve_child_authority_check(message["id"], _payload(message))
+        )
+        self._host_tasks.add(task)
+        task.add_done_callback(self._host_tasks.discard)
+
+    async def _serve_child_authority_check(
+        self, request_id: object, params: dict[str, Any]
+    ) -> None:
+        """Answer one authority question from the endpoint the owner bound.
+
+        Nothing here decides: the owner's responder evaluates its CURRENT
+        policy and answers allow/deny with its own revision vector. An
+        unbound endpoint, an undecodable question or a responder failure is
+        answered typed, so the child's bounded wait ends in a deny rather than
+        a decision made on no authority.
+        """
+        responder = self._child_authority_responder
+        if responder is None:
+            await self._answer_agent_request(
+                request_id,
+                UnsupportedAgentRequestError(
+                    "this wire client holds no bound authority endpoint; the "
+                    "owner that spawned the child never bound one"
+                ),
+            )
+            return
+        try:
+            result = responder(params)
+        except BaseException as exc:
+            self._record_diagnostic(
+                f"the authority endpoint refused the question: {exc}", request_id
+            )
+            await self._answer_agent_request(request_id, exc)
+            return
+        await self._send({"jsonrpc": "2.0", "id": request_id, "result": result})
 
     def _serve_agent_request(self, message: Mapping[str, Any], method: str) -> None:
         """Serve one agent-origin host-service request on its own task."""
@@ -1902,7 +2775,14 @@ class RootAgentProcess:  # noqa: PLR0904 - the coordinator-side port surface
             "error": {"code": type(error).__name__, "message": str(error)},
         })
 
+    def _observe_agent_sequence(self, payload: Mapping[str, Any]) -> None:
+        """Fold one relayed frame's agent-sequence stamp into the shared cursor."""
+        sequence = payload.get(AGENT_SEQUENCE_FIELD)
+        if isinstance(sequence, int) and not isinstance(sequence, bool):
+            self._last_agent_sequence = max(self._last_agent_sequence, sequence)
+
     def _deliver_notification(self, method: str, payload: dict[str, Any]) -> None:
+        self._observe_agent_sequence(payload)
         if method == AGENT_TURN_EVENT_METHOD:
             self._deliver(payload, "event")
             return
@@ -1918,11 +2798,101 @@ class RootAgentProcess:  # noqa: PLR0904 - the coordinator-side port surface
         if method == AGENT_TURN_ENDED_METHOD:
             self._deliver(payload, "ended")
             return
+        if method in {
+            AGENT_MCP_AUTH_URL_METHOD,
+            AGENT_MCP_AUTH_REQUIRED_METHOD,
+        } or method in {
+            AGENT_AGENTS_UPDATE_METHOD,
+            AGENT_RUN_COMPLETED_METHOD,
+            AGENT_AUTHORITY_CHANGED_METHOD,
+        }:
+            # A live backend binds the sink, so an unbound sink means no
+            # session owns the frame: drop it like any other unroutable one.
+            # The F10 agents-update arm rides the same relay shape -- and its
+            # snapshot is presentation-class, so a drop only delays the next
+            # mutation's fresher full copy. The G1b completion frame is the
+            # wake owner's own path and decodes typed first.
+            self._route_sink_frame(method, payload)
+            return
         # The table admitted the method, so only a table entry that lost its
         # handler reaches here: record it instead of failing the pump.
         self._record_diagnostic(
             "the table lists the method but no handler serves it", None, method=method
         )
+
+    def _route_sink_frame(self, method: str, payload: dict[str, Any]) -> None:
+        """Hand one relayed frame to the sink the live backend bound.
+
+        The MCP auth relays and the F10 agents-update relay take the frame
+        verbatim; a completion frame is decoded typed first, because its
+        consumer drives a parent turn and must never act on a frame it cannot
+        reconstruct exactly.
+        """
+        if method == AGENT_RUN_COMPLETED_METHOD:
+            self._deliver_run_completion(payload)
+            return
+        if method == AGENT_AUTHORITY_CHANGED_METHOD:
+            self._deliver_authority_changed(payload)
+            return
+        sink = (
+            self._agents_update_sink
+            if method == AGENT_AGENTS_UPDATE_METHOD
+            else self._mcp_notification_sink
+        )
+        if sink is None:
+            return
+        task = asyncio.create_task(sink(method, payload))
+        self._notifications.add(task)
+        task.add_done_callback(self._notifications.discard)
+
+    def _deliver_run_completion(self, payload: Mapping[str, Any]) -> None:
+        """Hand one settled child run to the sink the live backend binds (G1b).
+
+        An undecodable frame is a version skew between peers and is dropped
+        with a warning, never a pump failure and never a wire diagnostic: the
+        owner's ledger still answers the recovery read, so nothing is lost by
+        dropping it -- the same policy the agents/update relay applies to a
+        snapshot it cannot vouch for. An unbound sink means no session owns the
+        frame (the ready frame did not advertise the capability), and it is
+        dropped exactly like an unroutable notification.
+        """
+        try:
+            completion = decode_run_completion(payload)
+        except AgentWireError as exc:
+            logger.warning(
+                "Dropped a run-completion frame that does not decode: %s", exc
+            )
+            return
+        sink = self._run_completion_sink
+        if sink is None:
+            return
+        task = asyncio.create_task(sink(completion))
+        self._notifications.add(task)
+        task.add_done_callback(self._notifications.discard)
+
+    def _deliver_authority_changed(self, payload: Mapping[str, Any]) -> None:
+        """Hand one authority-change snapshot to the sink (G5, observability).
+
+        Unlike the completion carrier this frame drives nothing: it only tells
+        the coordinator that the owner's policy vector moved, so a dropped or
+        undecodable frame costs an observation and never an enforcement
+        decision -- the owner answers the next ``agent/authority/check`` from
+        its current policy regardless. An unbound sink means no live backend
+        is attached and the frame is dropped like any other unroutable one.
+        """
+        try:
+            changed = decode_authority_changed(payload)
+        except AgentWireError as exc:
+            logger.warning(
+                "Dropped an authority-change frame that does not decode: %s", exc
+            )
+            return
+        sink = self._authority_changed_sink
+        if sink is None:
+            return
+        task = asyncio.create_task(sink(changed))
+        self._notifications.add(task)
+        task.add_done_callback(self._notifications.discard)
 
     def _record_admission(self, payload: Mapping[str, Any]) -> None:
         """Hold one long operation's admission by the coordinator's request id.
@@ -2026,11 +2996,11 @@ class RootAgentProcess:  # noqa: PLR0904 - the coordinator-side port surface
     async def _request(
         self, method: str, params: dict[str, Any], *, timeout: float | None = None
     ) -> dict[str, Any]:
-        request_id = self._begin_request(params)
+        request_id = self._begin_request(method, params)
         return await self._await_request(request_id, method, params, timeout=timeout)
 
     def _begin_request(
-        self, params: Mapping[str, Any], *, long_method: str | None = None
+        self, method: str, params: Mapping[str, Any], *, long_method: str | None = None
     ) -> str:
         """Mint one coordinator request id, recording its absolute deadline.
 
@@ -2039,6 +3009,11 @@ class RootAgentProcess:  # noqa: PLR0904 - the coordinator-side port surface
         id it sent, not on whatever the pipe returns. ``long_method`` records a
         long operation as in flight for as long as this end waits on it, which
         is what refuses a short reconfigure mode before a frame is sent.
+
+        A request that depends on an additive capability the child's ready
+        frame did not announce is refused here, before any frame is sent: a
+        version skew is typed with a restart instruction, never a silent
+        fallback and never a replay.
         """
         if self._closed:
             raise RootAgentProcessError("the root agent process is closed")
@@ -2046,6 +3021,11 @@ class RootAgentProcess:  # noqa: PLR0904 - the coordinator-side port surface
             raise RootAgentExitedError(
                 self._death.reason, exit_code=self._death.exit_code
             )
+        missing = (
+            required_agent_capabilities(method, params) - self.advertised_capabilities
+        )
+        if missing:
+            raise RootAgentCapabilitySkewError(method, sorted(missing))
         request_id = coordinator_request_id(next(self._request_ids))
         self._last_request_id = request_id
         deadline = params.get("deadline")
@@ -2313,6 +3293,7 @@ async def spawn_root_agent_process(  # noqa: PLR0913 - the spawn surface
 __all__ = [
     "AgentProcessTurnFailed",
     "CompactSettlementRecord",
+    "RootAgentCapabilitySkewError",
     "RootAgentDeferredOperation",
     "RootAgentExitedError",
     "RootAgentOpTimeoutError",

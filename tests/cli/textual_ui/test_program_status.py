@@ -12,7 +12,8 @@ import base64
 from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager, suppress
 import re
-from typing import Any
+import time
+from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock, PropertyMock
 
 import pytest
@@ -39,11 +40,17 @@ from chartreux.app_server.models import (
     UserQuestionResult,
 )
 from chartreux.app_server.protocol import (
+    AgentSummaryModel,
     RootRecoveryAdmitResponse,
     RootRecoveryScheduleResponse,
 )
 from chartreux.app_server.session import AppServerSession, AppServerTurnError
 from chartreux.cli.textual_ui import program_status
+from chartreux.cli.textual_ui.agent_liveness import (
+    AgentLivenessPoller,
+    LivenessSnapshot,
+    SettlementInput,
+)
 from chartreux.cli.textual_ui.app import (
     _OWNERSHIP_MISSING,
     ChartreuxApp,
@@ -59,6 +66,7 @@ from chartreux.cli.textual_ui.program_status import (
     prepare_message,
 )
 from chartreux.cli.textual_ui.turn_supervisor import TurnOutcome
+from chartreux.cli.textual_ui.widgets.agent_bar import agent_is_active
 from chartreux.cli.textual_ui.widgets.compact import CompactMessage
 from chartreux.cli.textual_ui.widgets.messages import ErrorMessage
 from chartreux.core.events import UserMessageEvent
@@ -92,6 +100,81 @@ def _registered(*secrets: str) -> Iterator[None]:
     )
     with sr.bind_policy(policy):
         yield
+
+
+class _StaticLivenessInventory:
+    """Deterministic C7b test double for the app's liveness poller.
+
+    The owned emission sites' tests (ownership epochs, dedup, byte-exact
+    wire reports, release precedence) pin liveness observation to a
+    perpetually leg-qualifying inventory: none of them depends on polling
+    timing, and the design's own dropped-frame/leg/rotation coverage lives
+    in the liveness and composition nodes. Child activity is injected
+    through this seam exactly as production consumes it — the
+    snapshot-carried inventory, never the browser's event store
+    (agent_browser.py:154 stays a hint).
+    """
+
+    def __init__(self, agents: Sequence[AgentSummaryModel] = ()) -> None:
+        self.agents = tuple(agents)
+
+    @property
+    def attached(self) -> bool:
+        return True
+
+    @property
+    def confirmed_dead(self) -> bool:
+        return False
+
+    @property
+    def fence(self) -> int:
+        return 0
+
+    @property
+    def accepted(self) -> LivenessSnapshot:
+        now = time.monotonic()
+        return LivenessSnapshot(
+            session_id=None,
+            generation=None,
+            revision=0,
+            agents=self.agents,
+            issued_at=now - 0.01,
+            accepted_at=now - 0.005,
+            fence_at_issuance=0,
+            fence_at_acceptance=0,
+        )
+
+    def attach(self) -> None:
+        pass
+
+    def detach(self) -> None:
+        pass
+
+    def invalidate(self) -> None:
+        pass
+
+    def rearm(self) -> None:
+        pass
+
+    def note_event(self) -> None:
+        pass
+
+    def request_refresh(self) -> None:
+        pass
+
+    def settlement_input(self) -> SettlementInput:
+        return SettlementInput(
+            qualified=True,
+            child_active=any(agent_is_active(agent) for agent in self.agents),
+        )
+
+    def completion_qualifies(self) -> bool:
+        return True
+
+
+def _pin_liveness(app: ChartreuxApp, agents: Sequence[AgentSummaryModel] = ()) -> None:
+    """Swap the app's poller for the static seam (see _StaticLivenessInventory)."""
+    app._agent_liveness = cast(AgentLivenessPoller, _StaticLivenessInventory(agents))
 
 
 def _fake_app(
@@ -677,8 +760,10 @@ class TestProgramStatusEmitter:
 
 
 def _app_with_mock_emitter() -> tuple[ChartreuxApp, MagicMock]:
-    emitter = MagicMock(spec=ProgramStatusEmitter)
-    return build_test_chartreux_app(program_status=emitter), emitter
+    emitter: MagicMock = MagicMock(spec=ProgramStatusEmitter)
+    app = build_test_chartreux_app(program_status=emitter)
+    _pin_liveness(app)
+    return app, emitter
 
 
 def _turn_started(app: ChartreuxApp, turn_id: str) -> TurnStarted:
@@ -713,6 +798,7 @@ class TestAppEmissionLifecycle:
         fake = _fake_app()
         emitter = ProgramStatusEmitter(fake, get_enabled=lambda: True)
         app = build_test_chartreux_app(program_status=emitter)
+        _pin_liveness(app)
         async with app.run_test():
             await app._session_ready.wait()
             # Several readiness points run at startup; dedup keeps exactly one
@@ -728,6 +814,7 @@ class TestAppEmissionLifecycle:
         fake = _fake_app()
         emitter = ProgramStatusEmitter(fake, get_enabled=lambda: True)
         app = build_test_chartreux_app(program_status=emitter)
+        _pin_liveness(app)
         async with app.run_test():
             assert fake._driver.write.call_count == 1
             app._mark_session_ready()
@@ -769,6 +856,7 @@ class TestAppEmissionLifecycle:
         fake = _fake_app()
         emitter = ProgramStatusEmitter(fake, get_enabled=lambda: True)
         app = build_test_chartreux_app(program_status=emitter)
+        _pin_liveness(app)
         async with app.run_test():
             idle_report = "\x1b]7501;state=idle:app=chartreux\x07"
             assert fake._driver.write.call_args.args[0] == idle_report
@@ -787,6 +875,7 @@ class TestAppEmissionLifecycle:
         fake = _fake_app()
         emitter = ProgramStatusEmitter(fake, get_enabled=lambda: True)
         app = build_test_chartreux_app(program_status=emitter)
+        _pin_liveness(app)
         async with app.run_test():
             assert fake._driver.write.call_count == 1
             first_report = fake._driver.write.call_args.args[0]
@@ -3063,7 +3152,9 @@ def _wire_app() -> tuple[ChartreuxApp, MagicMock]:
     """The real app over a real emitter writing to a recording fake driver."""
     host = _fake_app()
     emitter = ProgramStatusEmitter(host, get_enabled=lambda: True)
-    return build_test_chartreux_app(program_status=emitter), host
+    app = build_test_chartreux_app(program_status=emitter)
+    _pin_liveness(app)
+    return app, host
 
 
 def _wire_states(host: MagicMock) -> list[str]:

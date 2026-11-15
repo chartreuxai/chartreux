@@ -102,6 +102,8 @@ from chartreux.app_server.models import (
 from chartreux.app_server.protocol.agents import (
     AgentsCancelParams as AgentsCancelParams,
     AgentsCancelResponse as AgentsCancelResponse,
+    AgentsInventoryReadParams as AgentsInventoryReadParams,
+    AgentsInventoryReadResponse as AgentsInventoryReadResponse,
     AgentsReconcileParams as AgentsReconcileParams,
     AgentsReconcileResponse as AgentsReconcileResponse,
     AgentsReleaseParams as AgentsReleaseParams,
@@ -308,6 +310,7 @@ from chartreux.app_server.protocol.sessions import (
     SessionListResponse as SessionListResponse,
     SessionLogReadParams as SessionLogReadParams,
     SessionLogReadResponse as SessionLogReadResponse,
+    SessionMemorialItem as SessionMemorialItem,
     SessionOpenParams as SessionOpenParams,
     SessionPlanHandoffParams as SessionPlanHandoffParams,
     SessionPlanHandoffResponse as SessionPlanHandoffResponse,
@@ -425,9 +428,14 @@ from chartreux.utils.tool_presentation import (
     ToolResultPresentation as ToolResultPresentation,
 )
 
+#: The wire method catalogue. ``session/title/update`` is retained as a typed
+#: unsupported alias for ``session/rename`` (the method that sets a manual
+#: session title): the server answers NOT_IMPLEMENTED for it on every
+#: transport rather than dropping the name into a bare unknown-method error.
 SERVER_METHODS: tuple[str, ...] = (
     "agent/transcript/get",
     "agents/cancel",
+    "agents/inventory/read",
     "agents/reconcile",
     "agents/release",
     "agents/resume",

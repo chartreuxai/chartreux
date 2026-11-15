@@ -178,6 +178,30 @@ class ChatInputContainer(Vertical):
                 widget.get_full_text(), widget._get_full_cursor_offset()
             )
 
+    def restore_draft(self, value: str) -> bool:
+        """Restore a refused send as the input's draft; never overwrite typing.
+
+        ``value`` is the full draft the user submitted, so the restore keeps its
+        input mode and its attachment tokens. The caret lands AFTER the draft:
+        restoring through the value setter alone leaves the caret at the start
+        (``TextArea.load_text``), and the next keystrokes then land in front of
+        the draft, submitting a prompt nobody typed -- the row-17 concatenation
+        replayed in ``pty-probe-archive/out/stdio-p0b`` (``probe-2: say
+        hiprobe-1: say hi``).
+
+        Text the user typed while the send was being refused is never
+        concatenated with, or overwritten by, the draft.
+
+        Returns ``True`` when the draft was restored.
+        """
+        if self.value:
+            return False
+        self.value = value
+        widget = self.input_widget
+        if widget is not None:
+            widget.set_cursor_offset(len(widget.text))
+        return True
+
     def _input_is_default_mode(self) -> bool:
         widget = self.input_widget
         return widget is None or widget.is_default_mode

@@ -41,13 +41,12 @@ from chartreux.core.model_catalog.schema import ModelCatalog
 from chartreux.core.utils.concurrency import run_sync
 from chartreux.ui.theme import resolve_auto_theme
 from chartreux.utils import keyring as keyring_utils
+from tests.app_server import executed_receipts
 from tests.differential import egress
 from tests.stubs.app_server import create_test_app_server_session
 from tests.stubs.fake_backend import FakeBackend
 from tests.stubs.fake_config_orchestrator import FakeConfigOrchestrator
 from tests.stubs.fake_mcp_registry import FakeMCPRegistry
-
-collect_ignore = ["perf"]
 
 _TESTS_ROOT = Path(__file__).parent
 _PROVIDER_CREDENTIALS = (
@@ -150,6 +149,50 @@ def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
 
 def pytest_addoption(parser: pytest.Parser) -> None:
     pass
+
+
+# -- per-transport executed receipts (capability manifest, C5b) ---------------
+#
+# Every item gets one receipt at teardown: its node id, its outcome, and the
+# transport it actually executed on. The transport stamp is taken by the seams
+# that establish one (see ``tests/app_server/executed_receipts.py``); everything
+# else is the ambient in_process route this suite's autouse pins. Receipts feed
+# the manifest gate, so they are recorded for the whole suite, not only the
+# modules the manifest happens to cite today.
+
+_RECEIPT_GATE_FAILURES: tuple[str, ...] = ()
+
+
+def pytest_runtest_setup(item: pytest.Item) -> None:
+    executed_receipts.begin_item(item.nodeid)
+
+
+def pytest_runtest_logreport(report: pytest.TestReport) -> None:
+    executed_receipts.record_phase(report.nodeid, report.when, report.outcome)
+
+
+def pytest_deselected(items: list[pytest.Item]) -> None:
+    for item in items:
+        executed_receipts.record_deselected(item.nodeid)
+
+
+def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
+    global _RECEIPT_GATE_FAILURES
+    if hasattr(session.config, "workerinput"):
+        return
+    _RECEIPT_GATE_FAILURES = executed_receipts.gate_failures()
+    if _RECEIPT_GATE_FAILURES:
+        session.exitstatus = 1
+
+
+def pytest_terminal_summary(
+    terminalreporter: pytest.TerminalReporter, exitstatus: int, config: pytest.Config
+) -> None:
+    if not _RECEIPT_GATE_FAILURES:
+        return
+    terminalreporter.write_sep("-", "executed-receipt gate failed")
+    for failure in _RECEIPT_GATE_FAILURES:
+        terminalreporter.write_line(failure, red=True)
 
 
 class _EmptyKeyring(KeyringBackend):

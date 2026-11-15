@@ -21,7 +21,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, cast
 
-from pydantic import BaseModel, JsonValue, TypeAdapter, ValidationError
+from pydantic import BaseModel, ConfigDict, JsonValue, TypeAdapter, ValidationError
 
 from chartreux.app_server.agent_admission import OperationMarker
 from chartreux.app_server.agent_snapshot import (
@@ -35,11 +35,18 @@ from chartreux.app_server.models import (
     PublicSessionState,
     SessionLogSummary,
 )
+from chartreux.app_server.process_bootstrap import (
+    AGENT_WIRE_CAPABILITY_LIVE_AGENT_INVENTORY,
+    AGENT_WIRE_CAPABILITY_PLAN_HANDOFF_ROTATION,
+    AGENT_WIRE_CAPABILITY_RECOVERY_EVIDENCE,
+    AGENT_WIRE_CAPABILITY_ROOT_RUN_COMPLETIONS,
+)
 from chartreux.app_server.protocol import (
     AgentTranscriptGetResponse,
     ConfigWriteParams,
     ConfigWriteResponse,
     ContextInjectParams,
+    ProtocolErrorCode,
     RuntimeSnapshot,
     SessionPlanHandoffParams,
     TurnSteerParams,
@@ -48,6 +55,7 @@ from chartreux.app_server.transport import TRANSPORT_ENV_VAR
 from chartreux.core.agent_loop._execution_port import ExecutionTurnRequest
 from chartreux.core.agent_loop._loop_types import AgentTurnOptions
 from chartreux.core.agent_loop._request_broker import UserInputSettlement
+from chartreux.core.config.models import RootRecoveryConfig
 from chartreux.core.events import (
     AssistantEvent,
     BackgroundJobsChangedEvent,
@@ -79,6 +87,7 @@ from chartreux.core.model_catalog.availability import (
     DeploymentExclusion,
     ExclusionReason,
 )
+from chartreux.core.recovery_models import RootTurnFailure
 from chartreux.core.session_types import CommittedModelIdentity
 from chartreux.core.subagents import TaskArgs, TaskResult
 from chartreux.core.tools.builtins.ask_user_question import AskUserQuestionArgs
@@ -132,6 +141,15 @@ AGENT_TURN_INTERRUPT_METHOD = "agent/turn/interrupt"
 AGENT_TURN_STEER_METHOD = "agent/turn/steer"
 AGENT_INJECT_METHOD = "agent/inject"
 AGENT_NOTICE_METHOD = "agent/notice"
+
+#: The shared agent-sequence cursor. Every event frame the agent relays on
+#: ``agent/turn/event`` and ``agent/notice`` carries ``sequence``, the next
+#: value of the agent's own event counter, and every snapshot payload carries
+#: the value current at its build (``agent_sequence``). The coordinator's
+#: watermark numbers its own publications, so it cannot order a snapshot
+#: against the events already relayed -- the shared cursor can, and monotone
+#: adoption keys on it.
+AGENT_SEQUENCE_FIELD = "sequence"
 
 # The manual `!` command's effect runs where the loop lives. The coordinator
 # queues the shell input beside queued prompts and asks this process for the
@@ -189,6 +207,474 @@ AGENT_SESSION_POLICY_READ_METHOD = "agent/session/policy/read"
 # agent's own orchestrator and layers, so the process that holds them answers.
 AGENT_SESSION_ROOTS_READ_METHOD = "agent/session/roots/read"
 AGENT_SESSION_ROOTS_SAVE_METHOD = "agent/session/roots/save"
+
+# Prompt preparation. It reads the live model, the session's working directory
+# and its session directory, and it writes attachment snapshots, so the fs
+# reads and writes cross the process boundary: the agent that owns the loop
+# answers, and the reply carries the prepared prompt it built. A preparation
+# that times out is an unknown outcome -- the request is never resent.
+AGENT_WORKSPACE_PROMPT_PREPARE_METHOD = "agent/workspace/prompt/prepare"
+
+# The configuration surface. The fields and settings views are projections of
+# the agent's own orchestrator, its layered sources and their save revisions;
+# the proxy view is read from, and written to, the env file this process
+# resolves. A coordinator copy would report a config the session is not
+# running on, so the process that owns them answers every one of these.
+AGENT_CONFIG_FIELDS_READ_METHOD = "agent/config/fields/read"
+AGENT_CONFIG_SETTINGS_READ_METHOD = "agent/config/settings/read"
+AGENT_CONFIG_PROXY_READ_METHOD = "agent/config/proxy/read"
+AGENT_CONFIG_PROXY_WRITE_METHOD = "agent/config/proxy/write"
+AGENT_CONFIG_SURFACE_METHODS = frozenset({
+    AGENT_CONFIG_FIELDS_READ_METHOD,
+    AGENT_CONFIG_SETTINGS_READ_METHOD,
+    AGENT_CONFIG_PROXY_READ_METHOD,
+    AGENT_CONFIG_PROXY_WRITE_METHOD,
+})
+"""The configuration requests one owner handler answers, whichever route sent them."""
+
+AGENT_CONFIG_PUBLIC_METHODS: Mapping[str, str] = {
+    AGENT_CONFIG_FIELDS_READ_METHOD: "config/fields/read",
+    AGENT_CONFIG_SETTINGS_READ_METHOD: "config/settings/read",
+    AGENT_CONFIG_PROXY_READ_METHOD: "config/proxy/read",
+    AGENT_CONFIG_PROXY_WRITE_METHOD: "config/proxy/write",
+}
+"""The app-server method each configuration carrier answers for.
+
+The agent's owner handler is the shipped resource handler, which dispatches the
+client-facing names; the carrier reuses it rather than reimplementing the
+projections, so a carrier's wire name never reaches it.
+"""
+
+# The dangerous-command authority surface. The read projects the session's
+# live grants, its accepted saved grants, the fresh disk read and the blocking
+# denylist; the revoke is the CAS: it names the authority generation the read
+# observed, and a superseded generation answers the defined conflict outcome,
+# never a false ack. Both run where the session's grant store and the root
+# orchestrator's saved-grant read/write live, so no coordinator copy of the
+# authority is ever read or revoked.
+AGENT_POLICY_DANGEROUS_COMMANDS_READ_METHOD = "agent/policy/dangerous_commands/read"
+AGENT_POLICY_DANGEROUS_COMMANDS_REVOKE_METHOD = "agent/policy/dangerous_commands/revoke"
+AGENT_POLICY_DANGEROUS_COMMANDS_METHODS = frozenset({
+    AGENT_POLICY_DANGEROUS_COMMANDS_READ_METHOD,
+    AGENT_POLICY_DANGEROUS_COMMANDS_REVOKE_METHOD,
+})
+"""The dangerous-command authority requests one owner handler answers."""
+
+AGENT_POLICY_DANGEROUS_COMMANDS_PUBLIC_METHODS: Mapping[str, str] = {
+    AGENT_POLICY_DANGEROUS_COMMANDS_READ_METHOD: "policy/dangerous_commands/read",
+    AGENT_POLICY_DANGEROUS_COMMANDS_REVOKE_METHOD: "policy/dangerous_commands/revoke",
+}
+"""The app-server method each authority carrier answers for."""
+
+# The subagent-management surface. A process-owned root owns its children, so
+# cancel, guarded release, resume and reconcile are answered there against that
+# process's own child records — never against a coordinator copy. The typed
+# outcomes and their guards are the in-process registry's, so a client reads one
+# contract whichever route answered it; an operation the process-backed child
+# records cannot represent answers its typed lifecycle disposition, never a
+# false success.
+AGENT_AGENTS_CANCEL_METHOD = "agent/agents/cancel"
+AGENT_AGENTS_RELEASE_METHOD = "agent/agents/release"
+AGENT_AGENTS_RESUME_METHOD = "agent/agents/resume"
+AGENT_AGENTS_RECONCILE_METHOD = "agent/agents/reconcile"
+AGENT_AGENTS_INVENTORY_READ_METHOD = "agent/agents/inventory/read"
+AGENT_AGENTS_METHODS = frozenset({
+    AGENT_AGENTS_CANCEL_METHOD,
+    AGENT_AGENTS_RELEASE_METHOD,
+    AGENT_AGENTS_RESUME_METHOD,
+    AGENT_AGENTS_RECONCILE_METHOD,
+    AGENT_AGENTS_INVENTORY_READ_METHOD,
+})
+"""The subagent-management requests one owner handler answers."""
+
+AGENT_AGENTS_PUBLIC_METHODS: Mapping[str, str] = {
+    AGENT_AGENTS_CANCEL_METHOD: "agents/cancel",
+    AGENT_AGENTS_RELEASE_METHOD: "agents/release",
+    AGENT_AGENTS_RESUME_METHOD: "agents/resume",
+    AGENT_AGENTS_RECONCILE_METHOD: "agents/reconcile",
+    AGENT_AGENTS_INVENTORY_READ_METHOD: "agents/inventory/read",
+}
+"""The app-server method each subagent-management carrier answers for."""
+
+# The child lifecycle's emission arm (F10). Spawn, run, settle and teardown
+# moments mutate the owner's handle inventory; the id-less notification that
+# carries one away rides the same pipe the coordinator's notification pump
+# already reads. It is presentation-class on the relay schema by name
+# (``agents/update``), so a saturated stream sheds it the same way the
+# in-process registry's emission would be shed: the next mutation always
+# carries a fresh full snapshot, never a lost delta.
+AGENT_AGENTS_UPDATE_METHOD = "agent/agents/update"
+
+# The child run's completion carrier (G1b). A background child run settles in
+# the process that owns it, and the parent model only learns of it from that
+# owner: one id-less ``agent/run/completed`` notification per settled run names
+# the agent, the run, the observed terminal outcome and the result-store
+# pointer. A completion is NOT a presentation delta -- a dropped frame would
+# silently lose the parent's wake -- so the owner also keeps a bounded ledger
+# of the completions it published, and the recovery read replays it.
+AGENT_RUN_COMPLETED_METHOD = "agent/run/completed"
+AGENT_RUN_COMPLETIONS_READ_METHOD = "agent/runs/completed/read"
+
+AGENT_RUN_COMPLETION_FIELDS = frozenset({
+    "session_id",
+    "agent_id",
+    "run_id",
+    "name",
+    "status",
+    "stop_reason",
+    "result_available",
+})
+"""The exact keys one completion frame carries; the codec never repairs one."""
+
+# The live child-authority carrier (G5). A child never decides from its own
+# copy of the parent's policy: before an admitted tool invocation it asks its
+# IMMEDIATE parent, over this wire, one typed question per decision, and the
+# parent answers from its CURRENT policy at request time. The question names
+# the child's incarnation epoch, its run generation, the parent session and
+# incarnation it believes it is talking to, its last-known revision vector and
+# the agent-origin request id -- so a reply can be fenced against a superseded
+# epoch, a reordered or replayed request and a revision rollback without any
+# wall-clock ordering. The answer is allow/deny only: a child never receives
+# policy it could execute on its own.
+AGENT_AUTHORITY_CHECK_METHOD = "agent/authority/check"
+AGENT_AUTHORITY_CHANGED_METHOD = "agent/authority/changed"
+
+AGENT_AUTHORITY_DECISION_KIND_TOOL_INVOCATION = "tool-invocation"
+AGENT_AUTHORITY_DECISION_KIND_TOOL_AVAILABILITY = "tool-availability"
+AGENT_AUTHORITY_DECISION_KINDS = frozenset({
+    AGENT_AUTHORITY_DECISION_KIND_TOOL_INVOCATION,
+    # The catalog axis (G5b): may this child ADVERTISE this tool name at all
+    # under the owner's current policy? A catalog question carries no
+    # invocation arguments, because it is asked before any call exists; it is
+    # the name-level ceiling that keeps the model-facing catalog and execution
+    # admission from disagreeing in either direction.
+    AGENT_AUTHORITY_DECISION_KIND_TOOL_AVAILABILITY,
+})
+"""The authority decisions this release names. An unknown kind denies."""
+
+AGENT_AUTHORITY_ALLOW = "allow"
+AGENT_AUTHORITY_DENY = "deny"
+AGENT_AUTHORITY_DECISIONS = frozenset({AGENT_AUTHORITY_ALLOW, AGENT_AUTHORITY_DENY})
+
+AUTHORITY_REVISION_COMPONENTS = frozenset({"policy", "registry", "grants", "ancestors"})
+"""The exact components of one monotone authority revision vector.
+
+Every component is a non-negative integer the owner reads from live state and
+that only ever advances. A peer's presented vector must be componentwise
+non-decreasing against what that same peer presented before, so an older
+policy presented as current (a rollback) is visible without a clock.
+"""
+
+AGENT_AUTHORITY_CHECK_FIELDS = frozenset({
+    "decision_kind",
+    "tool_name",
+    "implementation",
+    "arguments",
+    "child_agent_id",
+    "child_generation",
+    "epoch",
+    "parent_session_id",
+    "parent_incarnation",
+    "request_id",
+    "revision",
+})
+"""The exact keys one authority question carries; the codec never repairs one."""
+
+AGENT_AUTHORITY_DECISION_FIELDS = frozenset({
+    "decision",
+    "reason",
+    "epoch",
+    "parent_session_id",
+    "parent_incarnation",
+    "child_generation",
+    "request_id",
+    "revision",
+})
+"""The exact keys one authority answer carries, fenced to its question."""
+
+AGENT_AUTHORITY_CHANGED_FIELDS = frozenset({"session_id", "incarnation", "revision"})
+"""The exact keys one authority-change notification carries."""
+
+PARENT_INCARNATION_PAYLOAD_KEY = "parent_incarnation"
+"""The spawn payload key carrying the owner incarnation a child asks.
+
+A process child's authority questions name the parent incarnation they
+believe they are talking to, so the owner's fence can refuse an answer minted
+for a superseded incarnation. The value rides the spawn payload under this
+exact key and is never repaired. A payload that is present but unusable
+refuses the child's open typed; an ABSENT key is an owner older than this
+carrier, and the child's client is then left unbound -- it asks nothing, every
+decision denies and the whole catalog is withheld, so such a child runs no
+tools rather than running them unfenced (G5b, fail-closed).
+"""
+
+# The child transcript page. A child's transcript is scoped to the root session
+# and lives in that child process, so a page is read through this carrier: the
+# owner either forwards the page request to the live child's own reader or, once
+# the child is gone, reads its saved transcript from the child directory.
+AGENT_CHILD_TRANSCRIPT_PAGE_METHOD = "agent/child/transcript/page"
+AGENT_CHILD_TRANSCRIPT_PUBLIC_METHOD = "agent/transcript/get"
+"""The app-server method the child transcript page carrier answers for."""
+
+# The live history page. The attached session's authoritative projection -- live
+# messages plus any sealed prefix -- lives in the loop this agent owns; the host
+# reads persisted messages only, so a host answer for an attached id would be
+# stale. Saved/non-attached sessions keep the host route, and the coordinator's
+# not-found-to-host fallback for the public method is narrowed for attached ids.
+AGENT_SESSION_HISTORY_LIST_METHOD = "agent/session/history/list"
+AGENT_SESSION_HISTORY_LIST_PUBLIC_METHOD = "session/history/list"
+"""The app-server method the live history page carrier answers for."""
+
+# The scheduled-loop surface. A session's loops live in the loop manager of the
+# process that owns the loop, which is also what its scheduler reads, so a list,
+# create, delete or clear is answered there. A coordinator-side copy would be a
+# second schedule with its own fire times, so the requests cross as typed
+# requests and no scheduler is added to the coordinator; each reply is the
+# resource handler's own projection of the state the owner now holds.
+AGENT_LOOPS_LIST_METHOD = "agent/loops/list"
+AGENT_LOOPS_CREATE_METHOD = "agent/loops/create"
+AGENT_LOOPS_DELETE_METHOD = "agent/loops/delete"
+AGENT_LOOPS_CLEAR_METHOD = "agent/loops/clear"
+AGENT_LOOPS_METHODS = frozenset({
+    AGENT_LOOPS_LIST_METHOD,
+    AGENT_LOOPS_CREATE_METHOD,
+    AGENT_LOOPS_DELETE_METHOD,
+    AGENT_LOOPS_CLEAR_METHOD,
+})
+"""The scheduled-loop requests one owner handler answers."""
+
+AGENT_LOOPS_PUBLIC_METHODS: Mapping[str, str] = {
+    AGENT_LOOPS_LIST_METHOD: "loops/list",
+    AGENT_LOOPS_CREATE_METHOD: "loops/create",
+    AGENT_LOOPS_DELETE_METHOD: "loops/delete",
+    AGENT_LOOPS_CLEAR_METHOD: "loops/clear",
+}
+"""The app-server method each scheduled-loop carrier answers for.
+
+The owner handler is the shipped resource handler, so the carrier reuses its
+validation, its idle admission and its projection rather than reimplementing
+them, and a carrier's wire name never reaches it.
+"""
+
+# The diagnostics surface. The issues and hook count are projected from the loop
+# and hooks this process owns, and the debug log page is read through this
+# process's own log reader, so both session-scoped reads are answered where that
+# state lives. The bounds and the redaction are the shipped resource handler's
+# own: the carrier crosses the page exactly as the owner projects it and never
+# merges another process's view into it -- each entry keeps the pid provenance
+# its log line recorded.
+AGENT_DIAGNOSTICS_LIST_METHOD = "agent/diagnostics/list"
+AGENT_DIAGNOSTICS_LOGS_READ_METHOD = "agent/diagnostics/logs/read"
+AGENT_DIAGNOSTICS_METHODS = frozenset({
+    AGENT_DIAGNOSTICS_LIST_METHOD,
+    AGENT_DIAGNOSTICS_LOGS_READ_METHOD,
+})
+"""The diagnostics requests one owner handler answers."""
+
+AGENT_DIAGNOSTICS_PUBLIC_METHODS: Mapping[str, str] = {
+    AGENT_DIAGNOSTICS_LIST_METHOD: "diagnostics/list",
+    AGENT_DIAGNOSTICS_LOGS_READ_METHOD: "diagnostics/logs/read",
+}
+"""The app-server method each diagnostics carrier answers for."""
+
+# The latent catalog reads. The installed and discovered skills, the tool
+# inventory and the live counters are all resolved against the loop, config and
+# tool manager of the process that owns them, so each read is answered there
+# and the coordinator carries the owner's projection rather than re-deriving it
+# from a copy it does not hold. Identity is answered where the session's
+# resources are: this fork binds no account backend, so the owner's own answer
+# is the absent identity the response model already admits, and the read keeps
+# one shape on both topologies instead of answering not-found on one of them.
+AGENT_SKILLS_LIST_METHOD = "agent/skills/list"
+AGENT_SKILLS_INSTALLED_METHOD = "agent/skills/installed"
+AGENT_TOOLS_LIST_METHOD = "agent/tools/list"
+AGENT_STATS_READ_METHOD = "agent/stats/read"
+AGENT_IDENTITY_READ_METHOD = "agent/identity/read"
+AGENT_CATALOG_READ_METHODS = frozenset({
+    AGENT_SKILLS_LIST_METHOD,
+    AGENT_SKILLS_INSTALLED_METHOD,
+    AGENT_TOOLS_LIST_METHOD,
+    AGENT_STATS_READ_METHOD,
+    AGENT_IDENTITY_READ_METHOD,
+})
+"""The latent catalog reads one owner handler answers."""
+
+AGENT_CATALOG_WIRE_METHODS: Mapping[str, str] = {
+    "skills/list": AGENT_SKILLS_LIST_METHOD,
+    "skills/installed": AGENT_SKILLS_INSTALLED_METHOD,
+    "tools/list": AGENT_TOOLS_LIST_METHOD,
+    "stats/read": AGENT_STATS_READ_METHOD,
+    "identity/read": AGENT_IDENTITY_READ_METHOD,
+}
+"""The wire request each latent catalog read crosses as, keyed by public method."""
+
+AGENT_CATALOG_PUBLIC_METHODS: Mapping[str, str] = {
+    wire: public for public, wire in AGENT_CATALOG_WIRE_METHODS.items()
+}
+"""The app-server method each latent catalog carrier answers for."""
+
+# The review surface. Review checkpoints are session-local, memory-only state
+# created by the loop's own checkpoint recorder, so the review manager lives in
+# the loop that owns them: every read and mutation of that state is answered
+# where it exists, and the shipped review handler's validation, idle admission
+# and projection apply unchanged. A coordinator-side answer could only be a
+# copy of state it never held.
+AGENT_REVIEW_STATE_METHOD = "agent/review/state"
+AGENT_REVIEW_BASELINE_METHOD = "agent/review/baseline"
+AGENT_REVIEW_TURN_DIFF_METHOD = "agent/review/turn/diff"
+AGENT_REVIEW_HUNKS_METHOD = "agent/review/hunks"
+AGENT_REVIEW_APPROVE_METHOD = "agent/review/approve"
+AGENT_REVIEW_REVERT_METHOD = "agent/review/revert"
+AGENT_REVIEW_METHODS = frozenset({
+    AGENT_REVIEW_STATE_METHOD,
+    AGENT_REVIEW_BASELINE_METHOD,
+    AGENT_REVIEW_TURN_DIFF_METHOD,
+    AGENT_REVIEW_HUNKS_METHOD,
+    AGENT_REVIEW_APPROVE_METHOD,
+    AGENT_REVIEW_REVERT_METHOD,
+})
+"""The review requests one owner handler answers."""
+
+AGENT_REVIEW_WIRE_METHODS: Mapping[str, str] = {
+    "review/state": AGENT_REVIEW_STATE_METHOD,
+    "review/baseline": AGENT_REVIEW_BASELINE_METHOD,
+    "review/turnDiff": AGENT_REVIEW_TURN_DIFF_METHOD,
+    "review/hunks": AGENT_REVIEW_HUNKS_METHOD,
+    "review/approve": AGENT_REVIEW_APPROVE_METHOD,
+    "review/revert": AGENT_REVIEW_REVERT_METHOD,
+}
+"""The wire request each review call crosses as, keyed by public method."""
+
+AGENT_REVIEW_PUBLIC_METHODS: Mapping[str, str] = {
+    wire: public for public, wire in AGENT_REVIEW_WIRE_METHODS.items()
+}
+"""The app-server method each review carrier answers for."""
+
+# The MCP catalog surface. The agent owns the single orchestrator and the
+# catalog owner key, so every projection, mutation, login/logout and convergence
+# leg of the session-scoped mcp_catalog/* methods runs in that process; the
+# coordinator holds only projected views and revision keys and proxies control
+# over these typed requests. Each request also carries the typed owner key that
+# files the auth bindings agent-side.
+AGENT_MCP_CATALOG_READ_METHOD = "agent/mcp/catalog/read"
+AGENT_MCP_CATALOG_REFRESH_METHOD = "agent/mcp/catalog/refresh"
+AGENT_MCP_CATALOG_ADD_METHOD = "agent/mcp/catalog/add"
+AGENT_MCP_CATALOG_TOGGLE_METHOD = "agent/mcp/catalog/toggle"
+AGENT_MCP_CATALOG_REMOVE_METHOD = "agent/mcp/catalog/remove"
+AGENT_MCP_CATALOG_LOGIN_METHOD = "agent/mcp/catalog/login"
+AGENT_MCP_CATALOG_LOGOUT_METHOD = "agent/mcp/catalog/logout"
+AGENT_MCP_CATALOG_METHODS = frozenset({
+    AGENT_MCP_CATALOG_READ_METHOD,
+    AGENT_MCP_CATALOG_REFRESH_METHOD,
+    AGENT_MCP_CATALOG_ADD_METHOD,
+    AGENT_MCP_CATALOG_TOGGLE_METHOD,
+    AGENT_MCP_CATALOG_REMOVE_METHOD,
+    AGENT_MCP_CATALOG_LOGIN_METHOD,
+    AGENT_MCP_CATALOG_LOGOUT_METHOD,
+})
+"""The session-scoped MCP catalog requests one owner handler answers."""
+
+AGENT_MCP_CATALOG_PUBLIC_METHODS: Mapping[str, str] = {
+    AGENT_MCP_CATALOG_READ_METHOD: "mcp_catalog/read",
+    AGENT_MCP_CATALOG_REFRESH_METHOD: "mcp_catalog/refresh",
+    AGENT_MCP_CATALOG_ADD_METHOD: "mcp_catalog/add",
+    AGENT_MCP_CATALOG_TOGGLE_METHOD: "mcp_catalog/toggle",
+    AGENT_MCP_CATALOG_REMOVE_METHOD: "mcp_catalog/remove",
+    AGENT_MCP_CATALOG_LOGIN_METHOD: "mcp_catalog/login",
+    AGENT_MCP_CATALOG_LOGOUT_METHOD: "mcp_catalog/logout",
+}
+"""The app-server method each MCP catalog carrier answers for."""
+
+# The typed owner-key lifecycle. The coordinator mints one owner key per
+# session generation and sends it with every catalog request; release is
+# explicit on session end (replacing the GC weak-drop), and a plan-handoff
+# rotation re-keys atomically so the auth bindings survive the rotation.
+AGENT_MCP_OWNER_RELEASE_METHOD = "agent/mcp/owner/release"
+AGENT_MCP_OWNER_REKEY_METHOD = "agent/mcp/owner/rekey"
+
+# The config-reload convergence carriers. prepare/finish bracket the agent's
+# own config reload with the restrictive-suspension legs and return a typed
+# converged/partial receipt; fail runs the failure-restoration leg.
+AGENT_MCP_RELOAD_PREPARE_METHOD = "agent/mcp/reload/prepare"
+AGENT_MCP_RELOAD_FINISH_METHOD = "agent/mcp/reload/finish"
+AGENT_MCP_RELOAD_FAIL_METHOD = "agent/mcp/reload/fail"
+
+# The agent-emitted MCP auth relays, agent -> coordinator -> client on the
+# coordinator's notification pump: the login's authUrl and the registry's
+# authorization-required handshake (gated agent-side via the binding and the
+# read_mcp control port).
+AGENT_MCP_AUTH_URL_METHOD = "agent/mcp/catalog/authUrl"
+AGENT_MCP_AUTH_REQUIRED_METHOD = "agent/mcp/catalog/authRequired"
+
+# The root-recovery gate-eligibility evidence contract. The gate stays
+# coordinator-local, but every predicate input that lives with the loop crosses
+# this one request: the live [recovery.root] config read, the transcript-
+# integrity verdict projected from the live transcript, and the NON-MUTATING
+# availability snapshot. The coordinator re-fetches this bundle once per
+# schedule/admission decision — nothing is cached across a decision — and a
+# dead root answers the death receipt before any frame is sent. The typed
+# terminal projection of a failed turn rides the agent/turn/ended frame's
+# "failure" field instead (captured agent-side before callback cancellation).
+AGENT_RECOVERY_EVIDENCE_METHOD = "agent/recovery/evidence"
+
+
+class AgentRecoveryEvidence(BaseModel):
+    """The full gate-eligibility evidence set, built owner-side at reply time.
+
+    ``config`` is the live ``[recovery.root]`` section, ``integrity`` is the
+    transcript-integrity decline reason projected from the live transcript
+    (``None`` when the transcript is clean or the check itself failed —
+    meta-recovery never masks a decision), and ``availability`` is the
+    non-mutating same-base eligibility snapshot.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    config: RootRecoveryConfig
+    integrity: str | None = None
+    availability: AvailabilitySnapshot
+
+
+def decode_turn_failure(payload: Mapping[str, Any]) -> RootTurnFailure | None:
+    """Rebuild the typed terminal projection a turn/ended frame carries.
+
+    The field is optional: an older agent that predates the evidence contract
+    sends none, and the coordinator then simply has no projection to classify
+    (the gate declines "no_typed_projection" rather than guessing). A malformed
+    payload fails typed.
+    """
+    raw = payload.get("failure")
+    if raw is None:
+        return None
+    return RootTurnFailure.model_validate(_mapping(raw))
+
+
+class MCPCatalogReloadPlan(BaseModel):
+    """The typed prepare receipt of one config-reload MCP convergence.
+
+    The plan itself (the resolved previous catalog) stays agent-side between
+    the prepare and the finish request of the same owner key; the wire carries
+    only its revision-stamped receipt.
+    """
+
+    previous_revision: str
+    restrictive_names: list[str]
+
+
+class MCPCatalogReloadFinish(BaseModel):
+    """The typed converged/partial receipt of one config-reload convergence."""
+
+    converged: bool
+    runtime: dict[str, Any] | None = None
+
+
+class MCPOwnerKeyReceipt(BaseModel):
+    """The receipt of one typed owner-key lifecycle request."""
+
+    key: str
+    released: bool = False
+    rekeyed: bool = False
+
 
 RECONFIGURE_MODE_SETTINGS = "settings-update"
 RECONFIGURE_MODE_HISTORY_CLEAR = "history-clear"
@@ -358,12 +844,103 @@ AGENT_RECEIVING_REQUESTS = (
         AGENT_SESSION_POLICY_READ_METHOD,
         AGENT_SESSION_ROOTS_READ_METHOD,
         AGENT_SESSION_ROOTS_SAVE_METHOD,
+        # Prompt preparation: answered from the agent's own loop, model,
+        # cwd and session directory, because its fs reads and attachment
+        # writes cross the process boundary.
+        AGENT_WORKSPACE_PROMPT_PREPARE_METHOD,
+        # The configuration surface: the fields and settings projections of
+        # the agent's own orchestrator and layers, and the proxy settings
+        # read/write against the env file this process resolves.
+        AGENT_CONFIG_FIELDS_READ_METHOD,
+        AGENT_CONFIG_SETTINGS_READ_METHOD,
+        AGENT_CONFIG_PROXY_READ_METHOD,
+        AGENT_CONFIG_PROXY_WRITE_METHOD,
+        # The dangerous-command authority: the read projects the session's
+        # live and saved grants, and the CAS revoke names the generation the
+        # read observed, both answered where the session's store lives.
+        AGENT_POLICY_DANGEROUS_COMMANDS_READ_METHOD,
+        AGENT_POLICY_DANGEROUS_COMMANDS_REVOKE_METHOD,
+        # The subagent-management surface: a process-owned root owns its
+        # children, so cancel, guarded release, resume and reconcile answer
+        # from that process's own child records, and an operation those
+        # records cannot represent answers its typed lifecycle disposition.
+        AGENT_AGENTS_CANCEL_METHOD,
+        AGENT_AGENTS_RELEASE_METHOD,
+        AGENT_AGENTS_RESUME_METHOD,
+        AGENT_AGENTS_RECONCILE_METHOD,
+        # The live agent inventory: the revised snapshot of that same
+        # process-backed ownership, read as one typed control request.
+        AGENT_AGENTS_INVENTORY_READ_METHOD,
+        # G1b: the settled background runs that process recorded, read as the
+        # recovery sweep's source -- the run-completion notification's backstop.
+        AGENT_RUN_COMPLETIONS_READ_METHOD,
+        # The child transcript page: read through the live child's own reader
+        # or, once it is gone, from its saved transcript.
+        AGENT_CHILD_TRANSCRIPT_PAGE_METHOD,
+        # The live history page of the attached session: answered from the
+        # loop this agent owns, never from the host's persisted projection.
+        AGENT_SESSION_HISTORY_LIST_METHOD,
+        # The scheduled-loop surface: the schedule lives in this process's own
+        # loop manager, so every read and mutation of it is answered here and
+        # no coordinator copy of the schedule exists to drift.
+        AGENT_LOOPS_LIST_METHOD,
+        AGENT_LOOPS_CREATE_METHOD,
+        AGENT_LOOPS_DELETE_METHOD,
+        AGENT_LOOPS_CLEAR_METHOD,
+        # The diagnostics surface: the issues projection of this process's own
+        # loop and hook count, and the debug log page read through its own log
+        # reader with the request's own bounds and redaction.
+        AGENT_DIAGNOSTICS_LIST_METHOD,
+        AGENT_DIAGNOSTICS_LOGS_READ_METHOD,
+        # The latent catalog reads: the skills and tool inventory resolved
+        # against this process's own config and tool manager, the live counters
+        # of the loop it runs, and the identity its resources answer.
+        AGENT_SKILLS_LIST_METHOD,
+        AGENT_SKILLS_INSTALLED_METHOD,
+        AGENT_TOOLS_LIST_METHOD,
+        AGENT_STATS_READ_METHOD,
+        AGENT_IDENTITY_READ_METHOD,
+        # The review surface: the session-local checkpoints live in the loop
+        # this process owns, so every read and mutation of them is answered
+        # here and no coordinator copy of that state exists.
+        AGENT_REVIEW_STATE_METHOD,
+        AGENT_REVIEW_BASELINE_METHOD,
+        AGENT_REVIEW_TURN_DIFF_METHOD,
+        AGENT_REVIEW_HUNKS_METHOD,
+        AGENT_REVIEW_APPROVE_METHOD,
+        AGENT_REVIEW_REVERT_METHOD,
+        # The session-scoped MCP catalog surface: the agent owns the single
+        # orchestrator and the typed owner key, so every projection, mutation
+        # and auth leg runs here; the coordinator proxies control over the wire.
+        AGENT_MCP_CATALOG_READ_METHOD,
+        AGENT_MCP_CATALOG_REFRESH_METHOD,
+        AGENT_MCP_CATALOG_ADD_METHOD,
+        AGENT_MCP_CATALOG_TOGGLE_METHOD,
+        AGENT_MCP_CATALOG_REMOVE_METHOD,
+        AGENT_MCP_CATALOG_LOGIN_METHOD,
+        AGENT_MCP_CATALOG_LOGOUT_METHOD,
+        # The typed owner-key lifecycle: explicit release on session end, and
+        # the atomic re-key across a plan-handoff rotation.
+        AGENT_MCP_OWNER_RELEASE_METHOD,
+        AGENT_MCP_OWNER_REKEY_METHOD,
+        # The config-reload convergence legs around the agent's own reload.
+        AGENT_MCP_RELOAD_PREPARE_METHOD,
+        AGENT_MCP_RELOAD_FINISH_METHOD,
+        AGENT_MCP_RELOAD_FAIL_METHOD,
+        # The root-recovery gate-eligibility evidence contract: the
+        # coordinator-local gate's loop-owned predicate inputs are answered
+        # here at reply-write time, once per decision.
+        AGENT_RECOVERY_EVIDENCE_METHOD,
         # Served by the child agent process; the root refuses it typed.
         SUBAGENT_OPEN_METHOD,
         # Item 1 child seam: the publication teardown answers on its own
         # request id with the class it established, including the typed
         # refusal of an attempt this end never owned.
         AGENT_CHILD_TEARDOWN_METHOD,
+        # G5: a child asks its immediate parent for one typed authority
+        # decision before it runs an admitted tool. The parent answers from its
+        # CURRENT policy; a child never decides from a copy of it.
+        AGENT_AUTHORITY_CHECK_METHOD,
     })
     | POLICY_METHODS
 )
@@ -402,7 +979,77 @@ COORDINATOR_RECEIVING_NOTIFICATIONS = frozenset({
     AGENT_TURN_ENDED_METHOD,
     AGENT_TURN_EVENT_METHOD,
     AGENT_TURN_RETRYING_METHOD,
+    # The agent-emitted MCP auth relays: the login's authUrl and the
+    # authorization-required handshake gated owner-side, relayed to the client
+    # on the coordinator's notification pump.
+    AGENT_MCP_AUTH_URL_METHOD,
+    AGENT_MCP_AUTH_REQUIRED_METHOD,
+    # F10: the owner's child-inventory mutations, relayed onto the client's
+    # agents/update so root-owned children populate the agent browser.
+    AGENT_AGENTS_UPDATE_METHOD,
+    # G1b: the owner's settled background child runs, handed to the wake owner
+    # so the parent model is told a run finished (and can fetch its result).
+    AGENT_RUN_COMPLETED_METHOD,
+    # G5: the owner's authority revision advanced, so every decision taken
+    # under the previous vector is stale and must be asked again. The frame is
+    # an invalidation signal only -- it carries a fresh vector, never policy,
+    # and it grants nothing.
+    AGENT_AUTHORITY_CHANGED_METHOD,
 })
+
+CHILD_ORIGIN_REQUESTS = frozenset({
+    # G5b: a child's ONLY wire peer is the process that spawned it, so its
+    # authority question travels in this direction -- up the child's own pipe
+    # to the owner's per-child wire client. The owner binds the answering
+    # endpoint into that client when it publishes the child; a client with no
+    # bound endpoint answers the request typed, so a missing hop fails closed
+    # instead of leaving the child's tool call unanswered.
+    AGENT_AUTHORITY_CHECK_METHOD
+})
+"""Requests a spawned child asks its immediate parent's wire client.
+
+A child is never a coordinator: the tables above describe the two ends of the
+coordinator/agent wire, while this one describes the child/owner hop. Keeping
+it separate is what stops a child-origin frame from being served as if the
+coordinator had asked for it.
+"""
+
+CHILD_RECEIVING_NOTIFICATIONS = frozenset({
+    # G5b: the owner's invalidation, delivered down the child's own pipe. It is
+    # the same typed snapshot the coordinator receives for observability; on
+    # the child it is the ONLY signal that the vector it last saw moved. A
+    # child that never receives one simply asks again on its next decision --
+    # a dropped invalidation delays a refresh, it never launders a stale allow
+    # into an execution.
+    AGENT_AUTHORITY_CHANGED_METHOD
+})
+"""Notifications only an owner's per-child wire client sends its child."""
+
+
+def required_agent_capabilities(
+    method: str, params: Mapping[str, Any]
+) -> frozenset[str]:
+    """The additive capabilities one coordinator-origin request depends on.
+
+    A request that rides an additive wire feature names the capability it
+    needs. A peer whose ready frame did not announce that capability is a
+    version skew: the caller answers it typed with a restart instruction
+    instead of sending a frame an older peer would misread, fall back to
+    stale state, or replay.
+    """
+    if (
+        method == AGENT_SESSION_RECONFIGURE_METHOD
+        and params.get("mode") == RECONFIGURE_MODE_PLAN_HANDOFF
+    ):
+        return frozenset({AGENT_WIRE_CAPABILITY_PLAN_HANDOFF_ROTATION})
+    if method == AGENT_RECOVERY_EVIDENCE_METHOD:
+        return frozenset({AGENT_WIRE_CAPABILITY_RECOVERY_EVIDENCE})
+    if method == AGENT_AGENTS_INVENTORY_READ_METHOD:
+        return frozenset({AGENT_WIRE_CAPABILITY_LIVE_AGENT_INVENTORY})
+    if method == AGENT_RUN_COMPLETIONS_READ_METHOD:
+        return frozenset({AGENT_WIRE_CAPABILITY_ROOT_RUN_COMPLETIONS})
+    return frozenset()
+
 
 TURN_OUTCOME_COMPLETED = "completed"
 TURN_OUTCOME_FAILED = "failed"
@@ -573,6 +1220,21 @@ class AgentShellRefusedError(AgentWireError):
     """
 
 
+class AgentProtocolRefusal(AgentWireError):
+    """A refusal that publishes an app-server protocol code, not a class name.
+
+    Most refusals are named by their class, which IS their wire code. A request
+    the agent answers from a handler that already publishes the protocol's own
+    typed failures (a session mismatch, a rejected value, a busy session)
+    carries that code instead, so the coordinator reads the same failure the
+    in-process route publishes rather than a generic failure.
+    """
+
+    def __init__(self, code: ProtocolErrorCode, message: str) -> None:
+        super().__init__(message)
+        self.code = code
+
+
 _JSON_EVENT_TYPES: tuple[type[BaseEvent], ...] = (
     AssistantEvent,
     BackgroundJobsChangedEvent,
@@ -611,9 +1273,39 @@ _USER_INPUT_RESULT_TYPES: dict[str, type[BaseModel]] = {
 _IMAGES_ADAPTER: TypeAdapter[list[ImageAttachment]] = TypeAdapter(list[ImageAttachment])
 _RESOURCES_ADAPTER: TypeAdapter[list[UserResource]] = TypeAdapter(list[UserResource])
 
+CHILD_RUN_TURNS_FRAME_KEY = "live_turns_used"
+"""The child's run-progress turn count, stamped beside one relayed event (H1).
 
-def encode_event(event: BaseEvent) -> dict[str, Any]:
-    """Project one core event into its JSON-safe wire payload."""
+A child's run relays one event per streamed chunk and none at all for a
+tool-only step, so the frames it sends cannot count turns. The run's owner
+counts the assistant messages the run has committed and carries the running
+difference here -- a sibling of ``type``/``data``, never a field of the event
+itself: the event schema belongs to the core events, and a peer that does not
+know this key must still decode the frame. ``decode_event`` surfaces the value
+on the reconstructed event, so the reader that already receives events gets
+the count without a second method or an extra round trip. An absent key (an
+older peer) and a malformed value both read as unknown (``None``).
+"""
+
+
+def encode_event(
+    event: BaseEvent, *, live_turns_used: int | None = None
+) -> dict[str, Any]:
+    """Project one core event into its JSON-safe wire payload.
+
+    ``live_turns_used`` is the child's own run-progress count (see
+    ``CHILD_RUN_TURNS_FRAME_KEY``); a caller that does not report one keeps the
+    plain event payload, and a value the codec cannot carry is dropped rather
+    than failing the frame it rides.
+    """
+    payload = _encode_event_fields(event)
+    if _usable_turn_count(live_turns_used) is not None:
+        payload[CHILD_RUN_TURNS_FRAME_KEY] = live_turns_used
+    return payload
+
+
+def _encode_event_fields(event: BaseEvent) -> dict[str, Any]:
+    """The event's own wire fields, before any frame-level stamp."""
     match event:
         case ToolCallEvent():
             return {
@@ -650,7 +1342,46 @@ def encode_event(event: BaseEvent) -> dict[str, Any]:
 
 
 def decode_event(payload: Mapping[str, Any]) -> BaseEvent:
-    """Reconstruct one core event from its wire payload."""
+    """Reconstruct one core event from its wire payload.
+
+    A frame that carries the child's run-progress count (see
+    ``CHILD_RUN_TURNS_FRAME_KEY``) answers an event carrying the same value
+    under that name, so the reader that already consumes the event stream
+    reads the count without a second method or an extra round trip. A frame
+    from a peer that never sends the key -- and a malformed value -- answers a
+    plain event, which reads as unknown.
+    """
+    event = _decode_event_fields(payload)
+    live = _usable_turn_count(payload.get(CHILD_RUN_TURNS_FRAME_KEY))
+    if live is None:
+        return event
+    return event.model_copy(update={CHILD_RUN_TURNS_FRAME_KEY: live})
+
+
+def event_live_turns_used(event: BaseEvent) -> int | None:
+    """The run-progress turn count a decoded event carries, when usable.
+
+    The count is stamped on the event by ``decode_event`` and never derived
+    from the frames a run relayed: one event arrives per streamed chunk and a
+    tool-only step sends none, so the stream cannot count turns.
+    """
+    return _usable_turn_count(getattr(event, CHILD_RUN_TURNS_FRAME_KEY, None))
+
+
+def _usable_turn_count(value: object) -> int | None:
+    """A wire turn count only when it is a non-negative integer.
+
+    Mirrors the terminal carrier's own strictness (``reported_turns_used``): a
+    bool, a string, a float or a negative value is a peer value this reader
+    cannot trust, so the count stays unknown instead of being coerced.
+    """
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        return None
+    return value
+
+
+def _decode_event_fields(payload: Mapping[str, Any]) -> BaseEvent:
+    """The event a payload's own fields name, before any frame-level stamp."""
     kind = payload.get("type")
     if not isinstance(kind, str):
         raise UnsupportedAgentEventError(repr(kind))
@@ -1376,6 +2107,291 @@ def decode_inject_reply(payload: Mapping[str, Any]) -> list[BaseEvent]:
     return [decode_event(_mapping(event)) for event in events]
 
 
+@dataclass(frozen=True, slots=True)
+class AgentRunCompletion:
+    """One settled background child run, as the process that owns it observed it.
+
+    ``name`` is the owner's own display projection of the run's agent -- the
+    same string its inventory row carries -- so the coordinator composes the
+    model-facing wake without inventing a name of its own. ``status`` is the
+    settled ``RunStatus`` value and ``stop_reason`` the public
+    ``RunStopReason`` value (or ``None``); the pair is what the status word of
+    the wake text is derived from. ``(agent_id, run_id)`` is the result store
+    key the parent passes to ``get_agent_result``, and ``result_available``
+    says whether that exact run is still retrievable there.
+    """
+
+    session_id: str
+    agent_id: str
+    run_id: str
+    name: str
+    status: str
+    stop_reason: str | None
+    result_available: bool
+
+
+def encode_run_completion(completion: AgentRunCompletion) -> dict[str, Any]:
+    """Encode one settled run's completion frame, exactly as typed."""
+    return {
+        "session_id": completion.session_id,
+        "agent_id": completion.agent_id,
+        "run_id": completion.run_id,
+        "name": completion.name,
+        "status": completion.status,
+        "stop_reason": completion.stop_reason,
+        "result_available": completion.result_available,
+    }
+
+
+def decode_run_completion(payload: Mapping[str, Any]) -> AgentRunCompletion:
+    """Rebuild one completion frame; an inexact frame is refused typed.
+
+    The key set is exact: a frame that adds or omits a field is a version skew
+    between peers, and repairing it would fabricate the run the wake names.
+    """
+    keys = frozenset(payload)
+    if keys != AGENT_RUN_COMPLETION_FIELDS:
+        raise AgentWireError(
+            "a run-completion frame carries exactly "
+            f"{sorted(AGENT_RUN_COMPLETION_FIELDS)}, got {sorted(keys)}"
+        )
+    return AgentRunCompletion(
+        session_id=_require_str(payload["session_id"], "session id"),
+        agent_id=_require_str(payload["agent_id"], "agent id"),
+        run_id=_require_str(payload["run_id"], "run id"),
+        name=_require_str(payload["name"], "agent name"),
+        status=_require_str(payload["status"], "run status"),
+        stop_reason=_optional_str(payload["stop_reason"]),
+        result_available=bool(payload["result_available"]),
+    )
+
+
+def encode_run_completions(completions: Sequence[AgentRunCompletion]) -> dict[str, Any]:
+    """Encode the owner's completion ledger for the recovery read."""
+    return {"completions": [encode_run_completion(item) for item in completions]}
+
+
+def decode_run_completions(payload: Mapping[str, Any]) -> list[AgentRunCompletion]:
+    """Rebuild the completion ledger one recovery read answered with."""
+    items = payload.get("completions")
+    if not isinstance(items, list):
+        raise AgentWireError("a run-completions reply carries no completion list")
+    return [decode_run_completion(_mapping(item)) for item in items]
+
+
+@dataclass(frozen=True, slots=True)
+class AgentAuthorityCheck:
+    """One per-decision authority question a child asks its immediate parent.
+
+    ``implementation`` is the registry-provenance identity
+    (:func:`implementation_identity`) of the exact tool class the child intends
+    to run, and ``arguments`` are that invocation's canonical arguments. Both
+    are EVIDENCE for the parent, never authority: the parent resolves its own
+    implementation of ``tool_name``, refuses any identity that is not the same
+    class, and validates the arguments against that class before it decides.
+    ``epoch`` is the child incarnation's fresh random epoch, ``child_generation``
+    its run generation, ``request_id`` the agent-origin id the reply must
+    answer, and ``revision`` the child's last-known parent revision vector.
+    """
+
+    decision_kind: str
+    tool_name: str
+    implementation: str
+    arguments: Mapping[str, Any]
+    child_agent_id: str
+    child_generation: int
+    epoch: str
+    parent_session_id: str
+    parent_incarnation: str
+    request_id: str
+    revision: Mapping[str, int]
+
+
+def implementation_identity(tool_class: type[Any]) -> str:
+    """The registry-provenance identity both peers compute for one implementation.
+
+    The defining module and qualified name are what ``shipped_builtin_name``
+    already treats as the ground truth of builtin identity, and both are stable
+    across the two processes of a same-version pair, so an identity a child
+    claims is comparable with the class its parent resolves by name.
+    """
+    return f"{tool_class.__module__}:{tool_class.__qualname__}"
+
+
+def encode_authority_check(check: AgentAuthorityCheck) -> dict[str, Any]:
+    """Encode one authority question, exactly as typed."""
+    return {
+        "decision_kind": check.decision_kind,
+        "tool_name": check.tool_name,
+        "implementation": check.implementation,
+        "arguments": dict(check.arguments),
+        "child_agent_id": check.child_agent_id,
+        "child_generation": check.child_generation,
+        "epoch": check.epoch,
+        "parent_session_id": check.parent_session_id,
+        "parent_incarnation": check.parent_incarnation,
+        "request_id": check.request_id,
+        "revision": dict(check.revision),
+    }
+
+
+def decode_authority_check(payload: Mapping[str, Any]) -> AgentAuthorityCheck:
+    """Rebuild one authority question; an inexact frame is refused typed."""
+    keys = frozenset(payload)
+    if keys != AGENT_AUTHORITY_CHECK_FIELDS:
+        raise AgentWireError(
+            "an authority-check frame carries exactly "
+            f"{sorted(AGENT_AUTHORITY_CHECK_FIELDS)}, got {sorted(keys)}"
+        )
+    decision_kind = _require_str(payload["decision_kind"], "decision kind")
+    if decision_kind not in AGENT_AUTHORITY_DECISION_KINDS:
+        raise AgentWireError(f"unknown authority decision kind {decision_kind!r}")
+    return AgentAuthorityCheck(
+        decision_kind=decision_kind,
+        tool_name=_require_str(payload["tool_name"], "tool name"),
+        implementation=_require_str(
+            payload["implementation"], "implementation identity"
+        ),
+        arguments=_authority_arguments(payload["arguments"]),
+        child_agent_id=_require_str(payload["child_agent_id"], "child agent id"),
+        child_generation=_require_int(payload["child_generation"], "child generation"),
+        epoch=_require_str(payload["epoch"], "child epoch"),
+        parent_session_id=_require_str(payload["parent_session_id"], "parent session"),
+        parent_incarnation=_require_str(
+            payload["parent_incarnation"], "parent incarnation"
+        ),
+        request_id=_require_str(payload["request_id"], "request id"),
+        revision=_authority_revision(payload["revision"]),
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class AgentAuthorityDecision:
+    """One typed answer to an authority question.
+
+    It is fenced to the exact question it answers: the same ``epoch``,
+    ``parent_session_id``, ``parent_incarnation``, ``child_generation`` and
+    ``request_id`` come back with the owner's ``revision`` vector at decision
+    time, so a child can reject a reply minted for another incarnation, another
+    run or another outstanding request.
+    """
+
+    decision: str
+    reason: str | None
+    epoch: str
+    parent_session_id: str
+    parent_incarnation: str
+    child_generation: int
+    request_id: str
+    revision: Mapping[str, int]
+
+
+def encode_authority_decision(decision: AgentAuthorityDecision) -> dict[str, Any]:
+    """Encode one authority answer, exactly as typed."""
+    if decision.decision not in AGENT_AUTHORITY_DECISIONS:
+        raise AgentWireError(f"unknown authority decision {decision.decision!r}")
+    return {
+        "decision": decision.decision,
+        "reason": decision.reason,
+        "epoch": decision.epoch,
+        "parent_session_id": decision.parent_session_id,
+        "parent_incarnation": decision.parent_incarnation,
+        "child_generation": decision.child_generation,
+        "request_id": decision.request_id,
+        "revision": dict(decision.revision),
+    }
+
+
+def decode_authority_decision(payload: Mapping[str, Any]) -> AgentAuthorityDecision:
+    """Rebuild one authority answer; an inexact or unknown answer fails typed."""
+    keys = frozenset(payload)
+    if keys != AGENT_AUTHORITY_DECISION_FIELDS:
+        raise AgentWireError(
+            "an authority-decision frame carries exactly "
+            f"{sorted(AGENT_AUTHORITY_DECISION_FIELDS)}, got {sorted(keys)}"
+        )
+    decision = _require_str(payload["decision"], "authority decision")
+    if decision not in AGENT_AUTHORITY_DECISIONS:
+        raise AgentWireError(f"unknown authority decision {decision!r}")
+    return AgentAuthorityDecision(
+        decision=decision,
+        reason=_optional_str(payload["reason"]),
+        epoch=_require_str(payload["epoch"], "child epoch"),
+        parent_session_id=_require_str(payload["parent_session_id"], "parent session"),
+        parent_incarnation=_require_str(
+            payload["parent_incarnation"], "parent incarnation"
+        ),
+        child_generation=_require_int(payload["child_generation"], "child generation"),
+        request_id=_require_str(payload["request_id"], "request id"),
+        revision=_authority_revision(payload["revision"]),
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class AgentAuthorityChanged:
+    """The owner's fresh authority snapshot after its policy mutated.
+
+    The notification is an invalidation signal only: it carries no policy and
+    grants no decision. A child that holds one of these knows only that the
+    vector it last saw is stale, so it must ask again rather than re-decide.
+    """
+
+    session_id: str
+    incarnation: str
+    revision: Mapping[str, int]
+
+
+def encode_authority_changed(changed: AgentAuthorityChanged) -> dict[str, Any]:
+    """Encode one authority-change snapshot, exactly as typed."""
+    return {
+        "session_id": changed.session_id,
+        "incarnation": changed.incarnation,
+        "revision": dict(changed.revision),
+    }
+
+
+def decode_authority_changed(payload: Mapping[str, Any]) -> AgentAuthorityChanged:
+    """Rebuild one authority-change snapshot; an inexact frame fails typed."""
+    keys = frozenset(payload)
+    if keys != AGENT_AUTHORITY_CHANGED_FIELDS:
+        raise AgentWireError(
+            "an authority-change frame carries exactly "
+            f"{sorted(AGENT_AUTHORITY_CHANGED_FIELDS)}, got {sorted(keys)}"
+        )
+    return AgentAuthorityChanged(
+        session_id=_require_str(payload["session_id"], "session id"),
+        incarnation=_require_str(payload["incarnation"], "parent incarnation"),
+        revision=_authority_revision(payload["revision"]),
+    )
+
+
+def encode_parent_incarnation(incarnation: str) -> str:
+    """Encode the owner incarnation a spawn payload carries to its child."""
+    if not isinstance(incarnation, str) or not incarnation.strip():
+        raise AgentWireError("a parent incarnation is a non-empty string")
+    return incarnation
+
+
+def decode_parent_incarnation(payload: Mapping[str, Any]) -> str:
+    """Rebuild the owner incarnation a spawn payload carried, or fail typed.
+
+    A payload without the key is a peer that cannot be asked for live
+    authority, so the child's open refuses rather than opening an agent that
+    would have to decide unfenced.
+    """
+    if PARENT_INCARNATION_PAYLOAD_KEY not in payload:
+        raise AgentWireError(
+            "the spawn payload carries no parent incarnation, so the child "
+            "could not name the owner it asks"
+        )
+    value = payload[PARENT_INCARNATION_PAYLOAD_KEY]
+    if not isinstance(value, str) or not value.strip():
+        raise AgentWireError(
+            "the spawn payload's parent incarnation is not a non-empty string"
+        )
+    return value
+
+
 def encode_notice(event: BaseEvent) -> dict[str, Any]:
     """Encode one turn-less notice: an out-of-band event class only."""
     name = type(event).__name__
@@ -1618,6 +2634,7 @@ def encode_session_snapshot(snapshot: AgentSessionSnapshot) -> dict[str, Any]:
         "runtime": snapshot.runtime.model_dump(mode="json"),
         "session_dir": snapshot.session_dir,
         "jobs_dir": snapshot.jobs_dir,
+        "agent_sequence": snapshot.agent_sequence,
     }
 
 
@@ -1644,6 +2661,8 @@ def decode_session_snapshot(payload: Mapping[str, Any]) -> AgentSessionSnapshot:
         runtime=RuntimeSnapshot.model_validate(_mapping(payload.get("runtime"))),
         session_dir=_optional_str(payload.get("session_dir")),
         jobs_dir=_optional_str(payload.get("jobs_dir")),
+        agent_sequence=_optional_int(payload.get("agent_sequence"), "agent sequence")
+        or 0,
     )
 
 
@@ -2204,6 +3223,35 @@ def _require_float(value: object, what: str) -> float:
     if not isinstance(value, int | float) or isinstance(value, bool):
         raise UnsupportedAgentRequestError(f"the frame carries no {what}")
     return float(value)
+
+
+def _require_int(value: object, what: str) -> int:
+    if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+        raise UnsupportedAgentRequestError(f"the frame carries no {what}")
+    return value
+
+
+def _authority_arguments(value: object) -> Mapping[str, Any]:
+    """One invocation's canonical arguments: a string-keyed JSON mapping."""
+    if not isinstance(value, Mapping) or any(not isinstance(key, str) for key in value):
+        raise UnsupportedAgentRequestError("the frame carries no canonical arguments")
+    return dict(value)
+
+
+def _authority_revision(value: object) -> Mapping[str, int]:
+    """One complete authority revision vector; a partial one is a version skew."""
+    if (
+        not isinstance(value, Mapping)
+        or frozenset(value) != AUTHORITY_REVISION_COMPONENTS
+    ):
+        raise UnsupportedAgentRequestError(
+            "the frame carries no authority revision vector covering "
+            f"{sorted(AUTHORITY_REVISION_COMPONENTS)}"
+        )
+    return {
+        str(component): _require_int(item, "authority revision component")
+        for component, item in value.items()
+    }
 
 
 def _mapping(value: object) -> Mapping[str, Any]:

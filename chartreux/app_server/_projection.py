@@ -345,6 +345,10 @@ def _project_model_config(
         thinking=model.thinking,
         supports_images=model.supports_images,
         display_name=format_model_display_name(model.provider, model.name),
+        # The trigger this deployment resolves, so a client measures usage
+        # against compaction and never against the hard context window -- the
+        # same value the auto-compaction middleware compares tokens with.
+        auto_compact_threshold=model.auto_compact_threshold,
         thinking_levels=list(project_thinking_levels(config, model)),
     )
 

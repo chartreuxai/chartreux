@@ -38,7 +38,7 @@ max_results = 5
 
 ## Background stop and replacement
 
-`cancel_agent(agent_id, run_id=None)` requests a stop for the owning parent's background run. Pin `run_id` to avoid stopping newer work; omission selects the active run atomically. Its dispositions are `stop_requested`, `already_stopping`, `already_finishing`, `not_running`, `unknown_run`, and `forbidden`. Acceptance is not terminal cancellation: use `wait_for_agent` or `get_agent_result` after cleanup. Partial accumulated output and the winning stop reason are preserved subject to retention; zero-retention may evict the agent at finalization. Foreground runs are unsupported.
+`cancel_agent(agent_id, run_id=None)` requests a stop for the owning parent's background run. Pin `run_id` to avoid stopping newer work; omission selects the active run atomically. Its dispositions are `stop_requested`, `already_stopping`, `already_finishing`, `not_running`, `unknown_run`, and `forbidden`. Acceptance is not terminal cancellation: after cleanup, collect the terminal result with `get_agent_result` when the completion notification arrives. If cleanup is still running, a blocking `wait_for_agent` applies only under the ordinary three-condition wait exception — the result is a hard dependency of the next action, no independent work can proceed, and that action must occur in this turn rather than after notification — and an uncertain condition means ending the turn. Partial accumulated output and the winning stop reason are preserved subject to retention; zero-retention may evict the agent at finalization. Foreground runs are unsupported.
 
 `task(agent_id=..., replace_run=True)` stops busy work and launches its replacement in the same conversation only after old cleanup and result publication join. It holds the existing capacity allocation, works at capacity, and injects a deterministic supersession frame. Busy replacement forbids launch-config and identity changes; idle reuse keeps reconfiguration. Check `launch_outcome`: `already_stopping`, `already_finishing`, and `rejected_reservation` mean no launch. Successful replacement reports `metadata.replaced_run_id` and `metadata.replacement_run_id`. Caller cancellation or authority revocation prevents replacement admission; admission failure never resumes the old run.
 
@@ -229,7 +229,17 @@ Pruning applies during walks only: a touched path named at the top level is neve
 
 Budget semantics: inside this scoped submission scan the walk budget counts only the entries the run's write window can inspect, so a repository tree of pre-session files no longer exhausts it with nothing left to inspect. A separate absolute enumeration cap (65536 entries) bounds the raw walk, and reaching either limit still reports `scan-incomplete`, which blocks. A scan invoked without the scope keeps the count-every-entry budget.
 
-Accepted residual: content under a transient root is not inspected at submission (the report text channel is likewise unscanned), so a secret can pass a submission by living in a scratchpad or temp file. The pre-commit hook is untouched and still scans every staged blob, so a staged secret cannot ship through it.
+### Approved synthetic matches (submission manifest)
+
+The scan's only suppression surface is one repo-committed manifest, `.chartreux-secret-scan.json` (`schema_version: 1`, an `approved_matches` list, and a `residual_exclusions` list). An approved entry keys on the canonical project-relative path, the rule ID, and a digest of the rule's value-span bytes — the complete sensitive material that rule captures — so reformatting the surrounding line does not restore the hit when the digest covers a capture group alone (the generic keyword rule digests its captured value). The basis is per rule: a full-match rule digests the matched bytes themselves — the AWS secret rule's span is keyword, separator, quotes, and value together — so reformatting inside that match changes the digest, invalidates the approval, and blocks at both gates, a documented brittleness of the full-match basis. `residual_exclusions` behaves differently: it carries no digest, so reformatting the matched bytes does not disturb an entry. Only rules whose match span covers the complete credential are approvable: the private-key header rule is not (its span is the constant header alone), because approving that digest would suppress any private key at the path. `residual_exclusions` is the separate, digest-less (path, rule) section reserved for exactly those partial-coverage rules, and every other rule's match in a residual path still blocks at both gates. Its initial membership is **empty**: the executed inventory found every one of the twelve formerly excluded files full-coverage, so the pre-commit YAML exclude list shrank to zero and no residual entry ships. A future member is a release-reviewed policy addition with a recorded rationale — never a whole-file bypass.
+
+Both gates apply the manifest from the committed HEAD blob (`git show HEAD:<manifest>`), never from the working tree or the staged index. The submission gate freezes the manifest's revision digest into the run's completion contract at admission and re-reads the committed HEAD copy at scan time: an absent, unborn-HEAD, or malformed manifest means no approvals are active (fail closed), and a manifest that changed after admission — a worker's own mid-run commit included — surfaces a `policy_mismatch` that never masks simultaneous rule hits, is parent-retryable only, and is never auto-retried. The pre-commit hook reads the same committed HEAD manifest, so a single commit staging both a secret and its matching approval does not self-authorize, while a fresh clone carries the manifest as ordinary repository content and accepts the commit.
+
+A new synthetic value the repository must publish follows the approval-first two-commit sequence inside one reviewed change: commit the manifest entry first (path, rule, digest — no secret bytes enter the repository), then commit the fixture. A value update follows the same ordering and removes the old entry in the same change. Review bars entries for values the repository never publishes and expects non-functional fake values; a worker may never approve its own submission.
+
+Entry digests stay internal: findings and typed diagnostics may carry the manifest's revision digest or an entry's identifier (its position in `approved_matches`), never an entry digest, so the manifest is not an offline oracle over an approved value.
+
+Accepted residual: content under a transient root is not inspected at submission (the report text channel is likewise unscanned), so a secret can pass a submission by living in a scratchpad or temp file. The pre-commit hook is not bypassed by that placement: it scans the staged content it is handed — each path's git-index blob, never the working tree — and suppresses only a match covered by an approved entry in the committed HEAD manifest. A staged deletion ships no content, so there is nothing to scan for it; any other staged path whose content cannot be read blocks the commit fail-closed, and a staged credential with no approved entry cannot ship through it.
 
 Scope note: files written through the shell — redirects, `tee`, `sed -i`, heredocs, `cp`/`mv`/`install` destinations, `dd` output files — are not touched paths, but they are no longer unseen: the shell permission resolver collects each shell command's write-classified paths (`shell_command_write_paths`) and the submission gate adds them to the scan scope. The modeled network clients' downloads join that surface: `curl -o`/`--output` and `wget -O`/`--output-document` were always collected, and the derivable default downloads are too — `curl -O`/`--remote-name` and a plain `wget <url>` write the URL's file part in the working directory (under `--output-dir`/`-P` when given), so the scan sees them. The derivation is per URL for curl and per invocation for wget: curl's `-o`/`--output` and `-O`/`--remote-name` operands pair with the URLs one-for-one in command-line order (curl's man: "the first -o is for the first URL and so on"), so a paired `-o -` writes to stdout, only a URL with no paired output takes the `--remote-name-all` default, and every derivable destination of a multi-URL invocation is collected — with `--output-dir` composed into each relative `-o` operand, the collected write is the path curl actually writes; wget's `-O`/`--output-document` concatenates all documents into its one file, so it is itself the collected write and suppresses the derived names for every URL. Several download names are not derivable before the run and stay accepted scan limits: `curl -J`/`--remote-header-name` and `wget --content-disposition` save under the server-chosen `Content-Disposition` filename, which only exists once the response arrives, so such a download's file is not in the collected write surface (the URL-derived name the resolver does collect is not the file those flags write); `wget -E`/`--adjust-extension` renames the downloaded file after the transfer to match its content type, so the derived URL name is not the final file; and `wget -i`/`--input-file` reads its URLs from a file, so no download names are derived at all. Permitted inline interpreters are a named accepted residual on the other side: `python -c` and same-class `code -c`-style invocations, admitted by pinned policy, execute opaque code whose writes cannot be statically collected, so their write surface is outside the scan's guarantee. When a command's write surface cannot be established (an unmodeled construct, a failed analysis), the gate records an unknown-write-footprint sentinel and blocks the submission exactly like a scan-incomplete artifact, so the shell's write surface is covered fail-closed too. The backstops for what remains are the redaction backstop, which masks known secret values in tool output, and the pre-commit hook, which scans the staged content of the files actually being committed (read from the git index, not the working tree, so reverting a file on disk cannot launder a staged secret). A file staged for deletion ships no content, so the hook has nothing to scan for it; a path whose staged content cannot be read for any other reason blocks the commit fail-closed.
 
@@ -321,6 +331,35 @@ documented, not gated. They end with the root runtime; see
 daemon manager: arbitrary program effects are not contained, escaped descendants
 may survive, and crashes or forced process termination cannot guarantee cleanup.
 Jobs are not adopted after a restart.
+
+## Managed temporary files
+
+Verification runs write their temporary state under managed roots, not the
+shared per-user temp tree. A default `pytest` run in this repository is
+redirected by the repo-local `pytest_chartreux` plugin to a marked per-run root
+`<temproot>/chartreux-managed-<uid>/pytest-run-<rand>` (xdist workers share
+their controller's root), so no `pytest-of-<user>` numbered root is created; the
+legacy `/tmp/pytest-of-<user>` tree is never swept automatically. All native
+pytest deletion routes (the green whole-root cleanup, the per-test fixture
+dirs, an explicit basetemp's first-use wipe) pass the live-user gates, so
+nothing is deleted under a process that still holds it.
+
+The repository sets `tmp_path_retention_policy = "failed"`: a run retains only
+the failed tests' call-phase `tmp_path` directories and removes passed tests'
+dirs as they finish. Artifacts of setup/teardown-phase failures may not be
+retained under this policy — for deeper debugging, copy what you need before
+teardown, or rerun with a temporary `-o tmp_path_retention_policy=all` override.
+Red-run leftovers are marked allocations: once the owning run has exited they
+are reapable by the startup reaper; copy or rerun to preserve wanted artifacts.
+
+A worker run that needs its own destination passes an explicit `--basetemp`
+(and cache dirs) under its session scratchpad in a fresh, unique invocation
+directory: explicit destinations take precedence over the managed run root,
+land under the scratchpad, and are never reaped automatically. A destination
+chosen outside the scratchpad is user-owned and outside automatic reaping. In
+both cases the worker cleans only its own completed invocation's outputs, after
+preserving any requested diagnostics — no wildcard cleanup, and never a
+directory a still-running job is using.
 
 ## Shell authority and diagnostics
 

@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections import Counter
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+import re
 import time
 from typing import Any, ClassVar, Literal
 
@@ -44,6 +45,33 @@ def _run_outcome(agent: AgentSummaryModel) -> str | None:
     if agent.availability.lower() in {"failed", "error"}:
         return "failed"
     return None
+
+
+_ATTEMPT_HANDLE = re.compile(r"(?:^|-)attempt-([0-9a-f]{32})\Z")
+
+
+def short_agent_display_id(agent_id: str) -> str:
+    """The short DISPLAY form of a process-topology handle (R2).
+
+    A process-backed child's handle is ``{identity}-attempt-<uuid4 hex>``:
+    far too long to read beside a row's name or inside a prompt. The short
+    form keeps the attempt marker and the attempt uuid's first eight
+    characters (``attempt-1a2b3c4d``). Anything that is not exactly that
+    shape -- an in-process id, an already-short form, a foreign or malformed
+    record -- is returned unchanged, so an unexpected handle is never mangled.
+
+    Two attempts can share their first eight characters, which is why this
+    form is display-only and never a lookup key: the full handle stays on
+    every surface that acts on it (``full_metadata``, the launch ack's
+    structured fields and its ``agent_id=`` continuation instruction, wake
+    text, ``check_agents`` rows and every tool argument).
+    """
+    if not agent_id:
+        return agent_id
+    match = _ATTEMPT_HANDLE.search(agent_id)
+    if match is None:
+        return agent_id
+    return f"attempt-{match.group(1)[:8]}"
 
 
 def agent_state(agent: AgentSummaryModel) -> str:  # noqa: PLR0911 - state matrix
@@ -993,8 +1021,8 @@ class AgentBar(Vertical):  # noqa: PLR0904 -- Textual actions and event handlers
             )
             label = (agent.name or agent.agent_id) if agent is not None else agent_id
             self.query_one("#agent-release-prompt", NoMarkupStatic).update(
-                f"Release {label} ({agent_id})? Retained results and browser "
-                "access are discarded."
+                f"Release {label} ({short_agent_display_id(agent_id)})? Retained "
+                "results and browser access are discarded."
             )
 
     def _rows_content(self, rows: list[_Row]) -> Content:
@@ -1291,12 +1319,12 @@ class AgentBar(Vertical):  # noqa: PLR0904 -- Textual actions and event handlers
     def _agent_row(
         self, agent: AgentSummaryModel
     ) -> tuple[str, tuple[int, int] | None]:
-        """The agent row: derived name primary, handle dim secondary."""
+        """The agent row: derived name primary, short handle dim secondary."""
         state = _state_label(self._display_state(agent), _run_outcome(agent))
         return self._row_spans(
             agent.agent_id,
             agent.name or agent.agent_id,
-            secondary=agent.agent_id,
+            secondary=short_agent_display_id(agent.agent_id),
             state=state,
             uncollected=len(agent.uncollected_run_ids),
         )
@@ -1375,7 +1403,10 @@ class AgentBar(Vertical):  # noqa: PLR0904 -- Textual actions and event handlers
         model = agent_model_display_name(agent) or "unknown"
         context = _context_text(
             agent.context_tokens,
-            agent.context_window,
+            # Usage is measured against the agent's own compaction trigger, the
+            # same denominator the main row uses; an unobserved trigger renders
+            # unknown rather than borrowing the hard context window.
+            agent.context_threshold,
             compacting=agent.compacting,
             last_recorded=availability in {"closed", "evicted"},
         )
@@ -1430,6 +1461,12 @@ class AgentBar(Vertical):  # noqa: PLR0904 -- Textual actions and event handlers
             ),
             (
                 "Auto-compact threshold",
+                str(agent.context_threshold)
+                if agent.context_threshold is not None
+                else None,
+            ),
+            (
+                "Context window",
                 str(agent.context_window) if agent.context_window is not None else None,
             ),
             ("Result expired", str(agent.result_expired)),
@@ -1468,7 +1505,7 @@ class AgentBar(Vertical):  # noqa: PLR0904 -- Textual actions and event handlers
             + "\n"
             + _context_text(
                 agent.context_tokens,
-                agent.context_window,
+                agent.context_threshold,
                 compacting=agent.compacting,
                 last_recorded=agent.availability.lower() in {"closed", "evicted"},
             )

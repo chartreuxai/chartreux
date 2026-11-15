@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import base64
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -102,6 +103,35 @@ def _spec_names(manager: ToolManager) -> set[str]:
     return {spec.name for spec in manager.available_tool_specs()}
 
 
+class _LiveOwner:
+    """A stand-in for a process child's live authority client (G5b)."""
+
+    def __init__(self, verdicts: dict[str, bool]) -> None:
+        self._verdicts = verdicts
+
+    def catalog_withholds(self, tool_name: str) -> bool:
+        return self._verdicts.get(tool_name, False)
+
+
+def _live_manager(
+    tmp_path: Path,
+    config: ChartreuxConfigSchema,
+    identity: str,
+    parent: ToolManager | None,
+    owner: Any,
+) -> ToolManager:
+    return ToolManager(
+        lambda: config,
+        cwd=tmp_path,
+        defer_mcp=True,
+        accepted_token_getter=lambda: "accepted",
+        bound_identity=identity,
+        parent_authority_getter=(lambda: parent) if parent is not None else None,
+        parent_authority_revision_getter=((lambda: 0) if parent is not None else None),
+        live_authority_getter=lambda: owner,
+    )
+
+
 def test_vision_child_of_non_vision_parent_keeps_read_image(tmp_path: Path) -> None:
     """Non-vision parent + vision child: the child catalog stays truthful."""
     parent = _manager(tmp_path, _config("text"), "coder")
@@ -169,6 +199,41 @@ def test_authority_filtering_unchanged_under_the_capability_fix(tmp_path: Path) 
     assert set(MUTATING_TOOLS) <= set(parent.available_tools)
     # ... while its delegation ceiling stays non-mutating.
     assert set(MUTATING_TOOLS).isdisjoint(set(parent.delegable_tools))
+
+
+def test_a_live_verdict_narrows_the_catalog_and_never_widens_the_ceiling(
+    tmp_path: Path,
+) -> None:
+    """The live owner axis (G5b) only ever REMOVES from a child's catalog.
+
+    A process child's ceiling is decided in the parent's process, so the
+    manager asks the live client. That axis is a narrowing on top of the
+    authority axes already pinned above: a name the owner withholds leaves the
+    advertised specs, an owner allow never restores a name the delegation
+    posture or the delegation ceiling removed, and an unreadable verdict
+    withholds.
+    """
+    parent = _manager(tmp_path, _config("text"), "researcher")
+    owner = _LiveOwner({"read_file": True})
+    child = _live_manager(tmp_path, _config("text"), "coder", parent, owner)
+
+    specs = _spec_names(child)
+    # The owner's deny removes an otherwise-admitted non-mutating tool.
+    assert "read_file" not in specs
+    assert "read_file" in child.child_catalog_withholdings()
+    # An allow cannot restore a tool the parent's delegation posture removed.
+    assert "grep" in specs
+    for name in MUTATING_TOOLS:
+        assert name not in specs, name
+    assert set(MUTATING_TOOLS) <= child.child_catalog_withholdings()
+
+    # An unreadable verdict is a withholding, never an advertisement.
+    class _Broken:
+        def catalog_withholds(self, tool_name: str) -> bool:
+            raise RuntimeError("the owner's catalog cache is unreadable")
+
+    broken = _live_manager(tmp_path, _config("text"), "coder", parent, _Broken())
+    assert "grep" in broken.child_catalog_withholdings()
 
 
 @pytest.mark.asyncio

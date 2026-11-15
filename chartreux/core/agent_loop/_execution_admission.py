@@ -23,10 +23,20 @@ requirements privately. The gate re-arms a permit in the grant store for the
 duration of one synchronous revalidation and consumes it again before
 execution, so the re-armed authority is observable by no other coroutine: the
 gate never awaits.
+
+G5b adds one asynchronous leg for a PROCESS child: its ceiling lives in the
+process that spawned it, so the gate asks the owner again AFTER the snapshot
+await and immediately before the synchronous revalidation. That ask is the last
+thing that can stop the call: nothing awaits between it and ``invoke``, so a
+revocation ordered before the answer is not bypassed by the call, while a
+revocation ordered after it is the next call's problem — the per-decision
+contract the owner's own stability loop guarantees.
 """
 
 from __future__ import annotations
 
+import asyncio
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
@@ -136,3 +146,56 @@ def revalidate_execution_admission(
     if resolved is not None and resolved.permission == ToolPermission.NEVER:
         return resolved.reason or f"Tool '{tool_name}' is disabled by policy"
     return None
+
+
+def canonical_live_authority_arguments(args: Any) -> Mapping[str, Any]:
+    """The canonical arguments one live-authority question carries.
+
+    Both ends must agree on what "these arguments" means, so the wire form is
+    the validated model's JSON projection: exactly the values the invocation
+    will run with, in a shape the owner can re-validate against its own
+    implementation. A model that cannot project fails closed at the caller.
+    """
+    dump = getattr(args, "model_dump", None)
+    if dump is None:
+        return dict(args) if isinstance(args, Mapping) else {}
+    return dump(mode="json")
+
+
+async def live_authority_admission_denial(
+    tool: BaseTool, args: Any, tool_manager: ToolManager
+) -> str | None:
+    """Ask the live owner again at the execution handoff; ``None`` when allowed.
+
+    This is the ASYNC leg of the gate (G5b) and it is deliberately placed after
+    the file-snapshot await: that await is the world-change window in which an
+    owner can tighten or revoke, and a decision taken before it would authorize
+    the call on policy that no longer exists. Every failure of the question —
+    no live client, a dead pipe, a timeout, an unreadable or foreign answer —
+    is a denial: only the owner's own allow lets the call through.
+    """
+    ask = getattr(tool_manager, "live_authority_denial", None)
+    if ask is None:
+        return None
+    try:
+        arguments = canonical_live_authority_arguments(args)
+    except Exception:
+        logger.warning(
+            "Execution admission could not canonicalize the arguments tool=%s",
+            tool.get_name(),
+            exc_info=True,
+        )
+        return f"Tool '{tool.get_name()}' denied: its arguments cannot be presented to live authority"
+    try:
+        return await ask(tool.get_name(), type(tool), arguments)
+    except asyncio.CancelledError:
+        raise
+    except BaseException:
+        # The manager already maps a failed ask to a refusal; this is the
+        # belt-and-braces path for an ask that itself raised.
+        logger.warning(
+            "Execution admission live-authority ask failed tool=%s",
+            tool.get_name(),
+            exc_info=True,
+        )
+        return f"Tool '{tool.get_name()}' denied: live authority is unavailable"

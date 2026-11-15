@@ -471,11 +471,20 @@ class SubagentCompletion:
     lives and the frame carries it (item 2 B.3), because the ``outcome``/
     ``error`` strings alone cannot reconstruct the measured call evidence and
     parent-side eligibility would fail closed for every transient family.
+
+    ``turns_used`` is the child's own logical turn count for the run -- the
+    assistant messages it committed, the same count the in-process route
+    derives from its loop -- and it belongs here because only the run's owner
+    can count it: the run's event stream is not a turn stream (a streaming
+    loop emits one ``AssistantEvent`` per chunk and a tool-only step emits
+    none). ``None`` means the child reported no count, which the reader keeps
+    unknown rather than deriving one from frames.
     """
 
     outcome: str
     error: str | None = None
     failure: ChildFailureEvidence | None = None
+    turns_used: int | None = None
 
 
 type SubagentFrame = BaseEvent | SubagentCompletion

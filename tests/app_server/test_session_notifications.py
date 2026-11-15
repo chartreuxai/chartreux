@@ -1209,9 +1209,13 @@ async def test_event_gap_resynchronizes_through_session_read(monkeypatch) -> Non
     methods = []
     resynced = asyncio.Event()
 
-    async def tracked_request(method, params=None, *, wait_for_incoming=False):
+    async def tracked_request(
+        method, params=None, *, wait_for_incoming=False, timeout=None
+    ):
         methods.append(method)
-        return await request(method, params, wait_for_incoming=wait_for_incoming)
+        return await request(
+            method, params, wait_for_incoming=wait_for_incoming, timeout=timeout
+        )
 
     monkeypatch.setattr(client, "request", tracked_request)
     resync = session._resync
@@ -1264,9 +1268,13 @@ async def test_terminal_event_gap_completes_waiting_turn_from_snapshot(
     request = client.request
     methods: list[str] = []
 
-    async def tracked_request(method, params=None, *, wait_for_incoming=False):
+    async def tracked_request(
+        method, params=None, *, wait_for_incoming=False, timeout=None
+    ):
         methods.append(method)
-        return await request(method, params, wait_for_incoming=wait_for_incoming)
+        return await request(
+            method, params, wait_for_incoming=wait_for_incoming, timeout=timeout
+        )
 
     monkeypatch.setattr(client, "request", tracked_request)
     consume = session._state.projection.consume

@@ -85,6 +85,10 @@ class ReplacementStateView(Protocol):
 
     def _invalidate_recovery_locked(self, record: AgentRecord | None) -> None: ...
 
+    # v0.7.9 point 5 (C6a): advance the monotone inventory revision in the
+    # caller's held region (the registry lock).
+    def _advance_inventory_revision_locked(self) -> None: ...
+
 
 class ReplacementCoordinator:
     """Replacement arbitration and claim lifecycle for the registry.
@@ -265,6 +269,9 @@ class ReplacementCoordinator:
             run.requested_stop_reason = RunStopReason.RETASKED
             record.reserved_for_replacement = True
             record.replacement_owner = claim
+            # The reservation stops the run and reserves the record under the
+            # registry lock (point 5).
+            self._view._advance_inventory_revision_locked()
             return claim
 
     def _reserve_suspended_locked(
@@ -320,6 +327,9 @@ class ReplacementCoordinator:
         self._view._invalidate_recovery_locked(record)
         record.reserved_for_replacement = True
         record.replacement_owner = claim
+        # The suspended reservation exercises a fresh slot under the caller's
+        # registry lock (point 5).
+        self._view._advance_inventory_revision_locked()
         return claim
 
     @asynccontextmanager
@@ -358,6 +368,11 @@ class ReplacementCoordinator:
                             owner is None or owner is claim
                         ) and not claim.slot.transferred:
                             self._view._active_work_slots.discard(claim.slot)
+                        if owner is claim:
+                            # The handoff settlement rewrote the record's
+                            # replacement ownership under the registry lock
+                            # (point 5).
+                            self._view._advance_inventory_revision_locked()
                     break
                 except asyncio.CancelledError:
                     cancelled = True
@@ -368,6 +383,9 @@ class ReplacementCoordinator:
         """Settle the claim and schedule the completion-pending unwind (locked)."""
         record.reserved_for_replacement = False
         record.replacement_owner = None
+        # The claim settlement is a projection-visible OWNERSHIP/applicability
+        # change under the caller's registry lock (point 5).
+        self._view._advance_inventory_revision_locked()
         if record.current_run is None:
             if record.work_slot is not None:
                 self._view._active_work_slots.discard(record.work_slot)
@@ -424,6 +442,9 @@ class ReplacementCoordinator:
                 else:
                     record.state = _AgentState.IDLE
                     record.idle_since = self._view._clock()
+                # The unwind's terminal transition changed the projected row
+                # under the registry lock (point 5).
+                self._view._advance_inventory_revision_locked()
                 self._view._rearm_reaper_locked()
 
     async def rollback_reuse(
@@ -449,6 +470,9 @@ class ReplacementCoordinator:
                 if previous_idle_since is not None
                 else self._view._clock()
             )
+            # The failed admission restored idle residency under the registry
+            # lock (point 5).
+            self._view._advance_inventory_revision_locked()
             # Re-apply the committed policy only for a busy-replacement unwind:
             # a failed admission that followed a stopped run closes an unretained
             # instance instead of leaving it resident. A plain reuse failure

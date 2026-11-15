@@ -19,11 +19,17 @@ from unittest.mock import AsyncMock, Mock
 
 import pytest
 
-from chartreux.app_server import _runtime as runtime, agent_reconfigure, root_agent
+from chartreux.app_server import (
+    _runtime as runtime,
+    agent_reconfigure,
+    process_session_backend as psb_module,
+    root_agent,
+)
 from chartreux.app_server._connection_protocol import ClientInfo
 from chartreux.app_server._dispatch import RequestFailure
 from chartreux.app_server._projection import project_session_log
 from chartreux.app_server._runtime import close_agent_loop
+from chartreux.app_server._session_backend_port import SessionBackendError
 from chartreux.app_server._session_model import override_active_model
 from chartreux.app_server._session_runtime_impl import ProcessRootReconfigure
 from chartreux.app_server.agent_admission import (
@@ -37,9 +43,12 @@ from chartreux.app_server.agent_snapshot import (
     ADOPTION_NONE,
     MARKER_STALE,
     MarkerVerdict,
+    build_session_snapshot,
 )
 from chartreux.app_server.agent_wire import (
+    AGENT_AGENTS_INVENTORY_READ_METHOD,
     AGENT_COMPACT_METHOD,
+    AGENT_NOTICE_METHOD,
     AGENT_OP_ADMISSION_METHOD,
     AGENT_OP_CANCEL_METHOD,
     AGENT_OPEN_METHOD,
@@ -75,26 +84,51 @@ from chartreux.app_server.agent_wire import (
     decode_replace_reply,
     decode_session_snapshot,
     encode_manual_shell_context,
+    encode_notice,
     encode_open_accounting,
     encode_open_request,
     encode_reconfigure_request,
     encode_replace_request,
     encode_turn_request,
+    required_agent_capabilities,
 )
-from chartreux.app_server.models import TextContentBlock
+from chartreux.app_server.client import AppServerClient
+from chartreux.app_server.models import (
+    SessionTextContentBlock,
+    TextContentBlock,
+    TurnUserInputEntry,
+)
 from chartreux.app_server.process_bootstrap import (
+    ADVERTISED_CAPABILITIES,
+    AGENT_WIRE_CAPABILITY_LIVE_AGENT_INVENTORY,
+    AGENT_WIRE_CAPABILITY_PLAN_HANDOFF_ROTATION,
     PROCESS_PROTOCOL_VERSION,
+    ProtocolVersionMismatchError,
     ReadyFrame,
+    ReadyFrameMissingError,
     SpawnedProcess,
+    encode_ready_frame,
+    parse_ready_frame,
+)
+from chartreux.app_server.process_session_backend import (
+    DEFAULT_REQUEST_TIMEOUT as PSB_REQUEST_TIMEOUT,
 )
 from chartreux.app_server.protocol import (
     AgentConfig,
+    AgentsInventoryReadParams,
+    AppServerResponseError,
     ConfigWriteOpWire,
     ConfigWriteParams,
     ContextInjectParams,
     ProtocolErrorCode,
+    RuntimeReadParams,
     SessionOptions,
     SessionPlanHandoffParams,
+    SessionResumeParams,
+    SessionResumeResponse,
+    SessionTurnsListParams,
+    SessionTurnsListResponse,
+    TurnEnqueueParams,
     TurnSteerParams,
 )
 from chartreux.app_server.registry_manifest import RegistryManifest
@@ -102,14 +136,17 @@ from chartreux.app_server.root_agent_process import (
     COMPACT_DEADLINE,
     COMPACT_OBSERVATION_IN_FLIGHT,
     COMPACT_OBSERVATION_SETTLEMENT_UNKNOWN,
+    DEFAULT_REQUEST_TIMEOUT as ROOT_PORT_REQUEST_TIMEOUT,
     REPLACE_DEADLINE,
     CompactSettlementRecord,
+    RootAgentCapabilitySkewError,
     RootAgentProcess,
     RootAgentReconfigureConflict,
     RootAgentReplaceConflict,
     RootAgentRequestError,
     RootAgentSelectionError,
     RootAgentSessionNotFound,
+    RootFailureSignature,
     multi_process_root_selected,
     spawn_root_agent_process,
 )
@@ -1633,8 +1670,14 @@ async def _coordinated_agent(
     drop: Callable[[dict[str, Any], bool], bool] | None = None,
     rebind: Callable[..., Any] | None = None,
     loop: AgentLoop | None = None,
+    capabilities: frozenset[str] = ADVERTISED_CAPABILITIES,
 ) -> AsyncIterator[tuple[RootAgentProcess, _LossyTransport, AgentLoop]]:
-    """A coordinator handle and its agent, wired over one in-memory pair."""
+    """A coordinator handle and its agent, wired over one in-memory pair.
+
+    ``capabilities`` is what the child's ready frame announces; pass an empty
+    set to simulate an older same-version peer that lacks the additive
+    agent-wire capabilities.
+    """
     opened = loop if loop is not None else await _persisted_test_loop(tmp_path)
     client, server = memory_transport_pair()
     transport = _LossyTransport(client, drop or (lambda frame, outbound: False))
@@ -1647,7 +1690,9 @@ async def _coordinated_agent(
     spawned = SpawnedProcess(
         process=cast("subprocess.Popen[bytes]", _LiveProcess()),
         transport=cast("Any", transport),
-        ready=ReadyFrame(protocol_version=PROCESS_PROTOCOL_VERSION),
+        ready=ReadyFrame(
+            protocol_version=PROCESS_PROTOCOL_VERSION, capabilities=capabilities
+        ),
     )
     process = RootAgentProcess(
         spawned,
@@ -2196,7 +2241,10 @@ async def test_a_stale_payload_is_never_absence_evidence() -> None:
     spawned = SpawnedProcess(
         process=cast("subprocess.Popen[bytes]", _LiveProcess()),
         transport=cast("Any", _SilentTransport()),
-        ready=ReadyFrame(protocol_version=PROCESS_PROTOCOL_VERSION),
+        ready=ReadyFrame(
+            protocol_version=PROCESS_PROTOCOL_VERSION,
+            capabilities=ADVERTISED_CAPABILITIES,
+        ),
     )
     process = RootAgentProcess(spawned, heartbeat_interval=30.0)
     try:
@@ -2905,3 +2953,783 @@ def test_the_config_write_deadline_is_the_sized_wire_budget() -> None:
     from chartreux.app_server.root_agent_process import CONFIG_WRITE_DEADLINE
 
     assert CONFIG_WRITE_DEADLINE == 60.0
+
+
+# ---------------------------------------------------------------------------
+# Package A7a: handshake capability advertisement, version skew, the shared
+# 30s ordinary-request default, and ready-read semantics on the stdio route.
+# ---------------------------------------------------------------------------
+
+
+def test_the_ready_frame_advertises_the_agent_wire_capabilities() -> None:
+    frame = json.loads(encode_ready_frame().decode())
+    assert frame["capabilities"] == sorted(ADVERTISED_CAPABILITIES)
+    ready = parse_ready_frame(encode_ready_frame())
+    assert ready.protocol_version == PROCESS_PROTOCOL_VERSION
+    assert ready.capabilities == ADVERTISED_CAPABILITIES
+    assert AGENT_WIRE_CAPABILITY_PLAN_HANDOFF_ROTATION in ready.capabilities
+
+
+def test_an_older_same_version_child_announces_no_capabilities() -> None:
+    raw = json.dumps({
+        "chartreuxBootstrap": "ready",
+        "protocolVersion": PROCESS_PROTOCOL_VERSION,
+    })
+    ready = parse_ready_frame(raw)
+    assert ready.protocol_version == PROCESS_PROTOCOL_VERSION
+    assert ready.capabilities == frozenset()
+
+
+@pytest.mark.parametrize(
+    "capabilities",
+    ["plan-handoff-rotation", [1], [""], [None], {"plan-handoff-rotation": True}],
+)
+def test_a_malformed_capability_advertisement_is_a_missing_frame(
+    capabilities: Any,
+) -> None:
+    raw = json.dumps({
+        "chartreuxBootstrap": "ready",
+        "protocolVersion": PROCESS_PROTOCOL_VERSION,
+        "capabilities": capabilities,
+    })
+    with pytest.raises(ReadyFrameMissingError):
+        parse_ready_frame(raw)
+
+
+def test_a_different_protocol_version_is_a_typed_restart_error() -> None:
+    with pytest.raises(ProtocolVersionMismatchError) as older:
+        parse_ready_frame(encode_ready_frame(1))
+    assert older.value.expected == PROCESS_PROTOCOL_VERSION
+    assert older.value.received == 1
+    assert "restart both ends on the same chartreux version" in str(older.value)
+    assert "no traffic was sent" in str(older.value)
+
+    with pytest.raises(ProtocolVersionMismatchError) as newer:
+        parse_ready_frame(encode_ready_frame(3))
+    assert newer.value.received == 3
+
+
+def test_the_plan_handoff_reconfigure_is_the_only_capability_gated_request() -> None:
+    assert required_agent_capabilities(
+        AGENT_SESSION_RECONFIGURE_METHOD,
+        encode_reconfigure_request(mode=RECONFIGURE_MODE_PLAN_HANDOFF, deadline=1.0),
+    ) == frozenset({AGENT_WIRE_CAPABILITY_PLAN_HANDOFF_ROTATION})
+    assert (
+        required_agent_capabilities(
+            AGENT_SESSION_RECONFIGURE_METHOD,
+            encode_reconfigure_request(mode=RECONFIGURE_MODE_SETTINGS),
+        )
+        == frozenset()
+    )
+    assert required_agent_capabilities(AGENT_SESSION_RENAME_METHOD, {}) == frozenset()
+
+
+def test_the_stdio_request_default_matches_the_shared_30_second_bound() -> None:
+    # The recorded baseline was a private 60s on the stdio route; the shared
+    # ordinary-request default is 30s on every leg of the route.
+    assert PSB_REQUEST_TIMEOUT == 30.0
+    assert ROOT_PORT_REQUEST_TIMEOUT == 30.0
+    assert PSB_REQUEST_TIMEOUT == ROOT_PORT_REQUEST_TIMEOUT
+    assert PSB_REQUEST_TIMEOUT != 60.0
+
+
+@pytest.mark.asyncio
+async def test_a_child_without_the_rotation_capability_is_a_typed_skew_not_a_send(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    directory = _wire_episode(tmp_path)
+    loop = await _layered_logging_loop(monkeypatch, tmp_path)
+    await loop.session_logger.persist_plan_mode_durable(
+        _wire_plan_record(directory, tmp_path / "layered-sessions")
+    )
+    params = _wire_handoff_params(directory, loop.session_id)
+
+    async with _coordinated_agent(tmp_path, loop=loop, capabilities=frozenset()) as (
+        process,
+        transport,
+        _loop,
+    ):
+        assert process.advertised_capabilities == frozenset()
+        with pytest.raises(RootAgentCapabilitySkewError) as exc_info:
+            await process.plan_handoff(params)
+        error = exc_info.value
+        assert error.method == AGENT_SESSION_RECONFIGURE_METHOD
+        assert error.capabilities == (AGENT_WIRE_CAPABILITY_PLAN_HANDOFF_ROTATION,)
+        assert AGENT_WIRE_CAPABILITY_PLAN_HANDOFF_ROTATION in str(error)
+        assert "restart both ends on the same chartreux version" in str(error)
+        assert "was not sent" in str(error)
+        # No frame crossed the pipe: the skew is refused before any send, so
+        # there is no stale fallback and nothing to replay.
+        assert transport.requests(AGENT_SESSION_RECONFIGURE_METHOD) == []
+        # The handle still serves requests that need no additive capability.
+        snapshot = await process.snapshot(include_history=False)
+        assert snapshot.state.session.id == loop.session_id
+
+
+@pytest.mark.asyncio
+async def test_ready_read_answers_ready_only_while_the_root_is_live(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from tests.app_server.backend_contract.conftest import install_memory_root_agent
+    from tests.stubs.app_server import attach_test_app_server_session
+
+    loop = build_test_agent_loop()
+    install_memory_root_agent(monkeypatch, loop)
+    client_transport, server_transport = memory_transport_pair()
+    harness = await runtime.create_harness_server(
+        server_transport, transport_kind="stdio"
+    )
+    client = AppServerClient(client_transport, run_peer=harness.serve)
+    session = await attach_test_app_server_session(client)
+    try:
+        backend = cast(Any, harness._server._root)
+        session_id = session.session_id
+        # While the current generation is known live and open, the open
+        # handshake established readiness: the read is immediately ready.
+        read = await backend.dispatch_extension(
+            "session/ready/read", {"sessionId": session_id}
+        )
+        assert read.response.ready is True
+        wait = await backend.dispatch_extension(
+            "session/ready/wait", {"sessionId": session_id}
+        )
+        assert wait.response.ready is True
+
+        # After a declared death the read answers the death receipt, never a
+        # stale ready from the dead generation.
+        backend.process._declare_death(
+            "the root agent process exited",
+            signature=RootFailureSignature.DEATH_RECEIPT,
+        )
+        for method in ("session/ready/read", "session/ready/wait"):
+            with pytest.raises(SessionBackendError) as exc_info:
+                await backend.dispatch_extension(method, {"sessionId": session_id})
+            assert "death-receipt" in str(exc_info.value)
+    finally:
+        with suppress(BaseException):
+            await session.close()
+        with suppress(BaseException):
+            await client.close()
+        with suppress(BaseException):
+            await harness.close()
+        await loop.aclose()
+
+
+async def _runtime_read_harness(
+    monkeypatch: pytest.MonkeyPatch,
+) -> tuple[Any, Any, Any, Any]:
+    """One stdio harness over a memory-wire root; returns the closeable parts."""
+    from tests.app_server.backend_contract.conftest import install_memory_root_agent
+    from tests.stubs.app_server import attach_test_app_server_session
+
+    loop = build_test_agent_loop()
+    install_memory_root_agent(monkeypatch, loop)
+    client_transport, server_transport = memory_transport_pair()
+    harness = await runtime.create_harness_server(
+        server_transport, transport_kind="stdio"
+    )
+    client = AppServerClient(client_transport, run_peer=harness.serve)
+    session = await attach_test_app_server_session(client)
+    return harness, client, session, loop
+
+
+@pytest.mark.asyncio
+async def test_runtime_read_serves_a_fresh_agent_snapshot_while_live(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """C2a: runtime/read asks the agent for a fresh snapshot on every read.
+
+    The answer is the agent's live view at reply-write time, not the
+    coordinator's cached open-time copy: an agent-side change after the open
+    is visible on the very next read, and the read is adopted with the shared
+    agent-sequence cursor never older than the events already relayed.
+    """
+    harness, client, session, loop = await _runtime_read_harness(monkeypatch)
+    try:
+        backend = cast(Any, harness._server._root)
+        session_id = session.session_id
+        first = await backend.dispatch_extension(
+            "runtime/read", {"sessionId": session_id}
+        )
+        assert first.response.ready is True
+        # The adopted cursor is never older than the relayed events.
+        assert backend._adopted_agent_sequence >= backend.process.last_agent_sequence
+
+        # An agent-side change after the open: the next read must see it, so
+        # the read is fresh per call rather than the cached open snapshot.
+        monkeypatch.setattr(
+            loop.tool_manager, "pop_mcp_errors", lambda: {"fresh-marker": "boom"}
+        )
+        second = await backend.dispatch_extension(
+            "runtime/read", {"sessionId": session_id}
+        )
+        assert second.response.ready is True
+        assert second.response.runtime.mcp.discovery_errors == {"fresh-marker": "boom"}
+        assert second.response.runtime != first.response.runtime
+        assert backend._adopted_agent_sequence >= backend.process.last_agent_sequence
+    finally:
+        with suppress(BaseException):
+            await session.close()
+        with suppress(BaseException):
+            await client.close()
+        with suppress(BaseException):
+            await harness.close()
+        await loop.aclose()
+
+
+@pytest.mark.asyncio
+async def test_runtime_read_after_root_death_answers_the_death_receipt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """C2a: after a declared root death the read answers the death receipt.
+
+    The stale-snapshot case: a dead root must not keep serving the cached
+    runtime with ``ready=True``; the fresh-snapshot request fails typed and
+    the death receipt propagates instead.
+    """
+    harness, client, session, loop = await _runtime_read_harness(monkeypatch)
+    try:
+        backend = cast(Any, harness._server._root)
+        session_id = session.session_id
+        live = await backend.dispatch_extension(
+            "runtime/read", {"sessionId": session_id}
+        )
+        assert live.response.ready is True
+
+        backend.process._declare_death(
+            "the root agent process exited",
+            signature=RootFailureSignature.DEATH_RECEIPT,
+        )
+        with pytest.raises(SessionBackendError) as exc_info:
+            await backend.dispatch_extension("runtime/read", {"sessionId": session_id})
+        assert "death-receipt" in str(exc_info.value)
+    finally:
+        with suppress(BaseException):
+            await session.close()
+        with suppress(BaseException):
+            await client.close()
+        with suppress(BaseException):
+            await harness.close()
+        await loop.aclose()
+
+
+@pytest.mark.asyncio
+async def test_agent_inventory_read_after_root_death_answers_the_death_receipt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """C6b: after a declared root death the inventory read answers the receipt.
+
+    The live-inventory carrier must not keep serving a coordinator-side
+    view of the children once the owner is gone: the fresh agent-wire
+    request fails typed through the process failure, and the death receipt
+    propagates exactly like the runtime/read arm's.
+    """
+    harness, client, session, loop = await _runtime_read_harness(monkeypatch)
+    try:
+        backend = cast("Any", harness._server._root)
+        session_id = session.session_id
+        live = await backend.dispatch_extension("agents/inventory/read", {})
+        assert live.response.session_id == session_id
+        assert live.response.revision == 0
+        assert live.response.agents == []
+
+        backend.process._declare_death(
+            "the root agent process exited",
+            signature=RootFailureSignature.DEATH_RECEIPT,
+        )
+        with pytest.raises(SessionBackendError) as exc_info:
+            await backend.dispatch_extension("agents/inventory/read", {})
+        assert "death-receipt" in str(exc_info.value)
+    finally:
+        with suppress(BaseException):
+            await session.close()
+        with suppress(BaseException):
+            await client.close()
+        with suppress(BaseException):
+            await harness.close()
+        await loop.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(180)
+async def test_session_turns_list_serves_the_settled_turn_over_a_spawned_root(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """C5c: the spawned topology keeps the settled turn on its page.
+
+    A really spawned root agent is attached through the stdio harness -- no
+    memory-wire stand-in for the child -- and one turn is driven to
+    completion. The agent builds no turn projection of its own, so the
+    coordinator's records are the only copy: the page names the settled turn
+    both before and after the runtime/read that adopts a fresh agent state.
+    """
+    from chartreux.app_server import process_session_backend as psb_module
+    from chartreux.app_server.transport import STDIO_TRANSPORT
+    from tests.app_server import executed_receipts
+    from tests.stubs.app_server import attach_test_app_server_session
+
+    monkeypatch.setenv(TRANSPORT_ENV_VAR, STDIO_TRANSPORT)
+    executed_receipts.stamp_transport(STDIO_TRANSPORT)
+    real_spawn = psb_module.spawn_root_agent_process
+    command = _child_command(tmp_path)
+
+    async def scripted_spawn(**kwargs: Any) -> RootAgentProcess:
+        # The command override is the only change: the spawn, the pipe, the
+        # handshake and every frame are the production ones.
+        kwargs["command"] = command
+        kwargs["cwd"] = str(_REPO_ROOT)
+        return await real_spawn(**kwargs)
+
+    monkeypatch.setattr(psb_module, "spawn_root_agent_process", scripted_spawn)
+    client_transport, server_transport = memory_transport_pair()
+    harness = await runtime.create_harness_server(
+        server_transport, transport_kind=STDIO_TRANSPORT
+    )
+    client = AppServerClient(client_transport, run_peer=harness.serve)
+    session = await attach_test_app_server_session(client)
+    try:
+        _ = [event async for event in session.act("hello")]
+        session_id = session.session_id
+
+        settled = SessionTurnsListResponse.model_validate(
+            await client.request(
+                "session/turns/list", SessionTurnsListParams(session_id=session_id)
+            )
+        )
+        assert [turn.status for turn in settled.items] == ["completed"]
+
+        read = await client.request(
+            "runtime/read", RuntimeReadParams(session_id=session_id)
+        )
+        assert read["ready"] is True
+
+        # The read adopted a fresh agent-built state: the turn the spawned
+        # root actually ran is still the page's own.
+        after_read = SessionTurnsListResponse.model_validate(
+            await client.request(
+                "session/turns/list", SessionTurnsListParams(session_id=session_id)
+            )
+        )
+        assert [turn.id for turn in after_read.items] == [
+            turn.id for turn in settled.items
+        ]
+        assert [turn.status for turn in after_read.items] == ["completed"]
+    finally:
+        with suppress(BaseException):
+            await session.close()
+        with suppress(BaseException):
+            await client.close()
+        with suppress(BaseException):
+            await harness.close()
+
+
+@pytest.mark.asyncio
+async def test_a_child_without_the_inventory_capability_is_a_typed_skew_not_a_send(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """C6b: the inventory carrier is an additive capability, refused pre-send.
+
+    An older same-version peer that did not announce the
+    ``live-agent-inventory`` capability is a version skew: the coordinator
+    answers typed with a restart instruction before any frame crosses, so
+    there is no stale fallback for the read and nothing to replay.
+    """
+    async with _coordinated_agent(tmp_path, capabilities=frozenset()) as (
+        process,
+        transport,
+        loop,
+    ):
+        assert process.advertised_capabilities == frozenset()
+        with pytest.raises(RootAgentCapabilitySkewError) as exc_info:
+            await process.read_agent_inventory(
+                loop.session_id, AgentsInventoryReadParams()
+            )
+        error = exc_info.value
+        assert error.method == AGENT_AGENTS_INVENTORY_READ_METHOD
+        assert error.capabilities == (AGENT_WIRE_CAPABILITY_LIVE_AGENT_INVENTORY,)
+        assert AGENT_WIRE_CAPABILITY_LIVE_AGENT_INVENTORY in str(error)
+        assert "restart both ends on the same chartreux version" in str(error)
+        assert "was not sent" in str(error)
+        # No frame crossed the pipe: the skew is refused before any send, so
+        # there is no stale fallback and nothing to replay.
+        assert transport.requests(AGENT_AGENTS_INVENTORY_READ_METHOD) == []
+        # The handle still serves requests that need no additive capability.
+        snapshot = await process.snapshot(include_history=False)
+        assert snapshot.state.session.id == loop.session_id
+
+
+def test_the_ready_frame_advertises_the_live_inventory_capability() -> None:
+    """C6b: this build's ready frame answers the inventory carrier it serves.
+
+    The capability map routes the carrier to its advertised capability, and
+    the advertised set carries it, so same-version peers of this build are
+    never refused on the read.
+    """
+    assert required_agent_capabilities(
+        AGENT_AGENTS_INVENTORY_READ_METHOD, {"session_id": "s"}
+    ) == frozenset({AGENT_WIRE_CAPABILITY_LIVE_AGENT_INVENTORY})
+    assert AGENT_WIRE_CAPABILITY_LIVE_AGENT_INVENTORY in ADVERTISED_CAPABILITIES
+    assert (
+        AGENT_WIRE_CAPABILITY_LIVE_AGENT_INVENTORY
+        in parse_ready_frame(encode_ready_frame()).capabilities
+    )
+
+
+@pytest.mark.asyncio
+async def test_read_snapshot_adoption_is_monotone_against_relayed_events(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """C2a: adoption keys on the shared agent-sequence cursor, monotone.
+
+    The coordinator's watermark numbers its own publications, so it cannot
+    order a snapshot against relayed events; a snapshot whose agent-sequence
+    cursor is older than an event already relayed (or than the cursor already
+    adopted) is never adopted, so the adopted state can never present older
+    than events already relayed.
+    """
+    harness, client, session, loop = await _runtime_read_harness(monkeypatch)
+    try:
+        backend = cast(Any, harness._server._root)
+        process = backend.process
+        # One relayed event frame raises the shared cursor on the coordinator.
+        process._deliver_notification(
+            AGENT_NOTICE_METHOD,
+            {
+                "event": encode_notice(
+                    SessionTitleUpdatedEvent(
+                        session_id=loop.session_id, title="relayed"
+                    )
+                ),
+                "sequence": 10,
+            },
+        )
+        assert process.last_agent_sequence == 10
+
+        projection_before = backend._projection
+        # Older than the relayed event: skipped, the projection stands.
+        stale = build_session_snapshot(
+            loop, markers=(), incarnation_id="inc", agent_sequence=5
+        )
+        assert backend._adopt_read_snapshot(stale) is False
+        assert backend._projection is projection_before
+        assert backend._adopted_agent_sequence == 0
+
+        # At the relayed cursor: adopted.
+        fresh = build_session_snapshot(
+            loop, markers=(), incarnation_id="inc", agent_sequence=10
+        )
+        assert backend._adopt_read_snapshot(fresh) is True
+        assert backend._adopted_agent_sequence == 10
+        assert backend._projection is not projection_before
+
+        # Monotone: a later snapshot older than the adopted cursor is skipped.
+        older = build_session_snapshot(
+            loop, markers=(), incarnation_id="inc", agent_sequence=9
+        )
+        assert backend._adopt_read_snapshot(older) is False
+        assert backend._adopted_agent_sequence == 10
+    finally:
+        with suppress(BaseException):
+            await session.close()
+        with suppress(BaseException):
+            await client.close()
+        with suppress(BaseException):
+            await harness.close()
+        await loop.aclose()
+
+
+# ---------------------------------------------------------------------------
+# C2b: the death/resume/memorial safety unit — death receipts on both
+# transports, explicit session/resume respawn+handshake+restore,
+# old-generation fencing, memorial queue/shell state in the resume receipt,
+# no mutation replay, unknown-outcome reconcile, disconnect-terminal
+# disclosure. The stdio leg runs the root agent over a memory wire
+# (install_memory_root_agent); spawned-stdio legs land with C5c's PTY gate.
+# ---------------------------------------------------------------------------
+
+
+def _c2b_resume_params(session_id: str) -> dict[str, Any]:
+    return SessionResumeParams(session_id=session_id).model_dump(
+        mode="json", by_alias=True
+    )
+
+
+async def _c2b_close(harness: Any, client: Any, session: Any, loop: Any) -> None:
+    with suppress(BaseException):
+        await session.close()
+    with suppress(BaseException):
+        await client.close()
+    with suppress(BaseException):
+        await harness.close()
+    await loop.aclose()
+
+
+@pytest.mark.asyncio
+async def test_death_receipt_fences_every_request_and_discloses_the_terminal_disconnect(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """C2b: after confirmed root death every request fails with the receipt.
+
+    The server's per-request guard and every session-addressed carrier arm
+    answer the typed death receipt, and the receipt discloses that the stdio
+    disconnect is terminal, in-flight work can be lost, and the explicit
+    session/resume is the recovery path. Old-generation events publish
+    nothing any more.
+    """
+    harness, client, session, loop = await _runtime_read_harness(monkeypatch)
+    try:
+        backend = cast(Any, harness._server._root)
+        session_id = session.session_id
+        backend.process._declare_death(
+            "the root agent process exited",
+            signature=RootFailureSignature.DEATH_RECEIPT,
+        )
+        assert backend.is_dead
+        with pytest.raises(SessionBackendError) as guard_exc:
+            backend.guard_request()
+        guard_message = str(guard_exc.value)
+        assert "death-receipt" in guard_message
+        assert "in-flight work" in guard_message
+        assert "session/resume" in guard_message
+        assert "never replayed" in guard_message
+        with pytest.raises(SessionBackendError) as arm_exc:
+            await backend.dispatch_extension(
+                "session/ready/read", {"sessionId": session_id}
+            )
+        assert "death-receipt" in str(arm_exc.value)
+        # Old-generation fence: the dead generation publishes no events.
+        assert await backend.publish_callback(cast(Any, Mock())) is False
+    finally:
+        await _c2b_close(harness, client, session, loop)
+
+
+@pytest.mark.asyncio
+async def test_session_resume_after_root_death_respawns_and_surfaces_the_memorial(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """C2b: an explicit resume retires the dead backend and respawns once.
+
+    The resume receipt carries the retired generation's typed death receipt and
+    its coordinator-owned queue/shell records as memorial state; the
+    replacement generation handshakes, restores the durable session, and never
+    re-admits the memorial for execution. A second resume is the idempotent
+    reconcile: same live backend, no second spawn, no mutation replay.
+    """
+    harness, client, session, loop = await _runtime_read_harness(monkeypatch)
+    try:
+        backend = cast(Any, harness._server._root)
+        session_id = session.session_id
+        # The doomed generation's coordinator-durable state: one queued turn
+        # and one retained shell record.
+        backend._turn_queue.enqueue(
+            TurnEnqueueParams(
+                session_id=session_id,
+                entries=[
+                    TurnUserInputEntry(
+                        content=[SessionTextContentBlock(text="queued prompt")]
+                    )
+                ],
+            )
+        )
+        backend._shell_retained["entry-1"] = psb_module._PromotedShellRecord(
+            session_id=session_id,
+            entry_id="entry-1",
+            text="ls -la",
+            context=_manual_shell(),
+            committed=True,
+        )
+        backend.process._declare_death(
+            "the root agent process exited",
+            signature=RootFailureSignature.DEATH_RECEIPT,
+        )
+        old_process = backend.process
+        spawns = 0
+        real_spawn = psb_module.spawn_root_agent_process
+
+        async def counting_spawn(**kwargs: Any) -> Any:
+            nonlocal spawns
+            spawns += 1
+            return await real_spawn(**kwargs)
+
+        monkeypatch.setattr(psb_module, "spawn_root_agent_process", counting_spawn)
+
+        response = SessionResumeResponse.model_validate(
+            await client.request("session/resume", _c2b_resume_params(session_id))
+        )
+        # The receipt surfaces the retired generation's death and memorial.
+        assert response.death_receipt is not None
+        assert "death-receipt" in response.death_receipt
+        assert {item.kind for item in response.memorial} == {
+            "queued_turn",
+            "retained_shell_record",
+        }
+        assert {item.text for item in response.memorial} == {"queued prompt", "ls -la"}
+        # Exactly one respawn: the replacement handshakes and serves the same
+        # durable session id.
+        assert spawns == 1
+        assert response.state.session.id == session_id
+        new_backend = cast(Any, harness._server._root)
+        assert new_backend is not backend
+        assert new_backend.process is not old_process
+        read = await new_backend.dispatch_extension(
+            "runtime/read", {"sessionId": session_id}
+        )
+        assert read.response.ready is True
+        # Memorial state is never re-admitted: the new generation's queue and
+        # retained records start empty — the user re-submits from the receipt.
+        assert new_backend._turn_queue.state.items == []
+        assert not new_backend._shell_retained
+        # The old generation is fenced.
+        assert backend.is_dead
+        with pytest.raises(SessionBackendError) as fence_exc:
+            backend.guard_request()
+        assert "death-receipt" in str(fence_exc.value)
+        # A second resume reconciles idempotently: no respawn, no memorial.
+        again = SessionResumeResponse.model_validate(
+            await client.request("session/resume", _c2b_resume_params(session_id))
+        )
+        assert spawns == 1
+        assert again.death_receipt is None
+        assert again.memorial == []
+        assert harness._server._root is new_backend
+    finally:
+        await _c2b_close(harness, client, session, loop)
+
+
+@pytest.mark.asyncio
+async def test_a_concurrent_resume_is_fenced_never_a_second_spawn(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """C2b: two resumes for one dead generation never spawn two replacements.
+
+    The host fences the second resume with a typed conflict while the first
+    respawn is in flight; the in-flight one settles it.
+    """
+    harness, client, session, loop = await _runtime_read_harness(monkeypatch)
+    try:
+        backend = cast(Any, harness._server._root)
+        session_id = session.session_id
+        backend.process._declare_death(
+            "the root agent process exited",
+            signature=RootFailureSignature.DEATH_RECEIPT,
+        )
+        host = harness._server._session_backend_host
+        real_spawn = psb_module.spawn_root_agent_process
+        entered = asyncio.Event()
+        release = asyncio.Event()
+
+        async def gated_spawn(**kwargs: Any) -> Any:
+            entered.set()
+            await release.wait()
+            return await real_spawn(**kwargs)
+
+        monkeypatch.setattr(psb_module, "spawn_root_agent_process", gated_spawn)
+        params = SessionResumeParams(session_id=session_id)
+        first = asyncio.create_task(host.resume(params))
+        await entered.wait()
+        with pytest.raises(SessionBackendError) as exc_info:
+            await host.resume(params)
+        error = exc_info.value
+        assert error.code is ProtocolErrorCode.CONFLICT
+        assert "already in flight" in str(error)
+        release.set()
+        result = await first
+        assert result.death_receipt is not None
+        assert "death-receipt" in result.death_receipt
+    finally:
+        await _c2b_close(harness, client, session, loop)
+
+
+@pytest.mark.asyncio
+async def test_resume_against_the_live_generation_is_an_idempotent_reattach(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """C2b: resume of a still-live generation re-attaches without respawning.
+
+    This mirrors the in-process arm's same-id behavior and is the reconcile
+    path after an unknown outcome: resume is not a mutation, so retrying it
+    never spawns a second root and never replays anything.
+    """
+    harness, client, session, loop = await _runtime_read_harness(monkeypatch)
+    try:
+        backend = cast(Any, harness._server._root)
+        session_id = session.session_id
+        spawns = 0
+        real_spawn = psb_module.spawn_root_agent_process
+
+        async def counting_spawn(**kwargs: Any) -> Any:
+            nonlocal spawns
+            spawns += 1
+            return await real_spawn(**kwargs)
+
+        monkeypatch.setattr(psb_module, "spawn_root_agent_process", counting_spawn)
+        response = SessionResumeResponse.model_validate(
+            await client.request("session/resume", _c2b_resume_params(session_id))
+        )
+        assert spawns == 0
+        assert response.death_receipt is None
+        assert response.memorial == []
+        assert response.state.session.id == session_id
+        assert harness._server._root is backend
+    finally:
+        await _c2b_close(harness, client, session, loop)
+
+
+@pytest.mark.asyncio
+async def test_a_failed_respawn_is_an_actionable_failure_and_a_retry_reconciles(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """C2b: an unknown-outcome respawn answers typed and reconciles on retry.
+
+    A spawn failure after the death answers the actionable spawn diagnostic —
+    never a fresh empty session — and the dead generation keeps answering the
+    death receipt. Retrying session/resume (not a mutation) then spawns the one
+    replacement and surfaces the memorial.
+    """
+    harness, client, session, loop = await _runtime_read_harness(monkeypatch)
+    try:
+        backend = cast(Any, harness._server._root)
+        session_id = session.session_id
+        backend._turn_queue.enqueue(
+            TurnEnqueueParams(
+                session_id=session_id,
+                entries=[
+                    TurnUserInputEntry(
+                        content=[SessionTextContentBlock(text="queued prompt")]
+                    )
+                ],
+            )
+        )
+        backend.process._declare_death(
+            "the root agent process exited",
+            signature=RootFailureSignature.DEATH_RECEIPT,
+        )
+        real_spawn = psb_module.spawn_root_agent_process
+
+        async def failing_spawn(**kwargs: Any) -> Any:
+            raise RuntimeError("spawn exploded")
+
+        monkeypatch.setattr(psb_module, "spawn_root_agent_process", failing_spawn)
+        with pytest.raises(AppServerResponseError) as exc_info:
+            await client.request("session/resume", _c2b_resume_params(session_id))
+        error = exc_info.value.error
+        assert error.code is ProtocolErrorCode.INTERNAL_ERROR
+        assert "could not start the root agent" in error.message
+        # The dead generation still answers the death receipt on reads.
+        with pytest.raises(AppServerResponseError) as read_exc:
+            await client.request(
+                "runtime/read", RuntimeReadParams(session_id=session_id)
+            )
+        assert "death-receipt" in str(read_exc.value)
+        # Reconcile: retry the resume — it is not a mutation, so it is safe.
+        monkeypatch.setattr(psb_module, "spawn_root_agent_process", real_spawn)
+        response = SessionResumeResponse.model_validate(
+            await client.request("session/resume", _c2b_resume_params(session_id))
+        )
+        assert response.death_receipt is not None
+        assert "death-receipt" in response.death_receipt
+        assert [item.text for item in response.memorial] == ["queued prompt"]
+        assert response.state.session.id == session_id
+        assert harness._server._root is not backend
+    finally:
+        await _c2b_close(harness, client, session, loop)

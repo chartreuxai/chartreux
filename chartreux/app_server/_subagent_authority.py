@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from collections.abc import Awaitable, Callable
 from pathlib import Path
-from typing import TYPE_CHECKING
 
 from chartreux.app_server._subagent_records import (
     _accepted_saved_grants,
@@ -31,31 +30,29 @@ from chartreux.core.dangerous_commands import (
     canonical_remote_destination,
 )
 
-if TYPE_CHECKING:
-    from chartreux.app_server._sessions import SessionRuntime
-
 
 class DangerousCommandAuthority:
     """Dangerous-command grant authority inspection for the registered sessions.
 
     Narrow collaborator of the session runtime registry: sessions are
-    resolved through registry-supplied delegates (never snapshotted), the
-    dangerous-command store is reached through the resolved loop, and the
+    resolved through registry-supplied loop delegates (never snapshotted),
+    the dangerous-command store is reached through the resolved loop, and the
     root orchestrator — the only saved-grant read/write path — through the
-    root resolver. No state moves and no locks: none of the authority
+    root loop resolver. No state moves and no locks: none of the authority
     operations takes the registry lock, and no publication is added to any
-    path.
+    path. A single-owner process (the root agent serving the one session its
+    own loop is) supplies the same loop from every resolver.
     """
 
     def __init__(
         self,
-        resolve_live_session: Callable[[str], SessionRuntime],
+        resolve_live_loop: Callable[[str], AgentLoop],
         resolve_session_loop: Callable[[str], AgentLoop | None],
-        resolve_root: Callable[[], SessionRuntime | None],
+        resolve_root_loop: Callable[[], AgentLoop | None],
     ) -> None:
-        self._resolve_live_session = resolve_live_session
+        self._resolve_live_loop = resolve_live_loop
         self._resolve_session_loop = resolve_session_loop
-        self._resolve_root = resolve_root
+        self._resolve_root_loop = resolve_root_loop
 
     async def save_dangerous_command_grant(
         self, *, session_id: str, operation_id: str, expected_revision: str
@@ -69,12 +66,12 @@ class DangerousCommandAuthority:
         mutation lock is the only reservation, and nothing is published.
         """
         caller = self._resolve_session_loop(session_id)
-        root_runtime = self._resolve_root()
-        if caller is None or root_runtime is None:
+        root_loop = self._resolve_root_loop()
+        if caller is None or root_loop is None:
             raise ValueError(
                 "Dangerous-command grant save requires a registered session and root"
             )
-        return await root_runtime.agent_loop.config_orchestrator.save_dangerous_command_grant(
+        return await root_loop.config_orchestrator.save_dangerous_command_grant(
             project=caller.cwd,
             operation_id=operation_id,
             expected_revision=expected_revision,
@@ -102,12 +99,12 @@ class DangerousCommandAuthority:
         published.
         """
         caller = self._resolve_session_loop(session_id)
-        root_runtime = self._resolve_root()
-        if caller is None or root_runtime is None:
+        root_loop = self._resolve_root_loop()
+        if caller is None or root_loop is None:
             raise ValueError(
                 "Remote-exec grant save requires a registered session and root"
             )
-        return await root_runtime.agent_loop.config_orchestrator.save_remote_exec_grant(
+        return await root_loop.config_orchestrator.save_remote_exec_grant(
             project=caller.cwd,
             destination=destination,
             expected_revision=expected_revision,
@@ -136,15 +133,14 @@ class DangerousCommandAuthority:
         its revision. Blocking denylist entries are reported apart from grant
         authority because no grant overrides an explicit denylist veto.
         """
-        runtime = self._resolve_live_session(session_id)
-        loop = runtime.agent_loop
+        loop = self._resolve_live_loop(session_id)
         store = loop._dangerous_command_grants
         project = loop.cwd
-        root = self._resolve_root()
-        if root is None:
+        root_loop = self._resolve_root_loop()
+        if root_loop is None:
             raise ValueError("Dangerous-command authority requires a registered root")
         saved = await read_saved_dangerous_command_grants(
-            root.agent_loop.config_orchestrator, project=project
+            root_loop.config_orchestrator, project=project
         )
         return DangerousCommandAuthorityReadResponse(
             project=str(project),
@@ -221,10 +217,10 @@ class DangerousCommandAuthority:
         expected_disk_revision: str,
     ) -> tuple[DangerousCommandRevocationOutcome, str | None]:
         """Remove the saved authority through the root orchestrator, revision-checked."""
-        root = self._resolve_root()
-        if root is None:
+        root_loop = self._resolve_root_loop()
+        if root_loop is None:
             raise ValueError("Dangerous-command revocation requires a registered root")
-        orchestrator = root.agent_loop.config_orchestrator
+        orchestrator = root_loop.config_orchestrator
         if destination_identity is not None:
             result = await orchestrator.remove_remote_exec_grant(
                 project=loop.cwd,
@@ -311,8 +307,7 @@ class DangerousCommandAuthority:
                 "A destination-scoped revocation requires network.remote-exec "
                 "and one exact canonical destination"
             )
-        runtime = self._resolve_live_session(session_id)
-        loop = runtime.agent_loop
+        loop = self._resolve_live_loop(session_id)
         store = loop._dangerous_command_grants
         if store.authority_generation != expected_live_generation:
             return DangerousCommandRevokeResponse(

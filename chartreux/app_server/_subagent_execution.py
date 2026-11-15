@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Awaitable, Callable, Coroutine, Mapping, Sequence
 from contextlib import AbstractAsyncContextManager, suppress
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import json
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol
@@ -90,6 +90,7 @@ from chartreux.core.subagents import (
     normalize_task_summary,
 )
 from chartreux.core.tools.models import ToolPermission
+from chartreux.core.tools.secret_scan import ScanPolicy, committed_scan_policy
 from chartreux.core.utils import kill_async_subprocess
 from chartreux.model_display import format_model_display_name
 from chartreux.observability.logging import logger
@@ -610,6 +611,20 @@ def _parent_shared_roots(loop: Any) -> tuple[str, ...]:
         return ()
 
 
+@dataclass(frozen=True, slots=True)
+class AdmissionContract(FrozenCompletionContract):
+    """The frozen contract carrying the admission-frozen scan policy (A2).
+
+    ``scan_policy`` is the approved-match manifest policy computed from the
+    COMMITTED HEAD blob at admission — never the working tree or the index —
+    frozen for ALL runs (not only commit-mandated ones). The submission gate
+    reads it back off the contract and verifies it against the current HEAD
+    at scan time, failing closed on mismatch or absence.
+    """
+
+    scan_policy: ScanPolicy | None = None
+
+
 def freeze_run_admission(
     *,
     args: TaskArgs,
@@ -626,6 +641,7 @@ def freeze_run_admission(
     and the parent-shared roots. The admission HEAD baseline is captured
     alongside the frozen contract — only when the contract mandates a
     commit artifact; runs without a commit mandate perform no HEAD probes.
+    The committed-HEAD scan policy is frozen for ALL runs at admission.
     """
     loop = runtime.agent_loop
     try:
@@ -637,19 +653,22 @@ def freeze_run_admission(
         # report it still admits — the contract falls back to the cwd.
         roots = (str(loop.cwd),)
     identity_facts = get_builtin_identity(identity.removeprefix("builtin:"))
-    contract = FrozenCompletionContract.freeze(
-        identity=identity,
-        identity_revision=identity_revision,
-        seat=args.seat,
-        tier=tier,
-        cwd=str(loop.cwd),
-        roots=roots,
-        completion_check=args.completion_check,
-        required_artifacts=args.required_artifacts,
-        shell_less=_shell_less_launch(args, identity_facts),
-        audit_mode=loop.config.completion.mode,
-        capability=_verification_capability(parent),
-        shared_roots=_parent_shared_roots(loop),
+    contract = replace(
+        AdmissionContract.freeze(
+            identity=identity,
+            identity_revision=identity_revision,
+            seat=args.seat,
+            tier=tier,
+            cwd=str(loop.cwd),
+            roots=roots,
+            completion_check=args.completion_check,
+            required_artifacts=args.required_artifacts,
+            shell_less=_shell_less_launch(args, identity_facts),
+            audit_mode=loop.config.completion.mode,
+            capability=_verification_capability(parent),
+            shared_roots=_parent_shared_roots(loop),
+        ),
+        scan_policy=committed_scan_policy(loop.cwd),
     )
     admission_head = (
         _capture_admission_head(loop.cwd) if contract.requires_commit_artifact else None
@@ -696,6 +715,11 @@ class ExecutionStateView(Protocol):
     # P2a: the terminal-state registry acquisition — the serialization point
     # every run-state writer below acquires around its write.
     def acquire_run_state(self) -> AbstractAsyncContextManager[None]: ...
+
+    # v0.7.9 point 5 (C6a): advance the monotone inventory revision in the
+    # writer's held region — the registry lock, the run-state acquisition,
+    # or the flag write's no-await window.
+    def _advance_inventory_revision_locked(self) -> None: ...
 
     # C4: the launch-admission collaborator owns the override mint.
     _launch_admission: ChildLaunchAdmission
@@ -1111,6 +1135,9 @@ class SubagentExecution:
                 record.state = _AgentState.RUNNING
                 record.idle_since = None
                 self._view._rearm_reaper_locked()
+                # The reuse reservation flipped the record RUNNING under the
+                # registry lock (point 5 held-region rule (a)).
+                self._view._advance_inventory_revision_locked()
         else:
             record = None
         created_record = False
@@ -1303,6 +1330,9 @@ class SubagentExecution:
                             "Agent admission changed during child creation"
                         )
                     self._view._agent_records[agent_id] = record
+                    # The freshly inserted record joins the projection under
+                    # the registry lock (point 5).
+                    self._view._advance_inventory_revision_locked()
             except BaseException:
                 await self._view._rollback_created_child(
                     parent, runtime, ctx.tool_call_id
@@ -1413,6 +1443,9 @@ class SubagentExecution:
             record.current_run = run_record
             record.latest_run_id = run_id
             self._view._latest_run_ids[agent_id] = run_id
+            # The admission RUNNING write (P2a) advances the revision inside
+            # the held run-state region (point 5 held-region rule (b)).
+            self._view._advance_inventory_revision_locked()
         # The run's attribution join key: the child loop stamps every ledger
         # record made during this run with the run id (cleared at run end).
         runtime.agent_loop.run_identity = run_id
@@ -1550,10 +1583,16 @@ class SubagentExecution:
                         )
                     else:
                         self._view._latest_run_ids.pop(context.agent_id, None)
+                    # The prior-state restore rewrites the projected record
+                    # under the registry lock (point 5).
+                    self._view._advance_inventory_revision_locked()
         if context.created_record:
             async with self._view._registry_lock:
                 if self._view._agent_records.get(context.agent_id) is context.record:
                     self._view._agent_records.pop(context.agent_id)
+                    # The rolled-back record leaves the projection under the
+                    # registry lock (point 5).
+                    self._view._advance_inventory_revision_locked()
             await self._view._rollback_created_child(
                 parent, context.runtime, context.tool_call_id
             )
@@ -1727,6 +1766,7 @@ class SubagentExecution:
                 context.run_record.status, context.run_record.stop_reason = (
                     self._view._resolve_run_outcome(context.run_record, turn)
                 )
+                self._view._advance_inventory_revision_locked()
             # P2b: the sweep runs on every run-state terminal transition.
             await self.sweep_unnotified(parent, SWEEP_TRIGGER_TERMINAL_TRANSITION)
             # P6b case (a): a run cancelled before the audit starts takes
@@ -1792,6 +1832,7 @@ class SubagentExecution:
                     context.run_record.status = RunStatus.FAILED
                     context.run_record.stop_reason = RunStopReason.ERROR
                     context.run_record.failure = envelope
+                    self._view._advance_inventory_revision_locked()
                 failure_envelope = envelope
                 # P2b: terminal transition (publication rejection).
                 await self.sweep_unnotified(parent, SWEEP_TRIGGER_TERMINAL_TRANSITION)
@@ -1808,6 +1849,7 @@ class SubagentExecution:
                         context.runtime.turns.operation_terminal_turn(turn_id),
                     )
                 )
+                self._view._advance_inventory_revision_locked()
             # P2b: terminal transition (cancellation resolution).
             await self.sweep_unnotified(parent, SWEEP_TRIGGER_TERMINAL_TRANSITION)
             # P6b: the cancelled run takes the cancellation disposition even
@@ -1863,6 +1905,7 @@ class SubagentExecution:
             async with self._view.acquire_run_state():
                 context.run_record.status = RunStatus.FAILED
                 context.run_record.stop_reason = RunStopReason.ERROR
+                self._view._advance_inventory_revision_locked()
             # P2b: terminal transition (monitor failure).
             await self.sweep_unnotified(parent, SWEEP_TRIGGER_TERMINAL_TRANSITION)
             # Measure turns from observed work (assistant messages), never
@@ -2000,9 +2043,14 @@ class SubagentExecution:
                         root_generation=context.record.root_generation,
                         terminal_identity=context.run_record.terminal_identity,
                     )
+                    self._view._advance_inventory_revision_locked()
                 if decision.notify_permitted:
                     self._view._pending_notifications.add(key)
                 self._view._expire_results_locked()
+                if decision.resident:
+                    # The resident row's FINALIZING transition changed the
+                    # projection under the registry lock (point 5).
+                    self._view._advance_inventory_revision_locked()
             if not decision.notify_permitted:
                 return  # noqa: B012
             try:
@@ -2053,6 +2101,9 @@ class SubagentExecution:
                     f"({context.agent_id}, run {context.run_id})"
                     f" {status_word}."
                     " Use get_agent_result to retrieve the result."
+                    " Retrieve this run by its run_id; continue independent work"
+                    " or end your turn for other running agents rather than"
+                    " waiting by default."
                 )
                 if (
                     context.run_record.stop_reason is not RunStopReason.USER_CANCELLED
@@ -2119,6 +2170,12 @@ class SubagentExecution:
                             ),
                         ):
                             context.record.state = _AgentState.IDLE
+                        # The completion transition (suspend/close/idle) is a
+                        # projection-visible lifecycle change; suspend and
+                        # close bump on their own paths, and the direct IDLE
+                        # write bumps here, in the same locked region
+                        # (point 5).
+                        self._view._advance_inventory_revision_locked()
                     # WP4: observe the settled run for the automatic recovery
                     # controller AFTER the completion transition — a
                     # recoverably failed run is SUSPENDED by then. INERT
@@ -2295,6 +2352,9 @@ class SubagentExecution:
             f"({key[0]}, run {key[1]})"
             f" {status_word}."
             " Use get_agent_result to retrieve the result."
+            " Retrieve this run by its run_id; continue independent work"
+            " or end your turn for other running agents rather than"
+            " waiting by default."
         )
 
     def _deliver_synthesized(
@@ -2502,6 +2562,10 @@ class SubagentExecution:
             context.runtime.agent_loop.finalize_launch_reconfiguration(
                 context.prepared_reconfiguration, context.backend_publication
             )
+        # The acceptance tail's record writes (status/model/context fields)
+        # are one projection-visible mutation window with no await between
+        # them; the bump lands at the window's end (point 5 rule (c)).
+        self._view._advance_inventory_revision_locked()
         # P2b: the sweep at continuation start — admitting this dependency
         # run opens the continuation window, so any completed-but-unnotified
         # result left over from before it is surfaced here (and the bounded
@@ -2561,9 +2625,14 @@ class SubagentExecution:
         agent_name = self._view._record_name(context.record)
         response_text = (
             f"Background agent {agent_name} ({context.agent_id}, run {context.run_id}) "
-            "launched and running; use check_agents to monitor, "
-            "get_agent_result or wait_for_agent to retrieve the "
-            "result." + policy_guidance
+            "launched and running. Do independent work or end your turn; on the "
+            "completion notification, fetch the result with get_agent_result. "
+            "Use wait_for_agent only if the result is a hard dependency of your "
+            "next action, no independent work can proceed, and that action must "
+            "occur in this turn rather than after notification. If uncertain, "
+            "end your turn. Do not invent work to fill the wait; if there is "
+            "nothing real to do, end your turn. Use check_agents to inspect "
+            "progress." + policy_guidance
         )
         # WP5: every substitution emits its milestone notice (with the honest
         # cost implication) on the acknowledgment, and the ack carries the

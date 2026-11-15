@@ -118,7 +118,7 @@ async def test_recursive_grep_never_opens_blocked_candidate(
     execute = tool._execute_search
     content_commands: list[list[str]] = []
 
-    async def checked_command(cmd: list[str]) -> str:
+    async def checked_command(cmd: list[str], *, ledger: object = None) -> str:
         if "--files" not in cmd:
             operands = cmd[cmd.index("--") + 1 :]
             assert operands and "-r" not in cmd

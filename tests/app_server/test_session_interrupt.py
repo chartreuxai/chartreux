@@ -411,9 +411,20 @@ async def test_enqueue_response_does_not_restore_a_turn_promoted_by_newer_events
     request = client.request
 
     async def wait_for_promotion_before_returning(
-        method, params=None, *, wait_for_incoming=False
+        method,
+        params=None,
+        *,
+        wait_for_incoming=False,
+        response_boundary=None,
+        timeout=None,
     ):
-        response = await request(method, params, wait_for_incoming=wait_for_incoming)
+        response = await request(
+            method,
+            params,
+            wait_for_incoming=wait_for_incoming,
+            response_boundary=response_boundary,
+            timeout=timeout,
+        )
         if method != "app_server/session/turn/enqueue":
             return response
         queue_item_id = response["queueItemId"]
@@ -816,9 +827,20 @@ async def test_queue_read_does_not_restore_an_item_removed_by_a_newer_event(
         assert client is not None
         request = client.request
 
-        async def delay_queue_read(method, params=None, *, wait_for_incoming=False):
+        async def delay_queue_read(
+            method,
+            params=None,
+            *,
+            wait_for_incoming=False,
+            response_boundary=None,
+            timeout=None,
+        ):
             response = await request(
-                method, params, wait_for_incoming=wait_for_incoming
+                method,
+                params,
+                wait_for_incoming=wait_for_incoming,
+                response_boundary=response_boundary,
+                timeout=timeout,
             )
             if method == "app_server/session/turn/queue/read":
                 read_captured.set()
@@ -887,12 +909,23 @@ async def test_remove_queued_turn_reports_concurrent_promotion(
         request = client.request
 
         async def promote_before_remove(
-            method, params=None, *, wait_for_incoming=False
+            method,
+            params=None,
+            *,
+            wait_for_incoming=False,
+            response_boundary=None,
+            timeout=None,
         ):
             if method == "app_server/session/turn/queue/remove":
                 release_first.set()
                 await second_started.wait()
-            return await request(method, params, wait_for_incoming=wait_for_incoming)
+            return await request(
+                method,
+                params,
+                wait_for_incoming=wait_for_incoming,
+                response_boundary=response_boundary,
+                timeout=timeout,
+            )
 
         monkeypatch.setattr(client, "request", promote_before_remove)
 

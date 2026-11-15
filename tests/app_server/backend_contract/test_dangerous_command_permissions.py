@@ -10,7 +10,7 @@ in-process surfaces use.
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import AsyncIterator, Callable
 import json
 from pathlib import Path
 import subprocess
@@ -19,6 +19,7 @@ from typing import Any
 
 import httpx
 import pytest
+import pytest_asyncio
 import respx
 
 from chartreux.app_server._runtime import create_harness_server
@@ -36,16 +37,22 @@ from chartreux.app_server.protocol import (
     AppServerResponseError,
     ClientCapabilities,
     ClientInfo,
+    DangerousCommandAuthorityReadParams,
+    DangerousCommandRevokeParams,
     ProtocolErrorCode,
     SessionOptions,
 )
-from chartreux.app_server.transport import memory_transport_pair
+from chartreux.app_server.transport import STDIO_TRANSPORT, memory_transport_pair
+from chartreux.core.agent_loop import AgentLoop
 from chartreux.core.config._dangerous_command_authority import GRANTS_FIELD
 from chartreux.utils import AgentEntrypoint
 from tests.app_server.backend_contract.conftest import (
     BackendContractConnection,
     connect_backend_contract_host,
+    connect_backend_contract_stdio_host,
+    install_memory_root_agent,
 )
+from tests.conftest import build_test_agent_loop
 
 
 def _make_repo(path: Path) -> Path:
@@ -325,3 +332,161 @@ async def test_a_fresh_session_reads_the_saved_grant_from_disk(
     finally:
         await session.close()
         await connection.host.close()
+
+
+@pytest_asyncio.fixture
+async def authority_connection(
+    monkeypatch: pytest.MonkeyPatch,
+    stdio_after_autouse: str,
+    backend_contract_session_options: SessionOptions,
+    backend_contract_capabilities: ClientCapabilities,
+    dangerous_project: Path,
+) -> AsyncIterator[BackendContractConnection]:
+    """One connection on the node's transport, the agent's loop bound to the project.
+
+    The stdio leg runs the root agent over a memory wire (the spawned-stdio
+    legs land with C5c), with the loop's cwd set to the project so the
+    authority's project keying matches the in_process leg's session cwd.
+    """
+    loop: AgentLoop | None = None
+    if stdio_after_autouse == STDIO_TRANSPORT:
+        loop = build_test_agent_loop(cwd=dangerous_project)
+        install_memory_root_agent(monkeypatch, loop)
+        connection = await connect_backend_contract_stdio_host(
+            session_options=backend_contract_session_options,
+            capabilities=backend_contract_capabilities,
+        )
+    else:
+        connection = await connect_backend_contract_host(
+            session_options=backend_contract_session_options,
+            capabilities=backend_contract_capabilities,
+        )
+    try:
+        yield connection
+    finally:
+        await connection.host.close()
+        if loop is not None:
+            await loop.aclose()
+
+
+@pytest.mark.asyncio
+async def test_authority_read_and_revoke_round_trip_on_the_selected_transport(
+    authority_connection: BackendContractConnection, dangerous_project: Path
+) -> None:
+    session = await authority_connection.host.open_session()
+    try:
+        read = await session.resources.config.read_dangerous_command_authority()
+        assert read.project == str(dangerous_project)
+        assert read.live_grants == []
+        assert isinstance(read.live_authority_generation, int)
+
+        revoked = await session.resources.config.revoke_dangerous_command_grant(
+            operation_id="git.push",
+            expected_live_generation=read.live_authority_generation,
+            expected_disk_revision=None,
+            user_initiated=True,
+        )
+        assert revoked.live.status == "removed"
+        # No disk revision was supplied, so the saved side is not attempted.
+        assert revoked.saved.status == "skipped"
+        assert revoked.live_authority_generation == read.live_authority_generation
+
+        after = await session.resources.config.read_dangerous_command_authority()
+        assert after.live_grants == []
+    finally:
+        await session.close()
+
+
+@pytest.mark.asyncio
+async def test_a_superseded_generation_revoke_reports_the_conflict_outcome_set(
+    authority_connection: BackendContractConnection,
+) -> None:
+    """The CAS outcome set, pinned on whichever transport the node runs on.
+
+    A revoke naming a generation the read did not observe is a conflict that
+    reports the current generation and leaves the saved side untouched --
+    never a false ack; the generation the read did observe still revokes.
+    """
+    session = await authority_connection.host.open_session()
+    try:
+        read = await session.resources.config.read_dangerous_command_authority()
+        superseded = read.live_authority_generation + 1
+
+        conflicted = await session.resources.config.revoke_dangerous_command_grant(
+            operation_id="git.push",
+            expected_live_generation=superseded,
+            expected_disk_revision=None,
+            user_initiated=True,
+        )
+        assert conflicted.live.status == "conflict"
+        assert conflicted.live.generation == read.live_authority_generation
+        assert conflicted.saved.status == "skipped"
+        assert conflicted.live_authority_generation == read.live_authority_generation
+        assert conflicted.warning is None
+
+        applied = await session.resources.config.revoke_dangerous_command_grant(
+            operation_id="git.push",
+            expected_live_generation=read.live_authority_generation,
+            expected_disk_revision=None,
+            user_initiated=True,
+        )
+        assert applied.live.status == "removed"
+        assert applied.saved.status == "skipped"
+    finally:
+        await session.close()
+
+
+@pytest.mark.asyncio
+async def test_authority_param_and_session_refusals_on_the_selected_transport(
+    authority_connection: BackendContractConnection,
+) -> None:
+    session = await authority_connection.host.open_session()
+    try:
+        client = authority_connection.client
+        with pytest.raises(AppServerResponseError) as exc_info:
+            await client.request(
+                "policy/dangerous_commands/revoke",
+                DangerousCommandRevokeParams(
+                    session_id=session.session_id,
+                    operation_id="not-an-operation",
+                    expected_live_generation=0,
+                    expected_disk_revision=None,
+                    user_initiated=True,
+                ),
+            )
+        assert exc_info.value.error.code is ProtocolErrorCode.INVALID_PARAMS
+        # A destination scopes only network.remote-exec to one exact canonical
+        # destination; any other operation rejects it.
+        with pytest.raises(AppServerResponseError) as exc_info:
+            await client.request(
+                "policy/dangerous_commands/revoke",
+                DangerousCommandRevokeParams(
+                    session_id=session.session_id,
+                    operation_id="git.push",
+                    expected_live_generation=0,
+                    expected_disk_revision=None,
+                    destination="example.com",
+                    user_initiated=True,
+                ),
+            )
+        assert exc_info.value.error.code is ProtocolErrorCode.INVALID_PARAMS
+        with pytest.raises(AppServerResponseError) as exc_info:
+            await client.request(
+                "policy/dangerous_commands/read",
+                DangerousCommandAuthorityReadParams(session_id="unregistered-session"),
+            )
+        assert exc_info.value.error.code is ProtocolErrorCode.NOT_FOUND
+        with pytest.raises(AppServerResponseError) as exc_info:
+            await client.request(
+                "policy/dangerous_commands/revoke",
+                DangerousCommandRevokeParams(
+                    session_id="unregistered-session",
+                    operation_id="git.push",
+                    expected_live_generation=0,
+                    expected_disk_revision=None,
+                    user_initiated=True,
+                ),
+            )
+        assert exc_info.value.error.code is ProtocolErrorCode.NOT_FOUND
+    finally:
+        await session.close()

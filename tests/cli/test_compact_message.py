@@ -12,7 +12,7 @@ from chartreux.cli.textual_ui.widgets.session_status_line import SessionStatusLi
 from tests.conftest import build_test_chartreux_app
 
 _SPENT_TOKENS = 120_000
-_CONTEXT_WINDOW = 200_000
+_CONTEXT_WINDOW = 1_000_000
 
 
 class TestCompactMessage:
@@ -80,6 +80,11 @@ async def test_compaction_empties_the_context_gauge() -> None:
             app.query_one(SessionStatusLine).state.context_tokens
             == surviving_summary_tokens
         )
+        # The gauge's denominator survives the refresh too: it is the deployed
+        # compaction trigger, not the 1.0M window the read reports.
+        status = app.query_one(SessionStatusLine)
+        assert status.state.auto_compact_threshold == 500_000
+        assert "4k/500k (1%)" in status.render().plain
 
 
 @pytest.mark.asyncio

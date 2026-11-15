@@ -11,11 +11,14 @@ from pydantic import JsonValue, ValidationError
 
 from chartreux import __version__
 from chartreux.app_server._dispatch import (
+    SESSION_TITLE_UPDATE_ALIAS_METHOD,
     DispatchResult,
     RequestFailure,
     method_not_found,
+    unsupported_title_alias,
 )
 from chartreux.app_server._execution import cancel_tasks
+from chartreux.app_server._handler import session_fenced_failure, version_skew_failure
 from chartreux.app_server._host import HostRequestHandler
 from chartreux.app_server._model import ProtocolModel, validate_wire
 from chartreux.app_server._session_backend_port import (
@@ -64,6 +67,7 @@ from chartreux.app_server.protocol import (
     RootsReadParams,
     RootsReplaceParams,
     RootsSaveParams,
+    RuntimeSnapshot,
     ServerInfo,
     ServerRequest,
     SessionCompactParams,
@@ -82,6 +86,8 @@ from chartreux.app_server.protocol import (
     SessionSnapshotParams,
     SessionStartParams,
     SessionStartResponse,
+    SessionStopParams,
+    SessionStopResponse,
     SessionTitleUpdateParams,
     TransportKind,
     TurnEnqueueParams,
@@ -105,7 +111,7 @@ from chartreux.app_server.registry_manifest import (
     LiveAgentUnavailableError,
     RegistryManifest,
 )
-from chartreux.app_server.transport import JsonRpcTransport
+from chartreux.app_server.transport import STDIO_TRANSPORT, JsonRpcTransport
 from chartreux.core.config.harness_files import HarnessFilesManager
 from chartreux.core.subagents import LaunchConfigError
 from chartreux.observability.logging import logger
@@ -175,6 +181,15 @@ _SESSION_BACKEND_METHODS = frozenset({
 })
 
 
+_STOP_RECEIPT_TIMEOUT = 30.0
+"""How long close() waits for pending stop receipts before closing the transport.
+
+Stop waiters are exempt from shutdown cancellation and their receipts are
+delivered before the connection closes; this bound only guards a pathological
+waiter that never settles, so the shutdown cannot hang forever.
+"""
+
+
 @dataclass(slots=True)
 class CallbackDelivery:
     session_id: str
@@ -228,10 +243,24 @@ class AppServer:
         self._client_capabilities = ClientCapabilities()
         self._next_request_id = 1
         self._event_watermarks: dict[str, int] = {}
+        # Session rotations this connection adopted (superseded id -> rotated
+        # id) and the handoff source ids still in flight, so a request
+        # addressed to a superseded id is fenced instead of answered with a
+        # bare not-found or silently retried.
+        self._session_rotations: dict[str, str] = {}
+        self._pending_handoffs: set[str] = set()
         self._callback_requests: dict[int, CallbackDelivery] = {}
         self._client_requests: dict[int, PendingClientRequest] = {}
         self._abandoned_client_request_ids: set[int] = set()
         self._request_tasks: set[asyncio.Task[None]] = set()
+        # The request tasks currently serving session/stop. Stop waiters are
+        # exempt from shutdown cancellation so every pending stop receipt --
+        # coalesced ones included -- is delivered before the connection closes.
+        self._stop_waiters: set[asyncio.Task[None]] = set()
+        self._stop_lock = asyncio.Lock()
+        # The first in-flight stop's pending receipt: a second stop arriving
+        # during the first stop's persistence window coalesces into it.
+        self._stop_receipt: asyncio.Future[DispatchResult] | None = None
         self._backend_event_task: asyncio.Task[None] | None = None
         self._backend_event_backend: SessionBackend | None = None
         self._serve_task: asyncio.Task[None] | None = None
@@ -322,7 +351,20 @@ class AppServer:
         service = self._mcp_catalog_service
         if service is None:
             return
-        runtime_updated = await service.accept_auth_required(event.params, self._root)
+        root = self._root
+        if root is not None:
+            from chartreux.app_server.mcp_catalog import SessionMCPCatalogBinding
+
+            if not isinstance(root, SessionMCPCatalogBinding):
+                # The process-backed (stdio) root is not a catalog binding:
+                # the gate ran owner-side in the agent process, so this end
+                # relays the gated notification and the adopted runtime view.
+                await self._route_notification("mcp_catalog/authRequired", event.params)
+                await self._route_notification(
+                    "runtime/updated", root.runtime_updated_params()
+                )
+                return
+        runtime_updated = await service.accept_auth_required(event.params, root)
         if runtime_updated is None:
             return
         await self._route_notification("mcp_catalog/authRequired", event.params)
@@ -423,11 +465,25 @@ class AppServer:
             finally:
                 unsubscribe_usage()
                 if close_on_disconnect:
+                    if self._root is not None:
+                        # Terminal-disconnect disclosure: a stdio connection
+                        # drop stays terminal — in-flight work on the attached
+                        # root can be lost, and the explicit session/resume is
+                        # the recovery path; there is no transparent reconnect.
+                        logger.warning(
+                            "The stdio connection disconnected with session %s "
+                            "attached: the disconnect is terminal and in-flight "
+                            "work can be lost; resume explicitly with "
+                            "session/resume",
+                            self._root.session_id,
+                        )
                     await self.close()
                 else:
                     await self._detach_connection(transport)
 
     async def close(self) -> None:
+        if self._shutdown_complete:
+            return
         async with self._close_lock:
             if self._shutdown_complete:
                 return
@@ -446,13 +502,32 @@ class AppServer:
             self._connection_attached = False
             self._attaching = False
             self._reject_pending_client_requests(RuntimeError("App server closed"))
+            # Mark the shutdown complete before waiting on the stop waiters,
+            # so a waiter's own close() returns without blocking on this lock.
+            self._shutdown_complete = True
+            # Stop waiters are exempt from the cancellation above; every
+            # pending stop receipt -- coalesced ones included -- is delivered
+            # before the connection closes.
+            waiters = [
+                task
+                for task in self._stop_waiters
+                if task is not current and not task.done()
+            ]
+            if waiters:
+                done, pending = await asyncio.wait(
+                    waiters, timeout=_STOP_RECEIPT_TIMEOUT
+                )
+                if pending:
+                    logger.error(
+                        "Stop waiters did not deliver their receipts before close: %s",
+                        [task.get_name() for task in pending],
+                    )
             transport = self._transport
             if transport is not None:
                 try:
                     await transport.close()
                 except BaseException as exc:
                     errors.append(exc)
-            self._shutdown_complete = True
             if len(errors) == 1:
                 raise errors[0]
             if errors:
@@ -493,7 +568,11 @@ class AppServer:
     async def _stop_background_tasks(
         self, current: asyncio.Task[object] | None
     ) -> list[BaseException]:
-        tasks = [task for task in self._request_tasks if task is not current]
+        tasks = [
+            task
+            for task in self._request_tasks
+            if task is not current and task not in self._stop_waiters
+        ]
         backend_events = self._backend_event_task
         self._backend_event_task = None
         self._backend_event_backend = None
@@ -506,7 +585,11 @@ class AppServer:
     async def _stop_request_tasks(
         self, current: asyncio.Task[object] | None
     ) -> list[BaseException]:
-        tasks = [task for task in self._request_tasks if task is not current]
+        tasks = [
+            task
+            for task in self._request_tasks
+            if task is not current and task not in self._stop_waiters
+        ]
         backend_events = self._backend_event_task
         self._backend_event_task = None
         self._backend_event_backend = None
@@ -537,6 +620,20 @@ class AppServer:
             self._serve_task.cancel()
 
     async def _handle_request(self, request: ServerRequest) -> None:
+        current = asyncio.current_task()
+        if request.method == "session/stop" and current is not None:
+            # A stop waiter is exempt from shutdown cancellation, so its
+            # receipt -- the first stop's or a coalesced one -- is delivered
+            # before the connection closes.
+            self._stop_waiters.add(current)
+            try:
+                await self._handle_request_message(request)
+            finally:
+                self._stop_waiters.discard(current)
+            return
+        await self._handle_request_message(request)
+
+    async def _handle_request_message(self, request: ServerRequest) -> None:
         if request.method in _SESSION_ATTACHMENT_CANDIDATES:
             async with self._attachment_lock:
                 await self._handle_request_once(request)
@@ -691,6 +788,13 @@ class AppServer:
     ) -> DispatchResult:
         if method not in SERVER_METHODS:
             raise method_not_found(method)
+        if method == SESSION_TITLE_UPDATE_ALIAS_METHOD:
+            # A retained alias with no handler in either topology: the wire
+            # method for a manual title is session/rename. Refused before any
+            # session routing, so both transports answer alike instead of one
+            # reading as an unknown method and the other as an uncarried stdio
+            # operation naming a selector that does not carry it either.
+            raise unsupported_title_alias()
         if method == "usage/read":
             return await self._host_handler.read_usage(
                 raw_params,
@@ -703,9 +807,19 @@ class AppServer:
         if self._mcp_catalog_service is not None and self._mcp_catalog_service.handles(
             method
         ):
-            return await self._mcp_catalog_service.dispatch(
-                method, raw_params, root=self._root, notify=self._notify
+            agent_owned = (
+                self._transport_kind == STDIO_TRANSPORT
+                and self._root is not None
+                and isinstance(raw_params.get("sessionId"), str)
             )
+            if not agent_owned:
+                return await self._mcp_catalog_service.dispatch(
+                    method, raw_params, root=self._root, notify=self._notify
+                )
+            # A session-addressed catalog call on the stdio topology is owned
+            # by the agent process: it falls through to the root's extension
+            # dispatch, which carries it over the wire with the typed owner
+            # key. Sessionless calls keep the coordinator's host-side service.
         if method in {
             "config/schema",
             "session/history/get",
@@ -719,14 +833,49 @@ class AppServer:
             return await self._host_handler.dispatch(method, raw_params)
         if method == "session/delete":
             return await self._delete_session(raw_params)
+        if method == "session/stop":
+            return await self._dispatch_stop(raw_params)
         if _omits_session_id(method, raw_params):
             return await self._host_handler.dispatch(method, raw_params)
         if self._root is None:
             return await self._dispatch_without_root(method, raw_params)
-        result = await self._dispatch_to_root(method, raw_params)
-        if method == "session/stop":
-            await self._close_attached_runtime()
+        try:
+            result = await self._dispatch_to_root(method, raw_params)
+        except (RequestFailure, SessionBackendError) as exc:
+            fenced = await self._superseded_session_fence(exc, raw_params)
+            if fenced is not None:
+                raise fenced from exc
+            raise
         return result
+
+    async def _superseded_session_fence(
+        self, exc: RequestFailure | SessionBackendError, raw_params: dict[str, Any]
+    ) -> RequestFailure | None:
+        """Translate a bare not-found for a superseded id into the typed fence.
+
+        A request addressed to a session id a plan handoff rotated must never
+        answer bare NOT_FOUND or be silently retried: a settled rotation maps
+        the old id to the rotated one, and one still in flight between
+        handoff-send and settlement is resolved through the backend. A peer
+        that cannot report the rotation is a version skew, not a not-found.
+        """
+        if exc.code is not ProtocolErrorCode.NOT_FOUND:
+            return None
+        session_id = raw_params.get("sessionId")
+        if not isinstance(session_id, str):
+            return None
+        rotated = self._session_rotations.get(session_id)
+        if rotated is None and session_id in self._pending_handoffs:
+            resolver = getattr(self._root, "rotated_session_id_for", None)
+            if resolver is not None:
+                rotated = await resolver(session_id)
+        if rotated is not None and rotated != session_id:
+            return session_fenced_failure(session_id, rotated)
+        if session_id in self._pending_handoffs:
+            return version_skew_failure(
+                session_id, "the in-flight handoff's rotated identity is unavailable"
+            )
+        return None
 
     def _events_read(self, raw_params: dict[str, Any]) -> DispatchResult:
         """Reserve pull-based event replay for future clients.
@@ -756,6 +905,83 @@ class AppServer:
         if errors:
             raise BaseExceptionGroup("App-server session shutdown failed", errors)
 
+    async def _dispatch_stop(self, raw_params: dict[str, Any]) -> DispatchResult:
+        """Route one ``session/stop`` on either transport.
+
+        With a root attached the stop runs the coordinator lifecycle once
+        (coalesced); without one -- a fresh connection or a saved session --
+        the stop against the settled session is an ack.
+        """
+        params = validate_wire(SessionStopParams, raw_params)
+        if self._root is None:
+            return await self._ack_settled_stop(params)
+        return await self._coalesced_stop(raw_params)
+
+    async def _ack_settled_stop(self, params: SessionStopParams) -> DispatchResult:
+        """Ack a stop against a settled session via a fresh connection.
+
+        Repeat-safe applies outside the closed connection: a stop for a saved
+        session answers the ack instead of a conflict, and an unknown id stays
+        NOT_FOUND, exactly as the in-process arm's ``_require_session``.
+        """
+        probe = SessionReadParams(
+            session_id=params.session_id, history=PageRequest(limit=1)
+        )
+        try:
+            await self._host_handler.dispatch(
+                "session/read", probe.model_dump(mode="json", by_alias=True)
+            )
+        except RequestFailure as exc:
+            raise RequestFailure(
+                ProtocolErrorCode.NOT_FOUND, f"Session not found: {params.session_id}"
+            ) from exc
+        return DispatchResult(SessionStopResponse())
+
+    async def _coalesced_stop(self, raw_params: dict[str, Any]) -> DispatchResult:
+        """Run the stop lifecycle once; later stops coalesce into its receipt.
+
+        A second stop arriving during the first stop's persistence window
+        answers the first stop's pending receipt: no concurrent second
+        persistence runs.
+        """
+        async with self._stop_lock:
+            pending = self._stop_receipt
+            if pending is not None:
+                return await pending
+            receipt: asyncio.Future[DispatchResult] = (
+                asyncio.get_running_loop().create_future()
+            )
+            self._stop_receipt = receipt
+        try:
+            result = await self._run_stop(raw_params)
+        except BaseException as exc:
+            if not receipt.done():
+                receipt.set_exception(exc)
+                # The direct caller already raises this; mark it retrieved so
+                # a coalesced waiter is not the only consumer of it.
+                receipt.exception()
+            raise
+        if not receipt.done():
+            receipt.set_result(result)
+        return result
+
+    async def _run_stop(self, raw_params: dict[str, Any]) -> DispatchResult:
+        """One stop: the backend's lifecycle, then the attached runtime closes.
+
+        The root's termination and persistence are ordered ahead of the ack
+        frame: dispatch returns only after ``_close_attached_runtime`` ran, and
+        the response is sent afterwards.
+        """
+        try:
+            result = await self._dispatch_to_root("session/stop", raw_params)
+        except (RequestFailure, SessionBackendError) as exc:
+            fenced = await self._superseded_session_fence(exc, raw_params)
+            if fenced is not None:
+                raise fenced from exc
+            raise
+        await self._close_attached_runtime()
+        return result
+
     async def _delete_session(self, raw_params: dict[str, Any]) -> DispatchResult:
         params = validate_wire(SessionDeleteParams, raw_params)
         root = self._root
@@ -778,7 +1004,7 @@ class AppServer:
             return await self._host_handler.dispatch(method, raw_params)
         return await self._open_initial_session(method, raw_params)
 
-    async def _dispatch_to_root(
+    async def _dispatch_to_root(  # noqa: PLR0912 - the rotation fence adds a branch
         self, method: str, raw_params: dict[str, Any]
     ) -> DispatchResult:
         root = self._root
@@ -806,32 +1032,71 @@ class AppServer:
         if method in _SESSION_BACKEND_METHODS:
             raise RuntimeError(f"Session backend method was not routed: {method}")
         previous_session_id = root.session_id
+        handoff_source = (
+            raw_params.get("sessionId") if method == "session/plan/handoff" else None
+        )
+        if isinstance(handoff_source, str):
+            # Between handoff-send and settlement the source id is pending:
+            # a submit addressed to it is fenced, never forwarded against the
+            # pre-rotation session.
+            self._pending_handoffs.add(handoff_source)
         try:
-            result = await root.dispatch_extension(method, raw_params)
-        except SessionBackendError as exc:
-            if exc.code is ProtocolErrorCode.NOT_FOUND and method in {
-                "session/read",
-                "session/history/list",
-            }:
-                return await self._host_handler.dispatch(method, raw_params)
-            raise
-        try:
-            if result.session_attached and root.session_id != previous_session_id:
-                subscription = await root.subscribe(
-                    SessionReadParams(
-                        session_id=root.session_id, history=PageRequest(limit=200)
+            try:
+                result = await root.dispatch_extension(method, raw_params)
+            except SessionBackendError as exc:
+                if exc.code is ProtocolErrorCode.NOT_FOUND and method in {
+                    "session/read",
+                    "session/history/list",
+                    "session/turns/list",
+                }:
+                    if (
+                        method == "session/history/list"
+                        and raw_params.get("sessionId") == root.session_id
+                    ):
+                        # The attached session's live history is agent-owned:
+                        # a not-found from its carrier is a typed mismatch,
+                        # never the persisted host projection served for an
+                        # attached id.
+                        raise SessionBackendError(
+                            ProtocolErrorCode.CONFLICT,
+                            f"Session {root.session_id} is attached; its live "
+                            "history is served by the root agent, not the "
+                            "persisted host projection",
+                        ) from exc
+                    return await self._host_handler.dispatch(method, raw_params)
+                raise
+            try:
+                if result.session_attached and root.session_id != previous_session_id:
+                    # The dispatch rotated the session: remember old -> new so a
+                    # late request addressed to the old id is fenced, then
+                    # resubscribe the event stream to the rotated session.
+                    self._session_rotations[previous_session_id] = root.session_id
+                    # Release the old event consumer before subscribing: the
+                    # backend admits exactly one subscriber, and the rotation
+                    # replaces it.
+                    previous_task = self._backend_event_task
+                    if previous_task is not None:
+                        previous_task.cancel()
+                        with suppress(asyncio.CancelledError):
+                            await previous_task
+                    subscription = await root.subscribe(
+                        SessionReadParams(
+                            session_id=root.session_id, history=PageRequest(limit=200)
+                        )
                     )
-                )
-                await self._replace_backend_event_task(root, subscription)
-                await self._replay_pending_backend_events(
-                    root, subscription.snapshot.last_event_id
-                )
-            await self._flush_backend_events(root)
-        except BaseException:
-            if result.on_response_abandoned is not None:
-                result.on_response_abandoned()
-            raise
-        return result
+                    await self._replace_backend_event_task(root, subscription)
+                    await self._replay_pending_backend_events(
+                        root, subscription.snapshot.last_event_id
+                    )
+                await self._flush_backend_events(root)
+            except BaseException:
+                if result.on_response_abandoned is not None:
+                    result.on_response_abandoned()
+                raise
+            return result
+        finally:
+            if isinstance(handoff_source, str):
+                self._pending_handoffs.discard(handoff_source)
 
     async def _dispatch_backend_host_operation(
         self, method: str, raw_params: dict[str, Any]
@@ -931,6 +1196,12 @@ class AppServer:
                     state=response.state,
                     last_event_id=response.last_event_id,
                     plan_record=await lifecycle.backend.read_plan_record(),
+                    # A resume that respawned a confirmed-dead root surfaces the
+                    # retired generation's memorial queue/shell state and its
+                    # typed death receipt; the memorial is never re-admitted
+                    # for execution on the new generation.
+                    memorial=list(lifecycle.memorial),
+                    death_receipt=lifecycle.death_receipt,
                 ),
                 after_response=lifecycle.after_response,
                 session_attached=True,
@@ -1041,7 +1312,7 @@ class AppServer:
             runtime_updated=result.runtime_updated,
         )
 
-    async def _dispatch_backend_config(  # noqa: PLR0911, PLR0912 - explicit route ownership
+    async def _dispatch_backend_config(  # noqa: PLR0911, PLR0912, PLR0915 - explicit route ownership
         self, root: SessionBackend, method: str, raw_params: dict[str, Any]
     ) -> DispatchResult | None:
         if method in {"policy/roots/read", "policy/roots/replace"}:
@@ -1106,22 +1377,46 @@ class AppServer:
                     ProtocolErrorCode.NOT_FOUND,
                     f"Session not found: {params.session_id}",
                 )
-            plan = (
-                await self._mcp_catalog_service.prepare_config_reload(root)
-                if self._mcp_catalog_service is not None
-                else None
-            )
-            try:
-                result = await root.reload_config(params)
+            prepare_port = getattr(root, "prepare_mcp_reload", None)
+            finish_port = getattr(root, "finish_mcp_reload", None)
+            fail_port = getattr(root, "fail_mcp_reload", None)
+            if (
+                prepare_port is not None
+                and finish_port is not None
+                and fail_port is not None
+            ):
+                # The process-backed (stdio) root carries the MCP convergence
+                # legs to the agent process that owns the loop; this end only
+                # relays them and adopts the receipt's runtime view.
+                await prepare_port()
+                try:
+                    result = await root.reload_config(params)
+                    receipt = await finish_port()
+                except Exception:
+                    await fail_port()
+                    raise
                 mcp_runtime = (
-                    await self._mcp_catalog_service.finish_config_reload(root, plan)
+                    RuntimeSnapshot.model_validate(receipt.runtime)
+                    if receipt.runtime is not None
+                    else None
+                )
+            else:
+                plan = (
+                    await self._mcp_catalog_service.prepare_config_reload(root)
                     if self._mcp_catalog_service is not None
                     else None
                 )
-            except Exception:
-                if self._mcp_catalog_service is not None:
-                    await self._mcp_catalog_service.fail_config_reload(root, plan)
-                raise
+                try:
+                    result = await root.reload_config(params)
+                    mcp_runtime = (
+                        await self._mcp_catalog_service.finish_config_reload(root, plan)
+                        if self._mcp_catalog_service is not None
+                        else None
+                    )
+                except Exception:
+                    if self._mcp_catalog_service is not None:
+                        await self._mcp_catalog_service.fail_config_reload(root, plan)
+                    raise
             if mcp_runtime is not None:
                 result = SessionBackendResult(
                     response=result.response.model_copy(

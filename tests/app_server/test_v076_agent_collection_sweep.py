@@ -71,6 +71,13 @@ _TRIGGER_CONSTANT_NAMES = {
     "SWEEP_TRIGGER_CAP_BOUNDARY",
 }
 
+#: The v0.7.9 notification-first coaching both notification templates append
+#: after the retained "Use get_agent_result to retrieve the result." sentence.
+NOTIFICATION_COACHING = (
+    "Retrieve this run by its run_id; continue independent work or end your "
+    "turn for other running agents rather than waiting by default."
+)
+
 
 async def _wait_for(predicate, timeout: float = 5) -> None:
     deadline = time.monotonic() + timeout
@@ -200,6 +207,7 @@ def test_synthesized_notifications_project_like_any_injected_notice() -> None:
     synthesized = (
         "Background agent coder-1 (agent-1, run run-1) completed."
         " Use get_agent_result to retrieve the result."
+        f" {NOTIFICATION_COACHING}"
     )
     messages = [
         LLMMessage(role=Role.user, content="user question"),
@@ -254,6 +262,7 @@ async def test_sweep_gap_filters_exactly_once_and_no_marking() -> None:
             f"Background agent {registry._record_name(record)} "
             f"(agent-1, run run-1) completed."
             " Use get_agent_result to retrieve the result."
+            f" {NOTIFICATION_COACHING}"
         )
         assert parent.turns.started[0] == expected
         assert key in execution._sweep_surfaced
@@ -355,6 +364,10 @@ async def test_delivered_notification_is_surfaced_exactly_once(
     try:
         launch = await _launch_blocked(registry, parent, backend)
         key = (launch.agent_id, launch.run_id)
+        # Captured before completion: a zero-retention record is closed when
+        # the run settles, but the same record object carries the notification
+        # name at construction time.
+        record = registry._agent_records[launch.agent_id]
         backend.release.set()
         await _wait_for(lambda: key in registry._result_store)
         await _wait_for(lambda: key not in registry._pending_notifications)
@@ -362,6 +375,14 @@ async def test_delivered_notification_is_surfaced_exactly_once(
         delivered = [t for t in notifications if f"run {launch.run_id}" in t]
         assert len(delivered) == 1
         assert "completed" in delivered[0]
+        # Normal/sweep parity: for the same settled run the delivered
+        # notification and the sweep template are the same text — the added
+        # coaching rides both, with the status word and handles preserved.
+        assert delivered[0] == registry._execution._synthesize_notification(
+            key, record, None
+        )
+        assert NOTIFICATION_COACHING in delivered[0]
+        assert f"({launch.agent_id}, run {launch.run_id}) completed." in delivered[0]
         # The delivered path recorded the surfaced key...
         assert key in registry._execution._delivered_notification_keys
         # ...so several timer intervals with the result still uncollected do

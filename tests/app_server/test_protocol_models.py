@@ -1227,6 +1227,7 @@ def test_agents_update_carries_retention_metadata() -> None:
         "stopReason": None,
         "contextTokens": None,
         "contextWindow": None,
+        "contextThreshold": None,
         "compacting": False,
         "initialTaskSummary": "Initial task",
         "currentTaskSummary": None,
@@ -1841,3 +1842,28 @@ def test_root_recovery_cancel_wire_contract() -> None:
         validate_wire(RootRecoveryCancelParams, {"sessionId": "s"})
     with pytest.raises(ValidationError):
         validate_wire(RootRecoveryCancelResponse, {"cancelled": "maybe"})
+
+
+def test_agent_summary_context_threshold_wire_codec() -> None:
+    """H3: the row's compaction trigger is a strict wire field.
+
+    A positive count rides the wire; an absent key and every shape a peer
+    cannot vouch for (a bool, a string, a float, a nonpositive value) read as
+    unknown instead of being coerced into a denominator no child stated.
+    """
+    base = {"agentId": "child", "name": "worker-child", "availability": "running"}
+
+    absent = validate_wire(AgentSummaryModel, base)
+    assert absent.context_threshold is None
+
+    stated = validate_wire(AgentSummaryModel, base | {"contextThreshold": 500_000})
+    assert stated.context_threshold == 500_000
+    assert stated.model_dump(mode="json")["contextThreshold"] == 500_000
+
+    malformed = [
+        validate_wire(
+            AgentSummaryModel, base | {"contextThreshold": value}
+        ).context_threshold
+        for value in (True, "500000", -1, 0, 1.5)
+    ]
+    assert malformed == [None] * 5

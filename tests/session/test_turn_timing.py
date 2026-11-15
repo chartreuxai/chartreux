@@ -6,6 +6,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
+from pydantic import TypeAdapter, ValidationError
 import pytest
 
 from chartreux.app_server._agent_transcript import _project_entries
@@ -15,16 +16,20 @@ from chartreux.app_server._tool_projection import project_effect_state
 from chartreux.app_server._turns import TurnController
 from chartreux.app_server.events import ClientProjection
 from chartreux.app_server.models import (
+    BlockedSessionStatus,
     CancelledEffectState,
     FailedEffectState,
+    FailedSessionStatus,
     IdleSessionStatus,
     JsonPatchOperation,
     PublicEffectEntry,
     PublicMessageEntry,
     PublicSession,
     PublicSessionState,
+    PublicSessionStatus,
     PublicTurn,
     PublicTurnStatus,
+    RunningSessionStatus,
 )
 from chartreux.app_server.protocol import HistoryEntryUpdatedParams, TurnStartParams
 from chartreux.core.agent_loop.llm_gateway import TranscriptAppend
@@ -195,6 +200,30 @@ def _consumer(projector: EventProjector) -> ClientProjection:
             history=list(projector.history),
         )
     )
+
+
+def test_public_session_status_admits_no_composed_variant() -> None:
+    """v0.7.9 point 5 (C7c): the wire status stays the main turn's own
+    vocabulary — `IdleSessionStatus` (the injected status in `_consumer`
+    above) and its three active siblings are the whole union, with the
+    composited background-work semantics staying client-side: no
+    background-work status variant rides the public wire.
+    """
+    adapter = TypeAdapter(PublicSessionStatus)
+    for status in (
+        IdleSessionStatus(),
+        RunningSessionStatus(active_turn_id="turn-1"),
+        BlockedSessionStatus(
+            active_turn_id="turn-1", callback_id="callback-1", reason="question"
+        ),
+        FailedSessionStatus(message="failed"),
+    ):
+        assert isinstance(
+            adapter.validate_python(adapter.dump_python(status)), type(status)
+        )
+    for composed in ({"type": "working"}, {"type": "background"}):
+        with pytest.raises(ValidationError):
+            adapter.validate_python(composed)
 
 
 def test_completed_timing_patch_at_both_boundaries_and_frozen_content() -> None:

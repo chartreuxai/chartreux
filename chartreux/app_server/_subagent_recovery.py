@@ -152,6 +152,10 @@ class RecoveryStateView(Protocol):
 
     def _emit_agents_update(self) -> Coroutine[Any, Any, None]: ...
 
+    # v0.7.9 point 5 (C6a): advance the monotone inventory revision in the
+    # caller's held region (the registry lock).
+    def _advance_inventory_revision_locked(self) -> None: ...
+
 
 def _effective_eligibility(
     record: AgentRecord, envelope: FailureEnvelope
@@ -355,6 +359,9 @@ class SubagentRecovery:
         record.reconcile_outcome = None
         record.reconcile_reason_codes = []
         view._suspension_capture_locked(record)
+        # The suspension transition flipped the projected availability under
+        # the caller's registry lock (point 5).
+        view._advance_inventory_revision_locked()
         # WP3 (handoff §1.5): warm suspension keeps the live conversation
         # resident but RELEASES the provider connection — the failed
         # backend is retired through its ownership-aware lifetime and a
@@ -706,6 +713,9 @@ class SubagentRecovery:
                 record.pending_resume = operation
                 record.state = _AgentState.RESTORING
                 record.same_agent_resumes_used += 1
+                # The committed admission flipped the projected availability
+                # to RESTORING under this locked region (point 5).
+                view._advance_inventory_revision_locked()
                 # C6a: a COMMITTED admission stands down the pending automatic
                 # schedule — the timer must never fire on a RESTORING record.
                 # The episode itself stays active: the successor's completion
@@ -749,6 +759,10 @@ class SubagentRecovery:
                     record.pending_resume = None
                     record.state = _AgentState.SUSPENDED
                     record.same_agent_resumes_used = admission.resumes_used_before
+                    # The failed successor admission restored the projected
+                    # SUSPENDED availability under the registry lock
+                    # (point 5).
+                    view._advance_inventory_revision_locked()
                     # C6a rollback: the committed admission stood the
                     # automatic schedule down; a failed successor admission
                     # must re-arm it — a suspended agent produces no new
@@ -868,6 +882,9 @@ class SubagentRecovery:
         async with view._registry_lock:
             if view._agent_records.get(record.agent_id) is record:
                 record.pending_resume = None
+                # Clearing the pending admission is part of the projected
+                # resume state; bump under the registry lock (point 5).
+                view._advance_inventory_revision_locked()
         try:
             await view._emit_agents_update()
         except Exception as exc:
@@ -1009,6 +1026,9 @@ class SubagentRecovery:
                 if effect.disposition == "unrepeatable_damage"
             ]
             record.last_reconciled = (expected_run_id, transcript_boundary)
+            # The reconciliation flips the projected recovery eligibility
+            # under this locked region (point 5).
+            view._advance_inventory_revision_locked()
             if damage:
                 record.reconcile_outcome = ReconcileOutcome.PROHIBITED.value
                 record.reconcile_reason_codes = [

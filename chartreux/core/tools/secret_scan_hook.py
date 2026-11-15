@@ -15,18 +15,32 @@ fallback. Findings are printed as path, rule id, and location only: the
 scanner's findings never carry the matched value, so the hook's output
 cannot disclose a secret. Invocation is harness-side (pre-commit for
 user-driven commits), never model-invoked.
+
+Approved synthetic matches are suppressed by the repo-committed manifest
+(``.chartreux-secret-scan.json``), which the hook reads from the COMMITTED
+HEAD blob (``git show HEAD:<manifest>``) — never from the staged index or
+the working tree — so a single commit staging both a secret and its
+matching approval does not self-authorize; the documented approval-first
+two-commit sequence (approval commit, then fixture commit) is what clears
+a new synthetic value. A missing or malformed manifest fails closed: no
+approvals are active.
 """
 
 from __future__ import annotations
 
 from collections.abc import Iterable
+from pathlib import Path
 import subprocess
 import sys
 
 from chartreux.core.tools.secret_scan import (
     DEFAULT_MAX_SCAN_BYTES,
     SCAN_INCOMPLETE_RULE_ID,
+    ScanPolicy,
     SecretFinding,
+    canonical_project_identity,
+    committed_scan_policy,
+    git_toplevel,
     incomplete_finding,
     scan_bytes,
 )
@@ -100,6 +114,24 @@ def _git_object_exists(revision: str) -> bool:
     return completed.returncode == 0
 
 
+def _hook_policy_and_root() -> tuple[ScanPolicy, Path]:
+    """The hook's scan policy and project root.
+
+    The policy is the approved-match manifest committed at HEAD — read with
+    ``git show HEAD:<manifest>``, never the index or the working tree, so a
+    commit staging both a secret and its approval does not self-authorize.
+    Absent, unborn-HEAD, or malformed manifests fail closed to the empty
+    policy (no approvals active). The project root is the repository
+    toplevel so each scanned filename derives the SAME canonical
+    project-relative identity the manifest keys are spelled in; a filename
+    that cannot be canonicalized (a path escaping the repository) yields no
+    key and always blocks.
+    """
+    cwd = Path.cwd()
+    root = git_toplevel(cwd) or cwd
+    return committed_scan_policy(root), root
+
+
 def scan_staged(filenames: Iterable[str]) -> list[SecretFinding]:
     """Scan the staged content of each filename, fail-closed per path.
 
@@ -110,13 +142,19 @@ def scan_staged(filenames: Iterable[str]) -> list[SecretFinding]:
     lookup failure. Every other unreadable path is a genuine lookup failure
     and adds a ``scan-incomplete`` sentinel naming it and the reason — the
     hook never falls back to the working tree, so a staged secret cannot be
-    laundered by reverting the file on disk.
+    laundered by reverting the file on disk. Approved matches from the
+    committed-HEAD manifest are suppressed inside the scan, keyed by the
+    canonical project-relative identity of each filename.
     """
+    policy, root = _hook_policy_and_root()
     findings: list[SecretFinding] = []
     for filename in filenames:
         raw = staged_blob(filename)
         if raw is not None:
-            findings.extend(scan_bytes(raw, label=filename))
+            key_path = canonical_project_identity(filename, project_root=root)
+            findings.extend(
+                scan_bytes(raw, label=filename, key_path=key_path, policy=policy)
+            )
         elif _git_object_exists(f":{filename}"):
             # The index holds an entry whose blob could not be read: a
             # broken or missing object mid-stream — a genuine failure.

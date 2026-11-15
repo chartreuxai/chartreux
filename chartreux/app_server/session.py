@@ -14,7 +14,12 @@ from pydantic import ValidationError
 from chartreux.app_server._model import ProtocolModel, validate_wire
 from chartreux.app_server._streaming import finish_event_queue
 from chartreux.app_server._turn_input import session_content_blocks
-from chartreux.app_server.client import AppServerClient, AppServerConnectionClosed
+from chartreux.app_server.client import (
+    DEFAULT_STOP_REQUEST_TIMEOUT,
+    AppServerClient,
+    AppServerConnectionClosed,
+    AppServerRequestNotSent,
+)
 from chartreux.app_server.client_state import ClientBootstrap, ClientSessionState
 from chartreux.app_server.client_tools import ClientToolHandler
 from chartreux.app_server.connection import (
@@ -60,6 +65,8 @@ from chartreux.app_server.models import (
 from chartreux.app_server.protocol import (
     AgentsCancelParams,
     AgentsCancelResponse,
+    AgentsInventoryReadParams,
+    AgentsInventoryReadResponse,
     AgentsReconcileParams,
     AgentsReconcileResponse,
     AgentsReleaseParams,
@@ -132,6 +139,7 @@ from chartreux.app_server.protocol import (
     VerifiedEffectWire,
 )
 from chartreux.app_server.resources import AppServerResources
+from chartreux.app_server.transport import JsonRpcSendUncertain
 from chartreux.observability.logging import logger
 from chartreux.user_content import UserResource
 
@@ -175,6 +183,29 @@ class AppServerTurnError(RuntimeError):
         # terminal_turn_id) across the solicited and unsolicited paths.
         self.turn_id = turn_id
         super().__init__(self.error.message)
+
+
+class SessionStopUnknownOutcome(RuntimeError):
+    """A ``session/stop`` whose reply never arrived.
+
+    A stop is a lifecycle mutation, so a missing reply is an UNKNOWN outcome:
+    the stop may or may not have been applied server-side. Reconcile through
+    ``session/resume`` (or a fresh connection's ``session/read``); never resend
+    the stop blindly -- a replay could double-apply a mutation whose first
+    attempt did land.
+    """
+
+
+def _unknown_stop_outcome(
+    session_id: str | None, detail: str, cause: BaseException
+) -> SessionStopUnknownOutcome:
+    unknown = SessionStopUnknownOutcome(
+        f"session/stop for session {session_id} {detail}; the outcome is unknown "
+        "-- reconcile with session/resume (or a fresh connection's "
+        "session/read), never resend the stop"
+    )
+    unknown.__cause__ = cause
+    return unknown
 
 
 @dataclass(frozen=True, slots=True)
@@ -911,6 +942,22 @@ class AppServerSession:  # noqa: PLR0904
             AgentsReconcileResponse, await client.request("agents/reconcile", params)
         )
 
+    async def read_agent_inventory(self) -> AgentsInventoryReadResponse:
+        """Read the live agent inventory as one typed, revised snapshot.
+
+        The control-class read answers from the process that owns the
+        children: the response carries the owner's own wire projection, the
+        monotone inventory revision it sampled, and the root incarnation
+        ``(session_id, generation)`` the revision floor compares within. A
+        dead stdio root answers the death receipt, never a stale snapshot.
+        """
+        params = AgentsInventoryReadParams()
+        client = await self._ensure_attached()
+        return validate_wire(
+            AgentsInventoryReadResponse,
+            await client.request("agents/inventory/read", params),
+        )
+
     async def interrupt(self) -> None:
         active_turn_id = self._active_public_turn_id()
         if active_turn_id is None:
@@ -1193,13 +1240,57 @@ class AppServerSession:  # noqa: PLR0904
             await asyncio.gather(self._deferred_resync_task, return_exceptions=True)
             self._deferred_resync_task = None
         client = self._connection.current
+        stop_outcome: Exception | None = None
         if client is not None:
-            with suppress(Exception):
+            try:
                 validate_wire(
                     SessionStopResponse,
                     await client.request(
-                        "session/stop", SessionStopParams(session_id=self.session_id)
+                        "session/stop",
+                        SessionStopParams(session_id=self.session_id),
+                        # The stop is a long operation: the ordinary 30s
+                        # default must not time it out.
+                        timeout=DEFAULT_STOP_REQUEST_TIMEOUT,
                     ),
+                )
+            except AppServerResponseError as exc:
+                # A typed stop answer (e.g. the death receipt) is surfaced in
+                # the log instead of being swallowed.
+                logger.error("session/stop answered with a typed error: %s", exc)
+                stop_outcome = exc
+            except AppServerRequestNotSent as exc:
+                # Not sent: the client (or its channel) was already down when
+                # the stop was attempted, so the frame never left the process
+                # and nothing was mutated -- benign teardown, not unknown.
+                logger.debug("session/stop was not sent: %s", exc)
+            except JsonRpcSendUncertain as exc:
+                # The send failed only after the stop frame was queued (the
+                # writer died mid-send), so the server may have received it:
+                # non-delivery is not established, the outcome is unknown.
+                stop_outcome = _unknown_stop_outcome(
+                    self.session_id,
+                    "failed after the frame was queued, so delivery is unknown",
+                    exc,
+                )
+            except AppServerConnectionClosed as exc:
+                # The stop was in flight when its channel closed. That is NOT
+                # benign teardown: the server may have applied the stop before
+                # the peer went away, so the outcome is unknown.
+                stop_outcome = _unknown_stop_outcome(
+                    self.session_id, "lost its channel before the ack", exc
+                )
+            except RuntimeError as exc:
+                # Not sent: the transport refused the frame before queueing
+                # it, so nothing was mutated and the teardown continues.
+                logger.debug("session/stop was not sent: %s", exc)
+            except TimeoutError as exc:
+                # The stop's outcome is surfaced, never suppressed: a timed-out
+                # stop is an unknown outcome for a lifecycle mutation --
+                # reconcile via session/resume, never resend.
+                stop_outcome = _unknown_stop_outcome(
+                    self.session_id,
+                    f"did not answer within {DEFAULT_STOP_REQUEST_TIMEOUT:g}s",
+                    exc,
                 )
         await self._connection.close()
         if self._message_task is not None:
@@ -1213,6 +1304,8 @@ class AppServerSession:  # noqa: PLR0904
             await asyncio.gather(*client_request_tasks, return_exceptions=True)
             self._client_request_tasks.clear()
         self._close_event_streams()
+        if isinstance(stop_outcome, SessionStopUnknownOutcome):
+            raise stop_outcome
 
     async def _ensure_host_connected(self) -> AppServerClient:
         client = await self._connection.connect_host()

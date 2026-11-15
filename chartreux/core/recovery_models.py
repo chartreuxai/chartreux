@@ -1207,7 +1207,12 @@ class RootTurnFailure(BaseModel):
     interaction/effect barriers captured BEFORE ``_finalize_turn`` cancels
     callbacks (absence of callbacks afterwards proves nothing). The
     app-server recovery gate consumes this projection for its eligibility,
-    scheduling, and admission decisions; it never crosses the wire.
+    scheduling, and admission decisions. On the stdio topology the gate is
+    coordinator-local, so the projection crosses the agent wire once — the
+    agent attaches it to its ``agent/turn/ended`` terminal frame, captured
+    before the agent cancels its open user-input requests — and the
+    coordinator's gate consumes the wire copy; it never rides the
+    client-facing protocol.
 
     ``transient_cause_confirmed`` is the trusted-origin requirement: the
     failure carries MEASURED logical-call evidence (attached by the gateway

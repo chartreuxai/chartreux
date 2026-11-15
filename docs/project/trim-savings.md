@@ -23,7 +23,8 @@ here.
 
 ## Method
 
-The harness is `tests/perf/test_trim_savings.py`. Each trial builds a fresh
+The harness was `tests/perf/test_trim_savings.py` (removed with the rest of the
+`tests/perf/` tree in 0.7.9); each trial builds a fresh
 agent loop with session logging enabled, seeds one deterministic transcript
 mix, and drives a single turn past the auto-compact threshold so a compaction
 boundary exists. The landed post-turn seam then seals and publishes the settled
@@ -52,8 +53,8 @@ Per trial the harness records two independent evidences plus one side
 observation:
 
 1. **Retained-set delta (tracemalloc).** A post-GC `tracemalloc` snapshot
-   delta of the in-process retained set across the turn, using the shared
-   `tests/perf/_metrics.py` snapshot helpers. Tracing starts before the mix is
+   delta of the in-process retained set across the turn, using the harness's
+   `_metrics.py` snapshot helpers. Tracing starts before the mix is
    allocated, so freeing payload allocations is observable. `tracemalloc`
    inflates ordinary allocation accounting, so the delta is a relative
    measurement.
@@ -128,11 +129,8 @@ claim that it would improve user-visible memory without its own evidence.
 
 ## Reproducing
 
-From the repository root, on a quiet machine and serially:
-
-```bash
-uv run pytest tests/perf/test_trim_savings.py -n0
-```
-
-The test prints a `PERF-BLOB:trim_savings:` line with per-trial and per-cell
-numbers; set `CHARTREUX_PERF_REPORT=<path>` to append it to a file.
+This page is a record, not a runnable recipe: the harness shipped when these
+numbers were measured and was removed with the rest of `tests/perf/` in 0.7.9.
+While it shipped, a serial run (`pytest tests/perf/test_trim_savings.py -n0`)
+printed a `PERF-BLOB:trim_savings:` line with per-trial and per-cell numbers,
+appended to `CHARTREUX_PERF_REPORT=<path>` when set.

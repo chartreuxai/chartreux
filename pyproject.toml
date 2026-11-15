@@ -1,6 +1,6 @@
 [project]
 name = "chartreux"
-version = "0.7.8"
+version = "0.7.9"
 description = "Independent CLI coding assistant derived from Mistral Vibe"
 readme = "README.md"
 requires-python = ">=3.12"
@@ -236,9 +236,10 @@ ignore_decorators = ["@*"]
 [tool.pytest.ini_options]
 addopts = "-p pytest_chartreux -vvvv -q -n auto --dist=loadgroup --durations=10 --import-mode=importlib --maxschedchunk=1"
 timeout = 10
-markers = [
-    "perf: opt-in performance measurement scenario",
-]
+# Point-3 retention policy (the only native-policy activation, C4 chunk ii):
+# retain only failed tests' call-phase tmp dirs; passed tests' dirs are removed
+# per test. No fixed --basetemp here — the plugin presets the managed run root.
+tmp_path_retention_policy = "failed"
 filterwarnings = [
     # (e2e) streaming mock server is started in a thread; and the cli is spawn in a fork
     "ignore:This process \\(pid=.*\\) is multi-threaded, use of forkpty\\(\\) may lead to deadlocks in the child\\.:DeprecationWarning",

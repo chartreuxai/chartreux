@@ -19,6 +19,10 @@ from chartreux.app_server.models import (
     RunningSessionStatus,
     TokenUsage,
 )
+from chartreux.app_server.protocol import (
+    SessionTurnsListParams,
+    SessionTurnsListResponse,
+)
 from chartreux.core.agent_loop import AgentLoop
 from chartreux.core.llm_models import LLMMessage, Role
 from chartreux.core.session_types import SessionMetadata
@@ -195,6 +199,52 @@ def history_page(
         },
         "range": range_name,
     })
+
+
+def turns_page(
+    turns: list[PublicTurn], params: SessionTurnsListParams
+) -> SessionTurnsListResponse:
+    """Page one session's turns in the order the request asks for.
+
+    Both topologies page the same projection through here: the in-process
+    session pages the turn controller's live list and the process-backed
+    coordinator pages the projection it adopted from the agent's own events, so
+    the cursors and the page bounds cannot drift between them.
+    """
+    if params.sort_direction == "backward":
+        if params.cursor is None:
+            page = turns[-params.limit :]
+            first_index = max(0, len(turns) - len(page))
+        else:
+            end = next(
+                (index for index, turn in enumerate(turns) if turn.id == params.cursor),
+                0,
+            )
+            first_index = max(0, end - params.limit)
+            page = turns[first_index:end]
+        last_index = first_index + len(page) - 1
+    else:
+        first_index = (
+            0
+            if params.cursor is None
+            else next(
+                (
+                    index + 1
+                    for index, turn in enumerate(turns)
+                    if turn.id == params.cursor
+                ),
+                len(turns),
+            )
+        )
+        page = turns[first_index : first_index + params.limit]
+        last_index = first_index + len(page) - 1
+    next_cursor = page[0].id if page and first_index > 0 else None
+    backwards_cursor = page[-1].id if page and last_index < len(turns) - 1 else None
+    if params.sort_direction == "forward":
+        next_cursor, backwards_cursor = backwards_cursor, next_cursor
+    return SessionTurnsListResponse(
+        items=page, next_cursor=next_cursor, previous_cursor=backwards_cursor
+    )
 
 
 def token_usage(agent_loop: AgentLoop) -> TokenUsage:

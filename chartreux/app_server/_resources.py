@@ -59,6 +59,8 @@ from chartreux.app_server.protocol import (
     DiagnosticsLogsReadParams,
     DiagnosticsLogsReadResponse,
     EmptyResponse,
+    IdentityReadParams,
+    IdentityReadResponse,
     InventoryItemStateWire,
     LoopsClearParams,
     LoopsClearResponse,
@@ -323,7 +325,7 @@ class ResourceRequestHandler:
                 result = await self._dispatch_config(method, raw_params)
             case "skills":
                 result = await self._dispatch_skills(method, raw_params)
-            case "tools" | "stats" | "diagnostics":
+            case "tools" | "stats" | "diagnostics" | "identity":
                 result = self._dispatch_catalog(method, raw_params)
             case "loops":
                 result = await self._dispatch_loops(method, raw_params)
@@ -471,6 +473,14 @@ class ResourceRequestHandler:
                 response = self._diagnostics_logs_read(
                     validate_wire(DiagnosticsLogsReadParams, raw_params)
                 )
+            case "identity/read":
+                # This fork binds no account backend, so the session has no
+                # identity to project. The method stays advertised and the
+                # response admits an absent identity, so the owner answers that
+                # absence rather than a not-found a client cannot act on.
+                params = validate_wire(IdentityReadParams, raw_params)
+                self._require_session(params.session_id)
+                response = IdentityReadResponse(identity=None)
             case _:
                 raise method_not_found(method)
         return DispatchResult(response)

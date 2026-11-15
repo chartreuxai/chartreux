@@ -394,6 +394,21 @@ REUSE_LIFECYCLE_SENTENCES = (
     "A `closed` or `evicted` agent cannot be reused",
 )
 
+#: The v0.7.9 notification-first decision rule the reuse fragment carries
+#: verbatim: three wait conditions, the uncertain-case tie-break, and the
+#: anti-invention clause.
+REUSE_NOTIFICATION_FIRST_RULE = (
+    "end your turn and collect its result with `get_agent_result` when the "
+    "completion notification arrives, even if your next substantive action "
+    "depends on it",
+    "Use `wait_for_agent` only if the result is a hard dependency of your next "
+    "action, no independent work can proceed, and that action must occur in "
+    "this turn rather than after notification",
+    "If any of those conditions is uncertain, end your turn.",
+    "Do not invent independent work or dispatch unnecessary tasks to fill the "
+    "wait; if there is nothing real to do, end your turn.",
+)
+
 
 @pytest.mark.parametrize(
     ("directory", "selection", "catalog"),
@@ -406,6 +421,9 @@ def test_rendered_task_description_documents_lifecycle_semantics(
     rendered = _render_composed_task(selection, catalog)
     for sentence in REUSE_LIFECYCLE_SENTENCES:
         assert sentence in rendered
+    for clause in REUSE_NOTIFICATION_FIRST_RULE:
+        assert clause in rendered
+    assert "do not re-wait in the same turn" in rendered
     # Background-first launch guidance and opt-in retention come from the
     # task skeleton itself.
     assert "Launch in the background even when the result is a dependency" in rendered

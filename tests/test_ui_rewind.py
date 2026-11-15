@@ -12,7 +12,13 @@ from chartreux.app_server.protocol import (
     ProtocolError,
     ProtocolErrorCode,
 )
+from chartreux.app_server.transport import (
+    IN_PROCESS_TRANSPORT,
+    STDIO_TRANSPORT,
+    TRANSPORT_ENV_VAR,
+)
 from chartreux.cli.textual_ui.app import BottomApp, ChartreuxApp
+from chartreux.cli.textual_ui.session_flow import _refusal_notice
 from chartreux.cli.textual_ui.widgets.chat_input.container import ChatInputContainer
 from chartreux.cli.textual_ui.widgets.messages import UserMessage
 from chartreux.cli.textual_ui.widgets.rewind_app import RewindApp, _RewindStep
@@ -580,3 +586,62 @@ async def test_rewind_in_place_shows_no_session_hint() -> None:
         await _wait_until(pilot, lambda: not app._rewind_mode)
 
         assert len(app.query(RewindForkMessage)) == 0
+
+
+@pytest.mark.asyncio
+async def test_stdio_transport_disables_rewind_and_names_the_carrying_route(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """C2d: on stdio the transcript binding names the route that carries rewind.
+
+    The rewind pair is wire-deferred, so entering rewind mode on the stdio
+    route would only fail at the first read; the binding refuses up front and
+    the message names the restart that makes rewind workable.
+    """
+    monkeypatch.setenv(TRANSPORT_ENV_VAR, STDIO_TRANSPORT)
+    app = _make_app()
+    async with app.run_test() as pilot:
+        await _send_messages(pilot, ["hello", "world"])
+
+        await pilot.press("escape", "escape")
+        await _wait_until(
+            pilot,
+            lambda: any(
+                "is not carried over the stdio transport" in notice.message
+                for notice in app._notifications
+            ),
+        )
+
+        assert app._rewind_mode is False
+        assert app._rewind_highlighted_widget is None
+        assert app._current_bottom_app != BottomApp.Rewind
+        refusal = next(
+            notice.message
+            for notice in app._notifications
+            if "is not carried over the stdio transport" in notice.message
+        )
+        assert refusal.startswith("Rewinding a session is not carried")
+        assert f"{TRANSPORT_ENV_VAR}={IN_PROCESS_TRANSPORT}" in refusal
+
+
+def test_refusal_notice_words_the_next_step_per_transport(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A NOT_IMPLEMENTED refusal is retold per route; a failure stays a failure."""
+    refusal = ProtocolError(
+        code=ProtocolErrorCode.NOT_IMPLEMENTED,
+        message="session/rewind is not carried over the process wire in this "
+        "release: run the session with the in_process transport "
+        "(CHARTREUX_TRANSPORT=in_process)",
+    )
+    failure = ProtocolError(code=ProtocolErrorCode.INTERNAL_ERROR, message="boom")
+
+    monkeypatch.setenv(TRANSPORT_ENV_VAR, STDIO_TRANSPORT)
+    unavailable = _refusal_notice("Rewinding a session", refusal)
+    assert unavailable.startswith("Rewinding a session is not carried")
+    assert f"{TRANSPORT_ENV_VAR}={IN_PROCESS_TRANSPORT}" in unavailable
+    assert _refusal_notice("Rewinding a session", failure) == "boom"
+
+    monkeypatch.setenv(TRANSPORT_ENV_VAR, IN_PROCESS_TRANSPORT)
+    assert _refusal_notice("Rewinding a session", refusal) == refusal.message
+    assert _refusal_notice("Rewinding a session", failure) == "boom"

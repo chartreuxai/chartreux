@@ -11,8 +11,7 @@ Chartreux is an independent fork of Mistral Vibe.
 ## Verification
 
 - Full test suite (parallel) (timeout=900): `uv run pytest`
-- Full suite from a git worktree (parallel) (timeout=900): `cd <worktree> && PYTHONPATH=<worktree> uv run --project /home/pav/code/chartreux --no-sync pytest --ignore=tests/perf --ignore=tests/cli/test_installed_contracts.py`
-- Performance tests (serial only) (timeout=900): `uv run pytest tests/perf -n0`
+- Full suite from a git worktree (parallel) (timeout=900): `cd <worktree> && PYTHONPATH=<worktree> uv run --project /home/pav/code/chartreux --no-sync pytest --ignore=tests/cli/test_installed_contracts.py`
 - Typecheck (timeout=300): `uv run pyright`
 - Lint and format (timeout=180): `uv run ruff check . && uv run ruff format --check .`
 
@@ -30,6 +29,20 @@ Notes:
 - A project environment must already exist and be used read-only: point at it with `UV_PROJECT_ENVIRONMENT=<pre-provisioned external environment>` or run `uv run --project /home/pav/code/chartreux --no-sync`. Never let uv sync or create an environment implicitly inside the worktree.
 - Inspect fixtures and plugins for their destinations before a suite run. If a declared command, test, or plugin writes elsewhere inside the repository, or if safe isolation would change the meaning of a mandated command, stop and report instead of silently rewriting the command or claiming a pass.
 - Never delete pre-existing outputs, and capture long-suite output outside the tree.
+
+## Temporary-file placement
+
+- Every verification invocation gets its own fresh, unique invocation directory under the session scratchpad, and points its basetemp, pytest cache dir, uv cache, and ruff cache at it. An explicit destination under the scratchpad takes precedence over the managed run root and is never removed automatically; a worker choosing an arbitrary explicit destination outside the scratchpad is user-owned and stays outside automatic reaping (the backstop covers omission only: no explicit destination means the plugin's managed root).
+- Repo-default pytest runs land under the managed pytest run root (`<temproot>/chartreux-managed-<uid>/pytest-run-*` via `pytest_chartreux`), never under the shared `/tmp/pytest-of-<user>` tree; there is no fixed `--basetemp` in addopts. The legacy `/tmp/pytest-of-<user>` tree is never swept automatically.
+- The repo default is `tmp_path_retention_policy = "failed"`: only failed tests' call-phase tmp dirs are retained, passed tests' dirs are removed per test. Setup/teardown-phase failure artifacts may not be retained — copy-before-teardown, or rerun with a temporary `-o tmp_path_retention_policy=all` override, for deeper debugging.
+- Clean up only your own completed invocation's outputs, after preserving any requested diagnostics; no wildcard cleanup between packages, and never a directory a still-running job is using.
+
+## Secret scan
+
+- Verification artifacts — basetemps, tool caches, and logs — belong under the injected scratchpad, in a fresh, unique directory per verification invocation, for the organization and attribution of the worker's own artifacts. That placement does not extend the submission scan: paths under SHARED scratchpad roots are partitioned out as transient content — one bounded `INFO` log line, never a finding, never a block — so anything that must block submission must live outside shared scratchpad roots. Paths outside a scratchpad stay in the scan: a cache under `~/.cache` is scanned and still blocks, and a worker with no scratchpad stops the affected verification instead of choosing an uninspected location.
+- The approved-match manifest `.chartreux-secret-scan.json` is the only suppression surface, and it is policy, not a sandbox. Both gates apply it from the COMMITTED HEAD blob — the submission gate freezes it at admission and fails closed on a mid-run change, and the pre-commit hook reads HEAD, never the index or the working tree — so neither a working-tree edit nor a single commit staging a secret with its approval self-authorizes. An entry is canonical path + rule ID + digest of the rule's value-span bytes; only a rule whose match span covers the complete sensitive material is approvable, and `residual_exclusions` (path + rule, no digest) is reserved for partial-coverage rules and is EMPTY today.
+- A new synthetic fixture value follows the approval-first two-commit sequence inside one reviewed change: commit the manifest entry, then the fixture. Review bars entries for values the repository never publishes, and a worker may never approve its own submission.
+- This is instruction, not automatic enforcement: a session that breaks these rules still blocks at the fail-closed scan, and a `policy_mismatch` block is parent-retryable only — never auto-retried.
 
 ## Git workflow policy
 

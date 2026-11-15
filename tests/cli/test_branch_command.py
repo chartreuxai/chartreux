@@ -5,6 +5,11 @@ from types import SimpleNamespace
 
 import pytest
 
+from chartreux.app_server.transport import (
+    IN_PROCESS_TRANSPORT,
+    STDIO_TRANSPORT,
+    TRANSPORT_ENV_VAR,
+)
 from chartreux.cli.textual_ui.widgets.branch_created_message import BranchCreatedMessage
 from chartreux.cli.textual_ui.widgets.messages import ErrorMessage
 from chartreux.core.config import SessionLoggingConfig
@@ -112,3 +117,41 @@ async def test_branch_writes_resumable_detached_session(tmp_path: Path) -> None:
 
         await app.app_server.resume(new_session_id)
         assert app.app_server.session_id == new_session_id
+
+
+@pytest.mark.asyncio
+async def test_branch_is_disabled_on_stdio_with_the_workable_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """C2d: /branch refuses on stdio and names the route that carries a fork.
+
+    Fork is wire-deferred, so the command surface refuses before it issues one
+    instead of reporting a wire diagnostic, and the session it would have
+    branched is left alone.
+    """
+    monkeypatch.setenv(TRANSPORT_ENV_VAR, STDIO_TRANSPORT)
+    config = build_test_vibe_config(session_logging=_enabled_session_config(tmp_path))
+    app = build_test_chartreux_app(agent_loop=build_test_agent_loop(config=config))
+
+    async with app.run_test() as pilot:
+        sessions = app.app_server.resources.sessions
+        old_session_id = app.app_server.session_id
+        issued: list[str] = []
+
+        async def recording_fork(entry_id=None, *, attach=True):
+            issued.append("fork")
+            return _fork_response("new-branch-session-id")
+
+        sessions.fork = recording_fork  # type: ignore[method-assign]
+        handled = await app._handle_command("/branch")
+        await pilot.pause()
+
+        assert handled is True
+        assert issued == []
+        errors = [str(error._error) for error in app.query(ErrorMessage)]
+        assert any("not carried over the stdio transport" in text for text in errors)
+        assert any(
+            f"{TRANSPORT_ENV_VAR}={IN_PROCESS_TRANSPORT}" in text for text in errors
+        )
+        assert not app.query(BranchCreatedMessage)
+        assert app.app_server.session_id == old_session_id

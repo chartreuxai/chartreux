@@ -155,7 +155,19 @@ async def test_prompt_persists_user_display_content(
         **_metadata_kwargs(payload),
     )
 
-    session_dir = next(temp_session_dir.glob("session_*"))
+    entries = sorted(temp_session_dir.glob("session_*"))
+    session_dirs = [entry for entry in entries if entry.is_dir()]
+    registry_files = [
+        entry for entry in entries if entry.name.endswith(".registry.json")
+    ]
+
+    assert len(session_dirs) == 1
+    assert len(registry_files) == 1
+    session_dir = session_dirs[0]
+    assert registry_files[0] == session_dir.with_name(
+        f"{session_dir.name}.registry.json"
+    )
+
     messages_file = session_dir / "messages.jsonl"
     messages = [
         json.loads(line)

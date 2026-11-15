@@ -47,6 +47,7 @@ from chartreux.app_server.protocol import (
     SessionForkResponse,
     SessionListParams,
     SessionListResponse,
+    SessionMemorialItem,
     SessionPlanRecord,
     SessionPlanRecordWriteParams,
     SessionPlanRecordWriteResponse,
@@ -259,10 +260,17 @@ class SessionLifecycleResult:
     after the RPC response is sent. The server calls ``after_response()``
     once the client has received the result, so long-running post-activation
     work (e.g. awaiting deferred init) does not block the response.
+
+    A resume that respawned a confirmed-dead root generation also carries that
+    generation's memorial state (``memorial``) and its typed ``death_receipt``,
+    so the resume response surfaces both; they are never re-admitted for
+    execution on the new generation.
     """
 
     backend: SessionBackend
     after_response: Callable[[], None] | None = None
+    memorial: tuple[SessionMemorialItem, ...] = ()
+    death_receipt: str | None = None
 
 
 @dataclass(frozen=True, slots=True)

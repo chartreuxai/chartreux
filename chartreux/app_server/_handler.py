@@ -47,6 +47,7 @@ from chartreux.app_server._runtime import (
 from chartreux.app_server._session_backend_port import (
     AgentTranscriptReadSource,
     LiveTranscriptSourceRefused,
+    SessionBackendError,
 )
 from chartreux.app_server._session_model import (
     clear_session_active_model_override,
@@ -71,6 +72,7 @@ from chartreux.app_server._state import (
     build_public_state,
     build_stored_public_state,
     history_page,
+    turns_page,
 )
 from chartreux.app_server._turn_queue import (
     TurnQueueFullError,
@@ -103,6 +105,8 @@ from chartreux.app_server.models import (
 from chartreux.app_server.protocol import (
     AgentsCancelParams,
     AgentsCancelResponse,
+    AgentsInventoryReadParams,
+    AgentsInventoryReadResponse,
     AgentsReconcileParams,
     AgentsReconcileResponse,
     AgentsReleaseParams,
@@ -579,6 +583,26 @@ class CoreRequestHandler:
                     reason=result.reason,
                 )
             )
+        if method == "agents/inventory/read":
+            # v0.7.9 point 5: the typed live-inventory snapshot. In-process
+            # the owner is this registry: the C6a joint-acquisition read
+            # samples the revision and the TUI's wire projection together,
+            # so the response's revision describes EXACTLY the returned
+            # inventory and the incarnation pair names the floor the
+            # client compares within.
+            validate_wire(AgentsInventoryReadParams, raw_params)
+            self._require_attached(self._agent_loop.session_id)
+            if self._closed:
+                raise RequestFailure(ProtocolErrorCode.CONFLICT, "Session is closing")
+            snapshot = await self._sessions.inventory_snapshot()
+            return DispatchResult(
+                AgentsInventoryReadResponse(
+                    session_id=snapshot.session_id,
+                    generation=snapshot.generation,
+                    revision=snapshot.revision,
+                    agents=list(snapshot.agents),
+                )
+            )
         raise method_not_found(method)
 
     async def _dispatch_agent(
@@ -947,8 +971,12 @@ class CoreRequestHandler:
             )
         if method == "session/stop":
             stop_params = validate_wire(SessionStopParams, raw_params)
-            self._require_attached(stop_params.session_id)
-            await self.close()
+            self._require_session(stop_params.session_id)
+            if self._root_session.is_attached(stop_params.session_id):
+                await self.close()
+            # A stop against a settled (non-attached) session is an ack on
+            # both transports (in-process baseline change): repeat-safe
+            # applies outside the closed connection.
             return DispatchResult(SessionStopResponse())
         raise method_not_found(method)
 
@@ -1474,44 +1502,7 @@ class CoreRequestHandler:
         else:
             self._require_session(params.session_id)
             turns = self._turns.turns
-        if params.sort_direction == "backward":
-            if params.cursor is None:
-                page = turns[-params.limit :]
-                first_index = max(0, len(turns) - len(page))
-            else:
-                end = next(
-                    (
-                        index
-                        for index, turn in enumerate(turns)
-                        if turn.id == params.cursor
-                    ),
-                    0,
-                )
-                first_index = max(0, end - params.limit)
-                page = turns[first_index:end]
-            last_index = first_index + len(page) - 1
-        else:
-            first_index = (
-                0
-                if params.cursor is None
-                else next(
-                    (
-                        index + 1
-                        for index, turn in enumerate(turns)
-                        if turn.id == params.cursor
-                    ),
-                    len(turns),
-                )
-            )
-            page = turns[first_index : first_index + params.limit]
-            last_index = first_index + len(page) - 1
-        next_cursor = page[0].id if page and first_index > 0 else None
-        backwards_cursor = page[-1].id if page and last_index < len(turns) - 1 else None
-        if params.sort_direction == "forward":
-            next_cursor, backwards_cursor = backwards_cursor, next_cursor
-        return SessionTurnsListResponse(
-            items=page, next_cursor=next_cursor, previous_cursor=backwards_cursor
-        )
+        return turns_page(turns, params)
 
     async def _wait_ready(
         self, params: SessionReadyWaitParams
@@ -2627,10 +2618,26 @@ class CoreRequestHandler:
         return self._root_session.all_history(self._turns.history)
 
     def _require_session(self, session_id: str) -> None:
-        if not self._root_session.is_current(session_id):
-            raise RequestFailure(
-                ProtocolErrorCode.NOT_FOUND, f"Session not found: {session_id}"
-            )
+        if self._root_session.is_current(session_id):
+            return
+        rotated_to = self._rotated_handoff_target(session_id)
+        if rotated_to is not None:
+            raise session_fenced_failure(session_id, rotated_to)
+        raise RequestFailure(
+            ProtocolErrorCode.NOT_FOUND, f"Session not found: {session_id}"
+        )
+
+    def _rotated_handoff_target(self, session_id: str) -> str | None:
+        """The live session a rotation superseded ``session_id`` with, if any.
+
+        A plan handoff records the old id -> new id mapping when it rotates,
+        so a request still addressed to the superseded id is fenced with the
+        rotated identity instead of a bare not-found.
+        """
+        resolved = self._root_session._resolve_handoff(session_id)
+        if resolved != session_id and self._root_session.is_current(resolved):
+            return resolved
+        return None
 
     def _require_attached(self, session_id: str) -> None:
         self._require_session(session_id)
@@ -2644,6 +2651,9 @@ class CoreRequestHandler:
         if active_turn.id != turn_id:
             raise StaleTurnError(active_turn.id)
         if not self._root_session.routes_active_turn(session_id, active_turn):
+            rotated_to = self._rotated_handoff_target(session_id)
+            if rotated_to is not None:
+                raise session_fenced_failure(session_id, rotated_to)
             raise RequestFailure(
                 ProtocolErrorCode.NOT_FOUND, f"Session not found: {session_id}"
             )
@@ -2655,6 +2665,94 @@ def _record_scan_domain(domain: LoggingDomain | None) -> PlanScanDomain | None:
         return None
     return PlanScanDomain(
         save_dir=domain.save_dir, session_prefix=domain.session_prefix
+    )
+
+
+SESSION_FENCED_VARIANT = "session/fenced"
+"""The typed response variant a submit against a superseded session id answers.
+
+A plan handoff rotates the session, so a submit still addressed to the old id
+between handoff-send and settlement is fenced: the response is typed, carries
+the rotated session identity, the fence reason ``session_rotated``, and the
+adoption instruction, and the fenced submit is never replayed automatically.
+"""
+
+SESSION_ROTATED_FENCE_REASON = "session_rotated"
+VERSION_SKEW_VARIANT = "version_skew"
+
+
+def _session_fenced_data(superseded_id: str, rotated_id: str) -> dict[str, Any]:
+    return {
+        "code": SESSION_FENCED_VARIANT,
+        "reason": SESSION_ROTATED_FENCE_REASON,
+        "sessionId": rotated_id,
+        "supersededSessionId": superseded_id,
+        "instruction": (
+            f"Adopt the rotated session {rotated_id} — the plan-handoff result "
+            "carries it — and address the request to that session; the fenced "
+            "request was not replayed"
+        ),
+    }
+
+
+def session_fenced_failure(superseded_id: str, rotated_id: str) -> RequestFailure:
+    """The typed ``session/fenced`` refusal for a superseded session id."""
+    return RequestFailure(
+        ProtocolErrorCode.CONFLICT,
+        f"Session {superseded_id} was rotated by a plan handoff; adopt session "
+        f"{rotated_id} and address the request to it",
+        data=_session_fenced_data(superseded_id, rotated_id),
+    )
+
+
+def session_fenced_backend_error(
+    superseded_id: str, rotated_id: str
+) -> SessionBackendError:
+    """The backend-port twin of :func:`session_fenced_failure`."""
+    return SessionBackendError(
+        ProtocolErrorCode.CONFLICT,
+        f"Session {superseded_id} was rotated by a plan handoff; adopt session "
+        f"{rotated_id} and address the request to it",
+        data=_session_fenced_data(superseded_id, rotated_id),
+    )
+
+
+def version_skew_failure(session_id: str, detail: str) -> RequestFailure:
+    """The typed version-skew error an older peer without a variant gets.
+
+    Never a bare NOT_FOUND and never a silent retry: the peer answered without
+    the additive variant, so the caller is told to restart both ends on the
+    same version instead of continuing against stale state.
+    """
+    return RequestFailure(
+        ProtocolErrorCode.NOT_IMPLEMENTED,
+        _version_skew_message(detail),
+        data={
+            "code": VERSION_SKEW_VARIANT,
+            "variant": SESSION_FENCED_VARIANT,
+            "sessionId": session_id,
+        },
+    )
+
+
+def version_skew_backend_error(session_id: str, detail: str) -> SessionBackendError:
+    """The backend-port twin of :func:`version_skew_failure`."""
+    return SessionBackendError(
+        ProtocolErrorCode.NOT_IMPLEMENTED,
+        _version_skew_message(detail),
+        data={
+            "code": VERSION_SKEW_VARIANT,
+            "variant": SESSION_FENCED_VARIANT,
+            "sessionId": session_id,
+        },
+    )
+
+
+def _version_skew_message(detail: str) -> str:
+    return (
+        f"The connected peer does not carry the {SESSION_FENCED_VARIANT} response "
+        f"variant ({detail}); restart both ends on the same chartreux version — "
+        "the request was not retried"
     )
 
 

@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-from typing import Literal
+from typing import Annotated, Literal
 
-from pydantic import Field
+from pydantic import BeforeValidator, Field
 
 from chartreux.app_server._model import ProtocolModel
 from chartreux.config_values import (
@@ -11,12 +11,33 @@ from chartreux.config_values import (
 )
 
 
+def stated_compact_threshold(value: object) -> int | None:
+    """The compaction trigger a wire value states, or None when it states none.
+
+    The trigger is the token count usage is measured against, and a nonpositive
+    value means automatic compaction is off (the same reading the shared
+    context formatter takes). A bool, a string, a float or any other
+    non-integer is a value this side cannot trust, so it reads as unknown --
+    fail-closed, never coerced into a denominator no peer actually stated.
+    """
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    return value
+
+
 class ModelConfigView(ProtocolModel):
     name: str
     alias: str
     thinking: ThinkingLevel
     supports_images: bool
     display_name: str
+    # The active deployment's automatic-compaction trigger -- the denominator
+    # usage is rendered against, never the hard context window. None when the
+    # projection could not resolve it, so clients show unknown instead of
+    # substituting the window.
+    auto_compact_threshold: Annotated[
+        int | None, BeforeValidator(stated_compact_threshold)
+    ] = None
     # The levels this deployment declares, in vocabulary order. Empty when the
     # projection could not resolve them; clients then offer the full vocabulary.
     thinking_levels: list[ThinkingLevel] = Field(default_factory=list)

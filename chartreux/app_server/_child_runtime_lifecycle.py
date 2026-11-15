@@ -141,6 +141,11 @@ class ChildRuntimeAssemblyView(SubagentRunnerPort, SessionCoordinator, Protocol)
         self, evictions: list[AgentEviction] | None = None
     ) -> Coroutine[Any, Any, None]: ...
 
+    # v0.7.9 point 5 (C6a): advance the monotone inventory revision in the
+    # writer's held region (the registry lock, or the flag write's no-await
+    # window).
+    def _advance_inventory_revision_locked(self) -> None: ...
+
 
 class ChildRuntimeBinding:
     """Late-bound child runtime context (ASC area 7, migration step 1).
@@ -382,6 +387,10 @@ class ChildRuntimeAssembler:
                 record.stop_reason,
             )
         if before != after:
+            # The compaction/context/stop-reason flag writes are one
+            # projection-visible no-await window; the bump lands at its end
+            # (point 5 rule (c)).
+            self._view._advance_inventory_revision_locked()
             try:
                 await self._view._emit_agents_update()
             except Exception as exc:
@@ -450,6 +459,11 @@ class ChildDrainView(Protocol):
     def _emit_agents_update(
         self, evictions: list[AgentEviction] | None = None
     ) -> Coroutine[Any, Any, None]: ...
+
+    # v0.7.9 point 5 (C6a): advance the monotone inventory revision in the
+    # writer's held region (the drain's locked phases, each one a synchronous
+    # mutation window).
+    def _advance_inventory_revision_locked(self) -> None: ...
 
 
 class DrainContext:
@@ -728,6 +742,9 @@ class ChildDrain:
         # The empty inventory is the final payload: never leave a ghost row
         # behind for a registry whose children were force-terminated.
         view._drain_suppressed_inventory = True
+        # The timeout cleared the projection in one synchronous window
+        # (point 5 rule (c)).
+        view._advance_inventory_revision_locked()
 
     async def _drain_reapers(self, context: DrainContext) -> None:
         """Cancel and join the live reaper and the displaced reapers."""
@@ -832,6 +849,10 @@ class ChildDrain:
             self._view._readable_children.clear()
             self._view._readable_children_identities.clear()
             self._view._detached_child_ids.clear()
+            # The drain's inventory clear is one synchronous mutation window
+            # over every projected map under the held fence lock (point 5
+            # rule (c)).
+            self._view._advance_inventory_revision_locked()
 
     async def _drain_tracked_teardowns(self, context: DrainContext) -> None:
         """Join the tracked teardown tasks."""
@@ -1013,6 +1034,10 @@ class OrphanReaper:
             for agent_id, record in list(view._agent_records.items()):
                 if record.session_id in orphan_sessions:
                     view._agent_records.pop(agent_id, None)
+            # The sweep dropped orphaned rows and child maps in one
+            # synchronous window under the held fence lock (point 5
+            # rule (c)).
+            view._advance_inventory_revision_locked()
         reconciliations = await self._reconcile(child_dirs)
         results: list[OrphanReconciliation] = []
         for session_id, runtime in live:

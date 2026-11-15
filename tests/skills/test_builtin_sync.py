@@ -249,6 +249,23 @@ class TestBuiltinSkills:
             in prompt
         )
         assert "no identity-specific retention setting" in prompt
+        # v0.7.9 point 4: notification-first collection even when the next
+        # substantive action depends on the result, with the three wait
+        # conditions, the uncertain-case yield, and the anti-invention clause.
+        assert (
+            "end your turn and collect the result when the completion "
+            "notification arrives, even if your next substantive action "
+            "depends on it" in prompt
+        )
+        assert (
+            "Use `wait_for_agent` only if the result is a hard dependency of "
+            "your next action, no independent work can proceed, and that "
+            "action must occur in this turn rather than after notification" in prompt
+        )
+        assert (
+            "Do not invent independent work or dispatch unnecessary tasks to "
+            "fill the wait; if there is nothing real to do, end your turn." in prompt
+        )
 
     def test_chartreux_skill_documents_completion_audit(self) -> None:
         prompt = BUILTIN_SKILLS["chartreux"].prompt

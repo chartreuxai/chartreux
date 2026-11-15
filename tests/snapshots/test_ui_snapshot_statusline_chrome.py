@@ -89,6 +89,7 @@ class ChromeSnapshotApp(App[None]):
                     "stop_reason": stop_reason,
                     "context_tokens": 135_000,
                     "context_window": 400_000,
+                    "context_threshold": 400_000,
                     "turns_used": 2,
                 })
                 for agent_id, availability, compacting, stop_reason in (
@@ -172,6 +173,7 @@ def test_agent_duration_details(
                 idle_seconds=62 if availability != "running" else None,
                 context_tokens=135_000,
                 context_window=400_000,
+                context_threshold=400_000,
                 active_provider="ZAI",
                 base_model="glm-5.3",
                 turns_used=2,

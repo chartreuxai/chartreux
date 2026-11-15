@@ -180,6 +180,29 @@ async def test_status_lists_uncollected_results_from_the_last_agents_update(
 
 
 @pytest.mark.asyncio
+async def test_status_shortens_a_process_attempt_handle(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The section's handle is display-only, so a process handle is shortened.
+
+    The collected-result list is what a reader scans; the 40-character wire
+    handle there is noise. Uncollected RUN ids stay exact, because those are
+    what the reader passes to ``get_agent_result``.
+    """
+    _stub_status_app_server(monkeypatch)
+    attempt = "0f1e2d3c4b5a69788796a5b4c3d2e1f0"
+    full = f"researcher-attempt-{attempt}"
+    app = build_test_chartreux_app()
+    app._agent_summaries = [_agent(full, name="researcher-1", uncollected=("run-a",))]
+
+    text = await _render_status(app)
+
+    section = _background_results_section(text)
+    assert "- **researcher-1** (attempt-0f1e2d3c): run-a" in section
+    assert full not in section
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "branch",
     [

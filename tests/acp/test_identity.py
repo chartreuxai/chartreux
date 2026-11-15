@@ -13,9 +13,15 @@ from chartreux.acp.exceptions import (
 from chartreux.app_server.models import IdentityEntityView, IdentityView
 from chartreux.app_server.protocol import (
     AppServerResponseError,
+    IdentityReadParams,
+    IdentityReadResponse,
     ProtocolError,
     ProtocolErrorCode,
+    SessionOptions,
 )
+from chartreux.app_server.transport import IN_PROCESS_TRANSPORT, STDIO_TRANSPORT
+
+ACP_TRANSPORTS = (IN_PROCESS_TRANSPORT, STDIO_TRANSPORT)
 
 
 async def _new_session(agent: ChartreuxAcpAgent) -> str:
@@ -96,3 +102,40 @@ async def test_identity_read_maps_resource_errors_and_rejects_unsupported_method
         await acp_agent_loop.ext_method("identity/read", {"sessionId": session_id})
     with pytest.raises(NotImplementedMethodError):
         await acp_agent_loop.ext_method("identity/write", {"sessionId": session_id})
+
+
+# -- both-transport pin -------------------------------------------------------
+#
+# identity/read was the one latent read with no arm in either topology: this
+# fork binds no account backend, so the session has no identity to project. The
+# owner now answers that absence where the session's resources live, which is
+# what the response model and the ACP surface already admit, so the read keeps
+# one shape on both topologies. The stdio leg is the production topology over a
+# memory wire; the spawned-child legs land with the PTY harness (C5c).
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("transport", ACP_TRANSPORTS, ids=ACP_TRANSPORTS)
+async def test_identity_read_answers_on_both_transports(
+    transport: str, acp_sessions
+) -> None:
+    harness = await acp_sessions(
+        transport, session_options=SessionOptions(cwd=str(Path.cwd()))
+    )
+    session_id = await _new_session(harness.agent)
+
+    assert (
+        await harness.agent.ext_method("identity/read", {"sessionId": session_id}) == {}
+    )
+    response = IdentityReadResponse.model_validate(
+        await harness.server.request(
+            "identity/read", IdentityReadParams(session_id=session_id)
+        )
+    )
+    assert response.identity is None
+
+    with pytest.raises(AppServerResponseError) as excinfo:
+        await harness.server.request(
+            "identity/read", IdentityReadParams(session_id="not-this-session")
+        )
+    assert excinfo.value.error.code is ProtocolErrorCode.NOT_FOUND

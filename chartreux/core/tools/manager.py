@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Callable, Iterator, Mapping
 import hashlib
 import importlib.util
@@ -226,6 +227,7 @@ class ToolManager:  # noqa: PLR0904 - reviewed authority lookup joins the full m
         inherited_workspace: Workspace | None = None,
         parent_authority_getter: Callable[[], ToolManager] | None = None,
         parent_authority_revision_getter: Callable[[], int] | None = None,
+        live_authority_getter: Callable[[], Any] | None = None,
         accepted_token_getter: Callable[[], object] | None = None,
         task_description: str | None = None,
         session_root_grants: object | None = None,
@@ -259,6 +261,15 @@ class ToolManager:  # noqa: PLR0904 - reviewed authority lookup joins the full m
         # manager after the parent refreshes or tightens policy.
         self._parent_authority_getter = parent_authority_getter
         self._parent_authority_revision_getter = parent_authority_revision_getter
+        # G5b: the LIVE child-authority client a process child asks its owner
+        # through. It is separate from ``parent_authority_getter`` because a
+        # process child has no in-process ancestor to resolve: its ceiling
+        # lives in the process that spawned it and is asked per decision. The
+        # getter keeps a rebuilt manager (a config transaction replaces this
+        # one) on the same client, and ``_attached_live_authority`` serves
+        # managers built outside a loop.
+        self._live_authority_getter = live_authority_getter
+        self._attached_live_authority: Any = None
         # Managers without an accepted-revision signal retain live, uncached getters.
         self._accepted_token_getter = accepted_token_getter
         self._authority_generation = 0
@@ -1462,36 +1473,62 @@ class ToolManager:  # noqa: PLR0904 - reviewed authority lookup joins the full m
     def _child_catalog_withholds(self, tool_name: str) -> bool:
         """Whether this manager's advertised catalog withholds ``tool_name``.
 
-        ``parent_authority_getter`` is armed for every child manager by
-        ``child_runtime_policy`` and stays None for roots, so no separate
-        subagent flag is needed. The decision is made fresh at EVERY spec
-        assembly — nothing is cached — from the current loop-level restriction
-        and the current identity posture; the launching parent's delegation
-        ceiling is applied one step earlier, by ``available_tools``, which is
-        the catalog the specs are assembled from. A parent revocation therefore
-        drops a tool at the next assembly and a broadened delegation restores
-        an admitted one, so there is no "invocation permitted, definition
-        absent" (or its inverse) state. Withholding narrows only the
-        model-facing specs: execution is denied by the tool itself, which no
-        catalog selection can widen.
+        ``None`` parent authority no longer implies a root (G5b). An IN-PROCESS
+        child is armed with ``parent_authority_getter`` by
+        ``child_runtime_policy``; a PROCESS child has no in-process ancestor at
+        all, so its getter stays None and its ceiling arrives from the live
+        authority client instead. ``_is_bounded_child`` is therefore the test
+        for "is this a child", and a root manager withholds nothing.
+
+        The decision is made fresh at EVERY spec assembly — nothing is cached
+        here — from the current loop-level restriction, the current identity
+        posture, and (for a process child) the live catalog verdict the client
+        last took from the owner. The launching parent's delegation ceiling is
+        applied one step earlier, by ``available_tools``, which is the catalog
+        the specs are assembled from. A parent revocation therefore drops a
+        tool at the next assembly and a broadened delegation restores an
+        admitted one, so there is no "invocation permitted, definition absent"
+        (or its inverse) state. Withholding narrows only the model-facing
+        specs: execution is denied at the invocation gate, which no catalog
+        selection can widen — and that gate asks the owner on every call, so a
+        stale cache can only hide a definition, never authorize a call.
         """
-        if self._parent_authority_getter is None:
+        if not self._is_bounded_child:
             return False
         if tool_name in CHILD_CONTEXT_UNAVAILABLE_TOOLS:
             return True
-        return not self._identity_posture_allows_tool_name(tool_name)
+        if not self._identity_posture_allows_tool_name(tool_name):
+            return True
+        live = self.live_authority
+        if live is None:
+            return False
+        try:
+            return bool(live.catalog_withholds(tool_name))
+        except Exception:
+            # An unreadable verdict withholds: the model-facing catalog is the
+            # narrow surface, and a definition the owner cannot vouch for is
+            # never advertised as invocable.
+            return True
+
+    @property
+    def _is_bounded_child(self) -> bool:
+        """Whether this manager belongs to a bounded child, in EITHER topology."""
+        return (
+            self._parent_authority_getter is not None or self.live_authority is not None
+        )
 
     def child_catalog_withholdings(self) -> frozenset[str]:
         """Every registered name this manager's catalog withholds right now.
 
         The complete P1 rule over the CURRENT authority, for enumeration and
         reporting: a name is withheld from a bounded child IFF the child
-        cannot invoke it — the loop-level child restriction denies it, or it is
+        cannot invoke it — the loop-level child restriction denies it, it is
         not on this identity's personal axis (``available_tools`` applies the
-        personal posture AND the launching parent's delegation ceiling, live).
+        personal posture AND the launching parent's delegation ceiling, live),
+        or the live owner withholds it from this process child's catalog.
         Roots withhold nothing. Recomputed on every call.
         """
-        if self._parent_authority_getter is None:
+        if not self._is_bounded_child:
             return frozenset()
         with self._lock:
             registered = frozenset(self._all_tools)
@@ -1501,6 +1538,55 @@ class ToolManager:  # noqa: PLR0904 - reviewed authority lookup joins the full m
             for name in registered
             if name not in available or self._child_catalog_withholds(name)
         )
+
+    def attach_live_authority(self, authority: Any) -> None:
+        """Bind the live child-authority client this manager asks (G5b)."""
+        self._attached_live_authority = authority
+
+    @property
+    def live_authority(self) -> Any:
+        """The live child-authority client, or ``None`` for a root manager.
+
+        Read live on every use, so a manager rebuilt by a configuration
+        transaction sees the same client its loop holds.
+        """
+        if self._live_authority_getter is not None:
+            return self._live_authority_getter()
+        return self._attached_live_authority
+
+    async def live_authority_denial(
+        self, tool_name: str, tool_class: type[BaseTool], arguments: Mapping[str, Any]
+    ) -> str | None:
+        """Ask the live owner whether one invocation may run (G5b).
+
+        ``None`` when the owner allows it (or when this manager has no live
+        client, i.e. a root or an in-process child whose ceiling is applied
+        locally). Every other outcome is the refusal string the caller turns
+        into a skip: unbound, unavailable, timed out, undecodable, foreign or a
+        plain deny all land here as a refusal, so no failure mode on this axis
+        can produce an allow.
+
+        The client is read BEFORE the await and no lock of this manager is held
+        across it: the await is the child's own pipe round trip, and holding
+        ``_lock`` there would serialize the whole manager behind one coworker.
+        """
+        authority = self.live_authority
+        if authority is None:
+            return None
+        try:
+            return await authority.denial(
+                tool_name=tool_name, tool_class=tool_class, arguments=dict(arguments)
+            )
+        except asyncio.CancelledError:
+            raise
+        except BaseException as exc:
+            logger.warning(
+                "Live authority could not decide tool=%s: %s", tool_name, exc
+            )
+            return (
+                f"Tool '{tool_name}' denied: live authority is unavailable "
+                f"({type(exc).__name__}: {exc})"
+            )
 
     @property
     def available_tools(self) -> dict[str, type[BaseTool]]:

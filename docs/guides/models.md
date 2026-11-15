@@ -47,10 +47,15 @@ Provider definitions may supply extra headers and mark an endpoint as not emitti
 A deployment's `auto_compact_threshold` must be a positive whole integer token
 count; fractional values and `0` are rejected. If omitted, it uses the global
 `auto_compact_threshold` fallback in `config.toml`, where `0` disables automatic
-compaction. The TUI context denominator shows the deployment's
+compaction. This threshold is the TUI's context denominator: the status row
+renders usage over threshold, for example `45k/500k (9%)`, and the percentage is
+usage against the threshold and nothing else. The deployment's
 provider-documented `context_limit` (also a positive whole integer token count,
-and unknown unless the provider documentation states it), not this threshold; a
-deployment without a documented limit renders `—` as the denominator.
+and unknown unless the provider documentation states it) is the hard window, not
+the denominator, so the row never implies headroom that automatic compaction
+would not honour. Each subagent row in the agent browser measures against that
+agent's own threshold; a row whose threshold is unknown or switched off
+renders `—` as the denominator.
 
 Raising a deployment's `auto_compact_threshold` above its shipped value must
 satisfy the headroom invariant at config load and at launch: the threshold plus

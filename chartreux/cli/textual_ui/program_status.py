@@ -175,6 +175,23 @@ class ProgramStatusEmitter:
             # A dropped record beats a broken turn: close paths are non-essential.
             return
 
+    def reports_state(
+        self, *, state: str, kind: str | None = None, msg: str | None = None
+    ) -> bool:
+        """Whether the last written report is exactly this one.
+
+        A no-op comparison for the composed-ownership recompute: a refresh
+        whose composed state matches the wire must not call ``emit`` — every
+        emit call advances ``generation``, the fence the await-crossing
+        sites read. Guard-suppressed and deduplicated reports never landed
+        on the wire, so the answer for those stays False.
+        """
+        try:
+            report = encode_report(state, kind=kind, msg=prepare_message(msg))
+        except Exception:
+            return False
+        return report == self._last_report
+
     def republish(self) -> None:
         """Re-send the last written report, bypassing dedup (terminal resume)."""
         try:

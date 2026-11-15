@@ -16,6 +16,7 @@ secret, the rule id, or the matched line.
 
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 import subprocess
@@ -38,12 +39,22 @@ from chartreux.core.completion_contract import (
 from chartreux.core.events import AssistantEvent, ToolResultEvent
 from chartreux.core.subagent_submission import (
     BLOCK_MESSAGE_MAX_PATHS,
+    REMEDIATION_POLICY_MISMATCH,
+    REMEDIATION_RULE_HIT,
+    REMEDIATION_SCAN_INCOMPLETE,
+    SCAN_BLOCK_MAX_FINDINGS,
+    SCAN_BLOCK_SCHEMA_VERSION,
     UNKNOWN_WRITE_FOOTPRINT,
     bash_write_paths_from_result_event,
     blocked_submission_response,
+    build_scan_block,
+    effective_scan_policy,
+    resolve_scan_project_root,
     touched_path_from_result_event,
+    verify_admission_policy,
 )
 from chartreux.core.subagents import EmptySubagentResponseError, SubagentRunAccumulator
+from chartreux.core.tools import secret_scan
 from chartreux.core.tools.base import BaseToolState
 from chartreux.core.tools.builtins.bash import (
     Bash,
@@ -57,7 +68,13 @@ from chartreux.core.tools.builtins.read_file import ReadFile, ReadFileResult
 from chartreux.core.tools.builtins.write_file import WriteFile, WriteFileResult
 from chartreux.core.tools.secret_scan import (
     DEFAULT_MAX_SCAN_BYTES,
+    MANIFEST_FILENAME,
+    ApprovalKey,
+    FindingReason,
+    ScanPolicy,
     SecretFinding,
+    committed_scan_policy,
+    incomplete_finding,
     scan_paths,
 )
 from tests.mock.utils import collect_result
@@ -1137,3 +1154,631 @@ def test_scan_cutoff_is_per_run_not_per_retained_identity(tmp_path: Path) -> Non
     passed = second.build_result(turns_used=1)
     assert passed.completed is True
     assert passed.response == "wrote it"
+
+
+# --- A2: the admission-frozen committed-HEAD policy at the submission gate ----
+#
+# The manifest is frozen on the contract at admission from the COMMITTED HEAD
+# blob and verified against the current HEAD at scan time; a worker's
+# working-tree or staged manifest edit — or a mid-run manifest COMMIT — never
+# authorizes its own submission. Seeded secrets stay concatenation-built so
+# this file itself scans clean.
+
+OTHER_TOKEN = "ghp_" + "z9Y8x7W6v5U4t3S2r1Q0p9O8n7M6l5K4j3H2"
+SWAPPED_TOKEN = "ghp_" + "b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8S9"
+
+
+def _policy_repo(tmp_path: Path) -> Path:
+    """A real git repository with one committed file, as the run's cwd."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q", "-b", "main", str(repo)], check=True)
+    _git(repo, "config", "user.email", "p@example.com")
+    _git(repo, "config", "user.name", "P")
+    (repo / "tracked.txt").write_text("tracked\n", encoding="utf-8")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-q", "-m", "base")
+    return repo
+
+
+def _git(repo: Path, *args: str) -> None:
+    subprocess.run(["git", "-C", str(repo), *args], check=True)
+
+
+def _digest_of(line: str, rule_id: str) -> str:
+    keys: list[ApprovalKey] = []
+    secret_scan.scan_text(line + "\n", label="fixture.txt", keys=keys)
+    return next(key.digest for key in keys if key.rule_id == rule_id)
+
+
+def _manifest_entries(path: str, line: str) -> list[dict[str, str]]:
+    return [
+        {"path": path, "rule_id": RULE_ID, "digest": _digest_of(line, RULE_ID)},
+        {
+            "path": path,
+            "rule_id": "generic-keyword-assignment",
+            "digest": _digest_of(line, "generic-keyword-assignment"),
+        },
+    ]
+
+
+def _write_manifest(repo: Path, entries: list[dict[str, str]]) -> None:
+    (repo / secret_scan.MANIFEST_FILENAME).write_text(
+        json.dumps(
+            {
+                "schema_version": secret_scan.SCAN_POLICY_SCHEMA_VERSION,
+                "approved_matches": entries,
+                "residual_exclusions": [],
+            },
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+
+def _commit_manifest(repo: Path, entries: list[dict[str, str]]) -> None:
+    _write_manifest(repo, entries)
+    _git(repo, "add", "--", secret_scan.MANIFEST_FILENAME)
+    _git(repo, "commit", "-q", "-m", "approve synthetic matches")
+
+
+def _gate_contract(repo: Path, policy: ScanPolicy | None) -> SimpleNamespace:
+    # The shape freeze_run_admission freezes: cwd/roots plus the
+    # admission-frozen committed-HEAD scan policy.
+    return SimpleNamespace(
+        shared_roots=(), roots=(str(repo),), cwd=str(repo), scan_policy=policy
+    )
+
+
+def _gate_result(repo: Path, policy: ScanPolicy | None, name: str, content: str):
+    artifact = repo / name
+    artifact.write_text(content, encoding="utf-8")
+    accumulator = SubagentRunAccumulator()
+    accumulator.observe(AssistantEvent(content="wrote the config"), tool_call_id="task")
+    accumulator.observe(_write_event(str(artifact)), tool_call_id="task")
+    return accumulator.build_result(turns_used=1, contract=_gate_contract(repo, policy))
+
+
+def test_gate_passes_an_admission_frozen_approved_match(tmp_path: Path) -> None:
+    repo = _policy_repo(tmp_path)
+    _commit_manifest(repo, _manifest_entries("fixture.txt", SECRET_LINE))
+    # what freeze_run_admission froze at admission: the COMMITTED HEAD policy
+    frozen = committed_scan_policy(repo)
+    result = _gate_result(repo, frozen, "fixture.txt", SECRET_LINE + "\n")
+    assert result.completed is True
+    assert result.response == "wrote the config"
+
+
+def test_gate_blocks_a_different_credential_at_the_approved_path(
+    tmp_path: Path,
+) -> None:
+    repo = _policy_repo(tmp_path)
+    _commit_manifest(repo, _manifest_entries("fixture.txt", SECRET_LINE))
+    frozen = committed_scan_policy(repo)
+    other_line = f"GITHUB_TOKEN = {OTHER_TOKEN}"
+    result = _gate_result(repo, frozen, "fixture.txt", other_line + "\n")
+    assert result.completed is False
+    assert "failed the secret scan" in result.response
+    assert OTHER_TOKEN not in result.response
+    assert RULE_ID not in result.response
+
+
+def test_gate_working_tree_manifest_edit_does_not_authorize(tmp_path: Path) -> None:
+    repo = _policy_repo(tmp_path)
+    _commit_manifest(repo, [])  # committed manifest approves nothing
+    frozen = committed_scan_policy(repo)
+    # the worker edits the WORKING-TREE manifest mid-run to add the approval
+    _write_manifest(repo, _manifest_entries("fixture.txt", SECRET_LINE))
+    result = _gate_result(repo, frozen, "fixture.txt", SECRET_LINE + "\n")
+    assert result.completed is False
+    assert "failed the secret scan" in result.response
+    assert GITHUB_TOKEN not in result.response
+
+
+def test_gate_staged_manifest_does_not_authorize(tmp_path: Path) -> None:
+    repo = _policy_repo(tmp_path)
+    _commit_manifest(repo, [])
+    frozen = committed_scan_policy(repo)
+    # the worker STAGES the approval (index) without committing it
+    _write_manifest(repo, _manifest_entries("fixture.txt", SECRET_LINE))
+    _git(repo, "add", "--", secret_scan.MANIFEST_FILENAME)
+    result = _gate_result(repo, frozen, "fixture.txt", SECRET_LINE + "\n")
+    assert result.completed is False
+    assert "failed the secret scan" in result.response
+
+
+def test_gate_mid_run_manifest_commit_fails_closed(tmp_path: Path) -> None:
+    repo = _policy_repo(tmp_path)
+    _commit_manifest(repo, _manifest_entries("fixture.txt", SECRET_LINE))
+    frozen = committed_scan_policy(repo)
+    assert any(key.path == "fixture.txt" for key in frozen.approved), (
+        "the frozen policy carries the approval"
+    )
+    # mid-run, the worker COMMITS a manifest change: the current HEAD no
+    # longer matches the admission-frozen revision, so every approval drops
+    _commit_manifest(repo, [])
+    assert committed_scan_policy(repo).revision_digest != frozen.revision_digest
+    result = _gate_result(repo, frozen, "fixture.txt", SECRET_LINE + "\n")
+    assert result.completed is False
+    assert GITHUB_TOKEN not in result.response
+    # A3: the stale freeze surfaces as a policy_mismatch finding that
+    # COEXISTS with the independent rule hits — it never masks them — and
+    # the redacted message still names the artifact.
+    block = result.scan_block
+    assert block is not None
+    assert block.version == SCAN_BLOCK_SCHEMA_VERSION
+    assert block.status == "blocked"
+    by_reason = {finding.reason: finding for finding in block.findings}
+    assert by_reason["policy_mismatch"].category == "scan_incomplete"
+    assert by_reason["policy_mismatch"].path == MANIFEST_FILENAME
+    assert by_reason["policy_mismatch"].location is None
+    assert by_reason["match"].category == "rule_hit"
+    assert by_reason["match"].location is not None
+    assert block.finding_counts == {"rule_hit": 2, "scan_incomplete": 1}
+    # The policy section exposes only the policy-REVISION digests of the
+    # manifest file — never entry digests or matched bytes.
+    assert block.policy is not None
+    assert block.policy.frozen_revision_digest == frozen.revision_digest
+    assert (
+        block.policy.current_revision_digest
+        == committed_scan_policy(repo).revision_digest
+    )
+    assert block.remediation == REMEDIATION_POLICY_MISMATCH
+    assert "never retries" in block.remediation
+    assert "self-approval" in block.remediation
+    assert "may never approve its own submission" in block.remediation
+    dumped = result.model_dump_json()
+    assert GITHUB_TOKEN not in dumped
+    assert SECRET_LINE not in dumped
+    for key in frozen.approved:
+        assert key.digest not in dumped
+    # No report passthrough: the worker's report never reaches the result.
+    assert "wrote the config" not in dumped
+    # No automatic retry: rebuilding the same run is blocked again, with the
+    # same typed block — the harness never clears the mismatch itself.
+    again = _gate_result(repo, frozen, "fixture.txt", SECRET_LINE + "\n")
+    assert again.completed is False
+    assert again.scan_block is not None
+    assert again.scan_block.finding_counts == block.finding_counts
+
+
+def test_gate_value_swap_at_the_submission_boundary(tmp_path: Path) -> None:
+    repo = _policy_repo(tmp_path)
+    new_line = f"GITHUB_TOKEN = {SWAPPED_TOKEN}"
+    # the new value's approval is already committed (approval-first)
+    _commit_manifest(repo, _manifest_entries("fixture.txt", new_line))
+    frozen = committed_scan_policy(repo)
+    # the fixture was swapped to the approved new value: passes
+    result = _gate_result(repo, frozen, "fixture.txt", new_line + "\n")
+    assert result.completed is True
+    # the swapped-out old value is not approved anymore: blocks
+    result = _gate_result(repo, frozen, "fixture.txt", SECRET_LINE + "\n")
+    assert result.completed is False
+    assert "failed the secret scan" in result.response
+
+
+def test_gate_symlink_escaping_the_repo_is_uncanonicalizable_and_blocks(
+    tmp_path: Path,
+) -> None:
+    repo = _policy_repo(tmp_path)
+    _commit_manifest(repo, _manifest_entries("f.py", SECRET_LINE))
+    frozen = committed_scan_policy(repo)
+    outside = tmp_path / "outside.py"
+    outside.write_text(SECRET_LINE + "\n", encoding="utf-8")
+    link = repo / "link.py"
+    link.symlink_to(outside)
+    accumulator = SubagentRunAccumulator()
+    accumulator.observe(AssistantEvent(content="linked it"), tool_call_id="task")
+    accumulator.observe(_write_event(str(link)), tool_call_id="task")
+    # the whole tmp dir is authorized, so the escape target stays IN the
+    # scan's scope (repo class) — but it resolves outside the git project
+    # root, so it has no canonical identity
+    contract = SimpleNamespace(
+        shared_roots=(),
+        roots=(str(tmp_path), str(repo)),
+        cwd=str(repo),
+        scan_policy=frozen,
+    )
+    result = accumulator.build_result(turns_used=1, contract=contract)
+    # no canonical identity, so the approving policy cannot suppress the hit
+    assert result.completed is False
+    assert "failed the secret scan" in result.response
+
+
+def test_gate_scratchpad_link_into_the_repo_keeps_the_approved_identity(
+    tmp_path: Path,
+) -> None:
+    repo = _policy_repo(tmp_path)
+    _commit_manifest(repo, _manifest_entries("f.py", SECRET_LINE))
+    frozen = committed_scan_policy(repo)
+    artifact = repo / "f.py"
+    artifact.write_text(SECRET_LINE + "\n", encoding="utf-8")
+    scratch = tmp_path / "scratch"
+    scratch.mkdir()
+    link = scratch / "link.py"
+    link.symlink_to(artifact)
+    accumulator = SubagentRunAccumulator()
+    accumulator.observe(
+        AssistantEvent(content="wrote via the link"), tool_call_id="task"
+    )
+    accumulator.observe(_write_event(str(link)), tool_call_id="task")
+    result = accumulator.build_result(
+        turns_used=1, contract=_gate_contract(repo, frozen)
+    )
+    # the link spells the file through the scratchpad, but the gate derives
+    # the SAME canonical identity ("f.py"), so the approval applies
+    assert result.completed is True
+    assert result.response == "wrote via the link"
+
+
+def test_gate_without_an_admission_frozen_policy_blocks(tmp_path: Path) -> None:
+    # A contract carrying no frozen policy (the pre-A2 shape) gets no
+    # approvals at all: fail closed.
+    repo = _policy_repo(tmp_path)
+    _commit_manifest(repo, _manifest_entries("fixture.txt", SECRET_LINE))
+    result = _gate_result(repo, None, "fixture.txt", SECRET_LINE + "\n")
+    assert result.completed is False
+    assert "failed the secret scan" in result.response
+
+
+def test_resolve_scan_project_root_prefers_the_git_toplevel(tmp_path: Path) -> None:
+    repo = _policy_repo(tmp_path)
+    assert resolve_scan_project_root(str(repo), ()) == str(repo)
+    subdir = repo / "sub"
+    subdir.mkdir()
+    assert resolve_scan_project_root(str(subdir), ()) == str(repo)
+    plain = tmp_path / "plain"
+    plain.mkdir()
+    assert resolve_scan_project_root(str(plain), ()) == str(plain)
+    assert resolve_scan_project_root(None, ()) is None
+    assert resolve_scan_project_root(None, (str(plain),)) == str(plain)
+
+
+def test_effective_scan_policy_fails_closed_on_mismatch_and_absence(
+    tmp_path: Path,
+) -> None:
+    repo = _policy_repo(tmp_path)
+    _commit_manifest(repo, _manifest_entries("fixture.txt", SECRET_LINE))
+    frozen = committed_scan_policy(repo)
+    # matching HEAD: the frozen policy is used as-is
+    assert effective_scan_policy(frozen, str(repo)) is frozen
+    # no project root: cannot verify the freeze, fail closed
+    dropped = effective_scan_policy(frozen, None)
+    assert dropped is not None and dropped.approved == frozenset()
+    # no frozen policy: no approvals active
+    assert effective_scan_policy(None, str(repo)) is None
+    # mid-run change: mismatch drops every approval
+    _commit_manifest(repo, [])
+    dropped = effective_scan_policy(frozen, str(repo))
+    assert dropped is not None
+    assert dropped.approved == frozenset()
+    assert dropped.revision_digest == committed_scan_policy(repo).revision_digest
+
+
+# --- A3: bounded, versioned, typed scan-block diagnostics --------------------
+
+
+def test_verify_admission_policy_reports_mismatch_and_revision_digests(
+    tmp_path: Path,
+) -> None:
+    repo = _policy_repo(tmp_path)
+    _commit_manifest(repo, _manifest_entries("fixture.txt", SECRET_LINE))
+    frozen = committed_scan_policy(repo)
+    # No frozen policy: no approvals, no mismatch detection.
+    assert verify_admission_policy(None, str(repo)) == (None, False, None, None)
+    # Matching HEAD: the frozen policy is used as-is, no mismatch.
+    policy, mismatch, frozen_digest, current_digest = verify_admission_policy(
+        frozen, str(repo)
+    )
+    assert policy is frozen
+    assert mismatch is False
+    assert frozen_digest == current_digest == frozen.revision_digest
+    # Mid-run change: mismatch, fail closed, both revision digests reported.
+    _commit_manifest(repo, [])
+    policy, mismatch, frozen_digest, current_digest = verify_admission_policy(
+        frozen, str(repo)
+    )
+    assert mismatch is True
+    assert policy is not None and policy.approved == frozenset()
+    assert frozen_digest == frozen.revision_digest
+    assert current_digest == committed_scan_policy(repo).revision_digest
+    # No project root: cannot verify the freeze — mismatch, fail closed, and
+    # the current revision digest is not computable.
+    policy, mismatch, frozen_digest, current_digest = verify_admission_policy(
+        frozen, None
+    )
+    assert mismatch is True
+    assert policy is not None and policy.approved == frozenset()
+    assert frozen_digest == frozen.revision_digest
+    assert current_digest is None
+
+
+def test_build_result_attaches_the_typed_scan_block(tmp_path: Path) -> None:
+    artifact = tmp_path / "deploy.py"
+    artifact.write_text(f"# config\n{SECRET_LINE}\n", encoding="utf-8")
+    accumulator = SubagentRunAccumulator()
+    accumulator.observe(AssistantEvent(content="wrote the config"), tool_call_id="task")
+    accumulator.observe(_write_event(str(artifact)), tool_call_id="task")
+
+    result = accumulator.build_result(turns_used=2)
+
+    assert result.completed is False
+    # The redacted message is unchanged: rule hits only, so the rule-hit
+    # branch, no rule id, no location, no secret.
+    assert "failed the secret scan" in result.response
+    assert RULE_ID not in result.response
+    assert GITHUB_TOKEN not in result.response
+    # The typed block carries the actionable detail: version, status, both
+    # category counts, the rule hit with its safe path, location, reason
+    # code, and the fixed remediation string.
+    block = result.scan_block
+    assert block is not None
+    assert block.version == SCAN_BLOCK_SCHEMA_VERSION
+    assert block.status == "blocked"
+    assert block.finding_counts == {"rule_hit": 2, "scan_incomplete": 0}
+    assert block.truncated_counts == {"rule_hit": 0, "scan_incomplete": 0}
+    assert block.policy is None
+    assert block.remediation == REMEDIATION_RULE_HIT
+    assert "may never approve its own submission" in block.remediation
+    hit = next(finding for finding in block.findings if finding.rule_id == RULE_ID)
+    assert hit.category == "rule_hit"
+    assert hit.reason == "match"
+    assert hit.path == str(artifact)
+    assert hit.location is not None and hit.location.line == 2
+    assert hit.manifest_entries == []
+    # The rule id lives in the typed block, never in the redacted response;
+    # and no matched value, entry digest, or worker report is anywhere in
+    # the serialized result.
+    dumped = result.model_dump_json()
+    assert RULE_ID in dumped
+    assert GITHUB_TOKEN not in dumped
+    assert SECRET_LINE not in dumped
+    assert "wrote the config" not in dumped
+
+
+def test_unblocked_result_carries_no_scan_block(tmp_path: Path) -> None:
+    artifact = tmp_path / "clean.py"
+    artifact.write_text("value = 1\n", encoding="utf-8")
+    accumulator = SubagentRunAccumulator()
+    accumulator.observe(AssistantEvent(content="done"), tool_call_id="task")
+    accumulator.observe(_write_event(str(artifact)), tool_call_id="task")
+    result = accumulator.build_result(turns_used=1)
+    assert result.completed is True
+    assert result.scan_block is None
+    # Omitted from dumps entirely when None (the pre-A3 dump shape).
+    assert "scan_block" not in result.model_dump(mode="json")
+
+
+def test_build_result_scan_block_for_an_incomplete_artifact(tmp_path: Path) -> None:
+    artifact = tmp_path / "big-artifact.txt"
+    artifact.write_text("x" * DEFAULT_MAX_SCAN_BYTES + "\n", encoding="utf-8")
+    accumulator = SubagentRunAccumulator()
+    accumulator.observe(
+        AssistantEvent(content="wrote the artifact"), tool_call_id="task"
+    )
+    accumulator.observe(_write_event(str(artifact)), tool_call_id="task")
+
+    result = accumulator.build_result(turns_used=1)
+
+    assert result.completed is False
+    block = result.scan_block
+    assert block is not None
+    assert block.finding_counts == {"rule_hit": 0, "scan_incomplete": 1}
+    finding = block.findings[0]
+    assert finding.category == "scan_incomplete"
+    assert finding.reason == "file_size_limit"
+    assert finding.path == str(artifact)
+    # An incomplete finding renders NO location (its (1,1) is internal).
+    assert finding.location is None
+    assert block.remediation == REMEDIATION_SCAN_INCOMPLETE
+    assert "may never approve its own submission" in block.remediation
+
+
+def test_build_result_unknown_footprint_scan_block() -> None:
+    accumulator = SubagentRunAccumulator()
+    accumulator.observe(AssistantEvent(content="done"), tool_call_id="task")
+    accumulator.observe(_bash_event(unknown=True), tool_call_id="task")
+
+    result = accumulator.build_result(turns_used=1)
+
+    assert result.completed is False
+    # The redacted message still names the sentinel path.
+    assert UNKNOWN_WRITE_FOOTPRINT in result.response
+    block = result.scan_block
+    assert block is not None
+    finding = block.findings[0]
+    assert finding.category == "scan_incomplete"
+    assert finding.reason == "unknown_write_footprint"
+    # Nullability covers the sentinel PATH, not the location fields.
+    assert finding.path is None
+    assert finding.location is None
+    assert block.remediation == REMEDIATION_SCAN_INCOMPLETE
+
+
+def test_build_scan_block_truncation_is_category_preserving() -> None:
+    # More rule hits than the cap plus incomplete findings: the truncation
+    # never drops a whole category, and both category counts are present.
+    findings = [
+        SecretFinding(
+            path=f"/repo/a-{index:03d}.py",
+            rule_id=RULE_ID,
+            description="GitHub token",
+            line=1,
+            column=1,
+        )
+        for index in range(SCAN_BLOCK_MAX_FINDINGS + 5)
+    ]
+    findings += [
+        incomplete_finding(
+            f"/repo/big-{index}.bin", "why", reason_code=FindingReason.FILE_SIZE_LIMIT
+        )
+        for index in range(2)
+    ]
+
+    block = build_scan_block(findings)
+
+    assert len(block.findings) == SCAN_BLOCK_MAX_FINDINGS
+    assert block.finding_counts == {
+        "rule_hit": SCAN_BLOCK_MAX_FINDINGS + 5,
+        "scan_incomplete": 2,
+    }
+    # Both categories survive the cap: one incomplete finding was swapped in
+    # for a rule hit, so 6 rule hits and 1 incomplete finding were dropped.
+    assert {finding.category for finding in block.findings} == {
+        "rule_hit",
+        "scan_incomplete",
+    }
+    assert block.truncated_counts == {"rule_hit": 6, "scan_incomplete": 1}
+    assert block.remediation == REMEDIATION_RULE_HIT
+
+
+def test_build_scan_block_orders_findings_deterministically() -> None:
+    findings = [
+        SecretFinding(
+            path="/repo/b.py", rule_id=RULE_ID, description="d", line=9, column=2
+        ),
+        SecretFinding(
+            path="/repo/a.py",
+            rule_id="aws-access-key-id",
+            description="d",
+            line=1,
+            column=1,
+        ),
+        SecretFinding(
+            path="/repo/a.py", rule_id=RULE_ID, description="d", line=3, column=4
+        ),
+    ]
+    block = build_scan_block(list(reversed(findings)))
+    assert [
+        (f.path, f.rule_id, f.location.line if f.location else None)
+        for f in block.findings
+    ] == [
+        ("/repo/a.py", "aws-access-key-id", 1),
+        ("/repo/a.py", RULE_ID, 3),
+        ("/repo/b.py", RULE_ID, 9),
+    ]
+    again = build_scan_block(findings)
+    assert block == again
+
+
+def test_build_scan_block_remediation_selection_and_policy_section() -> None:
+    rule_hit = SecretFinding(
+        path="/repo/a.py", rule_id=RULE_ID, description="d", line=1, column=1
+    )
+    incomplete = incomplete_finding(
+        "/repo/big.bin", "why", reason_code=FindingReason.FILE_SIZE_LIMIT
+    )
+    mismatch = incomplete_finding(
+        MANIFEST_FILENAME, "why", reason_code=FindingReason.POLICY_MISMATCH
+    )
+    # Rule hits only: the rule-hit remediation, no policy section.
+    block = build_scan_block([rule_hit])
+    assert block.remediation == REMEDIATION_RULE_HIT
+    assert block.policy is None
+    # Incomplete only: the incomplete remediation.
+    block = build_scan_block([incomplete])
+    assert block.remediation == REMEDIATION_SCAN_INCOMPLETE
+    assert block.policy is None
+    # A policy_mismatch selects its own remediation and exposes ONLY the
+    # policy-revision digests in the policy section.
+    block = build_scan_block(
+        [rule_hit, incomplete, mismatch],
+        frozen_revision_digest="f" * 64,
+        current_revision_digest="c" * 64,
+    )
+    assert block.remediation == REMEDIATION_POLICY_MISMATCH
+    assert block.policy is not None
+    assert block.policy.frozen_revision_digest == "f" * 64
+    assert block.policy.current_revision_digest == "c" * 64
+    assert {finding.reason for finding in block.findings} == {
+        "match",
+        "file_size_limit",
+        "policy_mismatch",
+    }
+    # The mismatch coexists with the rule hit — it does not mask it.
+    assert block.finding_counts == {"rule_hit": 1, "scan_incomplete": 2}
+
+
+def test_gate_surfaces_per_entry_manifest_identifiers_only(tmp_path: Path) -> None:
+    # Two approvals share one (path, rule); the artifact carries a THIRD
+    # value: the block names WHICH entries share the hit's (path, rule) —
+    # identifiers only, never digests.
+    repo = _policy_repo(tmp_path)
+    line_a = f"GITHUB_TOKEN = {OTHER_TOKEN}"
+    line_b = f"GITHUB_TOKEN = {SWAPPED_TOKEN}"
+    _commit_manifest(
+        repo,
+        [
+            {
+                "path": "fixture.txt",
+                "rule_id": RULE_ID,
+                "digest": _digest_of(line_a, RULE_ID),
+            },
+            {
+                "path": "fixture.txt",
+                "rule_id": RULE_ID,
+                "digest": _digest_of(line_b, RULE_ID),
+            },
+        ],
+    )
+    frozen = committed_scan_policy(repo)
+    assert len(frozen.entry_ids[("fixture.txt", RULE_ID)]) == 2
+
+    result = _gate_result(repo, frozen, "fixture.txt", SECRET_LINE + "\n")
+
+    assert result.completed is False
+    block = result.scan_block
+    assert block is not None
+    hit = next(finding for finding in block.findings if finding.rule_id == RULE_ID)
+    assert hit.manifest_entries == ["approved_matches[0]", "approved_matches[1]"]
+    dumped = result.model_dump_json()
+    assert GITHUB_TOKEN not in dumped
+    for key in frozen.approved:
+        assert key.digest not in dumped
+
+
+def test_gate_suspect_path_artifact_block_is_opaque(tmp_path: Path) -> None:
+    # A matched credential in the FILENAME: the block's path degrades to the
+    # deterministic opaque identifier, in the typed block AND the redacted
+    # message — the token appears nowhere in the result.
+    artifact = tmp_path / ("leak-" + GITHUB_TOKEN + ".py")
+    artifact.write_text(SECRET_LINE + "\n", encoding="utf-8")
+    accumulator = SubagentRunAccumulator()
+    accumulator.observe(AssistantEvent(content="wrote it"), tool_call_id="task")
+    accumulator.observe(_write_event(str(artifact)), tool_call_id="task")
+
+    result = accumulator.build_result(turns_used=1)
+
+    assert result.completed is False
+    block = result.scan_block
+    assert block is not None
+    assert block.findings
+    for finding in block.findings:
+        assert finding.path is not None
+        assert finding.path.startswith("<opaque-path:")
+    dumped = result.model_dump_json()
+    assert GITHUB_TOKEN not in dumped
+    assert GITHUB_TOKEN not in result.response
+    assert str(artifact) not in dumped
+
+
+def test_gate_control_character_path_is_stripped_in_the_block(tmp_path: Path) -> None:
+    # A path carrying non-printable control characters is always stripped,
+    # in the typed block and the redacted message alike.
+    artifact = tmp_path / "we\x1bird.py"
+    artifact.write_text(SECRET_LINE + "\n", encoding="utf-8")
+    accumulator = SubagentRunAccumulator()
+    accumulator.observe(AssistantEvent(content="wrote it"), tool_call_id="task")
+    accumulator.observe(_write_event(str(artifact)), tool_call_id="task")
+
+    result = accumulator.build_result(turns_used=1)
+
+    assert result.completed is False
+    block = result.scan_block
+    assert block is not None
+    for finding in block.findings:
+        assert finding.path == str(tmp_path / "weird.py")
+        assert finding.path is not None
+        assert all(character.isprintable() for character in finding.path)
+    assert "\x1b" not in result.response

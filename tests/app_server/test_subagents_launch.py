@@ -795,8 +795,14 @@ async def test_post_commit_update_failure_does_not_cancel_busy_child(
         assert acknowledgement.response == (
             f"Background agent {expected_name} "
             f"({acknowledgement.agent_id}, run {acknowledgement.run_id}) "
-            "launched and running; use check_agents to monitor, "
-            "get_agent_result or wait_for_agent to retrieve the result. "
+            "launched and running. Do independent work or end your turn; on the "
+            "completion notification, fetch the result with get_agent_result. "
+            "Use wait_for_agent only if the result is a hard dependency of your "
+            "next action, no independent work can proceed, and that action must "
+            "occur in this turn rather than after notification. If uncertain, "
+            "end your turn. Do not invent work to fill the wait; if there is "
+            "nothing real to do, end your turn. Use check_agents to inspect "
+            "progress. "
             "This agent is not retained and closes when the run completes; "
             "the result stays retrievable via get_agent_result. "
             "Launch with retain=true to keep a resident agent."
@@ -1312,6 +1318,14 @@ async def test_retained_launch_consumes_the_top_level_model(
             context,
         )
         assert result.run_id is not None
+        # The retained acknowledgment keeps its policy suffix alongside the
+        # notification-first rule.
+        assert "launched and running. Do independent work or end your turn;" in (
+            result.response
+        )
+        assert "This agent is retained and stays resident after the run " in (
+            result.response
+        )
         await registry.wait_for_agent(record.agent_id, result.run_id)
         assert child.config.active_model == "other"
         assert child.committed_model is not None
@@ -2950,13 +2964,21 @@ class _RecordingProcessSpawn:
         return child
 
 
-def _process_parent(tmp_path: Path) -> AgentLoop:
+def _process_parent(tmp_path: Path, *, retain_agents: bool = False) -> AgentLoop:
     """A root loop with a real session directory for the child's own transcript."""
     logging = SessionLoggingConfig(
         enabled=True, save_dir=str(tmp_path / "sessions"), session_prefix="session"
     )
+    config = _config()
     return build_test_agent_loop(
-        config=_config().model_copy(update={"session_logging": logging}),
+        config=config.model_copy(
+            update={
+                "session_logging": logging,
+                "subagents": config.subagents.model_copy(
+                    update={"retain_agents": retain_agents}
+                ),
+            }
+        ),
         backend=FakeBackend([mock_llm_chunk(content="ack")]),
     )
 
@@ -3076,6 +3098,74 @@ async def test_retained_process_child_keeps_its_process_across_retasks(
         assert {link.session_id for link in metadata.child_sessions} == {
             "child-session-1"
         }
+    finally:
+        await parent.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("config_default", "explicit_retain", "expected"),
+    [
+        (True, None, True),
+        (False, None, False),
+        (False, True, True),
+        (True, False, False),
+    ],
+)
+async def test_process_child_retention_reads_the_generation_config(
+    tmp_path: Path, config_default: bool, explicit_retain: bool | None, expected: bool
+) -> None:
+    """The coordinator spawn route honors ``[subagents].retain_agents``.
+
+    A fresh process launch with no explicit ``retain`` takes the generation's
+    configured default instead of the constructor's hardcoded ``False``, and
+    an explicit argument in either direction overrides that default.
+    """
+    parent = _process_parent(tmp_path, retain_agents=config_default)
+    root_dir = parent.session_logger.session_dir
+    assert root_dir is not None
+    spawn = _RecordingProcessSpawn(root_dir)
+    registry, root = _process_registry(parent, spawn)
+    try:
+        handle = await _publish_process_child(
+            registry, root, parent, retain=explicit_retain
+        )
+        assert handle.retained is expected
+    finally:
+        await parent.aclose()
+
+
+@pytest.mark.asyncio
+async def test_process_child_reuse_retain_false_demotes_the_committed_policy(
+    tmp_path: Path,
+) -> None:
+    """``retain=false`` on a re-task is the only demotion of a retained child."""
+    parent = _process_parent(tmp_path, retain_agents=True)
+    root_dir = parent.session_logger.session_dir
+    assert root_dir is not None
+    spawn = _RecordingProcessSpawn(root_dir)
+    registry, root = _process_registry(parent, spawn)
+    try:
+        first = await _publish_process_child(
+            registry, root, parent, attempt_id="attempt-a"
+        )
+        assert first.retained is True
+        second = await _publish_process_child(
+            registry,
+            root,
+            parent,
+            tool_call_id="task-2",
+            retain=False,
+            reuse=first,
+            attempt_id="attempt-b",
+        )
+
+        # The re-task still runs on the process it already has, but the handle
+        # now carries the demoted policy: this continuation is its last run.
+        assert second is first
+        assert second.retained is False
+        assert len(spawn.specs) == 1
+        assert spawn.spawned[0].closes == 0
     finally:
         await parent.aclose()
 

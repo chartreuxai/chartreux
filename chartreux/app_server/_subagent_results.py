@@ -118,6 +118,10 @@ class ResultsStateView(Protocol):
 
     def _note_uncollected_change_locked(self, agent_id: str) -> None: ...
 
+    # v0.7.9 point 5 (C6a): advance the monotone inventory revision in the
+    # caller's held region (the registry lock).
+    def _advance_inventory_revision_locked(self) -> None: ...
+
 
 @dataclass
 class PinnedWait:
@@ -174,6 +178,7 @@ class RunResults:
     def expire_locked(self) -> None:
         """Evict unreferenced results past the per-generation cap (locked)."""
         unreferenced_by_generation: dict[int, list[StoredRunResult]] = {}
+        expired_any = False
         for key, stored in self._view._result_store.items():
             if (
                 key not in self._view._pending_notifications
@@ -190,6 +195,7 @@ class RunResults:
                 unreferenced, key=lambda item: (item.completed_at, item.agent_id)
             )[:excess]:
                 key = (stored.agent_id, stored.run_id)
+                expired_any = True
                 # U3b: an uncollected key leaves a visible agent's list here.
                 listed = key not in self._view._collected_results
                 self._view._result_store.pop(key, None)
@@ -215,6 +221,11 @@ class RunResults:
                     for run in record.run_history:
                         if run.run_id == stored.run_id:
                             run.result = None
+        if expired_any:
+            # The expiry removed projection-visible state (store entries,
+            # expiry markers, uncollected list rows, result stamps) under the
+            # caller's registry lock (point 5).
+            self._view._advance_inventory_revision_locked()
 
     def resolve_locked(
         self, agent_id: str, run_id: str | None
@@ -397,6 +408,9 @@ class RunResults:
         ):
             return
         self._view._collected_results.discard(key)
+        # The revoked publication dropped a collection marker the uncollected
+        # projection showed; the caller holds the registry lock (point 5).
+        self._view._advance_inventory_revision_locked()
 
     def purge_agent_locked(self, agent_id: str) -> set[tuple[str, str]]:
         """Purge every result collection entry for one agent (locked).
@@ -1174,6 +1188,9 @@ class RunResults:
                     stop_reason=run.requested_stop_reason,
                 )
             run.requested_stop_reason = reason
+            # The stopping latch is a projection-visible stop-reason write
+            # under the registry lock (point 5).
+            self._view._advance_inventory_revision_locked()
         # This helper is synchronous: no scheduling gap between arbitration and
         # interruption, no lock across cleanup awaits, and no monitor cancellation.
         if not self.interrupt_operation(record, run):

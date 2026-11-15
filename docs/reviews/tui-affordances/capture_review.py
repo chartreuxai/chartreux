@@ -955,16 +955,6 @@ def fixtures() -> list[Fixture]:
             ),
         ),
         Fixture(
-            "resumed-transcript",
-            "sessions",
-            "ChartreuxApp",
-            _factory(
-                "test_ui_snapshot_session_resume", "SnapshotTestAppWithResumedSession"
-            ),
-            None,
-            ("load fake prior session",),
-        ),
-        Fixture(
             "rewind-panel",
             "sessions",
             "RewindApp",

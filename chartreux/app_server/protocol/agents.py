@@ -9,6 +9,7 @@ from pydantic import Field
 
 from chartreux.app_server._model import ProtocolModel
 from chartreux.app_server.models import PublicRecoveryEligibility, RunStopReason
+from chartreux.app_server.protocol.notifications import AgentSummaryModel
 
 
 class CancelOutcome(StrEnum):
@@ -163,3 +164,31 @@ class AgentsReconcileResponse(ProtocolModel):
     eligibility: PublicRecoveryEligibility | None = None
     reason_codes: list[str] = Field(default_factory=list)
     reason: str | None = None
+
+
+class AgentsInventoryReadParams(ProtocolModel):
+    """The typed live-agent-inventory request (v0.7.9 point 5).
+
+    The read is control-class and session-scoped: the attached session is the
+    address, so the carrier pins it the same way the management routes do and
+    the request body itself carries no fields.
+    """
+
+
+class AgentsInventoryReadResponse(ProtocolModel):
+    """One consistent live-agent-inventory snapshot (v0.7.9 point 5).
+
+    The inventory is the owner's wire projection (the same agent summaries the
+    TUI bar consumes), sampled with the monotone inventory revision under the
+    owner's serialization boundary, so the revision describes EXACTLY the
+    returned inventory. ``session_id``/``generation`` name the ROOT incarnation
+    the revision belongs to: the accepted-revision floor is compared only
+    within one identical pair — a new generation of the same session id is a
+    new incarnation and establishes a fresh floor, and revisions are never
+    compared across incarnations.
+    """
+
+    session_id: str | None = None
+    generation: int | None = None
+    revision: int = Field(ge=0, strict=True)
+    agents: list[AgentSummaryModel] = Field(default_factory=list)

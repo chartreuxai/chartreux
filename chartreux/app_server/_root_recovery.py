@@ -76,7 +76,43 @@ from chartreux.core.recovery_models import (
 from chartreux.core.utils.retry import jittered_backoff
 from chartreux.observability.logging import logger
 
-__all__ = ["RootRecoveryGate", "RootRecoverySessionView"]
+__all__ = [
+    "RootRecoveryGate",
+    "RootRecoverySessionView",
+    "transcript_integrity_verdict",
+]
+
+
+def transcript_integrity_verdict(messages: Sequence[LLMMessage]) -> str | None:
+    """Project the transcript-integrity decline reason from live messages.
+
+    Read-only pre-check over the live transcript (live tail exempt: the
+    designed backfill repairs unresolved calls before any request). A live
+    list owning a sealed prefix mints its authority here; a plain sequence
+    yields None and markers stay fail-closed. A check failure degrades to
+    no-reason (meta-recovery: the gate never masks a decision on a
+    pre-check error), and a poisoned transcript parks to the manual fallback —
+    never another doomed continuation. Shared by the in-process gate (over
+    its live message list) and the agent process (whose wire reply carries
+    this verdict as the transcript-integrity projection).
+    """
+    try:
+        violations = validate_transcript(
+            messages,
+            live_tail_exempt=True,
+            archived_prefix=live_archive_authority(messages),
+        )
+    except Exception:
+        logger.exception("root recovery transcript integrity pre-check failed")
+        return None
+    if violations:
+        logger.warning(
+            "Root recovery declined: transcript integrity violations: %s",
+            "; ".join(str(violation) for violation in violations),
+        )
+        return "transcript_integrity"
+    return None
+
 
 #: Bounded FIFO capacity of the typed terminal projections (by turn id).
 _PROJECTION_CAPACITY = 64
@@ -225,6 +261,7 @@ class RootRecoveryGate:
         stage_notice: Callable[[RootRecoveryNoticeDetail, str], ProjectedUpdate | None],
         emit_projected: Callable[[ProjectedUpdate], Awaitable[None]],
         transcript_integrity: Callable[[], Sequence[LLMMessage]] | None = None,
+        transcript_integrity_verdict: Callable[[], str | None] | None = None,
     ) -> None:
         self._config = config
         self._session_view = session_view
@@ -237,6 +274,11 @@ class RootRecoveryGate:
         # Defaulted so existing constructions (and the gate unit tests) are
         # unaffected.
         self._transcript_integrity = transcript_integrity
+        # OPTIONAL wire collaborator: a pre-validated transcript-integrity
+        # projection (the reason string, or None) computed owner-side over
+        # the live transcript and carried on the agent wire. When set it
+        # replaces the in-process message-list validation.
+        self._transcript_integrity_verdict = transcript_integrity_verdict
         # Typed terminal projections by turn id (bounded FIFO).
         self._projections: dict[str, RootTurnFailure] = {}
         # Active + recently ended episodes by episode id.
@@ -721,29 +763,23 @@ class RootRecoveryGate:
         check failure degrades to no-reason (meta-recovery: the gate never
         masks a decision on a pre-check error), and a poisoned transcript
         parks to the manual fallback — never another doomed continuation.
+        A wire-fed verdict (the stdio topology's owner-side projection)
+        replaces the in-process validation when one is bound.
         """
+        if self._transcript_integrity_verdict is not None:
+            try:
+                return self._transcript_integrity_verdict()
+            except Exception:
+                logger.exception("root recovery transcript integrity pre-check failed")
+                return None
         if self._transcript_integrity is None:
             return None
         try:
-            live_messages = self._transcript_integrity()
-            violations = validate_transcript(
-                live_messages,
-                live_tail_exempt=True,
-                # M1 (P4d): a live list owning a sealed prefix mints its
-                # authority here; a plain sequence yields None and markers
-                # stay fail-closed.
-                archived_prefix=live_archive_authority(live_messages),
-            )
+            messages = self._transcript_integrity()
         except Exception:
             logger.exception("root recovery transcript integrity pre-check failed")
             return None
-        if violations:
-            logger.warning(
-                "Root recovery declined: transcript integrity violations: %s",
-                "; ".join(str(violation) for violation in violations),
-            )
-            return "transcript_integrity"
-        return None
+        return transcript_integrity_verdict(messages)
 
     def _live_availability(self) -> AvailabilitySnapshot:
         """The non-mutating eligibility snapshot; a read failure degrades to

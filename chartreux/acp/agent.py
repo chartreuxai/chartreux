@@ -133,6 +133,7 @@ from chartreux.app_server.protocol import (
     ClientCapabilities as AppServerClientCapabilities,
     ClientInfo,
     ClientToolCapability,
+    ProtocolError,
     ProtocolErrorCode,
     ReviewBaselineParams,
     ReviewHunksParams,
@@ -336,6 +337,24 @@ class SessionRetryingNotification(BaseModel):
     session_id: str = Field(serialization_alias="sessionId")
     category: PublicRetryCategory
     detail: str
+
+
+def _rpc_refusal(operation: str, error: ProtocolError) -> InvalidRequestError:
+    """Reword one wire refusal for an RPC caller.
+
+    The wire diagnostic names a selector the caller cannot set: which topology
+    the agent server runs is the operator's choice, not the editor's. An
+    uncarried operation therefore reaches the RPC client as what the caller can
+    ask for, while any other code keeps its own text -- an internal failure
+    stays a failure instead of reading as unsupported.
+    """
+    if error.code is not ProtocolErrorCode.NOT_IMPLEMENTED:
+        return InvalidRequestError(error.message)
+    return InvalidRequestError(
+        f"{operation} is not available from this agent server: the stdio "
+        "topology does not carry it in this release. Restart the agent server "
+        "on the in-process topology to use it."
+    )
 
 
 class ChartreuxAcpAgent(AcpAgent):
@@ -944,7 +963,7 @@ class ChartreuxAcpAgent(AcpAgent):
         except ValidationError as exc:
             raise InvalidRequestError(f"Invalid fork parameters: {exc}") from exc
         except AppServerResponseError as exc:
-            raise InvalidRequestError(exc.error.message) from exc
+            raise _rpc_refusal("Session fork", exc.error) from exc
         child = await self._create_session(
             Path(cwd),
             ResumeSessionIntent(fork.state.session.id),
@@ -1231,7 +1250,7 @@ class ChartreuxAcpAgent(AcpAgent):
                     entry_id
                 )
             except AppServerResponseError as exc:
-                raise InvalidRequestError(exc.error.message) from exc
+                raise _rpc_refusal("Rewind preview", exc.error) from exc
             return {"paths": paths}
         try:
             response = await session.app_server.resources.sessions.rewind(
@@ -1240,7 +1259,7 @@ class ChartreuxAcpAgent(AcpAgent):
                 inplace=True,
             )
         except AppServerResponseError as exc:
-            raise InvalidRequestError(exc.error.message) from exc
+            raise _rpc_refusal("Session rewind", exc.error) from exc
         return {
             "messageContent": response.message,
             "restoreErrors": list(response.restore_errors),

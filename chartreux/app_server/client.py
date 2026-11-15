@@ -36,7 +36,28 @@ class AppServerConnectionClosed(RuntimeError):
     pass
 
 
+class AppServerRequestNotSent(AppServerConnectionClosed):
+    """A request whose frame never reached the transport.
+
+    The client was already closed, or its channel was already down, when the
+    send was attempted, so the peer cannot have observed the frame: the
+    outcome is not-sent (nothing was mutated), not unknown. Subclasses
+    ``AppServerConnectionClosed`` so existing connection-loss handling keeps
+    working unchanged.
+    """
+
+
 _DEFAULT_REQUEST_TIMEOUT = 30.0
+
+DEFAULT_STOP_REQUEST_TIMEOUT = 120.0
+"""The client's extended timeout for ``session/stop``.
+
+The ordinary 30s default must not time out the stop: the stop is a lifecycle
+long operation (callbacks and queued work settle, then the root terminates and
+persists before the ack), so a 30s deadline would turn every slow stop into an
+unknown outcome. A stop that still times out here is an unknown outcome --
+reconciled through ``session/resume``, never resent.
+"""
 
 
 def _validated_timeout(value: float, *, name: str) -> float:
@@ -189,7 +210,13 @@ class AppServerClient:
             if timeout is None
             else _validated_timeout(timeout, name="timeout")
         )
-        await self.start()
+        try:
+            await self.start()
+        except RuntimeError as exc:
+            # The client was already closed or its channel already down when
+            # the send was attempted, so the frame never reached the transport:
+            # the request is not-sent, not lost in flight.
+            raise AppServerRequestNotSent(str(exc)) from exc
         request_id = f"client-{self._next_request_id}"
         self._next_request_id += 1
         future: asyncio.Future[_ClientResponse] = (

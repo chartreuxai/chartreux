@@ -1,25 +1,102 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Callable
+from collections.abc import AsyncIterator, Callable
 import json
 from pathlib import Path
 import tomllib
 
 import httpx
 import pytest
+import pytest_asyncio
 import respx
 import tomli_w
 
 from chartreux.app_server.protocol import (
     AppServerResponseError,
     ClientCapabilities,
+    ConfigFieldsReadParams,
+    ConfigFieldsReadResponse,
+    ConfigProxyWriteParams,
     ConfigWriteOpWire,
     ProtocolErrorCode,
     SessionOptions,
+    SettingsReadParams,
+    SettingsReadResponse,
 )
 from chartreux.app_server.session import AppServerSession
-from tests.app_server.backend_contract.conftest import connect_backend_contract_host
+from chartreux.app_server.transport import STDIO_TRANSPORT
+from chartreux.core.agent_loop import AgentLoop
+from chartreux.core.config import build_default_orchestrator
+from chartreux.core.config.harness_files import HarnessFilesManager
+from tests.app_server.backend_contract.conftest import (
+    BackendContractConnection,
+    connect_backend_contract_host,
+    connect_backend_contract_stdio_host,
+    install_memory_root_agent,
+)
+from tests.stubs.fake_backend import FakeBackend
+from tests.stubs.fake_mcp_registry import FakeMCPRegistry
+
+
+async def _layered_agent_loop() -> AgentLoop:
+    """A loop whose orchestrator is the real layered stack over this test's config.
+
+    The configuration reads project the agent's own orchestrator and its
+    layered sources, so the stdio leg's memory root runs the shipped
+    orchestrator rather than an in-memory double: a read answered on either
+    route is then comparable leaf for leaf.
+    """
+    manager = HarnessFilesManager(sources=("user", "project"))
+    return AgentLoop(
+        config_orchestrator=await build_default_orchestrator(
+            harness_files=manager.for_session(Path.cwd())
+        ),
+        backend=FakeBackend(),
+        mcp_registry=FakeMCPRegistry(),
+    )
+
+
+@pytest_asyncio.fixture
+async def configuration_connection(
+    monkeypatch: pytest.MonkeyPatch,
+    stdio_after_autouse: str,
+    backend_contract_session_options: SessionOptions,
+    backend_contract_capabilities: ClientCapabilities,
+) -> AsyncIterator[BackendContractConnection]:
+    """One connection on the node's transport, its agent owning the real config."""
+    loop: AgentLoop | None = None
+    if stdio_after_autouse == STDIO_TRANSPORT:
+        loop = await _layered_agent_loop()
+        install_memory_root_agent(monkeypatch, loop)
+        connection = await connect_backend_contract_stdio_host(
+            session_options=backend_contract_session_options,
+            capabilities=backend_contract_capabilities,
+        )
+    else:
+        connection = await connect_backend_contract_host(
+            session_options=backend_contract_session_options,
+            capabilities=backend_contract_capabilities,
+        )
+    try:
+        yield connection
+    finally:
+        await connection.host.close()
+        if loop is not None:
+            await loop.aclose()
+
+
+@pytest_asyncio.fixture
+async def configuration_session(
+    configuration_connection: BackendContractConnection,
+    backend_contract_mistral_api: respx.Route,
+) -> AsyncIterator[AppServerSession]:
+    """One session on the node's transport with an agent-owned layered config."""
+    session = await configuration_connection.host.open_session()
+    try:
+        yield session
+    finally:
+        await session.close()
 
 
 @pytest.mark.asyncio
@@ -318,3 +395,106 @@ async def test_config_mutations_conflict_while_a_turn_is_running(
         await turn
 
     assert exc_info.value.error.code is ProtocolErrorCode.CONFLICT
+
+
+@pytest.mark.asyncio
+async def test_config_fields_read_is_answered_by_the_owning_agent(
+    configuration_connection: BackendContractConnection,
+    configuration_session: AppServerSession,
+) -> None:
+    result = await configuration_connection.client.request(
+        "config/fields/read",
+        ConfigFieldsReadParams(session_id=configuration_session.session_id),
+    )
+
+    response = ConfigFieldsReadResponse.model_validate(result)
+    wires = {wire.name: wire for wire in response.fields}
+    assert wires
+    assert wires["theme"].value == configuration_session.resources.config.current.theme
+    assert response.targets
+    # The revision of the source a save would be checked against travels with
+    # the read, so a stale-revision save is refused on either route.
+    assert isinstance(response.revisions["user-toml"], str)
+
+
+@pytest.mark.asyncio
+async def test_settings_read_pairs_leaves_with_the_user_revision(
+    configuration_connection: BackendContractConnection,
+    configuration_session: AppServerSession,
+) -> None:
+    result = await configuration_connection.client.request(
+        "config/settings/read",
+        SettingsReadParams(session_id=configuration_session.session_id),
+    )
+
+    response = SettingsReadResponse.model_validate(result)
+    leaves = {field.path: field for field in response.fields}
+    assert leaves
+    assert (
+        leaves["ask_confirmation_on_exit"].effective_value
+        is configuration_session.resources.config.current.ask_confirmation_on_exit
+    )
+    assert response.catalog
+    assert response.web_search is not None
+    assert response.user_layer == "user-toml"
+    assert isinstance(response.user_revision, str)
+
+
+@pytest.mark.asyncio
+async def test_proxy_settings_round_trip_where_the_env_file_lives(
+    configuration_session: AppServerSession,
+) -> None:
+    proxy = "http://proxy.backend-contract.test:3128"
+    before = await configuration_session.resources.config.read_proxy()
+    assert before.values["HTTPS_PROXY"] is None
+
+    await configuration_session.resources.config.update_proxy({"HTTPS_PROXY": proxy})
+    written = await configuration_session.resources.config.read_proxy()
+    assert written.values["HTTPS_PROXY"] == proxy
+    assert "HTTPS_PROXY" in written.descriptions
+
+    await configuration_session.resources.config.update_proxy({"HTTPS_PROXY": None})
+    cleared = await configuration_session.resources.config.read_proxy()
+    assert cleared.values["HTTPS_PROXY"] is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("changes", "named"),
+    [
+        ({"NOT_A_PROXY_VAR": "http://proxy.test:3128"}, "NOT_A_PROXY_VAR"),
+        ({"HTTPS_PROXY": "proxy.test:3128"}, "HTTPS_PROXY"),
+    ],
+)
+async def test_rejected_proxy_write_keeps_the_in_process_param_refusal(
+    configuration_connection: BackendContractConnection,
+    configuration_session: AppServerSession,
+    changes: dict[str, str | None],
+    named: str,
+) -> None:
+    with pytest.raises(AppServerResponseError) as exc_info:
+        await configuration_connection.client.request(
+            "config/proxy/write",
+            ConfigProxyWriteParams(
+                session_id=configuration_session.session_id, changes=changes
+            ),
+        )
+
+    assert exc_info.value.error.code is ProtocolErrorCode.INVALID_PARAMS
+    assert named in exc_info.value.error.message
+
+
+@pytest.mark.asyncio
+async def test_config_write_applies_in_the_owning_agent_and_reports_its_runtime(
+    configuration_session: AppServerSession,
+) -> None:
+    await configuration_session.resources.config.update(
+        {"theme": "dark"}, reload_runtime=True
+    )
+
+    assert configuration_session.resources.config.current.theme == "dark"
+
+    # The read that follows a write answers from the same owner, so a route
+    # that wrote somewhere else would show the stale value here.
+    fields = await configuration_session.resources.config.read_fields()
+    assert {wire.name: wire for wire in fields.fields}["theme"].value == "dark"

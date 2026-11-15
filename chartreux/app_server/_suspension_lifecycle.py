@@ -176,6 +176,10 @@ class SuspensionStateView(Protocol):
     @staticmethod
     def _agent_id_sort_key(agent_id: str) -> int: ...
 
+    # v0.7.9 point 5 (C6a): advance the monotone inventory revision in the
+    # caller's held region (the registry lock).
+    def _advance_inventory_revision_locked(self) -> None: ...
+
 
 class SuspensionLifecycle:
     """Warm-suspension caps, byte accounting, and expiry for the registry.
@@ -345,6 +349,9 @@ class SuspensionLifecycle:
         view._agent_records.pop(agent_id, None)
         view._children.pop(record.session_id, None)
         view._child_links.pop(record.session_id, None)
+        # The expired suspension left the projection with its dedup
+        # bookkeeping under the caller's registry lock (point 5).
+        view._advance_inventory_revision_locked()
         run = record.current_run or (
             record.run_history[-1] if record.run_history else None
         )

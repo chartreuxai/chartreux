@@ -2,6 +2,95 @@
 
 All notable changes to Chartreux are documented in this file.
 
+## 0.7.9 (2026-11-15)
+
+This release stabilizes the app-server subagent lifecycle: a running process
+child carries live telemetry instead of a null row until it settles, handles are
+short on display surfaces and whole wherever they act, a busy retained child
+refuses a re-task with the registry's typed error, and a foreground run is busy
+for admission. A batch of flaky-test fixes lands across the recovery, parity,
+and turn-page chains, the performance test suite is removed, and the scratchpad
+lock-contention and stop-arm paths are hardened. The changelog contract now
+enforces one file-wide unreleased heading and real ISO dates.
+
+### Changed
+
+- **Subagent-result collection is notification-first.** Every shipped decision
+  point — the orchestrator identity, the rendered composition reuse fragment,
+  the `task`, `wait_for_agent`, `check_agents`, and `cancel_agent` prompts, both
+  `get_agent_result` pending responses, the `still_running` guidance, the launch
+  acknowledgment, both completion-notification templates, the builtin
+  `chartreux` skill, and the shipped `main-design`/`main-plan` skills — teaches
+  the same rule: do independent work while a run is active, otherwise end the
+  turn and collect on the completion notification even when the next substantive
+  action depends on the result; use `wait_for_agent` only if the result is a hard
+  dependency of the next action, no independent work can proceed, and the action
+  must occur in the current turn rather than after notification; if any
+  condition is uncertain, end the turn; do not invent work to fill the wait. A
+  `still_running` timeout remains a normal outcome, and a same-turn re-wait is
+  prohibited. Wait mechanics, the 1500-second default, explicit indefinite
+  waiting, retention, delivery marking, status mapping, and notification
+  scheduling are unchanged. This is a guidance intervention, not an enforcement
+  gate: a model may still wait eagerly or follow conflicting higher-priority
+  instructions.
+
+### Fixed
+
+- **A running subagent row carries live telemetry (H1-H6).** A process child
+  reports its turn count on its own event carrier, the host takes a bounded
+  observation tick with a run-id fence after the read suspends, and the row
+  renders its model, provider, and context usage during the run instead of after
+  it settles. Subagent rows measure usage against their own compaction
+  threshold, a handle is short on display surfaces and whole on every surface
+  that acts on it, a re-task of a running retained child is refused with the
+  registry's typed busy error before any admission state moves, and a foreground
+  run is busy for admission so no publication exit strands or outlives its
+  claim.
+- **The recovery and parity chains are stable under parallel load (R1-R6).** The
+  rewind and interrupt request doubles carry the keywords the client sends, the
+  parity oracle normalizes the managed scratchpad allocation in its parent
+  context, the grep-cancellation doubles carry an unallocatable pid, the
+  persistence and retain-rejection pins select the session directory rather than
+  a registry file beside it, and the drifted relative-path and resume snapshot
+  nodes are deleted.
+- **Scratchpad lock contention degrades instead of failing the boot or reap
+  (R4, W3, W10, W11).** The reaper sweep takes the parent lock non-blocking per
+  entry, startup init is bounded under a held parent lock, a busy-lock boot
+  degrade retries bounded in-session, and the retry reaches construction-time
+  reads while reap lock holds shrink.
+- **Stop outcomes tell a not-sent teardown apart from a lost mid-stop (W4,
+  W8).** The stop arm surfaces a pre-ack channel loss instead of swallowing it
+  and reports whether teardown never sent anything.
+- **An adoption no longer wipes the live turn page (R3).** The coordinator keeps
+  its own turn records, so adopting another session cannot erase the turns the
+  current page renders.
+- **The changelog heading contract rejects impossible dates and a second
+  unreleased heading (W1, W9).** The release-heading helper rejects impossible
+  calendar dates, and the single unreleased heading cap is file-wide.
+
+### Removed
+
+- **The performance test suite is removed.** The performance tests and every live
+  reference to them are deleted; the remaining suites keep their coverage.
+
+### Upgrade notes
+
+- **Copied `main-design`/`main-plan` skills need a manual merge.** A skill
+  directory that shadows the shipped one keeps its own text and does not receive
+  this change: a user copy under `~/.chartreux/skills/<name>/`, a project copy
+  under `.chartreux/skills/<name>/`, or a configured `skill_paths` entry wins
+  over the shipped skill in discovery order. In this environment the effective
+  copies are `/home/pav/.chartreux/skills/main-design/SKILL.md` and
+  `/home/pav/.chartreux/skills/main-plan/SKILL.md`. Inspect the effective skill
+  source, compare the local copy with the updated shipped skill, and merge the
+  notification-first clause by hand while preserving local customizations. Run
+  `/reload` or start a fresh conversation afterwards, and confirm the effective
+  source in that new session before treating the local conflict as resolved:
+  already-injected skill text and a conversation's frozen policy are not
+  retroactively changed. This release deliberately does not overwrite user
+  files, add automatic synchronization or staleness detection, or pin skill
+  versions.
+
 ## 0.7.8 (2026-11-12)
 
 The multi-process contract designed in v0.7.7 becomes the interactive default
@@ -2556,7 +2645,7 @@ completion audit — ships together as v0.6.0.
   MCP SDK logs, and matches runtime environment-only MCP static authentication.
 - Successful trust-store repairs clear stale load-error state.
 
-## 0.4.0 (unreleased)
+## 0.4.0 (2026-10-02)
 
 ### Added
 

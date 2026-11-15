@@ -132,7 +132,16 @@ class AgentOpenReply:
 
 @dataclass(frozen=True, slots=True)
 class AgentSessionSnapshot:
-    """One agent-side session read: public state, gate view and marker records."""
+    """One agent-side session read: public state, gate view and marker records.
+
+    ``agent_sequence`` is the agent's own event-sequence cursor current when
+    this payload was built: every event frame the agent relays to the
+    coordinator is stamped with the next value of the same counter, so the
+    coordinator can order an adopted snapshot against the events it has
+    already relayed. The coordinator's own watermark numbers its publications,
+    not the agent's events, so it cannot establish that ordering -- this
+    cursor is what can.
+    """
 
     constructed_at: float
     incarnation_id: str
@@ -144,6 +153,7 @@ class AgentSessionSnapshot:
     runtime: RuntimeSnapshot
     session_dir: str | None
     jobs_dir: str | None
+    agent_sequence: int = 0
 
     def marker_for(self, request_id: str) -> OperationMarker | None:
         """The marker record this payload carries for one coordinator request."""
@@ -249,6 +259,7 @@ def build_session_snapshot(
     history_limit: int = SNAPSHOT_HISTORY_LIMIT,
     include_history: bool = True,
     clock: Callable[[], float] = time.monotonic,
+    agent_sequence: int = 0,
 ) -> AgentSessionSnapshot:
     """Build one snapshot payload from the live loop, at reply-write time."""
     session_dir, jobs_dir = session_dirs(loop)
@@ -272,6 +283,7 @@ def build_session_snapshot(
         runtime=session_runtime_view(loop),
         session_dir=str(session_dir) if session_dir is not None else None,
         jobs_dir=str(jobs_dir) if jobs_dir is not None else None,
+        agent_sequence=agent_sequence,
     )
 
 

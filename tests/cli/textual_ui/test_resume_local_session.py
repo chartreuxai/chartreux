@@ -28,7 +28,8 @@ from tests.cli.textual_ui.test_history_grouping import _message
 from tests.conftest import build_test_chartreux_app
 
 _RESUMED_TOKENS = 50_000
-_RESUMED_CONTEXT_WINDOW = 200_000
+_RESUMED_CONTEXT_WINDOW = 1_000_000
+_RESUMED_COMPACT_THRESHOLD = 400_000
 
 
 @pytest.fixture
@@ -167,6 +168,11 @@ async def test_resume_local_session_updates_context_progress(
                 context_tokens=_RESUMED_TOKENS, session_prompt_tokens=_RESUMED_TOKENS
             )
             runtime._state.context_window = _RESUMED_CONTEXT_WINDOW
+            # The resumed session's deployment states its own trigger; the
+            # denominator follows it, never the window this read reports.
+            chartreux_app.config.active_model.auto_compact_threshold = (
+                _RESUMED_COMPACT_THRESHOLD
+            )
 
         chartreux_app.app_server.resume = AsyncMock(side_effect=_apply_resumed_stats)
         chartreux_app._resume_history_from_messages = AsyncMock()
@@ -176,8 +182,9 @@ async def test_resume_local_session_updates_context_progress(
 
         widget = chartreux_app.query_one(SessionStatusLine)
         assert widget.state.context_tokens == _RESUMED_TOKENS
-        assert widget.state.auto_compact_threshold == _RESUMED_CONTEXT_WINDOW
-        assert "50k/200k (25%)" in widget.render().plain
+        assert widget.state.auto_compact_threshold == _RESUMED_COMPACT_THRESHOLD
+        assert "50k/400k (12%)" in widget.render().plain
+        assert "50k/1.0M" not in widget.render().plain
 
 
 @pytest.mark.asyncio

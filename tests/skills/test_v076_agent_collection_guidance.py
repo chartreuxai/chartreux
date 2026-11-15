@@ -1,23 +1,17 @@
-"""v0.7.6 P2 chunk 2f: the notification-first guidance rewrite (E0 inventory).
+"""Notification-first subagent-collection guidance (v0.7.6 inventory, v0.7.9 rule).
 
 Every tiled guidance site in the E0 inventory stops teaching "launch, then
 collect with wait_for_agent" and instead teaches
 launch -> completion notification -> targeted fetch (digest first, full on
 demand), naming both delivery modes wherever fetch teaching occurs.
 
-Two inventory sites are pinned by tests outside this chunk's owned file list
-and are therefore NOT rewritten here; ``TestPinnedCollisionSites`` documents
-them and asserts the pins stay intact:
-
-- the launch-ack text in ``app_server/_subagent_execution.py`` is pinned by
-  exact response equality in ``tests/app_server/test_subagents_launch.py``
-  and by prefix in ``tests/app_server/test_subagent_management_surface.py``;
-- the still-running fallback message in ``get_agent_result.py``'s legacy
-  (test-double) branch is pinned by ``tests/tools/test_agent_management.py``;
-  only the P2d delivery-path branch was rewritten;
-- the fixture-mirror line 19 old claim renders from
-  ``core/dispatch/renderer.py``'s ``_COMPOSITION_REUSE`` block, which is
-  outside this chunk's owned files, so it was left untouched.
+v0.7.9 point 4 reconditions the same inventory to the decision rule: three wait
+conditions, the uncertain-case yield, and the anti-invention clause. The three
+sites v0.7.6 recorded as pinned collisions — the launch acknowledgment in
+``app_server/_subagent_execution.py``, the legacy pending fallback in
+``get_agent_result.py``, and the ``_COMPOSITION_REUSE`` renderer clause — are
+rewritten here together with the pins that blocked them, so no site asserts
+the old co-equal-wait guidance anymore.
 """
 
 from __future__ import annotations
@@ -37,6 +31,12 @@ NOTIFICATION_FIRST = "completion notification"
 #: Both delivery modes must be named at every fetch-teaching site.
 MODE_DIGEST = 'mode="digest"'
 MODE_FULL = 'mode="full"'
+
+#: The anti-invention clause of the shipped decision rule.
+ANTI_INVENTION = (
+    "Do not invent independent work or dispatch unnecessary tasks to fill the "
+    "wait; if there is nothing real to do, end your turn."
+)
 
 
 @dataclass(frozen=True)
@@ -61,27 +61,120 @@ TASK_MD_OLD = (
     "the result stays retrievable with `get_agent_result` or `wait_for_agent`",
     "`get_agent_result(agent_id, run_id)` to retrieve a completed result "
     "without waiting",
+    "or block on the run with `wait_for_agent`",
 )
 TASK_MD_REQUIRED = (NOTIFICATION_FIRST, MODE_DIGEST, MODE_FULL)
+
+#: The three wait conditions, the uncertain-case yield, and the
+#: anti-invention clause, as this site words them.
+TASK_RULE = (
+    "even if your next substantive action depends on it",
+    "Use `wait_for_agent` only if the result is a hard dependency of your next "
+    "action, no independent work can proceed, and that action must occur in "
+    "this turn rather than after notification",
+    "If any of those conditions is uncertain, end your turn.",
+    ANTI_INVENTION,
+)
+WFA_RULE = (
+    "Use this blocking tool only if the result is a hard dependency of your "
+    "next action, no independent work can proceed, and that action must occur "
+    "in this turn rather than after notification",
+    "If uncertain, end your turn.",
+    ANTI_INVENTION,
+    "never re-invoke the wait in the same turn",
+)
+CANCEL_RULE = (
+    "only if the result is a hard dependency of your next action, no "
+    "independent work can proceed, and that action must occur in this turn "
+    "rather than after notification; if any of those conditions is uncertain, "
+    "end your turn",
+    "Acceptance of the request is not proof of completion.",
+)
+CHECK_RULE = ("not a blocking wait", "uncollected_run_ids")
+#: Python source wraps literals across physical lines, so source-file checks
+#: use fragments that each sit inside one literal; the rendered/markdown sites
+#: use whole sentences above.
+GAR_RULE = (
+    "Agent is still running; a completion notification arrives ",
+    'mode="digest" (default) or mode="full", or collect a ',
+    "uncollected_run_ids. Use wait_for_agent (same modes) only ",
+    "if the result is a hard dependency of your next action, no ",
+    "independent work can proceed, and that action must occur in ",
+    "this turn rather than after notification; if uncertain, ",
+    "end your turn.",
+)
+LEGACY_GAR_RULE = (
+    "Agent is still running; fetch the result when the ",
+    "completion notification arrives, or collect it by ",
+    "run_id from check_agents' uncollected_run_ids. Use ",
+    "wait_for_agent only if the result is a hard dependency ",
+    "of your next action, no independent work can proceed, ",
+    "and that action must occur in this turn rather than ",
+    "after notification; if uncertain, end your turn.",
+)
+ACK_RULE = (
+    "launched and running. Do independent work or end your turn; on the ",
+    "completion notification, fetch the result with get_agent_result. ",
+    "Use wait_for_agent only if the result is a hard dependency of your ",
+    "next action, no independent work can proceed, and that action must ",
+    "occur in this turn rather than after notification. If uncertain, ",
+    "end your turn. Do not invent work to fill the wait; if there is ",
+    "nothing real to do, end your turn. Use check_agents to inspect ",
+)
+BUILTIN_SKILL_RULE = (
+    "Use `wait_for_agent` only if the result is a hard dependency of your next "
+    "action, no independent work can proceed, and that action must occur in "
+    "this turn rather than after notification; if any of those conditions is "
+    "uncertain, end your turn.",
+    ANTI_INVENTION,
+)
+ADVISOR_SKILL_RULE = (
+    "Use `wait_for_agent` only if the result is a hard dependency of your next "
+    "action, no independent work can proceed, and synthesis must occur in this "
+    "turn rather than after notification. If uncertain, end your turn.",
+    ANTI_INVENTION,
+)
+SUBAGENTS_RULE = (
+    "Never re-invoke ",
+    "wait_for_agent in the same turn. In a later turn, re-wait only if ",
+    "the result is a hard dependency of your next action, no independent ",
+    "work can proceed, and that action must occur in that turn rather ",
+    "than after notification; if uncertain, end your turn. Use ",
+    "between turns. Prefer the completion notification and fetch the ",
+)
+#: The reuse fragment lives in a Python string, so its rule is asserted
+#: through literal-local fragments (the active fixture carries the joined
+#: sentences, checked with TASK_RULE).
+RENDERER_RULE_FRAGMENTS = (
+    "end your turn and collect its result with `get_agent_result` when the ",
+    "completion notification arrives, even if your next substantive action ",
+    "depends on it. Use `wait_for_agent` only if the result is a hard ",
+    "dependency of your next action, no independent work can proceed, and ",
+    "that action must occur in this turn rather than after notification. If ",
+    "any of those conditions is uncertain, end your turn. Do not invent ",
+    "independent work or dispatch unnecessary tasks to fill the wait; if ",
+    "`still_running` timeout is a normal outcome: end your turn or continue ",
+    "do not re-wait in the same turn",
+)
 
 INVENTORY: tuple[Site, ...] = (
     Site(
         "task.md:9,:11,:31",
         "chartreux/core/tools/builtins/prompts/task.md",
         TASK_MD_OLD,
-        TASK_MD_REQUIRED,
+        TASK_MD_REQUIRED + TASK_RULE,
     ),
     Site(
         "fixture standalone/task.md:9,:11,:68",
         "tests/fixtures/dispatch/standalone/task.md",
         TASK_MD_OLD,
-        TASK_MD_REQUIRED,
+        TASK_MD_REQUIRED + TASK_RULE,
     ),
     Site(
         "wait_for_agent.md:1",
         "chartreux/core/tools/builtins/prompts/wait_for_agent.md",
         ("for a specific invocation, and optionally a positive `timeout`",),
-        (NOTIFICATION_FIRST, '"digest"', '"full"'),
+        (NOTIFICATION_FIRST, '"digest"', '"full"') + WFA_RULE,
     ),
     Site(
         "cancel_agent.md:3",
@@ -90,7 +183,7 @@ INVENTORY: tuple[Site, ...] = (
             "Use `wait_for_agent` or `get_agent_result` to retrieve the "
             "terminal result after cleanup",
         ),
-        (NOTIFICATION_FIRST, MODE_DIGEST, MODE_FULL),
+        (NOTIFICATION_FIRST, MODE_DIGEST, MODE_FULL) + CANCEL_RULE,
     ),
     Site(
         "check_agents.md:1",
@@ -99,32 +192,33 @@ INVENTORY: tuple[Site, ...] = (
             "Collect one with `get_agent_result(agent_id, run_id=...)` or "
             "`wait_for_agent`",
         ),
-        (NOTIFICATION_FIRST, MODE_DIGEST, MODE_FULL),
+        (NOTIFICATION_FIRST, MODE_DIGEST, MODE_FULL) + CHECK_RULE,
     ),
     Site(
         "get_agent_result.py delivery-path pending message",
         "chartreux/core/tools/builtins/get_agent_result.py",
         (),
-        ("a completion notification arrives", 'mode="digest"', 'mode="full"'),
+        ("a completion notification arrives", 'mode="digest"', 'mode="full"')
+        + GAR_RULE,
     ),
     Site(
         "chartreux.py:728 (builtin skill prompt)",
         "chartreux/core/skills/builtins/chartreux.py",
         ("then wait for it with `wait_for_agent`", "wait if its result is needed"),
-        (NOTIFICATION_FIRST, MODE_DIGEST, MODE_FULL),
+        (NOTIFICATION_FIRST, MODE_DIGEST, MODE_FULL) + BUILTIN_SKILL_RULE,
         skill_prompt=True,
     ),
     Site(
         "main-plan SKILL.md:27",
         "chartreux/skills/main-plan/SKILL.md",
         ("collect the advisor's result with `wait_for_agent`",),
-        (NOTIFICATION_FIRST, MODE_DIGEST, MODE_FULL),
+        (NOTIFICATION_FIRST, MODE_DIGEST, MODE_FULL) + ADVISOR_SKILL_RULE,
     ),
     Site(
         "main-design SKILL.md:27",
         "chartreux/skills/main-design/SKILL.md",
         ("collect the advisor's result with `wait_for_agent`",),
-        (NOTIFICATION_FIRST, MODE_DIGEST, MODE_FULL),
+        (NOTIFICATION_FIRST, MODE_DIGEST, MODE_FULL) + ADVISOR_SKILL_RULE,
     ),
     Site(
         "subagents.py:279-291,:711-718",
@@ -133,7 +227,7 @@ INVENTORY: tuple[Site, ...] = (
             "re-invoke wait_for_agent in a later turn. The variants are mutually",
             "to keep waiting, or call check_agents to inspect progress.",
         ),
-        (NOTIFICATION_FIRST, 'mode="digest"', 'mode="full"'),
+        (NOTIFICATION_FIRST, 'mode="digest"', 'mode="full"') + SUBAGENTS_RULE,
     ),
 )
 
@@ -196,8 +290,9 @@ class TestConsistentLanguage:
 
 
 class TestGetAgentResultDeliveryBranch:
-    """The P2d pending branch teaches notification-first; the legacy branch
-    keeps its pinned message (test-double fallback).
+    """Both pending-path responses are reconditioned: the P2d delivery branch
+    and the legacy (test-double) fallback teach notification-first collection
+    and condition any wait on the three conditions.
     """
 
     def test_pending_branch_is_notification_first(self) -> None:
@@ -211,39 +306,51 @@ class TestGetAgentResultDeliveryBranch:
         assert 'mode="digest"' in branch
         assert 'mode="full"' in branch
         assert "use wait_for_agent or try again later" not in branch
+        for clause in GAR_RULE:
+            assert clause in branch
 
-    def test_legacy_branch_keeps_the_pinned_message_once(self) -> None:
-        # tests/tools/test_agent_management.py:513-515 pins the legacy
-        # (manager-without-_run_results) pending message verbatim.
+    def test_legacy_branch_is_reconditioned(self) -> None:
+        # tests/tools/test_agent_management.py pins the legacy
+        # (manager-without-_run_results) pending message verbatim; v0.7.9
+        # rewrote that message and updated the pin in the same package, so the
+        # old unconditional blocking advice survives nowhere.
         source = (
             ROOT / "chartreux/core/tools/builtins/get_agent_result.py"
         ).read_text()
-        assert source.count("use wait_for_agent or try again later") == 1
+        assert source.count("use wait_for_agent or try again later") == 0
+        start = source.index("if results is None:")
+        end = source.index("# P2d delivery states")
+        branch = source[start:end]
+        for clause in LEGACY_GAR_RULE:
+            assert clause in branch
 
 
 class TestPinnedCollisionSites:
-    """Inventory sites whose rewrite is blocked by pins outside this chunk's
-    owned files — asserted intact so the collision is visible, not silent.
+    """Inventory sites v0.7.6 recorded as blocked by pins in files it did not
+    own. v0.7.9 owns those pins and updates them in this package, so the sites
+    assert the rewritten notification-first text instead of the old wording.
     """
 
-    def test_launch_ack_text_still_carries_the_pinned_response(self) -> None:
-        # tests/app_server/test_subagents_launch.py:768-777 pins the full
-        # acknowledgment response by equality; test_subagent_management_
-        # surface.py:480 pins its prefix. Rewriting it would break those
-        # unowned tests, so the site is left as-is and reported.
+    def test_launch_ack_carries_the_notification_first_rule(self) -> None:
+        # tests/app_server/test_subagents_launch.py pins the full
+        # acknowledgment by equality and test_subagent_management_surface.py
+        # pins its prefix; both were updated with the rewrite in this package.
         source = (ROOT / "chartreux/app_server/_subagent_execution.py").read_text()
-        assert "launched and running; use check_agents to monitor, " in source
-        assert "get_agent_result or wait_for_agent to retrieve the " in source
+        for clause in ACK_RULE:
+            assert clause in source
+        assert "launched and running; use check_agents to monitor, " not in source
+        assert "get_agent_result or wait_for_agent to retrieve the " not in source
 
-    def test_renderer_reuse_block_outside_owned_files(self) -> None:
-        # The fixture-mirror line 19 claim renders from core/dispatch/renderer.py's
-        # _COMPOSITION_REUSE block, which this chunk did not own; v0.7.8 package
-        # 13 reconciled that clause to notification-first and regenerated the
-        # fixture, so the pin follows the rendered clause in both places.
+    def test_renderer_reuse_block_carries_the_rule(self) -> None:
+        # The fixture-mirror clause renders from core/dispatch/renderer.py's
+        # _COMPOSITION_REUSE block; v0.7.9 replaced the running-agent sentence
+        # with the same decision rule and regenerated the active fixtures.
         renderer = (ROOT / "chartreux/core/dispatch/renderer.py").read_text()
         fixture = (ROOT / "tests/fixtures/dispatch/standalone/task.md").read_text()
-        assert "collect its result on the completion notification" in renderer
-        assert "collect its result on the completion notification" in fixture
+        for fragment in RENDERER_RULE_FRAGMENTS:
+            assert fragment in renderer
+        for clause in TASK_RULE:
+            assert clause in fixture
 
 
 class TestPinnedPhrasesPreserved:
@@ -294,3 +401,59 @@ class TestPinnedPhrasesPreserved:
         assert "Retention is opt-in." in prompt
         assert "for a final continuation that closes afterward" in prompt
         assert "Use `cancel_agent(agent_id, run_id)`" in prompt
+
+
+class TestTaskPromptClauses:
+    """The three separate task.md clauses, tested one by one — file-wide
+    presence alone would let one occurrence carry the rule for all three.
+    """
+
+    @staticmethod
+    def _clause(anchor: str) -> str:
+        text = (ROOT / "chartreux/core/tools/builtins/prompts/task.md").read_text()
+        start = text.index(anchor)
+        end = text.find("\n\n", start)
+        return text[start:] if end == -1 else text[start:end]
+
+    def test_launch_clause_conditions_the_wait_and_foreground_exception(self) -> None:
+        clause = self._clause(
+            "Launch in the background even when the result is a dependency"
+        )
+        assert NOTIFICATION_FIRST in clause
+        assert "even if your next substantive action depends on it" in clause
+        assert TASK_RULE[1] in clause
+        assert "If any of those conditions is uncertain, end your turn." in clause
+        assert ANTI_INVENTION in clause
+        assert "or block on the run with `wait_for_agent`" not in clause
+        # The preserved foreground exception is true foreground semantics, not
+        # a wait substitute for a background-eligible run.
+        assert (
+            "the caller's next action must consume the child's result in the "
+            "current turn and the child cannot run detached" in clause
+        )
+        assert "never a wait-substitute for a background-eligible run" in clause
+        assert "amendable mid-flight" in clause
+
+    def test_retention_clause_has_no_second_blocking_alternative(self) -> None:
+        clause = self._clause("Retention is opt-in.")
+        assert "get_agent_result" in clause
+        assert MODE_DIGEST in clause and MODE_FULL in clause
+        assert "until result expiry" in clause
+        assert "wait_for_agent" not in clause
+        assert "retain: true" in clause
+
+    def test_cancellation_clause_keeps_facts_and_conditions_the_wait(self) -> None:
+        clause = self._clause("Use `cancel_agent(agent_id, run_id)`")
+        assert "Acceptance means stop requested, not terminal cancellation." in clause
+        assert "That notification-first fetch is the default collection path" in clause
+        assert (
+            "only if the result is a hard dependency of your next action, no "
+            "independent work can proceed, and that action must occur in this "
+            "turn rather than after notification; if any of those conditions is "
+            "uncertain, end your turn" in clause
+        )
+        assert "never re-invoke the wait in the same turn" in clause
+        assert "Use `release_agent(agent_id)`" in clause
+        assert "Releasing an agent discards its retained results" in clause
+        assert "Background agents cannot be launched from subagents." in clause
+        assert MODE_DIGEST in clause and MODE_FULL in clause

@@ -47,6 +47,18 @@ class _AnonymousCatalog:
     __slots__ = ("__weakref__",)
 
 
+class _OwnerKeyHandle:
+    """Weak-keyable handle a typed owner key strong-references.
+
+    The agent wire carries a typed owner key in place of object identity, so
+    the process that owns the catalog files its bindings under this handle;
+    the handle lives exactly as long as its key does, which the key registry
+    below controls explicitly rather than by GC timing.
+    """
+
+    __slots__ = ("__weakref__",)
+
+
 type _Catalogs = weakref.WeakKeyDictionary[object, dict[str, MCPServer]]
 
 
@@ -74,12 +86,60 @@ class MCPAuthenticationService(MCPAuthorizationProvider):
         self._bindings: weakref.WeakKeyDictionary[object, dict[str, _Binding]] = (
             weakref.WeakKeyDictionary()
         )
+        # Typed owner keys a wire peer addressed this process under. The key
+        # strong-references its handle, so a binding filed under the handle is
+        # released by an explicit release/rekey below, never dropped mid-session
+        # by GC timing the way a bare weak owner would be.
+        self._owner_keys: dict[str, _OwnerKeyHandle] = {}
         self._fingerprints: dict[str, str] = {}
         self._locks: dict[str, asyncio.Lock] = {}
         self._descriptor_generations: dict[str, int] = {}
         self._connection_generations: dict[str, int] = {}
         self._authorization_material: dict[str, str] = {}
         self._rejected_material: dict[str, str] = {}
+
+    def acquire_owner_key(self, key: str) -> object:
+        """Return the strong handle one typed owner key holds, registering it.
+
+        Idempotent: a key the peer already named maps to the same handle, so
+        repeated requests under one key keep one binding set.
+        """
+        handle = self._owner_keys.get(key)
+        if handle is None:
+            handle = _OwnerKeyHandle()
+            self._owner_keys[key] = handle
+        return handle
+
+    def release_owner_key(self, key: str) -> bool:
+        """Explicitly release one typed owner key, deterministically.
+
+        The session end that owns the key releases it here instead of waiting
+        for the weak owner to be collected: the handle and every binding filed
+        under it are removed now. Returns whether the key was live.
+        """
+        handle = self._owner_keys.pop(key, None)
+        if handle is None:
+            return False
+        self._bindings.pop(handle, None)
+        self._config_catalogs.pop(handle, None)
+        return True
+
+    def rekey_owner_key(self, old_key: str, new_key: str) -> object:
+        """Move a typed owner key across a session rotation, atomically.
+
+        The handle itself is unchanged, so every binding filed under it
+        survives the re-key: there is no window in which neither key holds the
+        handle, which is what a session-id-derived key would leave behind.
+        """
+        handle = self._owner_keys.pop(old_key, None)
+        if handle is None:
+            handle = self._owner_keys.get(new_key) or _OwnerKeyHandle()
+        self._owner_keys[new_key] = handle
+        return handle
+
+    def owner_key_is_live(self, key: str) -> bool:
+        """Whether one typed owner key currently holds a handle."""
+        return key in self._owner_keys
 
     async def bind_catalog(
         self, servers: Sequence[MCPServer], *, owner: object | None = None

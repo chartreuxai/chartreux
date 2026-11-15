@@ -11,9 +11,17 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol, cast
 from uuid import uuid4
 
+from chartreux.app_server._session_backend_services import SpawnClientIdentity
 from chartreux.app_server._subagent_records import AgentRecord
 from chartreux.app_server._subagent_recovery import _effective_eligibility
-from chartreux.app_server._subagent_transcript import ChildTombstoneRecord
+from chartreux.app_server._subagent_transcript import (
+    CLIENT_CAPABILITIES_PAYLOAD_KEY,
+    CLIENT_INFO_PAYLOAD_KEY,
+    INHERITED_WORKSPACE_PAYLOAD_KEY,
+    ChildTombstoneRecord,
+    encode_child_policy_payload,
+    encode_inherited_workspace,
+)
 from chartreux.app_server.subagent_ports import (
     CHILD_HANDOFF_PAYLOAD_KEY,
     CHILD_TEARDOWN_REASON,
@@ -66,6 +74,7 @@ from chartreux.core.subagents import (
     LaunchConfig,
     LaunchConfigError,
     ReconcileOutcome,
+    RetentionPolicy,
     RunStatus,
     TaskArgs,
 )
@@ -166,6 +175,9 @@ class LaunchStateView(Protocol):
     _agent_records: dict[str, AgentRecord]
     _package_replacements: dict[str, int]
     _registry_lock: asyncio.Lock
+    # The generation's retention policy: the fresh-launch
+    # ``[subagents].retain_agents`` default a process spawn resolves through.
+    _retention_policy: RetentionPolicy
     # Item 1 child seam: the process-backed spawn adapter this run selected
     # (None keeps the in-process publication path byte for byte), and the
     # coordinator-side handles of the children that live in their own process.
@@ -192,6 +204,10 @@ class LaunchStateView(Protocol):
     ) -> AbstractAsyncContextManager[None]: ...
 
     def _invalidate_recovery_locked(self, record: AgentRecord | None) -> None: ...
+
+    # v0.7.9 point 5 (C6a): advance the monotone inventory revision in the
+    # mutation's registry-held or synchronous no-await window.
+    def _advance_inventory_revision_locked(self) -> None: ...
 
 
 @dataclass
@@ -408,10 +424,17 @@ class ProcessChildPublication:
         spawn: SubagentSpawnPort,
         *,
         rollback_wait: float,
+        identity: SpawnClientIdentity | None = None,
     ) -> None:
         self._admission = admission
         self._spawn = spawn
         self._rollback_wait = rollback_wait
+        # The coordinator's validated client identity, handed over by whoever
+        # provisions the process-backed spawn adapter: a fresh process child
+        # validates its own ClientInfo at open, so the payload needs it. None
+        # keeps the legacy payload shape (a registry that provisions no
+        # identity never spawns through this publisher in production).
+        self._identity = identity
 
     async def publish(
         self,
@@ -430,7 +453,10 @@ class ProcessChildPublication:
             agent_name = attempt.candidate.identity.replace(":", "-")
             if reuse is not None and reuse.alive:
                 # A retained child keeps its process: the re-task only links
-                # the new tool call to the process that already exists.
+                # the new tool call to the process that already exists. The
+                # retention decision still applies, so an explicit
+                # ``retain=false`` continuation closes it after this run.
+                reuse.retained = retained
                 await self._link(attempt, reuse, agent_name)
                 return reuse
             root_session_dir = attempt.parent.agent_loop.session_logger.session_dir
@@ -520,11 +546,31 @@ class ProcessChildPublication:
             ) from exc
 
     def _handoff_payload(self, attempt: ChildPublicationAttempt) -> dict[str, Any]:
-        """The spawn handoff: the parent's rendered, redacted working set."""
+        """The spawn handoff, client identity and parent workspace."""
         message = attempt.parent.agent_loop.file_state_handoff_message()
-        if message is None or not message.content:
-            return {}
-        return {CHILD_HANDOFF_PAYLOAD_KEY: message.content}
+        payload: dict[str, Any] = {}
+        if message is not None and message.content:
+            payload[CHILD_HANDOFF_PAYLOAD_KEY] = message.content
+        if self._identity is not None:
+            payload[CLIENT_INFO_PAYLOAD_KEY] = self._identity.client_info().model_dump(
+                mode="json"
+            )
+            payload[CLIENT_CAPABILITIES_PAYLOAD_KEY] = (
+                self._identity.client_capabilities().model_dump(mode="json")
+            )
+        # The child is constructed as a subagent, so its loop needs the parent
+        # workspace this coordinator's parent loop holds: it rides the payload
+        # unconditionally, and an open that never received it fails loudly.
+        payload[INHERITED_WORKSPACE_PAYLOAD_KEY] = encode_inherited_workspace(
+            attempt.parent.agent_loop.tool_manager.workspace
+        )
+        # F11: the parent's accepted policy rides the same payload
+        # unconditionally -- restrictions, mode restrictions, dispatch root
+        # grants and the budget-bearing session options, all read from the
+        # parent loop (the same source the in-process route's
+        # child_runtime_policy hands an in-process child).
+        payload.update(encode_child_policy_payload(attempt.parent.agent_loop))
+        return payload
 
     async def _fail(
         self,
@@ -1506,11 +1552,17 @@ class ChildLaunchAdmission:
                 tool_call_id=ctx.tool_call_id,
                 attempt_id=resolved_attempt_id,
             )
-            retained = (
-                bool(args.retain)
-                if args.retain is not None
-                else bool(reuse is not None and reuse.retained)
-            )
+            # The retention decision mirrors the in-process admission: an
+            # explicit ``retain`` argument wins, a reuse inherits the
+            # instance's committed policy (an explicit ``retain=false`` makes
+            # it a final continuation), and a fresh launch takes the
+            # generation's ``[subagents].retain_agents`` default.
+            if args.retain is not None:
+                retained = bool(args.retain)
+            elif reuse is not None:
+                retained = bool(reuse.retained)
+            else:
+                retained = bool(self._view._retention_policy.retain_agents)
             publisher = ProcessChildPublication(
                 self,
                 spawn,
@@ -1519,6 +1571,13 @@ class ChildLaunchAdmission:
                     if rollback_wait is None
                     else rollback_wait
                 ),
+                # The MAY-member of the launch-state view: a registry that
+                # provisions a coordinator-side process spawn also provisions
+                # the backend services the spawn payload reads its client
+                # identity through (read dynamically, so instance patches
+                # shadow like every other view member and a registry that
+                # never spawns this way stays untouched).
+                identity=getattr(self._view, "spawn_client_identity", None),
             )
             return await publisher.publish(
                 attempt, retained=retained, mint=mint, reuse=reuse
@@ -1595,6 +1654,9 @@ class ChildLaunchAdmission:
                 raise
             self._view._children[child.session_id] = runtime
             self._view._child_links[child.session_id] = (parent, ctx.tool_call_id)
+            # The published child registration lands in one synchronous
+            # window inside the publication fence (point 5 rule (c)).
+            self._view._advance_inventory_revision_locked()
             try:
                 # The attempt id rides the FIRST durable write: a torn
                 # persist-to-link window stays attributable to its attempt.
@@ -1630,6 +1692,9 @@ class ChildLaunchAdmission:
         attempt_id = published_attempt_id(child, parent, tool_call_id)
         self._view._children.pop(session_id, None)
         self._view._child_links.pop(session_id, None)
+        # The rejected child's registration rows leave together, in the same
+        # synchronous window (point 5 rule (c)).
+        self._view._advance_inventory_revision_locked()
         with suppress(Exception):
             await parent.turns.unlink_subagent(tool_call_id, session_id)
         with suppress(Exception):

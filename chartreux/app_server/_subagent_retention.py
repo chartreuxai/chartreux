@@ -116,6 +116,10 @@ class RetentionStateView(Protocol):
 
     def _suspension_expire_elapsed_locked(self, now: float) -> list[AgentRecord]: ...
 
+    # v0.7.9 point 5 (C6a): advance the monotone inventory revision in the
+    # caller's held region (the registry lock).
+    def _advance_inventory_revision_locked(self) -> None: ...
+
 
 @dataclass(frozen=True)
 class EvictionNotice:
@@ -131,6 +135,33 @@ class EvictionNotice:
     eviction: AgentEviction
     tombstone: _AgentTombstone | None
     authority: object
+
+
+def _terminal_context_threshold(record: AgentRecord) -> int | None:
+    """A settled row's compaction trigger, read exactly as its live row was.
+
+    A closed row is still a subagent row, so it renders usage against the
+    child's own trigger rather than the window beside it. The value is the one
+    the live summary projection reads from the record's child loop, taken here
+    at the tombstone's build (the settle, while the record still holds its
+    runtime). It fails closed to unknown when that projection cannot resolve
+    the child's active model or states no trustworthy integer -- never the
+    window, whose compaction no child performs.
+
+    The computation lives in the registry's live projection so the closed row
+    and the live row can never disagree about the denominator; it is imported
+    here rather than at module scope because the registry imports this module.
+    A denominator is never load-bearing for a lifecycle transition, so a
+    projection that fails at all answers unknown instead of failing the
+    settle that is building this row.
+    """
+    from chartreux.app_server._sessions import _record_compact_threshold
+
+    try:
+        return _record_compact_threshold(record)
+    except Exception:
+        logger.debug("Could not resolve a settled row's threshold", exc_info=True)
+        return None
 
 
 class AgentRetention:
@@ -178,6 +209,12 @@ class AgentRetention:
         expired-suspension) agent's terminal metadata still shows WHY the
         run failed. The data is on the record at build time and the wire
         (``AgentSummary.last_failure``) already supports it.
+
+        The compaction-threshold denominator is carried the same way: the
+        settled row keeps rendering usage against the trigger its live row
+        read from the child's own active model, so closing an agent never
+        drops the row back to an unknown denominator (and never to the
+        window).
         """
         agent_id = record.agent_id
         latest_run_id = record.latest_run_id or (
@@ -225,6 +262,7 @@ class AgentRetention:
             effective_thinking=record.effective_thinking,
             context_tokens=record.context_tokens,
             context_window=record.context_window,
+            context_threshold=_terminal_context_threshold(record),
             compacting=record.compacting,
             stop_reason=record.stop_reason,
             last_failure=last_failure,
@@ -249,6 +287,9 @@ class AgentRetention:
     def insert_locked(self, agent_id: str, tombstone: _AgentTombstone) -> None:
         """Store terminal metadata and enforce the oldest-first count cap."""
         self._view._evicted_agents[agent_id] = tombstone
+        # The stored tombstone joins the visible terminal metadata under the
+        # caller's registry lock (point 5).
+        self._view._advance_inventory_revision_locked()
         cap = self._view._retention_policy.max_tombstones
         if cap <= 0:
             return
@@ -293,6 +334,10 @@ class AgentRetention:
         for agent_id in expired:
             self._view._evicted_agents.pop(agent_id, None)
             self._view._pending_evictions.pop(agent_id, None)
+        if expired:
+            # The pruned terminal metadata leaves the projection under the
+            # caller's registry lock (point 5).
+            self._view._advance_inventory_revision_locked()
         return expired
 
     def close_unretained_locked(
@@ -319,6 +364,9 @@ class AgentRetention:
         self._view._agent_records.pop(agent_id, None)
         self._view._children.pop(record.session_id, None)
         self._view._child_links.pop(record.session_id, None)
+        # The unretained closure detaches the record (and stores its
+        # tombstone below) under the caller's registry lock (point 5).
+        self._view._advance_inventory_revision_locked()
         tombstone = self._view._build_terminal_tombstone(
             record, run, AgentAvailability.CLOSED, idle_seconds=0.0
         )
@@ -388,6 +436,10 @@ class AgentRetention:
             tombstone = self._view._build_terminal_tombstone(
                 record, run, AgentAvailability.EVICTED, idle_duration
             )
+            # The evicted record left the projection with its pending
+            # authority and latest-run bookkeeping under this locked region
+            # (point 5).
+            self._view._advance_inventory_revision_locked()
             if tombstone is not None:
                 self._view._insert_tombstone_locked(agent_id, tombstone)
                 # Rearm promptly so tombstone expiry is scheduled even when

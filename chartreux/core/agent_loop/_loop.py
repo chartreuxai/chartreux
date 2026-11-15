@@ -31,6 +31,9 @@ from chartreux.core.agent_loop._context_injection import ContextInjector
 from chartreux.core.agent_loop._dangerous_command_grants import (
     DangerousCommandGrantStore,
 )
+from chartreux.core.agent_loop._execution_admission import (
+    canonical_live_authority_arguments,
+)
 from chartreux.core.agent_loop._execution_port import TurnExecutionPort
 from chartreux.core.agent_loop._file_state_context import (
     FileStateContext,
@@ -200,7 +203,14 @@ from chartreux.core.recovery_models import PackageTier
 from chartreux.core.review import ReviewManager
 from chartreux.core.rewind import RewindManager
 from chartreux.core.root_grants import RootGrantPort
-from chartreux.core.scratchpad import cleanup_scratchpad, init_scratchpad
+from chartreux.core.scratchpad import (
+    ScratchpadInitRetry,
+    bind_scratchpad,
+    cleanup_scratchpad,
+    init_scratchpad,
+    reap_stale_allocations,
+    unbind_scratchpad,
+)
 from chartreux.core.session.session_id import generate_session_id
 from chartreux.core.session.session_lease import SessionLease
 from chartreux.core.session.session_logger import SessionLogger
@@ -230,6 +240,7 @@ from chartreux.core.system_prompt import (
     _git_status_caches,
 )
 from chartreux.core.timing import CompletedTurnTiming, InvocationTiming
+from chartreux.core.tmp_ownership import ambient_binding
 from chartreux.core.tools import secret_redaction
 from chartreux.core.tools.base import BaseTool, InvokeContext, ToolPermission
 from chartreux.core.tools.builtins.skill import build_skill_result
@@ -248,6 +259,13 @@ from chartreux.observability.logging import logger
 from chartreux.user_content import UserDisplayContent, UserResource
 from chartreux.utils.cache_store import CacheStore, InMemoryCacheStore
 from chartreux.utils.paths import is_dangerous_directory
+
+# W11: the startup reaper sweep runs at most once per process (the reaper
+# cadence is per process start, not per session boot). Re-sweeping the whole
+# managed parent on every session boot multiplied the machine-global parent
+# lock churn under parallel suites and starved the non-blocking boot inits.
+_startup_sweep_guard = threading.Lock()
+_startup_swept = False
 
 
 def _is_git_executable_available() -> bool:
@@ -629,8 +647,37 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
         self.session_id = session_id or generate_session_id()
         self._session_lease = session_lease
         self.parent_session_id = parent_session_id
+        if not is_subagent:
+            # Startup reaper at top-level session start: collect managed
+            # allocations whose owners are conclusively dead (fail-closed).
+            # The sweep takes the parent lock non-blocking per entry, and the
+            # scratchpad init below is non-blocking too, so a boot under lock
+            # contention skips and retains busy entries (retained-lock-busy)
+            # and degrades to no scratchpad instead of queueing behind the
+            # lock — the whole startup path is bounded under a held lock.
+            # W11: the sweep runs at most once per process (stamp below) —
+            # re-sweeping the whole managed parent on every session boot
+            # multiplied the machine-global lock churn under parallel suites
+            # and starved the non-blocking boot inits.
+            global _startup_swept
+            with _startup_sweep_guard:
+                if not _startup_swept:
+                    reap_stale_allocations()
+                    _startup_swept = True
         self.scratchpad_dir = (
             init_scratchpad(self.session_id) if not is_subagent else None
+        )
+        if self.scratchpad_dir is not None:
+            # Spawn sites append to the session allocation's ledger.
+            bind_scratchpad(self.scratchpad_dir)
+        # W10/W11: a boot init that degraded (busy parent lock / OSError) is
+        # not permanent — arm a bounded retry budget (the boot attempt counts
+        # as the first attempt) spent one non-blocking attempt per turn
+        # (_ensure_scratchpad) and per degraded scratchpad_dir read (the
+        # accessor), so construction-time reads before any turn also reach
+        # the retry.
+        self._scratchpad_retry: ScratchpadInitRetry | None = self._arm_scratchpad_retry(
+            is_subagent
         )
 
         self.agent_manager = AgentManager(
@@ -678,6 +725,13 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
         # frozen as the integrity and diff anchor, never as the served
         # table (ADR 0022).
         task_description = task_description_for_config(config)
+        # G5b: the live child-authority client this loop asks its owner through.
+        # It is a PROCESS child's ceiling (a process child has no in-process
+        # ancestor), installed by the child server at open; a root and an
+        # in-process child keep it None and their ceilings stay local. The
+        # manager reads it through this getter so a configuration transaction
+        # that rebuilds the manager keeps the same client.
+        self._live_authority: Any | None = None
         self.tool_manager = ToolManager(
             lambda: self.config,
             mcp_registry=self.mcp_registry,
@@ -689,6 +743,7 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
             inherited_workspace=self._inherited_workspace,
             parent_authority_getter=self._parent_authority_getter,
             parent_authority_revision_getter=self._parent_authority_revision_getter,
+            live_authority_getter=lambda: self._live_authority,
             cwd=self.cwd,
             harness_files=self.harness_files,
             scratchpad_dir=self.scratchpad_dir,
@@ -1360,6 +1415,19 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
             inherited_root_grants=self._dispatch_root_grants,
         )
 
+    def attach_live_authority(self, authority: Any | None) -> None:
+        """Install the live child-authority client this loop asks (G5b).
+
+        The process child's server calls this at open, once, with the client it
+        speaks to its owner through. The loop keeps it so every manager this
+        loop rebuilds (a configuration transaction replaces the tool manager)
+        reads the SAME client, and it attaches it to the current manager so the
+        very next catalog assembly and invocation ask the owner. A root loop
+        never calls this, and detaching leaves the loop exactly as it was.
+        """
+        self._live_authority = authority
+        self.tool_manager.attach_live_authority(authority)
+
     async def record_child_session(
         self,
         child: AgentLoop,
@@ -1651,6 +1719,7 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
         self._workspace_relocator.release_move_trust()
         self.harness_files.revoke_session_trusts()
         cleanup_scratchpad(self.scratchpad_dir)
+        unbind_scratchpad()
         lease = self._session_lease
         self._session_lease = None
         if lease is not None:
@@ -2073,6 +2142,9 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
             raise AgentLoopStateError(
                 f"Cannot start a turn while {self._holders[0]} is running"
             )
+        # W10: before this turn's tools bind to the scratchpad, spend one
+        # bounded non-blocking retry of a boot-time busy-lock degrade.
+        self._ensure_scratchpad()
         self._backend_lifetime.drain(whole_turn_active=False)
         options = turn_options or AgentTurnOptions()
         if options.user_initiated_retry and self.committed_model is not None:
@@ -2816,6 +2888,7 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
             skill_manager=self.skill_manager,
             is_skill_loaded=self._context_injector.skill_already_loaded,
             scratchpad_dir=self.scratchpad_dir,
+            tmp_ledger_binding=ambient_binding(),
             hook_config_result=self._hook_config_result,
             session_id=self.session_id,
             mcp_pool=self._mcp_pool,
@@ -2831,6 +2904,20 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
         self, tool: BaseTool, args: BaseModel, tool_call_id: str | None = None
     ) -> ToolDecision:
         tool_name = tool.get_name()
+        # G5b: a process child asks its owner BEFORE it resolves anything
+        # locally, so a call the owner already refuses never reaches a grant
+        # prompt or a path-authority walk. This answer is advisory for the
+        # call's admission; the execution handoff asks again, after the
+        # snapshot await, and that answer is the one the invocation runs on.
+        live_denial = await self.tool_manager.live_authority_denial(
+            tool_name, type(tool), canonical_live_authority_arguments(args)
+        )
+        if live_denial is not None:
+            return ToolDecision(
+                verdict=ToolExecutionResponse.SKIP,
+                approval_type=ToolPermission.NEVER,
+                feedback=live_denial,
+            )
         # Always evaluate invocation guards, even with old grants/bypass flags.
         ctx = tool.resolve_permission(args)
         config_perm = self.tool_manager.get_tool_config(tool_name).permission
@@ -3308,6 +3395,82 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
         """Create the scratchpad needed to rebind without changing live state."""
         return None if self._is_subagent else init_scratchpad(session_id)
 
+    @property
+    def scratchpad_dir(self) -> Path | None:
+        """The session scratchpad, with a bounded retry on a degraded read.
+
+        W11: a read while the session is degraded (the boot init returned
+        None under a busy parent lock) spends ONE bounded NON-BLOCKING
+        attempt from the armed :class:`ScratchpadInitRetry` budget — the
+        same fail-closed attempt the per-turn :meth:`_ensure_scratchpad`
+        spends — so a construction-time read (before any turn runs) still
+        reaches the retry. The attempt never blocks on the lock and never
+        creates partial state; once the budget is spent the read is a plain
+        no-op returning None (the session stays degraded instead of
+        spinning). A closing loop never spends: the close path must not
+        allocate a scratchpad it is about to clean up.
+        """
+        value = self._scratchpad_dir
+        if value is not None or getattr(self, "_closing", False):
+            return value
+        return self._spend_scratchpad_retry()
+
+    @scratchpad_dir.setter
+    def scratchpad_dir(self, value: Path | None) -> None:
+        self._scratchpad_dir = value
+
+    def _spend_scratchpad_retry(self) -> Path | None:
+        """One bounded non-blocking retry attempt while degraded.
+
+        Shared by the :attr:`scratchpad_dir` accessor (construction-time
+        reads) and the per-turn :meth:`_ensure_scratchpad`. On recovery the
+        live consumers are re-pointed at the new allocation: the tool
+        manager (when it exists yet) and the ambient spawn-ledger binding.
+        Returns the current scratchpad path, None while still degraded.
+        """
+        retry = getattr(self, "_scratchpad_retry", None)
+        if retry is None or self._scratchpad_dir is not None:
+            return self._scratchpad_dir
+        path = retry.attempt()
+        if path is None:
+            return None
+        self._scratchpad_dir = path
+        tool_manager = getattr(self, "tool_manager", None)
+        if tool_manager is not None:
+            tool_manager.set_scratchpad_dir(path)
+        bind_scratchpad(path)
+        return path
+
+    def _arm_scratchpad_retry(self, is_subagent: bool) -> ScratchpadInitRetry | None:
+        """The bounded in-session retry budget for a boot-degraded init.
+
+        None when the session already has a scratchpad or is a subagent
+        (subagents never own one); otherwise a budget whose first attempt is
+        the boot attempt itself, spent one non-blocking retry per turn via
+        :meth:`_ensure_scratchpad` and per degraded read via the
+        :attr:`scratchpad_dir` accessor. The startup path itself stays
+        non-blocking and never queues behind the lock.
+        """
+        if is_subagent or self._scratchpad_dir is not None:
+            return None
+        return ScratchpadInitRetry(self.session_id, attempts=1)
+
+    def _ensure_scratchpad(self) -> None:
+        """One bounded, non-blocking retry of a boot-degraded scratchpad init.
+
+        W10: a session whose boot init returned None (busy parent lock or
+        OSError) retries once per turn here, through the bounded
+        :class:`ScratchpadInitRetry` budget armed in ``__init__`` — the same
+        spend the :attr:`scratchpad_dir` accessor makes on a degraded read.
+        Each attempt is the same non-blocking fail-closed init — the session
+        never queues behind the lock, nothing partial is created, and after
+        the budget is spent this is a no-op (the session stays degraded
+        instead of spinning). On recovery the live consumers are re-pointed
+        at the new allocation: the tool manager, the scratchpad getter, and
+        the ambient spawn-ledger binding.
+        """
+        self._spend_scratchpad_retry()
+
     def rebind_to_session(
         self,
         session_id: str,
@@ -3363,6 +3526,10 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
         self.parent_session_id = parent_session_id
         self.scratchpad_dir = prepared.scratchpad_dir
         self.tool_manager.set_scratchpad_dir(prepared.scratchpad_dir)
+        if prepared.scratchpad_dir is not None:
+            # Rebind the spawn-ledger binding to the resumed session's
+            # allocation; the previous allocation is gated-closed below.
+            bind_scratchpad(prepared.scratchpad_dir)
         # The persisted bundle is the conversation's policy record (design
         # §10): the rebind re-installs its committed identity binding and
         # keeps the metadata's bundle in step, so the resumed conversation

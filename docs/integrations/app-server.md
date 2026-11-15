@@ -313,6 +313,26 @@ values with the second labeled as the API effort. The estimate describes the
 next request only: an in-flight call keeps the encoding it started with, and a
 failover may pick another deployment.
 
+## Session status scope
+
+The session state's `/status` describes the main turn only. When a completed
+main turn leaves background agents running, `session/updated` keeps patching
+`/status` to `{"type":"idle"}`: wire `idle` means the main turn is idle, not
+that no background work is active. The active variants keep their existing
+active-turn fields — `running` carries the real `activeTurnId` of the new main
+turn, `blocked` adds its callback id and reason — and starting a new main turn
+yields the existing `running` patch. No background-work status variant exists
+and the server composes no status on the client's behalf: a client that needs
+to know whether background agents are active reads the agent inventory
+(`agents/update` deliveries, with `check_agents` the authoritative read for an
+agent that has just changed).
+
+The interactive interface's OSC 7501 terminal report has a deliberately wider
+scope: `working` covers the main turn or an active background subagent, and
+after a completed turn the terminal's `done` is deferred until that background
+work is no longer active (see the terminal guide). Wire `idle` and terminal
+`working` can therefore coexist — a difference in scope, not wire parity.
+
 ## Subagent resume and reconciliation
 
 A recoverably failed background agent is suspended (warm, non-terminal; see

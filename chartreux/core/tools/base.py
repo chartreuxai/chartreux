@@ -56,6 +56,7 @@ if TYPE_CHECKING:
         SubagentRunnerPort,
         TaskResult,
     )
+    from chartreux.core.tmp_ownership import SpawnLedgerBinding
     from chartreux.core.tools.io_port import ToolIOPort
     from chartreux.core.tools.mcp.pool import MCPConnectionPool
     from chartreux.core.tools.models import PermissionContext
@@ -92,6 +93,11 @@ class InvokeContext:
     skill_manager: SkillManager | None = field(default=None)
     is_skill_loaded: Callable[[str], bool] | None = field(default=None)
     scratchpad_dir: Path | None = field(default=None)
+    # The invoking context's managed-allocation ledger binding, delivered next
+    # to scratchpad_dir: spawn sites append to the ledger of the allocation
+    # bound to this context (never the command's cwd alone). Delivery only —
+    # the wiring that populates it lands with the point-3 integration.
+    tmp_ledger_binding: SpawnLedgerBinding | None = field(default=None)
     hook_config_result: HookConfigResult | None = field(default=None)
     session_id: str | None = field(default=None)
     mcp_pool: MCPConnectionPool | None = field(default=None)

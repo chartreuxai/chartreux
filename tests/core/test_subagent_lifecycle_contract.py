@@ -13,7 +13,9 @@ from __future__ import annotations
 from collections.abc import AsyncGenerator
 from dataclasses import FrozenInstanceError
 import importlib
+import inspect
 from pathlib import Path
+import tomllib
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
@@ -21,6 +23,7 @@ from pydantic import ValidationError
 import pytest
 
 from chartreux.app_server._sessions import SessionRuntimeRegistry
+from chartreux.app_server.root_agent import AgentChildHost
 from chartreux.core.agents.identities import builtin_identities
 from chartreux.core.agents.manager import AgentManager
 from chartreux.core.config import ChartreuxConfigSchema
@@ -38,6 +41,8 @@ from chartreux.core.subagents import (
     UnknownAgentError,
     WaitForAgentResult,
     WaitStatus,
+    prepare_subagent_prompt,
+    still_running_guidance,
 )
 from chartreux.core.tools.base import BaseToolState, InvokeContext, ToolError
 from chartreux.core.tools.builtins.task import Task, TaskToolConfig
@@ -131,6 +136,9 @@ class TestForegroundRetentionRejection:
         )
         root = MagicMock()
         root.agent_loop.session_id = "root"
+        # A runtime with no session directory: bind_root skips the registry
+        # manifest and writer fence, which need a real directory to write to.
+        root.agent_loop.session_logger.session_dir = None
         registry.bind_root(root)
         ctx = InvokeContext(tool_call_id="test-call-id", session_id="root")
         args = TaskArgs(task="work", background=False, retain=retain)
@@ -415,6 +423,36 @@ class TestWaitDispositionTypes:
         assert disposition.turns_used == 3
         assert "End your turn" in (disposition.guidance or "")
 
+    def test_still_running_guidance_is_notification_first_and_conditional(self) -> None:
+        """v0.7.9 point 4: the shipped guidance leads with yielding, prefers
+        the completion notification and a fetch, forbids a same-turn re-wait,
+        and conditions any later re-wait on the three wait conditions while
+        retaining identifiers, elapsed time, status, turns and modes.
+        """
+        guidance = still_running_guidance(
+            agent_id="agent-1",
+            run_id="run-1",
+            elapsed_seconds=12.5,
+            run_status=RunStatus.RUNNING,
+            turns_used=3,
+        )
+
+        assert guidance.startswith("Agent agent-1 (run run-1) is still running")
+        assert "after 12.5s and 3 turns" in guidance
+        assert "End your turn or continue independent work now" in guidance
+        assert 'mode="digest"' in guidance and 'mode="full"' in guidance
+        assert "Never re-invoke wait_for_agent in the same turn." in guidance
+        assert guidance.index("Prefer the completion notification") < guidance.index(
+            "In a later turn, re-wait only if"
+        )
+        assert (
+            "re-wait only if the result is a hard dependency of your next "
+            "action, no independent work can proceed, and that action must "
+            "occur in that turn rather than after notification" in guidance
+        )
+        assert "if uncertain, end your turn" in guidance
+        assert "check_agents" in guidance
+
     @pytest.mark.parametrize(
         "missing",
         [
@@ -552,3 +590,109 @@ class TestWaitDispositionTypes:
                 "result": {"response": "done", "turns_used": 1, "completed": True},
                 "unexpected": 1,
             })
+
+
+class TestVerificationArtifactBrief:
+    """The verification-artifact discipline rides in every task brief (A4)."""
+
+    def test_a_scratchpad_brief_names_a_unique_invocation_directory(self) -> None:
+        prompt = prepare_subagent_prompt(
+            "Run the suite.",
+            InvokeContext(tool_call_id="call-1", scratchpad_dir=Path("/tmp/sp")),
+        )
+
+        assert "fresh, unique directory under this scratchpad directory" in prompt
+        assert "basetemps, tool caches, and logs" in prompt
+        # A destination outside the scratchpad stays scanned and still blocks.
+        assert (
+            "Paths outside the scratchpad are still scanned and still block" in prompt
+        )
+        # Cleanup is the worker's own completed invocation only: no wildcard
+        # removal, and no live job's directory is touched.
+        assert "Clean up only your own completed invocation's directory" in prompt
+        assert "never wildcard-remove sibling invocations" in prompt
+        assert "any directory a still-running job is using" in prompt
+
+    def test_a_brief_without_a_scratchpad_stops_the_verification(self) -> None:
+        prompt = prepare_subagent_prompt(
+            "Run the suite.", InvokeContext(tool_call_id="call-2")
+        )
+
+        assert "this run has no scratchpad directory" in prompt
+        assert "Do not fall back to ~/.cache" in prompt
+        assert "Stop the affected verification" in prompt
+        assert "report the unavailable destination" in prompt
+        # No scratchpad header is claimed, and the task text still closes the
+        # brief.
+        assert "Scratchpad directory" not in prompt
+        assert prompt.endswith("Run the suite.")
+
+    def test_both_dispatch_paths_route_through_the_brief_seam(self) -> None:
+        # The spawned path (AgentChildHost.run_child) and the monitored path
+        # (SessionRuntimeRegistry._start_child_turn) both send the same brief,
+        # so the discipline reaches workers in either dispatch mode.
+        spawned = inspect.getsource(AgentChildHost.run_child)
+        monitored = inspect.getsource(SessionRuntimeRegistry._start_child_turn)
+
+        assert "prepare_subagent_prompt(args.task, ctx)" in spawned
+        assert "prepare_subagent_prompt(args.task, ctx)" in monitored
+
+
+class TestTmpPlacementBrief:
+    """The temporary-placement discipline rides in the scratchpad brief (C4 chunk ii)."""
+
+    def test_a_scratchpad_brief_carries_the_invocation_dir_discipline(self) -> None:
+        prompt = prepare_subagent_prompt(
+            "Run the suite.",
+            InvokeContext(tool_call_id="call-3", scratchpad_dir=Path("/tmp/sp")),
+        )
+
+        assert (
+            "own fresh, unique invocation directory under this scratchpad directory"
+            in prompt
+        )
+        assert "basetemp, pytest cache, uv cache, and ruff cache" in prompt
+        # An explicit destination under the scratchpad wins and is never reaped.
+        assert "takes precedence and is never removed automatically" in prompt
+        # A default run lands under the managed root, never the shared tree.
+        assert "managed pytest run root" in prompt
+        assert "never under the shared /tmp/pytest-of-<user> tree" in prompt
+        # Failed-only retention, with the copy-before-teardown debug flow.
+        assert "Only failed tests keep their call-phase directories" in prompt
+        assert "setup/teardown-phase artifacts are not retained" in prompt
+        assert prompt.endswith("Run the suite.")
+
+    def test_a_brief_without_a_scratchpad_has_no_tmp_placement(self) -> None:
+        prompt = prepare_subagent_prompt(
+            "Run the suite.", InvokeContext(tool_call_id="call-4")
+        )
+
+        assert "this run has no scratchpad directory" in prompt
+        # Without a scratchpad no destination can be named: the brief stops the
+        # verification instead of instructing a placement.
+        assert "invocation directory" not in prompt
+        assert "managed pytest run root" not in prompt
+
+    def test_repo_pytest_ini_retains_failed_tests_only(self) -> None:
+        pyproject = Path(__file__).resolve().parents[2] / "pyproject.toml"
+        if not pyproject.is_file():
+            pytest.skip("repository pyproject.toml not present (installed context)")
+        with pyproject.open("rb") as handle:
+            data = tomllib.load(handle)
+        ini_options = data["tool"]["pytest"]["ini_options"]
+        assert ini_options["tmp_path_retention_policy"] == "failed"
+
+    def test_agents_md_and_safety_guide_carry_the_placement_contract(self) -> None:
+        repo_root = Path(__file__).resolve().parents[2]
+        agents_md = repo_root / "AGENTS.md"
+        safety = repo_root / "docs" / "guides" / "tools-safety.md"
+        if not agents_md.is_file() or not safety.is_file():
+            pytest.skip("repository docs not present (installed context)")
+        agents_text = agents_md.read_text(encoding="utf-8")
+        safety_text = safety.read_text(encoding="utf-8")
+
+        assert "## Temporary-file placement" in agents_text
+        assert 'tmp_path_retention_policy = "failed"' in agents_text
+        assert "## Managed temporary files" in safety_text
+        assert 'tmp_path_retention_policy = "failed"' in safety_text
+        assert "never reaped automatically" in safety_text

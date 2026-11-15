@@ -24,7 +24,7 @@ Plan how to deliver an approved design without expanding scope. The main agent r
 task(task="Planning analysis for: <design goal>. Design: <approved approach>. Files and subsystems: <list>. Constraints: <dependencies, shared interfaces, preserved behavior>. Return: bounded work packages, dependency order, safe parallelism, acceptance checks per package, verification commands, and rollback approach.", purpose="planning-analysis")
 ```
 
-The launch runs in the background by default — a completion notification arrives when the advisor's run finishes; fetch the result then with `get_agent_result` (`mode="digest"` by default, `mode="full"` for the full body) before synthesizing, or block on the run with `wait_for_agent` (same modes).
+The launch runs in the background by default. Do independent work or end your turn; when the completion notification arrives, fetch the advisor's result with `get_agent_result` (`mode="digest"` by default, `mode="full"` for the full body) before synthesizing. Use `wait_for_agent` only if the result is a hard dependency of your next action, no independent work can proceed, and synthesis must occur in this turn rather than after notification. If uncertain, end your turn. Do not invent independent work or dispatch unnecessary tasks to fill the wait; if there is nothing real to do, end your turn.
 
 For cross-cutting changes that span multiple subsystems, first dispatch a bounded exploration child (`purpose="exploration"`) that loads `sub-architecture-mapper` to map interfaces and dependencies, then use that output to frame the planning question.
 

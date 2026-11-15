@@ -234,6 +234,17 @@ class CommandRegistry:
                 description="Select theme",
                 handler="_show_theme",
             ),
+            "tmp-residue": Command(
+                aliases=frozenset(["/tmp-residue"]),
+                description=(
+                    "Preview temp residue (managed scratchpad/pytest-run roots "
+                    "and legacy unmarked trees); read-only here — removal only "
+                    "via `chartreux tmp-residue remove <path>...` after an "
+                    "interactive exact-path confirmation"
+                ),
+                handler="_show_tmp_residue",
+                side_channel=True,
+            ),
         }
 
     @property

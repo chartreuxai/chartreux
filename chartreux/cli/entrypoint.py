@@ -39,6 +39,7 @@ def parse_arguments() -> argparse.Namespace:
             "  models         Manage the model catalog (chartreux models --help).\n"
             "  skills         Compare user skill copies with the shipped ones (chartreux skills --help).\n"
             "  trust          Inspect and remove stored workspace trust decisions (chartreux trust --help).\n"
+            "  tmp-residue    Preview temp residue and remove it after an interactive confirmation (chartreux tmp-residue --help).\n"
             "\n"
             "Environment variables:\n"
             "  CHARTREUX_HOME       Override the Chartreux home directory (default: ~/.chartreux)\n"
@@ -523,6 +524,10 @@ def _dispatch_sessionless_command(argv: list[str]) -> bool:
             from chartreux.cli.trust_command import run_trust_cli
 
             run_trust_cli(argv[1:])
+        case ["tmp-residue"]:
+            from chartreux.cli.tmp_residue_command import run_tmp_residue_cli
+
+            run_tmp_residue_cli(argv[1:])
         case _:
             return False
     return True

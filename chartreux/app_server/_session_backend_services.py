@@ -9,6 +9,21 @@ from chartreux.app_server.models import PublicCallbackEntry
 from chartreux.app_server.protocol import ClientCapabilities, ClientInfo
 
 
+class SpawnClientIdentity(Protocol):
+    """The client-identity subset a coordinator-side process spawn needs.
+
+    A fresh process-backed child validates its own ``ClientInfo`` at open, so
+    the payload a coordinator-built spawn carries must include the same
+    validated identity the root route sends. The session backend services
+    satisfy this structurally (they expose both reads), so the app-server
+    services object can be handed over without an adapter.
+    """
+
+    def client_info(self) -> ClientInfo: ...
+
+    def client_capabilities(self) -> ClientCapabilities: ...
+
+
 class SessionBackendServices(Protocol):
     def client_info(self) -> ClientInfo: ...
 

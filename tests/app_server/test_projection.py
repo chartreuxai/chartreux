@@ -1112,3 +1112,41 @@ def test_history_keeps_sealed_turns_the_live_list_no_longer_holds(
     entries = _archived_history(tmp_path, _SEALED_RECORDS, live)
 
     assert _visible(entries) == ["one", "two", "effect:read_file"]
+
+
+def test_config_view_carries_the_active_compaction_threshold() -> None:
+    """H3: the wire view states the trigger, so a client needs no window math.
+
+    The deployment's ``context_limit`` is projected beside it and stays a
+    different fact: the status row measures against the threshold.
+    """
+    from chartreux.core.config import ModelConfig
+
+    models = [
+        ModelConfig(
+            name="model-a",
+            provider="mistral",
+            alias="alpha",
+            auto_compact_threshold=333_000,
+            context_limit=900_000,
+        ),
+        ModelConfig(
+            name="model-b",
+            provider="mistral",
+            alias="beta",
+            auto_compact_threshold=444_000,
+            context_limit=1_200_000,
+        ),
+    ]
+    config = build_test_vibe_config(models=models, active_model="beta")
+
+    view = project_config_view(config)
+
+    assert view.active_model.alias == "beta"
+    assert view.active_model.auto_compact_threshold == 444_000
+    thresholds = {model.alias: model.auto_compact_threshold for model in view.models}
+    assert thresholds["alpha"] == 333_000
+    assert thresholds["beta"] == 444_000
+    # The hard window is a separate provider fact: this test catalog states
+    # none, and the trigger is still carried without one.
+    assert config.get_active_model().context_limit is None

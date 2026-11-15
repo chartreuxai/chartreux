@@ -17,6 +17,17 @@ class InvalidJsonRpcMessage(RuntimeError):
     pass
 
 
+class JsonRpcSendUncertain(RuntimeError):
+    """A send whose writer was cancelled or stopped after its frame was queued.
+
+    The writer can be cancelled mid-write after the frame entered the outbox,
+    so the peer may have received it: delivery is unknown, not established as
+    undelivered. Only raised post-queue -- a send refused before queueing
+    keeps the plain ``RuntimeError`` (non-delivery established), and a writer
+    that failed with its own error keeps propagating that error.
+    """
+
+
 TRANSPORT_ENV_VAR = "CHARTREUX_TRANSPORT"
 IN_PROCESS_TRANSPORT = "in_process"
 STDIO_TRANSPORT = "stdio"
@@ -234,15 +245,24 @@ class StdioJsonRpcTransport:
         allow_writer_exit: bool = False,
     ) -> None:
         self._check_writer(writer_task, allow_stopped=allow_writer_exit)
+        frame = item is not None
         put_task = asyncio.create_task(self._outbox.put(item))
         try:
             done, _ = await asyncio.wait(
                 (put_task, writer_task), return_when=asyncio.FIRST_COMPLETED
             )
             if writer_task in done:
-                self._check_writer(writer_task, allow_stopped=allow_writer_exit)
+                # The frame was queued only if its put already landed; a writer
+                # that died before the put never saw the frame (not sent).
+                self._check_writer(
+                    writer_task,
+                    allow_stopped=allow_writer_exit,
+                    uncertain=frame and put_task.done(),
+                )
             await put_task
-            self._check_writer(writer_task, allow_stopped=allow_writer_exit)
+            self._check_writer(
+                writer_task, allow_stopped=allow_writer_exit, uncertain=frame
+            )
         finally:
             if not put_task.done():
                 put_task.cancel()
@@ -253,15 +273,26 @@ class StdioJsonRpcTransport:
 
     @staticmethod
     def _check_writer(
-        writer_task: asyncio.Task[None], *, allow_stopped: bool = False
+        writer_task: asyncio.Task[None],
+        *,
+        allow_stopped: bool = False,
+        uncertain: bool = False,
     ) -> None:
         if not writer_task.done():
             return
         try:
             writer_task.result()
         except asyncio.CancelledError as exc:
+            if uncertain:
+                raise JsonRpcSendUncertain(
+                    "JSON-RPC writer was cancelled after the frame was queued"
+                ) from exc
             raise RuntimeError("JSON-RPC writer was cancelled") from exc
         if not allow_stopped:
+            if uncertain:
+                raise JsonRpcSendUncertain(
+                    "JSON-RPC writer stopped after the frame was queued"
+                )
             raise RuntimeError("JSON-RPC writer stopped unexpectedly")
 
     async def _write_messages(self) -> None:

@@ -222,12 +222,15 @@ The `[status_line]` table controls the bottom session status row. Unknown fields
 | `context_style` | `"tokens-percent"` | `tokens` or `tokens-percent`. |
 | `separator` | `"pipe"` | `space` or `pipe`. |
 
-Context renders without a label, for example `135k/1.0M (14%)`; the denominator
-is the deployment's provider-documented context limit, not the effective
-automatic-compaction threshold. A deployment whose provider documents no
-context limit renders the unknown denominator as `—`. The `tokens` variant
-omits the percentage. Git branch lookup is asynchronous and cached. Configure
-this row in Settings > Status line; see the
+Context renders without a label, for example `45k/500k (9%)`: usage over the
+effective automatic-compaction threshold, so the percentage measures how close
+the session is to compacting and never the remaining share of the model's hard
+window. The same usage-over-threshold reading applies to every subagent row in
+the agent browser, which uses that agent's own threshold; a row whose threshold
+is unknown or switched off renders the unknown denominator as `—` rather than
+substituting the context window. The `tokens` variant omits the percentage. Git
+branch lookup is asynchronous and cached. Configure this row in Settings > Status
+line; see the
 [configuration guide](../guides/configuration.md#status-line-and-message-timing)
 for editor controls.
 

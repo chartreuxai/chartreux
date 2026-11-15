@@ -555,7 +555,13 @@ async def test_expired_question_draft_lifecycle_characterization() -> None:
     drained_question.close_for_expiry.assert_called_once_with()
     drained_app._show_callback.assert_not_called()
     drained_app._switch_to_input_app.assert_awaited_once_with()
-    drained_app._program_status.emit.assert_called_once_with("idle")
+    # C7a: the return-to-input release composes — no site emits a status
+    # literal directly. The dismissal carries no outcome of its own and no
+    # turn is active, so the shared recompute restores idle (the
+    # composed-status matrix node pins that byte on a real app).
+    drained_app._settle_composed_status.assert_called_once_with(
+        outcome=None, turn_active=False
+    )
 
 
 @pytest.mark.asyncio

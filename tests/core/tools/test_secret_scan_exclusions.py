@@ -10,7 +10,9 @@ file itself stays clean under the secret scan.
 
 from __future__ import annotations
 
+import hashlib
 import inspect
+import json
 import logging
 import os
 from pathlib import Path
@@ -36,6 +38,8 @@ from chartreux.core.tools.builtins.write_file import WriteFile, WriteFileResult
 from chartreux.core.tools.secret_scan import (
     DEFAULT_MAX_SCAN_BYTES,
     DEFAULT_MAX_WALK_ENTRIES,
+    ApprovalKey,
+    ScanPolicy,
     scan_paths,
 )
 from chartreux.observability.logging import logger
@@ -190,6 +194,8 @@ def test_over_budget_sentinel_still_fires_for_qualifying_entries(
     assert [finding.rule_id for finding in findings] == ["scan-incomplete"]
     assert findings[0].path == str(tree)
     assert "budget" in findings[0].description
+    # A3: the sentinel carries its closed reason code.
+    assert findings[0].reason == secret_scan.FindingReason.WALK_BUDGET
 
 
 def test_absolute_enumeration_cap_bounds_a_structural_walk(
@@ -209,6 +215,9 @@ def test_absolute_enumeration_cap_bounds_a_structural_walk(
     assert [finding.rule_id for finding in findings] == ["scan-incomplete"]
     assert findings[0].path == str(tree)
     assert "2-entry" in findings[0].description
+    # A3: the enumeration cap has its own closed reason code, distinct from
+    # the walk budget's.
+    assert findings[0].reason == secret_scan.FindingReason.ENUMERATION_LIMIT
 
 
 def test_a_large_repo_root_completes_under_the_qualifying_budget(
@@ -417,6 +426,16 @@ def test_gate_still_blocks_the_unknown_write_footprint(tmp_path: Path) -> None:
     assert result.completed is False
     assert "could not be fully inspected" in result.response
     assert UNKNOWN_WRITE_FOOTPRINT in result.response
+    # A3: the typed block classifies the sentinel with its closed reason
+    # code and renders no path for it (the sentinel names no path).
+    block = result.scan_block
+    assert block is not None
+    assert block.finding_counts == {"rule_hit": 0, "scan_incomplete": 1}
+    finding = block.findings[0]
+    assert finding.reason == "unknown_write_footprint"
+    assert finding.category == "scan_incomplete"
+    assert finding.path is None
+    assert finding.location is None
 
 
 # --- Pre-commit hook: untouched --------------------------------------------
@@ -465,3 +484,353 @@ def test_the_hook_still_scans_staged_content_under_a_pruned_name(
     assert GITHUB_RULE_ID in result.stdout
     assert "Commit blocked" in result.stdout
     assert GITHUB_TOKEN not in result.stdout
+
+
+# --- A2: the committed approved-match manifest (scan policy) -----------------
+#
+# One repo-committed manifest (.chartreux-secret-scan.json) governs BOTH gates;
+# approved hits are suppressed INSIDE scanning, keyed by canonical path + rule
+# + value-span digest. Seeded secrets stay concatenation-built so this file
+# itself scans clean.
+
+REPO_ROOT = Path(secret_scan.__file__).resolve().parents[3]
+OTHER_TOKEN = "ghp_" + "z9Y8x7W6v5U4t3S2r1Q0p9O8n7M6l5K4j3H2"
+HEADER_LINE = "-----BEGIN " + "RSA PRIVATE KEY-----"
+
+#: The 12 whole files the pre-commit hook's YAML exclude used to name; the
+#: manifest replaced that list.
+FORMERLY_YAML_EXCLUDED = (
+    "tests/agent_loop/test_chartreux_policy_denials.py",
+    "tests/agent_loop/test_secret_redaction_exfil.py",
+    "tests/cli/test_question_app.py",
+    "tests/cli/textual_ui/test_dangerous_command_question.py",
+    "tests/core/hooks/test_hooks.py",
+    "tests/core/test_background_jobs.py",
+    "tests/core/tools/test_secret_redaction.py",
+    "tests/core/tools/test_secret_scan.py",
+    "tests/recovery/test_failure_envelope.py",
+    "tests/tools/test_bash_project_env.py",
+    "tests/tools/test_glob_expansion_budget_diagnostics.py",
+    "tests/tools/test_shell_diagnostics.py",
+)
+
+
+def _digest_of(line: str, rule_id: str) -> str:
+    keys: list[ApprovalKey] = []
+    secret_scan.scan_text(line + "\n", label="f.py", keys=keys)
+    return next(key.digest for key in keys if key.rule_id == rule_id)
+
+
+def _policy_document(
+    approved: list[dict[str, str]], residual: list[dict[str, str]] | None = None
+) -> bytes:
+    return json.dumps({
+        "schema_version": secret_scan.SCAN_POLICY_SCHEMA_VERSION,
+        "approved_matches": approved,
+        "residual_exclusions": residual or [],
+    }).encode("utf-8")
+
+
+def _policy_of(
+    approved: list[dict[str, str]], residual: list[dict[str, str]] | None = None
+) -> ScanPolicy:
+    policy = secret_scan.parse_scan_policy(_policy_document(approved, residual))
+    assert policy is not None
+    return policy
+
+
+def _approved_entry(path: str, line: str, rule_id: str) -> dict[str, str]:
+    return {"path": path, "rule_id": rule_id, "digest": _digest_of(line, rule_id)}
+
+
+def _both_entries(path: str, line: str) -> list[dict[str, str]]:
+    return [
+        _approved_entry(path, line, GITHUB_RULE_ID),
+        _approved_entry(path, line, "generic-keyword-assignment"),
+    ]
+
+
+# --- A2: manifest parsing (fail closed on malformed) --------------------------
+
+
+def test_parse_scan_policy_round_trips_a_valid_manifest() -> None:
+    raw = _policy_document(_both_entries("f.py", SECRET_LINE))
+    policy = secret_scan.parse_scan_policy(raw)
+    assert policy is not None
+    assert policy.revision_digest == hashlib.sha256(raw).hexdigest()
+    assert {(k.path, k.rule_id) for k in policy.approved} == {
+        ("f.py", GITHUB_RULE_ID),
+        ("f.py", "generic-keyword-assignment"),
+    }
+    assert policy.residual == frozenset()
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        b"not json\n",
+        b"[]\n",
+        # missing top-level key
+        json.dumps({"schema_version": 1, "approved_matches": []}).encode(),
+        json.dumps({
+            "schema_version": 1,
+            "approved_matches": [],
+            "residual_exclusions": [],
+            "extra": 1,
+        }).encode(),
+        json.dumps({
+            "schema_version": 2,
+            "approved_matches": [],
+            "residual_exclusions": [],
+        }).encode(),
+        # non-approvable (partial-coverage) rule can never be approved
+        _policy_document([
+            {"path": "f.py", "rule_id": "private-key-header", "digest": "0" * 64}
+        ]),
+        # unknown rule
+        _policy_document([
+            {"path": "f.py", "rule_id": "no-such-rule", "digest": "0" * 64}
+        ]),
+        # bad digest shape
+        _policy_document([
+            {"path": "f.py", "rule_id": GITHUB_RULE_ID, "digest": "xyz"}
+        ]),
+        # non-canonical paths
+        _policy_document([
+            {"path": "/abs/f.py", "rule_id": GITHUB_RULE_ID, "digest": "0" * 64}
+        ]),
+        _policy_document([
+            {"path": "../f.py", "rule_id": GITHUB_RULE_ID, "digest": "0" * 64}
+        ]),
+        _policy_document([
+            {"path": "a//b.py", "rule_id": GITHUB_RULE_ID, "digest": "0" * 64}
+        ]),
+        # approvable rule in the residual section is a whole-value bypass
+        _policy_document(
+            [], [{"path": "f.py", "rule_id": GITHUB_RULE_ID, "rationale": "x"}]
+        ),
+        # residual entry without a rationale
+        _policy_document(
+            [], [{"path": "f.py", "rule_id": "private-key-header", "rationale": ""}]
+        ),
+    ],
+)
+def test_parse_scan_policy_rejects_malformed_manifests(raw: bytes) -> None:
+    assert secret_scan.parse_scan_policy(raw) is None
+    # ...and the blob loader still fails closed, keeping the revision digest
+    policy = secret_scan.policy_from_blob(raw)
+    assert policy.approved == frozenset()
+    assert policy.residual == frozenset()
+    assert policy.revision_digest == hashlib.sha256(raw).hexdigest()
+
+
+def test_policy_from_blob_absent_means_no_approvals() -> None:
+    policy = secret_scan.policy_from_blob(None)
+    assert policy.approved == frozenset()
+    assert policy.residual == frozenset()
+    assert policy.revision_digest is None
+
+
+def test_is_approved_never_approves_an_uncanonicalizable_key() -> None:
+    policy = _policy_of(_both_entries("f.py", SECRET_LINE))
+    assert (
+        secret_scan.is_approved(
+            policy, ApprovalKey(path=None, rule_id=GITHUB_RULE_ID, digest="0" * 64)
+        )
+        is False
+    )
+
+
+# --- A2: in-scan suppression ---------------------------------------------------
+
+
+def test_policy_suppresses_an_approved_hit_in_an_explicit_file(tmp_path: Path) -> None:
+    root = tmp_path / "proj"
+    root.mkdir()
+    artifact = root / "f.py"
+    _seed_github(artifact)
+    policy = _policy_of(_both_entries("f.py", SECRET_LINE))
+    assert scan_paths([artifact], project_root=root) != []
+    assert scan_paths([artifact], project_root=root, policy=policy) == []
+
+
+def test_policy_suppresses_an_approved_hit_in_a_walked_directory(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "proj"
+    tree = root / "tree"
+    (tree / "nested").mkdir(parents=True)
+    _seed_github(tree / "a.py")
+    _seed_github(tree / "nested" / "b.py")
+    policy = _policy_of(
+        _both_entries("tree/a.py", SECRET_LINE)
+        + _both_entries("tree/nested/b.py", SECRET_LINE)
+    )
+    assert scan_paths([tree], project_root=root, policy=policy) == []
+    # without the policy the same walk finds both
+    assert len(scan_paths([tree], project_root=root)) == 4
+
+
+def test_policy_blocks_a_different_value_at_the_approved_path(tmp_path: Path) -> None:
+    root = tmp_path / "proj"
+    root.mkdir()
+    artifact = root / "f.py"
+    _seed_github(artifact)
+    # the policy approves a DIFFERENT token at the same (path, rule)
+    other_line = f"GITHUB_TOKEN = {OTHER_TOKEN}"
+    policy = _policy_of(_both_entries("f.py", other_line))
+    findings = scan_paths([artifact], project_root=root, policy=policy)
+    assert {f.rule_id for f in findings} == {
+        GITHUB_RULE_ID,
+        "generic-keyword-assignment",
+    }
+
+
+def test_policy_blocks_a_second_credential_on_the_same_line(tmp_path: Path) -> None:
+    root = tmp_path / "proj"
+    root.mkdir()
+    artifact = root / "f.py"
+    artifact.write_text(
+        f"tokens = {GITHUB_TOKEN} and {OTHER_TOKEN}\n", encoding="utf-8"
+    )
+    policy = _policy_of([_approved_entry("f.py", SECRET_LINE, GITHUB_RULE_ID)])
+    findings = scan_paths([artifact], project_root=root, policy=policy)
+    # the approved token is suppressed; the different token on the SAME
+    # line still blocks (one finding left, at the second token's column)
+    assert [f.rule_id for f in findings] == [GITHUB_RULE_ID]
+    assert findings[0].column == len("tokens = ") + len(GITHUB_TOKEN) + len(" and ") + 1
+
+
+def test_policy_multi_rule_hit_suppresses_only_its_own_rule(tmp_path: Path) -> None:
+    root = tmp_path / "proj"
+    root.mkdir()
+    artifact = root / "f.py"
+    _seed_github(artifact)
+    policy = _policy_of([_approved_entry("f.py", SECRET_LINE, GITHUB_RULE_ID)])
+    findings = scan_paths([artifact], project_root=root, policy=policy)
+    assert [f.rule_id for f in findings] == ["generic-keyword-assignment"]
+
+
+def test_residual_exclusion_suppresses_only_its_own_rule(tmp_path: Path) -> None:
+    root = tmp_path / "proj"
+    root.mkdir()
+    artifact = root / "f.py"
+    artifact.write_text(HEADER_LINE + "\n" + SECRET_LINE + "\n", encoding="utf-8")
+    policy = _policy_of(
+        [],
+        [
+            {
+                "path": "f.py",
+                "rule_id": "private-key-header",
+                "rationale": "partial-coverage fixture",
+            }
+        ],
+    )
+    findings = scan_paths([artifact], project_root=root, policy=policy)
+    # the residual entry suppresses the header rule only; the github hit in
+    # the same file still blocks
+    assert [f.rule_id for f in findings] == [
+        GITHUB_RULE_ID,
+        "generic-keyword-assignment",
+    ]
+
+
+def test_scan_incomplete_is_never_suppressible(tmp_path: Path) -> None:
+    root = tmp_path / "proj"
+    root.mkdir()
+    artifact = root / "big.bin"
+    artifact.write_bytes(b"x" * (DEFAULT_MAX_SCAN_BYTES + 1))
+    policy = _policy_of(_both_entries("big.bin", SECRET_LINE))
+    findings = scan_paths([artifact], project_root=root, policy=policy)
+    assert [f.rule_id for f in findings] == ["scan-incomplete"]
+
+
+def test_symlink_escaping_the_project_is_uncanonicalizable_and_blocks(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "proj"
+    root.mkdir()
+    outside = tmp_path / "outside.py"
+    _seed_github(outside)
+    link = root / "link.py"
+    link.symlink_to(outside)
+    policy = _policy_of(_both_entries("f.py", SECRET_LINE))
+    findings = scan_paths([link], project_root=root, policy=policy)
+    # the link resolves outside the root: no canonical identity, so even an
+    # approving policy cannot suppress the hit
+    assert {f.rule_id for f in findings} == {
+        GITHUB_RULE_ID,
+        "generic-keyword-assignment",
+    }
+
+
+def test_scratchpad_root_swap_into_the_project_keeps_the_same_identity(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "proj"
+    root.mkdir()
+    artifact = root / "f.py"
+    _seed_github(artifact)
+    scratch = tmp_path / "scratch"
+    scratch.mkdir()
+    link = scratch / "link.py"
+    link.symlink_to(artifact)
+    policy = _policy_of(_both_entries("f.py", SECRET_LINE))
+    # the link spells the file through the scratchpad root, but both gates
+    # derive the SAME canonical identity, so the approval applies
+    assert scan_paths([link], project_root=root, policy=policy) == []
+
+
+# --- A2: the committed manifest and the removed YAML exclude ------------------
+
+
+def test_committed_manifest_parses_with_an_empty_residual_section() -> None:
+    raw = (REPO_ROOT / secret_scan.MANIFEST_FILENAME).read_bytes()
+    policy = secret_scan.parse_scan_policy(raw)
+    assert policy is not None
+    assert policy.residual == frozenset()
+    assert policy.approved, "the reviewed inventory is non-empty"
+    assert policy.revision_digest == hashlib.sha256(raw).hexdigest()
+
+
+def test_committed_manifest_scans_clean_itself() -> None:
+    # The manifest carries only fingerprints, and its formatting keeps every
+    # rule from matching it: committing or touching it never self-blocks.
+    manifest = REPO_ROOT / secret_scan.MANIFEST_FILENAME
+    assert scan_paths([manifest], project_root=REPO_ROOT) == []
+
+
+def test_committed_manifest_matches_the_recomputed_reviewed_inventory() -> None:
+    # Anti-drift: the committed manifest is exactly the findings the scanner
+    # computes over the 12 formerly YAML-excluded files today.
+    raw = (REPO_ROOT / secret_scan.MANIFEST_FILENAME).read_bytes()
+    policy = secret_scan.parse_scan_policy(raw)
+    assert policy is not None
+    recomputed: set[tuple[str, str, str]] = set()
+    for rel in FORMERLY_YAML_EXCLUDED:
+        keys: list[ApprovalKey] = []
+        scan_paths([REPO_ROOT / rel], project_root=REPO_ROOT, keys=keys)
+        assert keys, rel
+        for key in keys:
+            path = key.path
+            assert path is not None and path == rel
+            recomputed.add((path, key.rule_id, key.digest))
+    committed = {(k.path, k.rule_id, k.digest) for k in policy.approved}
+    assert committed == recomputed
+
+
+def test_secret_scan_hook_config_has_no_yaml_exclude_left() -> None:
+    # The whole-file exclude shrank to zero: the secret-scan hook block in
+    # .pre-commit-config.yaml carries no exclude, and none of the 12
+    # formerly-excluded paths appear anywhere in the file.
+    config = (REPO_ROOT / ".pre-commit-config.yaml").read_text(encoding="utf-8")
+    lines = config.splitlines()
+    start = next(index for index, line in enumerate(lines) if "id: secret-scan" in line)
+    block: list[str] = []
+    for line in lines[start:]:
+        if block and (line.startswith("      - id:") or line.startswith("  - repo:")):
+            break
+        block.append(line)
+    assert not any("exclude" in line for line in block)
+    for rel in FORMERLY_YAML_EXCLUDED:
+        assert rel not in config

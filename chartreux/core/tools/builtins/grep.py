@@ -15,6 +15,13 @@ from typing import TYPE_CHECKING, Any
 from pydantic import BaseModel, Field, JsonValue
 
 from chartreux.core.events import ToolStreamEvent
+from chartreux.core.tmp_ownership import (
+    SpawnLedgerBinding,
+    SpawnRefusedError,
+    ambient_binding,
+    binding_from_context,
+    process_identity_tuple,
+)
 from chartreux.core.tools.base import (
     BaseTool,
     BaseToolConfig,
@@ -739,6 +746,10 @@ class Grep(
     ) -> AsyncGenerator[ToolStreamEvent | GrepResult, None]:
         backend = self._detect_backend()
         self._validate_args(args)
+        # The invoking context's ledger binding: the search binary spawn
+        # registers in the allocation bound to this context, never to the
+        # command's cwd alone.
+        ledger_binding = binding_from_context(ctx)
         stop = threading.Event()
         try:
             for _restart in range(_RESTARTS):
@@ -786,7 +797,9 @@ class Grep(
                                 root, excludes, args.use_default_ignore, token
                             )
                         self._ensure_current(token)
-                        listed = await self._execute_search(cmd)
+                        listed = await self._execute_search_guarded(
+                            cmd, ledger=ledger_binding
+                        )
                         self._ensure_current(token)
                         candidates = await self._stage(
                             _intersect_listing,
@@ -816,7 +829,11 @@ class Grep(
                             cmd.extend(["--no-config", "--no-ignore"])
                         cmd.extend(["--", *(str(path) for path in paths)])
                         self._ensure_current(token)  # Last gate before spawn.
-                        chunks.append(await self._execute_search(cmd))
+                        chunks.append(
+                            await self._execute_search_guarded(
+                                cmd, ledger=ledger_binding
+                            )
+                        )
                         self._ensure_current(token)
                     if worker:
                         result = await self._stage(
@@ -1130,7 +1147,7 @@ class Grep(
                     cmd.extend(["--glob", f"!/{literal}/"])
                     dirs.remove(name)
         cmd.extend(["--", str(root)])
-        listed = await self._execute_search(cmd)
+        listed = await self._execute_search_guarded(cmd)
         # Compare lexical names: resolving here can resurrect an ignored alias
         # merely because its target was listed under another name.
         visible = {self.cwd / path for path in listed.split("\0") if path}
@@ -1239,7 +1256,19 @@ class Grep(
 
         return cmd
 
-    async def _execute_search(self, cmd: list[str]) -> str:
+    async def _execute_search(
+        self, cmd: list[str], *, ledger: SpawnLedgerBinding | None = None
+    ) -> str:
+        # The binary spawn is hooked into registration like every other spawn
+        # site: with a binding (the invoking context's, else the ambient one)
+        # the intent is appended BEFORE the exec, a failed spawn retracts it,
+        # and a successful spawn completes it with the child's full identity
+        # tuple captured in-frame. The grep child is not session-separated,
+        # so it is not a leader group.
+        binding = ledger if ledger is not None else ambient_binding()
+        handle = None
+        if binding is not None:
+            handle = binding.begin_spawn(is_leader_group=False)
         try:
             proc = await asyncio.create_subprocess_exec(
                 *cmd,
@@ -1248,39 +1277,49 @@ class Grep(
                 cwd=self.cwd,
                 env=scrub_child_env(os.environ),
             )
+        except BaseException:
+            if binding is not None and handle is not None:
+                binding.retract_spawn(handle)
+            raise
+        if binding is not None and handle is not None:
+            binding.complete_spawn(handle, proc.pid, process_identity_tuple(proc.pid))
 
-            try:
-                stdout_bytes, stderr_bytes = await asyncio.wait_for(
-                    proc.communicate(), timeout=self.config.default_timeout
-                )
-            except TimeoutError:
-                await kill_async_subprocess(proc, kill_process_group=False)
-                raise ToolError(
-                    f"Search timed out after {self.config.default_timeout}s"
-                )
-            except asyncio.CancelledError:
-                await asyncio.shield(
-                    kill_async_subprocess(proc, kill_process_group=False)
-                )
-                raise
+        try:
+            stdout_bytes, stderr_bytes = await asyncio.wait_for(
+                proc.communicate(), timeout=self.config.default_timeout
+            )
+        except TimeoutError:
+            await kill_async_subprocess(proc, kill_process_group=False)
+            raise ToolError(f"Search timed out after {self.config.default_timeout}s")
+        except asyncio.CancelledError:
+            await asyncio.shield(kill_async_subprocess(proc, kill_process_group=False))
+            raise
 
-            # Residual unboundedness: communicate() still collects complete process
-            # output in memory before worker decoding/parsing; this is not a byte cap.
-            decode_stop = threading.Event()
-            try:
-                stdout, stderr = await asyncio.to_thread(
-                    _decode_output, stdout_bytes, stderr_bytes, decode_stop
-                )
-            except asyncio.CancelledError:
-                decode_stop.set()
-                raise
+        # Residual unboundedness: communicate() still collects complete process
+        # output in memory before worker decoding/parsing; this is not a byte cap.
+        decode_stop = threading.Event()
+        try:
+            stdout, stderr = await asyncio.to_thread(
+                _decode_output, stdout_bytes, stderr_bytes, decode_stop
+            )
+        except asyncio.CancelledError:
+            decode_stop.set()
+            raise
 
-            if proc.returncode not in {0, 1}:
-                error_msg = stderr or f"Process exited with code {proc.returncode}"
-                raise ToolError(f"grep error: {error_msg}")
+        if proc.returncode not in {0, 1}:
+            error_msg = stderr or f"Process exited with code {proc.returncode}"
+            raise ToolError(f"grep error: {error_msg}")
 
-            return stdout
+        return stdout
 
+    async def _execute_search_guarded(
+        self, cmd: list[str], *, ledger: SpawnLedgerBinding | None = None
+    ) -> str:
+        try:
+            return await self._execute_search(cmd, ledger=ledger)
+        except SpawnRefusedError as exc:
+            # Typed pre-fork refusal: the search binary was never started.
+            raise ToolError(f"Search spawn refused before start: {exc}") from exc
         except ToolError:
             raise
         except Exception as exc:

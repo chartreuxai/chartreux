@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
@@ -11,6 +11,7 @@ import os
 from pathlib import Path
 import tempfile
 from typing import TYPE_CHECKING, Any, Protocol
+from uuid import UUID
 
 from chartreux.app_server._agent_transcript import archive_transcript_source
 from chartreux.app_server._subagent_records import (
@@ -23,10 +24,22 @@ from chartreux.app_server._subagent_records import (
     _AgentTombstone,
 )
 from chartreux.core.agent_loop import AgentLoop
+from chartreux.core.config._dangerous_command_authority import (
+    ProjectDangerousCommandGrant,
+    ProjectRemoteExecGrant,
+)
+from chartreux.core.config._restrictions import (
+    PolicySourceIdentity,
+    SourceRestrictions,
+    ToolRestriction,
+)
+from chartreux.core.config._root_authority import ProjectRootAuthority
 from chartreux.core.config.models import SessionLoggingConfig
+from chartreux.core.dangerous_commands import RemoteDestination
 from chartreux.core.session.session_permissions import METADATA_FILENAME
 from chartreux.core.session_types import ChildSessionLink
 from chartreux.core.subagents import UnknownAgentError
+from chartreux.core.workspace import Workspace
 from chartreux.utils.session_id import shorten_session_id
 
 if TYPE_CHECKING:
@@ -367,6 +380,27 @@ ROOT_SESSION_DIR_PAYLOAD_KEY = "root_session_dir"
 AGENT_NAME_PAYLOAD_KEY = "agent_name"
 """Spawn-payload key carrying the child's transcript folder prefix."""
 
+CLIENT_INFO_PAYLOAD_KEY = "client_info"
+"""Spawn-payload key carrying the validated client identity the child re-opens with."""
+
+CLIENT_CAPABILITIES_PAYLOAD_KEY = "client_capabilities"
+"""Spawn-payload key carrying the client capabilities the child re-opens with."""
+
+INHERITED_WORKSPACE_PAYLOAD_KEY = "inherited_workspace"
+"""Spawn-payload key carrying the parent workspace a child loop must inherit."""
+
+AGENT_CONFIG_PAYLOAD_KEY = "agent_config"
+"""Spawn-payload key carrying the parent's live session options the child opens with."""
+
+INHERITED_RESTRICTIONS_PAYLOAD_KEY = "inherited_restrictions"
+"""Spawn-payload key carrying the accepted source restrictions a child inherits."""
+
+INHERITED_MODE_RESTRICTIONS_PAYLOAD_KEY = "inherited_mode_restrictions"
+"""Spawn-payload key carrying the parent's mode restrictions a child inherits."""
+
+INHERITED_ROOT_GRANTS_PAYLOAD_KEY = "inherited_root_grants"
+"""Spawn-payload key carrying the bare roots the parent was granted at dispatch."""
+
 
 class ChildTranscriptError(RuntimeError):
     """Base class for child-transcript durability and reconciliation failures."""
@@ -374,6 +408,463 @@ class ChildTranscriptError(RuntimeError):
 
 class ChildTranscriptPathError(ChildTranscriptError):
     """A child transcript path escaped the root session's ``agents/`` subtree."""
+
+
+class ChildTranscriptPayloadError(ChildTranscriptError):
+    """A spawn-payload value failed its strict codec."""
+
+
+def encode_inherited_workspace(workspace: Workspace) -> dict[str, Any]:
+    """Encode the inherited workspace as the JSON-safe payload value.
+
+    Every field is a plain path, so the encoding is exact string round-trips:
+    the child re-opens with the same canonical cwd, roots and ceiling.
+    """
+    return {
+        "cwd": str(workspace.cwd),
+        "authorized_roots": [str(root) for root in workspace.authorized_roots],
+        "ceiling": (
+            None
+            if workspace.ceiling is None
+            else encode_inherited_workspace(workspace.ceiling)
+        ),
+    }
+
+
+def decode_inherited_workspace(payload: object) -> Workspace:
+    """Strictly decode one inherited-workspace payload value.
+
+    No fallback and no repair: a malformed value raises the typed payload
+    error instead of opening the child with a workspace it never had. A
+    payload WITHOUT the key is not decoded here at all -- the child answers
+    that shape with the loud ``inherited_workspace`` open failure an
+    old-version peer deserves.
+    """
+    if not isinstance(payload, dict) or set(payload) != {
+        "cwd",
+        "authorized_roots",
+        "ceiling",
+    }:
+        raise ChildTranscriptPayloadError(
+            "the inherited_workspace payload must carry exactly cwd, "
+            "authorized_roots and ceiling"
+        )
+    cwd = payload["cwd"]
+    roots = payload["authorized_roots"]
+    if not isinstance(cwd, str) or not cwd:
+        raise ChildTranscriptPayloadError(
+            "the inherited_workspace payload needs a cwd string"
+        )
+    if not isinstance(roots, list) or not all(
+        isinstance(root, str) and root for root in roots
+    ):
+        raise ChildTranscriptPayloadError(
+            "the inherited_workspace payload needs authorized_roots "
+            "as a list of path strings"
+        )
+    ceiling = payload["ceiling"]
+    return Workspace(
+        cwd=Path(cwd),
+        authorized_roots=tuple(Path(root) for root in roots),
+        ceiling=None if ceiling is None else decode_inherited_workspace(ceiling),
+    )
+
+
+_SOURCE_RESTRICTION_KEYS = frozenset({
+    "layer_name",
+    "locator",
+    "kind",
+    "content_fingerprint",
+    "store_fingerprint",
+    "tools",
+    "identity",
+    "authorized_roots",
+    "dangerous_command_grants",
+    "remote_exec_grants",
+    "replaces_roots",
+})
+
+
+def encode_source_restrictions(
+    restrictions: tuple[SourceRestrictions, ...],
+) -> list[dict[str, Any]]:
+    """Encode accepted source restrictions as JSON-safe payload values."""
+    return [_encode_source_restriction(restriction) for restriction in restrictions]
+
+
+def _encode_source_restriction(restriction: SourceRestrictions) -> dict[str, Any]:
+    identity = None
+    if restriction.identity is not None:
+        identity = {
+            "owner": str(restriction.identity.owner),
+            "source": str(restriction.identity.source),
+        }
+    return {
+        "layer_name": restriction.layer_name,
+        "locator": restriction.locator,
+        "kind": restriction.kind,
+        "content_fingerprint": restriction.content_fingerprint,
+        "store_fingerprint": restriction.store_fingerprint,
+        "tools": [
+            {
+                "tool_name": tool.tool_name,
+                "denied": tool.denied,
+                "denylist": list(tool.denylist),
+                "sensitive_patterns": list(tool.sensitive_patterns),
+            }
+            for tool in restriction.tools
+        ],
+        "identity": identity,
+        "authorized_roots": [
+            {
+                "project": str(authority.project),
+                "roots": [str(root) for root in authority.roots],
+            }
+            for authority in restriction.authorized_roots
+        ],
+        "dangerous_command_grants": [
+            {"project": str(grant.project), "operations": list(grant.operations)}
+            for grant in restriction.dangerous_command_grants
+        ],
+        "remote_exec_grants": [
+            {
+                "project": str(grant.project),
+                "destinations": [
+                    {
+                        "user": destination.user,
+                        "host": destination.host,
+                        "port": destination.port,
+                    }
+                    for destination in grant.destinations
+                ],
+            }
+            for grant in restriction.remote_exec_grants
+        ],
+        "replaces_roots": restriction.replaces_roots,
+    }
+
+
+def decode_source_restrictions(payload: object) -> tuple[SourceRestrictions, ...]:
+    """Strictly decode the inherited-restrictions payload value.
+
+    No fallback and no repair: every field must carry exactly the shape the
+    encoder wrote, so a malformed value raises the typed payload error instead
+    of opening the child with a policy it never had.
+    """
+    if not isinstance(payload, list):
+        raise ChildTranscriptPayloadError(
+            "the inherited restrictions payload must be a list of source records"
+        )
+    return tuple(_decode_source_restriction(record) for record in payload)
+
+
+def _decode_source_restriction(record: object) -> SourceRestrictions:
+    if not isinstance(record, dict) or set(record) != _SOURCE_RESTRICTION_KEYS:
+        raise ChildTranscriptPayloadError(
+            "an inherited restriction must carry exactly the source record keys"
+        )
+    kind = record["kind"]
+    if kind not in {"source", "mode"}:
+        raise ChildTranscriptPayloadError(
+            "an inherited restriction carries an unknown source kind"
+        )
+    tools = _decode_tool_restrictions(record["tools"])
+    identity = _decode_policy_source_identity(record["identity"])
+    authorized_roots = _decode_authorized_roots(record["authorized_roots"])
+    dangerous_command_grants = _decode_dangerous_command_grants(
+        record["dangerous_command_grants"]
+    )
+    remote_exec_grants = _decode_remote_exec_grants(record["remote_exec_grants"])
+    store_fingerprint = record["store_fingerprint"]
+    if store_fingerprint is not None and not isinstance(store_fingerprint, str):
+        raise ChildTranscriptPayloadError(
+            "an inherited restriction needs a store fingerprint string or null"
+        )
+    if not isinstance(record["replaces_roots"], bool):
+        raise ChildTranscriptPayloadError(
+            "an inherited restriction needs replaces_roots as a boolean"
+        )
+    for field in ("layer_name", "locator", "content_fingerprint"):
+        if not isinstance(record[field], str):
+            raise ChildTranscriptPayloadError(
+                "an inherited restriction needs string provenance fields"
+            )
+    return SourceRestrictions(
+        layer_name=record["layer_name"],
+        locator=record["locator"],
+        kind=kind,
+        content_fingerprint=record["content_fingerprint"],
+        store_fingerprint=store_fingerprint,
+        tools=tools,
+        identity=identity,
+        authorized_roots=authorized_roots,
+        dangerous_command_grants=dangerous_command_grants,
+        remote_exec_grants=remote_exec_grants,
+        replaces_roots=record["replaces_roots"],
+    )
+
+
+def _decode_tool_restrictions(payload: object) -> tuple[ToolRestriction, ...]:
+    if not isinstance(payload, list):
+        raise ChildTranscriptPayloadError(
+            "inherited tool restrictions must be a list of tool records"
+        )
+    tools: list[ToolRestriction] = []
+    for record in payload:
+        if not isinstance(record, dict) or set(record) != {
+            "tool_name",
+            "denied",
+            "denylist",
+            "sensitive_patterns",
+        }:
+            raise ChildTranscriptPayloadError(
+                "an inherited tool restriction must carry exactly its four keys"
+            )
+        tool_name, denied = record["tool_name"], record["denied"]
+        denylist, sensitive = record["denylist"], record["sensitive_patterns"]
+        if not isinstance(tool_name, str) or not tool_name:
+            raise ChildTranscriptPayloadError(
+                "an inherited tool restriction needs a tool name string"
+            )
+        if not isinstance(denied, bool):
+            raise ChildTranscriptPayloadError(
+                "an inherited tool restriction needs denied as a boolean"
+            )
+        for values, label in (
+            (denylist, "denylist"),
+            (sensitive, "sensitive_patterns"),
+        ):
+            if not isinstance(values, list) or not all(
+                isinstance(value, str) for value in values
+            ):
+                raise ChildTranscriptPayloadError(
+                    f"an inherited tool restriction needs {label} as a string list"
+                )
+        tools.append(
+            ToolRestriction(
+                tool_name=tool_name,
+                denied=denied,
+                denylist=tuple(denylist),
+                sensitive_patterns=tuple(sensitive),
+            )
+        )
+    return tuple(tools)
+
+
+def _decode_policy_source_identity(payload: object) -> PolicySourceIdentity | None:
+    if payload is None:
+        return None
+    if not isinstance(payload, dict) or set(payload) != {"owner", "source"}:
+        raise ChildTranscriptPayloadError(
+            "an inherited policy source identity must carry owner and source"
+        )
+    try:
+        return PolicySourceIdentity(
+            owner=UUID(payload["owner"]), source=UUID(payload["source"])
+        )
+    except (ValueError, AttributeError, TypeError) as exc:
+        raise ChildTranscriptPayloadError(
+            "an inherited policy source identity needs two UUID strings"
+        ) from exc
+
+
+def _decode_authorized_roots(payload: object) -> tuple[ProjectRootAuthority, ...]:
+    if not isinstance(payload, list):
+        raise ChildTranscriptPayloadError(
+            "inherited authorized roots must be a list of authority records"
+        )
+    authorities: list[ProjectRootAuthority] = []
+    for record in payload:
+        if not isinstance(record, dict) or set(record) != {"project", "roots"}:
+            raise ChildTranscriptPayloadError(
+                "an inherited root authority must carry project and roots"
+            )
+        project, roots = record["project"], record["roots"]
+        if not isinstance(project, str) or not project:
+            raise ChildTranscriptPayloadError(
+                "an inherited root authority needs a project string"
+            )
+        if (
+            not isinstance(roots, list)
+            or not roots
+            or not all(isinstance(root, str) and root for root in roots)
+        ):
+            raise ChildTranscriptPayloadError(
+                "an inherited root authority needs roots as path strings"
+            )
+        authorities.append(
+            ProjectRootAuthority(
+                project=Path(project), roots=tuple(Path(root) for root in roots)
+            )
+        )
+    return tuple(authorities)
+
+
+def _decode_dangerous_command_grants(
+    payload: object,
+) -> tuple[ProjectDangerousCommandGrant, ...]:
+    if not isinstance(payload, list):
+        raise ChildTranscriptPayloadError(
+            "inherited dangerous-command grants must be a list of grant records"
+        )
+    grants: list[ProjectDangerousCommandGrant] = []
+    for record in payload:
+        if not isinstance(record, dict) or set(record) != {"project", "operations"}:
+            raise ChildTranscriptPayloadError(
+                "an inherited command grant must carry project and operations"
+            )
+        project, operations = record["project"], record["operations"]
+        if not isinstance(project, str) or not project:
+            raise ChildTranscriptPayloadError(
+                "an inherited command grant needs a project string"
+            )
+        if not isinstance(operations, list) or not all(
+            isinstance(operation, str) for operation in operations
+        ):
+            raise ChildTranscriptPayloadError(
+                "an inherited command grant needs operations as a string list"
+            )
+        grants.append(
+            ProjectDangerousCommandGrant(
+                project=Path(project), operations=tuple(operations)
+            )
+        )
+    return tuple(grants)
+
+
+def _decode_remote_exec_grants(payload: object) -> tuple[ProjectRemoteExecGrant, ...]:
+    if not isinstance(payload, list):
+        raise ChildTranscriptPayloadError(
+            "inherited remote-exec grants must be a list of grant records"
+        )
+    grants: list[ProjectRemoteExecGrant] = []
+    for record in payload:
+        if not isinstance(record, dict) or set(record) != {"project", "destinations"}:
+            raise ChildTranscriptPayloadError(
+                "an inherited remote-exec grant must carry project and destinations"
+            )
+        project, destinations = record["project"], record["destinations"]
+        if not isinstance(project, str) or not project:
+            raise ChildTranscriptPayloadError(
+                "an inherited remote-exec grant needs a project string"
+            )
+        if not isinstance(destinations, list):
+            raise ChildTranscriptPayloadError(
+                "an inherited remote-exec grant needs destinations as a list"
+            )
+        parsed: list[RemoteDestination] = []
+        for destination in destinations:
+            if not isinstance(destination, dict) or set(destination) != {
+                "user",
+                "host",
+                "port",
+            }:
+                raise ChildTranscriptPayloadError(
+                    "an inherited remote destination must carry user, host and port"
+                )
+            user, host, port = (
+                destination["user"],
+                destination["host"],
+                destination["port"],
+            )
+            if not isinstance(user, str) or not isinstance(host, str):
+                raise ChildTranscriptPayloadError(
+                    "an inherited remote destination needs user and host strings"
+                )
+            if isinstance(port, bool) or not isinstance(port, int):
+                raise ChildTranscriptPayloadError(
+                    "an inherited remote destination needs port as an integer"
+                )
+            parsed.append(RemoteDestination(user=user, host=host, port=port))
+        grants.append(
+            ProjectRemoteExecGrant(project=Path(project), destinations=tuple(parsed))
+        )
+    return tuple(grants)
+
+
+def encode_inherited_root_grants(roots: tuple[Path, ...]) -> list[str]:
+    """Encode the dispatch root grants as the JSON-safe payload value."""
+    return [str(root) for root in roots]
+
+
+def decode_inherited_root_grants(payload: object) -> tuple[Path, ...]:
+    """Strictly decode the inherited root grants payload value."""
+    if not isinstance(payload, list) or not all(
+        isinstance(root, str) and root for root in payload
+    ):
+        raise ChildTranscriptPayloadError(
+            "the inherited root grants payload needs a list of path strings"
+        )
+    return tuple(Path(root) for root in payload)
+
+
+def encode_child_policy_payload(loop: AgentLoop) -> dict[str, Any]:
+    """The parent-policy keys every process spawn must merge unconditionally.
+
+    The process-route counterpart of the in-process route's
+    ``child_runtime_policy`` handover: the parent loop's accepted source
+    restrictions (its own inherited sources plus the live orchestrator's
+    source-kind contributions, deduplicated), its mode restrictions, its
+    dispatch root grants and its budget-bearing session options ride the
+    spawn payload. Every value is read from the parent loop -- nothing is
+    fabricated. ``parent_authority_getter`` and
+    ``parent_authority_revision_getter`` are process-locals no payload can
+    carry; a payload without these keys answers the child's loud open
+    failure instead of opening with a policy it never had.
+    """
+    from chartreux.app_server.protocol import AgentConfig
+
+    policy = loop.runtime_policy
+    sources = loop.config_orchestrator.restrictions
+    child_sources = tuple(
+        dict.fromkeys(
+            policy.inherited_restrictions
+            + tuple(source for source in sources if source.kind == "source")
+        )
+    )
+    return {
+        AGENT_CONFIG_PAYLOAD_KEY: AgentConfig(
+            cwd=str(loop.cwd),
+            max_turns=policy.max_turns,
+            max_price=policy.max_price,
+            max_session_tokens=policy.max_session_tokens,
+            run_max_price=policy.run_max_price,
+            run_max_session_tokens=policy.run_max_session_tokens,
+            headless=policy.headless,
+        ).model_dump(mode="json"),
+        INHERITED_RESTRICTIONS_PAYLOAD_KEY: encode_source_restrictions(child_sources),
+        INHERITED_MODE_RESTRICTIONS_PAYLOAD_KEY: encode_source_restrictions(
+            policy.inherited_mode_restrictions
+        ),
+        INHERITED_ROOT_GRANTS_PAYLOAD_KEY: encode_inherited_root_grants(
+            loop._dispatch_root_grants
+        ),
+    }
+
+
+def require_child_policy_payload_keys(payload: Mapping[str, Any]) -> None:
+    """Refuse a spawn payload missing its parent-policy keys.
+
+    The strict F11 stance, matching F6's workspace stance: a legacy payload a
+    pre-F11 peer would have opened with an empty policy answers the typed
+    payload error at the child's open, never a silent default.
+    """
+    missing = [
+        key
+        for key in (
+            AGENT_CONFIG_PAYLOAD_KEY,
+            INHERITED_RESTRICTIONS_PAYLOAD_KEY,
+            INHERITED_MODE_RESTRICTIONS_PAYLOAD_KEY,
+            INHERITED_ROOT_GRANTS_PAYLOAD_KEY,
+        )
+        if key not in payload
+    ]
+    if missing:
+        raise ChildTranscriptPayloadError(
+            "a child spawn payload is missing its parent-policy keys ("
+            + ", ".join(missing)
+            + ")"
+        )
 
 
 class ChildTranscriptOutcome(StrEnum):
@@ -940,6 +1431,9 @@ __all__ = [
     "CHILD_START_MARKER_FILENAME",
     "CHILD_TOMBSTONE_FILENAME",
     "CHILD_TRANSCRIPTS_DIRNAME",
+    "CLIENT_CAPABILITIES_PAYLOAD_KEY",
+    "CLIENT_INFO_PAYLOAD_KEY",
+    "INHERITED_WORKSPACE_PAYLOAD_KEY",
     "ROOT_SESSION_DIR_PAYLOAD_KEY",
     "ChildResultRecord",
     "ChildStartMarker",
@@ -948,6 +1442,7 @@ __all__ = [
     "ChildTranscriptError",
     "ChildTranscriptOutcome",
     "ChildTranscriptPathError",
+    "ChildTranscriptPayloadError",
     "ChildTranscriptStore",
     "TranscriptReads",
     "TranscriptReadsView",
@@ -957,6 +1452,8 @@ __all__ = [
     "child_transcript_logging",
     "child_transcript_root_for",
     "child_transcripts_root",
+    "decode_inherited_workspace",
+    "encode_inherited_workspace",
     "persisted_child_attempt_id",
     "read_child_transcript",
     "resolve_child_root_session_dir",

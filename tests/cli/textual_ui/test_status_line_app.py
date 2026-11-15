@@ -13,6 +13,7 @@ from chartreux.app_server.models import (
     PublicEntryGenerationStatus,
 )
 from chartreux.app_server.protocol import (
+    AgentSummaryModel,
     StatsUpdatedParams,
     WorkspaceBranchReadResponse,
 )
@@ -20,6 +21,7 @@ from chartreux.cli.textual_ui.widgets.messages import AssistantMessage, UserMess
 from chartreux.cli.textual_ui.widgets.session_status_line import SessionStatusLine
 from chartreux.core.background_jobs import BashStartArgs, BashStopArgs
 from tests.cli.textual_ui.test_history_grouping import _message
+from tests.cli.textual_ui.test_program_status import _pin_liveness
 from tests.conftest import build_test_agent_loop, build_test_chartreux_app
 
 
@@ -106,12 +108,12 @@ async def test_quit_feedback_survives_stats_and_settings_refresh(
                     emitted_at=0,
                     session_id=app.app_server.session_id,
                     stats=AgentStatsSnapshot(context_tokens=135_000),
-                    context_window=400_000,
+                    context_window=1_000_000,
                 )
             )
         )
         app.app_server._state.stats = AgentStatsSnapshot(context_tokens=135_000)
-        app.app_server._state.context_window = 400_000
+        app.app_server._state.context_window = 1_000_000
         app.config.status_line.separator = "pipe"
         app._on_config_changed(app.config)
         assert status.config.separator == "pipe"
@@ -121,7 +123,10 @@ async def test_quit_feedback_survives_stats_and_settings_refresh(
         else:
             app._quit_manager.cancel_confirmation()
         assert app._quit_manager.confirm_key is None
-        assert "135k/400k (34%)" in status.render().plain
+        # The denominator is the configured compaction trigger (500k), never the
+        # model's 1.0M hard window the stats event reports.
+        assert "135k/500k (27%)" in status.render().plain
+        assert "1.0M" not in status.render().plain
         assert "again to quit" not in status.render().plain
         assert status.size.height == 1
 
@@ -184,6 +189,9 @@ async def test_public_root_context_updates_main_details_and_compacting_status() 
         await pilot.pause()
         status = app.query_one(SessionStatusLine)
         assert app._agent_bar is not None
+        # The deployment's compaction trigger is the denominator for the whole
+        # scenario; the stats events report a 1.0M hard window beside it.
+        assert app.config.active_model.auto_compact_threshold == 500_000
         checkpoint = PublicCheckpointEntry(
             id="compaction",
             session_id=app.app_server.session_id,
@@ -200,7 +208,7 @@ async def test_public_root_context_updates_main_details_and_compacting_status() 
                     emitted_at=0,
                     session_id=app.app_server.session_id,
                     stats=AgentStatsSnapshot(context_tokens=135_000),
-                    context_window=400_000,
+                    context_window=1_000_000,
                 )
             )
         )
@@ -210,14 +218,14 @@ async def test_public_root_context_updates_main_details_and_compacting_status() 
         # Checkpoint completion precedes the stats notification: retain the old
         # over-threshold measurement to detect a stale-numerator flash.
         app.app_server._state.stats = AgentStatsSnapshot(context_tokens=500_000)
-        app.app_server._state.context_window = 400_000
+        app.app_server._state.context_window = 1_000_000
         checkpoint.generation_status = PublicEntryGenerationStatus.COMPLETED
         app._refresh_status_for_event(HistoryEntryAdded(checkpoint))
         assert not status.state.compacting
         assert status.state.context_tokens is None
-        assert "500k" not in status.render().plain
-        assert "500k" not in app._agent_bar.full_metadata()
-        assert "—" in status.render().plain
+        assert "500k/500k" not in status.render().plain
+        assert "500k/500k" not in app._agent_bar.full_metadata()
+        assert "—/500k" in status.render().plain
         app._refresh_context_progress()
         assert status.state.context_tokens is None
         await app._handle_turn_event(
@@ -227,12 +235,12 @@ async def test_public_root_context_updates_main_details_and_compacting_status() 
                     emitted_at=0,
                     session_id=app.app_server.session_id,
                     stats=AgentStatsSnapshot(context_tokens=0),
-                    context_window=400_000,
+                    context_window=1_000_000,
                 )
             )
         )
-        assert "0/400k (0%)" in status.render().plain
-        assert "0/400k (0%)" in app._agent_bar.full_metadata()
+        assert "0/500k (0%)" in status.render().plain
+        assert "0/500k (0%)" in app._agent_bar.full_metadata()
 
 
 @pytest.mark.asyncio
@@ -296,3 +304,123 @@ async def test_timestamp_preference_applies_to_history_and_live_widgets() -> Non
         restored = next(widget for widget in roots if isinstance(widget, UserMessage))
         assert not restored.header.show_message_timestamps
         assert restored.posted_at == posted_at
+
+
+@pytest.mark.asyncio
+async def test_main_row_stays_main_scoped_while_a_child_composes_osc_working() -> None:
+    """v0.7.9 point 5 (C7c): with the main turn idle and a running child in
+    the accepted liveness snapshot, the composed OSC decision is `working`
+    while the agents-browser Main row reports `Idle` — the row stays scoped to
+    the main agent (`_agent_job_active`, app.py:6193 territory) and never
+    reads the composed child activity.
+    """
+    app = build_test_chartreux_app()
+    async with app.run_test() as pilot:
+        await app._session_ready.wait()
+        await pilot.pause()
+        assert app._agent_bar is not None
+        running_child = AgentSummaryModel(
+            agent_id="child",
+            name="child",
+            availability="running",
+            current_run_status="running",
+        )
+        # The sole composed child-activity input: the accepted snapshot (C7b).
+        _pin_liveness(app, (running_child,))
+        assert app._composed_child_active() is True
+        assert app._agent_job_active() is False
+        decision = app._status_composition.decision(
+            callback_owner=app._composed_callback_owner(),
+            turn_active=app._agent_job_active(),
+            child_active=app._composed_child_active(),
+        )
+        assert decision.state == "working"
+        # The same instant keeps the Main row main-scoped: Idle, not Running.
+        app._refresh_main_agent_details()
+        metadata = app._agent_bar.full_metadata()
+        assert "Identity: Main agent" in metadata
+        assert "State: Idle" in metadata
+        assert "State: Running" not in metadata
+
+
+@pytest.mark.asyncio
+async def test_status_denominator_is_the_configured_compaction_threshold() -> None:
+    """H3: a fresh session measures usage at the trigger, not the window.
+
+    The runtime's own ``context_window`` read is the deployment's hard window;
+    the status row must never borrow it as the denominator, so the two are
+    pinned apart here and the rendered percentage is usage over threshold.
+    """
+    app = build_test_chartreux_app()
+    async with app.run_test() as pilot:
+        await app._session_ready.wait()
+        await pilot.pause()
+        status = app.query_one(SessionStatusLine)
+        runtime = app.app_server.resources.runtime
+        model = app.config.active_model
+        assert model.auto_compact_threshold == 500_000
+        assert runtime.context_window != model.auto_compact_threshold
+        assert status.state.auto_compact_threshold == 500_000
+
+        runtime._state.stats = AgentStatsSnapshot(context_tokens=45_000)
+        app._refresh_context_progress()
+        assert "45k/500k (9%)" in status.render().plain
+        assert "45k/1.0M" not in status.render().plain
+
+
+@pytest.mark.asyncio
+async def test_model_change_moves_the_denominator_to_the_new_threshold() -> None:
+    app = build_test_chartreux_app()
+    async with app.run_test() as pilot:
+        await app._session_ready.wait()
+        await pilot.pause()
+        status = app.query_one(SessionStatusLine)
+        runtime = app.app_server.resources.runtime
+        runtime._state.stats = AgentStatsSnapshot(context_tokens=100_000)
+        app._refresh_context_progress()
+        assert "100k/500k (20%)" in status.render().plain
+
+        app.config.active_model.auto_compact_threshold = 250_000
+        app._on_config_changed(app.config)
+        await pilot.pause()
+        assert status.state.auto_compact_threshold == 250_000
+        assert "100k/250k (40%)" in status.render().plain
+        assert "/500k" not in status.render().plain
+
+
+@pytest.mark.asyncio
+async def test_unknown_compaction_threshold_renders_an_unknown_denominator() -> None:
+    """A peer that cannot state the trigger leaves the denominator unknown.
+
+    The window is known at the same instant, so this pins that the row does
+    not fall back to it.
+    """
+    app = build_test_chartreux_app()
+    async with app.run_test() as pilot:
+        await app._session_ready.wait()
+        await pilot.pause()
+        status = app.query_one(SessionStatusLine)
+        runtime = app.app_server.resources.runtime
+        runtime._state.stats = AgentStatsSnapshot(context_tokens=45_000)
+        app.config.active_model.auto_compact_threshold = None
+        app._on_config_changed(app.config)
+        await pilot.pause()
+        assert status.state.auto_compact_threshold is None
+        assert "45k/—" in status.render().plain
+        assert "1.0M" not in status.render().plain
+
+
+@pytest.mark.asyncio
+async def test_disabled_compaction_renders_the_off_notice() -> None:
+    app = build_test_chartreux_app()
+    async with app.run_test() as pilot:
+        await app._session_ready.wait()
+        await pilot.pause()
+        status = app.query_one(SessionStatusLine)
+        runtime = app.app_server.resources.runtime
+        runtime._state.stats = AgentStatsSnapshot(context_tokens=45_000)
+        app.config.active_model.auto_compact_threshold = 0
+        app._on_config_changed(app.config)
+        await pilot.pause()
+        assert status.state.auto_compact_threshold == 0
+        assert "45k (auto-compact off)" in status.render().plain

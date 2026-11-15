@@ -43,7 +43,7 @@ def _make_request(url: str = "https://example.com") -> httpx.Request:
 
 
 class UnrelatedStatusError(RuntimeError):
-    def __init__(self, status: HTTPStatus) -> None:
+    def __init__(self, status: object) -> None:
         self.status = status
         super().__init__("unrelated failure")
 
@@ -92,8 +92,24 @@ class TestIsRetryableHttpError:
         error = StreamHTTPError("stream failed", HTTPStatus.UNAUTHORIZED)
         assert _is_retryable_http_error(error) is False
 
-    def test_unrelated_status_attribute_is_not_retryable(self) -> None:
+    def test_unrelated_integer_status_attribute_is_retryable(self) -> None:
+        # Production duck-types an integer ``.status`` (failures._status), so an
+        # unrelated exception exposing 429 is classified by that status — a
+        # retryable rate limit — exactly like a provider error.
         error = UnrelatedStatusError(HTTPStatus.TOO_MANY_REQUESTS)
+        assert _is_retryable_http_error(error) is True
+
+    def test_unrelated_malformed_string_status_is_not_retryable(self) -> None:
+        # The integer gate rejects a non-numeric ``.status``, so no status is
+        # recognized and the failure classifies UNKNOWN — never retried.
+        error = UnrelatedStatusError("429")
+        assert _is_retryable_http_error(error) is False
+
+    @pytest.mark.parametrize("status", [True, False])
+    def test_unrelated_boolean_status_is_not_retryable(self, status: bool) -> None:
+        # Booleans satisfy the integer gate as 1/0, neither a retryable HTTP
+        # status, so the failure still classifies UNKNOWN — never retried.
+        error = UnrelatedStatusError(status)
         assert _is_retryable_http_error(error) is False
 
 

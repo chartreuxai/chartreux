@@ -92,6 +92,10 @@ class ReleaseStateView(Protocol):
         self, teardown: asyncio.Task[None], agent_id: str, outcome: ReleaseAgentOutcome
     ) -> Coroutine[Any, Any, ReleaseAgentOutcome]: ...
 
+    # v0.7.9 point 5 (C6a): advance the monotone inventory revision in the
+    # caller's held region (the registry lock).
+    def _advance_inventory_revision_locked(self) -> None: ...
+
 
 @dataclass
 class ReleaseContext:
@@ -244,6 +248,10 @@ class AgentRelease:
             self._view._release_notification_suppression(agent_id)
             raise UnknownAgentError(f"Unknown agent: {agent_id}")
         self._view._rearm_reaper_locked()
+        # The release critical section detached the record, terminal metadata,
+        # and result state under the registry lock; the projection changed
+        # before the tracked teardown runs (point 5).
+        self._view._advance_inventory_revision_locked()
         context = ReleaseContext(
             agent_id=agent_id,
             record=record,

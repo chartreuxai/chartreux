@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import shutil
 
+from chartreux.core.tmp_ownership import SpawnLedgerBinding, ambient_binding
 from chartreux.core.tools.builtins._shell_argv import ShellToken, split_shell_tokens
 from chartreux.core.tools.secret_redaction import scrub_child_env
 from chartreux.core.utils.async_subprocess import spawn_registered_process
@@ -183,6 +184,7 @@ async def spawn_argv_command(
     *,
     cwd: Path | None = None,
     extra_env: Mapping[str, str] | None = None,
+    ledger: SpawnLedgerBinding | None = None,
 ) -> asyncio.subprocess.Process:
     """Run one fully literal argv without any shell in between.
 
@@ -191,9 +193,14 @@ async def spawn_argv_command(
     the caller bound cannot be re-expanded into different arguments. This is
     the transport that CONSUMES a bound literal plan (F1pkg1(c)): it never
     falls back to running the original shell text.
+
+    ``ledger`` binds the spawn to an allocation's registration ledger; with
+    none given, the process's ambient binding (the invoking context's own
+    allocation) applies.
     """
     env = _shell_environment(extra_env)
     cwd = cwd or Path.cwd()
+    binding = ledger if ledger is not None else ambient_binding()
     return await spawn_registered_process(
         asyncio.create_subprocess_exec(
             *argv,
@@ -203,7 +210,8 @@ async def spawn_argv_command(
             env=env,
             cwd=cwd,
             start_new_session=True,
-        )
+        ),
+        ledger=binding,
     )
 
 
@@ -213,6 +221,7 @@ async def spawn_shell_command(
     cwd: Path | None = None,
     merge_stderr: bool = False,
     extra_env: Mapping[str, str] | None = None,
+    ledger: SpawnLedgerBinding | None = None,
 ) -> asyncio.subprocess.Process:
     # F1pkg1(c): the pinned contract is consumed AT EXECUTION, from ONE read
     # of the executor: the binary whose contract is checked is the binary
@@ -230,6 +239,7 @@ async def spawn_shell_command(
         )
     env = _shell_environment(extra_env, contract=contract)
     cwd = cwd or Path.cwd()
+    binding = ledger if ledger is not None else ambient_binding()
     return await spawn_registered_process(
         asyncio.create_subprocess_shell(
             command,
@@ -242,7 +252,8 @@ async def spawn_shell_command(
             cwd=cwd,
             executable=executor,
             start_new_session=True,
-        )
+        ),
+        ledger=binding,
     )
 
 

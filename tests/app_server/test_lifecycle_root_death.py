@@ -349,7 +349,12 @@ async def test_the_death_watcher_names_its_death_receipt_signature() -> None:
         await process.close()
 
     assert death.signature is RootFailureSignature.DEATH_RECEIPT
-    assert death.diagnostic == "death-receipt: the root agent process exited"
+    assert death.diagnostic.startswith("death-receipt: the root agent process exited")
+    # C2b: the receipt carries the terminal-disconnect disclosure — in-flight
+    # work can be lost and the explicit session/resume is the recovery path.
+    assert "in-flight work" in death.diagnostic
+    assert "session/resume" in death.diagnostic
+    assert "never replayed" in death.diagnostic
     assert any(
         "death-receipt" in diagnostic.message() for diagnostic in process.diagnostics
     )

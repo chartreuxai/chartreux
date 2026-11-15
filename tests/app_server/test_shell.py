@@ -257,7 +257,8 @@ async def test_shell_text_executor_identity_is_the_spawned_executable(
         spawned.append(kwargs["executable"])
         return object()
 
-    async def spawn_registered_process(spawn: Any) -> Any:
+    async def spawn_registered_process(spawn: Any, *, ledger: Any = None) -> Any:
+        del ledger
         await spawn
         return object()
 

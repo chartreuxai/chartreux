@@ -17,7 +17,7 @@ past its hard cap.
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Awaitable, Callable, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Collection, Mapping, Sequence
 from contextlib import suppress
 from dataclasses import dataclass, field
 from enum import StrEnum
@@ -40,6 +40,11 @@ from chartreux.app_server.transport import (
     signal_terminate,
     terminate_process,
 )
+from chartreux.core.tmp_ownership import (
+    SpawnLedgerBinding,
+    ambient_binding,
+    process_identity_tuple,
+)
 
 PROCESS_PROTOCOL_VERSION = 2
 """The process wire version both ends must share.
@@ -48,6 +53,79 @@ Version 2 is the bidirectional agent-wire extension: origin-prefixed request
 ids and the closed per-direction dispatch tables. A pair that does not share a
 version rejects at the ready frame instead of misreading frames.
 """
+
+AGENT_WIRE_CAPABILITY_PLAN_HANDOFF_ROTATION = "plan-handoff-rotation"
+"""Additive agent-wire capability announced in the ready frame.
+
+A child that announces it runs the reconfigure plan-handoff long operation
+that rotates the session, so the coordinator may adopt the rotated identity
+and fence the superseded one (the ``session/fenced`` contract). A peer that
+does not announce it is a version skew, answered typed with a restart
+instruction instead of a silent fallback.
+"""
+
+AGENT_WIRE_CAPABILITY_RECOVERY_EVIDENCE = "recovery-evidence"
+"""Additive agent-wire capability announced in the ready frame.
+
+A child that announces it serves the ``agent/recovery/evidence`` request and
+attaches the typed terminal projection to its ``agent/turn/ended`` frames, so
+the coordinator-local root-recovery gate can decide on owner-side evidence.
+A peer that does not announce it is a version skew, answered typed with a
+restart instruction instead of a silent fallback.
+"""
+
+AGENT_WIRE_CAPABILITY_LIVE_AGENT_INVENTORY = "live-agent-inventory"
+"""Additive agent-wire capability announced in the ready frame.
+
+A child that announces it serves the ``agent/agents/inventory/read`` request,
+so the coordinator reads the live agent inventory as one typed, revised
+snapshot answered by the process that owns the children -- never from a
+coordinator cache. A peer that does not announce it is a version skew,
+answered typed with a restart instruction instead of a stale fallback.
+"""
+
+AGENT_WIRE_CAPABILITY_ROOT_AGENTS_UPDATE = "root-agents-update"
+"""Additive agent-wire capability announced in the ready frame.
+
+A root agent that announces it emits the ``agent/agents/update`` id-less
+notification at its child-inventory mutation moments, so the coordinator
+relays them onto the client-facing ``agents/update`` and root-owned children
+populate the agent browser. A peer that does not announce it never has the
+sink bound, so the browser falls back to the live inventory read alone.
+"""
+
+AGENT_WIRE_CAPABILITY_ROOT_RUN_COMPLETIONS = "root-run-completions"
+"""Additive agent-wire capability announced in the ready frame.
+
+A root agent that announces it emits the ``agent/run/completed`` id-less
+notification at each background child run's settle moment and serves the
+``agent/runs/completed/read`` recovery ledger, so the coordinator can tell the
+parent model a run finished and wake it. A peer that does not announce it never
+has the completion sink bound and never wakes a parent from a snapshot it
+cannot vouch for -- the ordinary tool response stays the only completion path.
+"""
+
+AGENT_WIRE_CAPABILITY_LIVE_CHILD_AUTHORITY = "live-child-authority"
+"""Additive agent-wire capability announced in the ready frame.
+
+A process that announces it takes part in live child authority: the owner
+serves the typed ``agent/authority/check`` decision per invocation from its
+CURRENT policy and emits ``agent/authority/changed`` when that policy moves,
+and a child asks its immediate parent instead of deciding from a spawn-time
+snapshot. The capability is MANDATORY on both ends of a process child: a peer
+that does not announce it is a version skew, and child publication is refused
+rather than silently downgraded to the static inherited policy (F11).
+"""
+
+ADVERTISED_CAPABILITIES = frozenset({
+    AGENT_WIRE_CAPABILITY_PLAN_HANDOFF_ROTATION,
+    AGENT_WIRE_CAPABILITY_RECOVERY_EVIDENCE,
+    AGENT_WIRE_CAPABILITY_LIVE_AGENT_INVENTORY,
+    AGENT_WIRE_CAPABILITY_ROOT_AGENTS_UPDATE,
+    AGENT_WIRE_CAPABILITY_ROOT_RUN_COMPLETIONS,
+    AGENT_WIRE_CAPABILITY_LIVE_CHILD_AUTHORITY,
+})
+"""The capability set this installation announces in its ready frame."""
 
 BOOTSTRAP_ENV_VAR = "CHARTREUX_PROCESS_BOOTSTRAP"
 
@@ -97,7 +175,8 @@ class ProtocolVersionMismatchError(ProcessBootstrapError):
     def __init__(self, *, expected: int, received: int) -> None:
         super().__init__(
             "process protocol version mismatch: "
-            f"expected {expected}, child announced {received}"
+            f"expected {expected}, child announced {received}; "
+            "restart both ends on the same chartreux version — no traffic was sent"
         )
         self.expected = expected
         self.received = received
@@ -131,6 +210,8 @@ class ProcessTreeClosingError(ProcessBootstrapError):
 @dataclass(frozen=True, slots=True)
 class ReadyFrame:
     protocol_version: int
+    capabilities: frozenset[str] = frozenset()
+    """The additive capabilities the child announced; empty for an older peer."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -433,28 +514,48 @@ class ProcessTreeShutdown:
             await self._sleep(min(PROCESS_POLL_INTERVAL, remaining))
 
 
-def encode_ready_frame(protocol_version: int = PROCESS_PROTOCOL_VERSION) -> bytes:
-    """Encode the single framed announcement the child writes before traffic."""
+def encode_ready_frame(
+    protocol_version: int = PROCESS_PROTOCOL_VERSION,
+    *,
+    capabilities: object = ADVERTISED_CAPABILITIES,
+) -> bytes:
+    """Encode the single framed announcement the child writes before traffic.
+
+    The frame also advertises the additive capabilities this installation
+    carries, so the parent can tell a same-version peer that lacks one from a
+    peer that has it.
+    """
     if isinstance(protocol_version, bool) or not isinstance(protocol_version, int):
         raise ValueError("protocol_version must be a positive integer")
     if protocol_version < 1:
         raise ValueError("protocol_version must be a positive integer")
-    frame = {_READY_KEY: _READY_VALUE, "protocolVersion": protocol_version}
+    frame = {
+        _READY_KEY: _READY_VALUE,
+        "protocolVersion": protocol_version,
+        "capabilities": sorted(_validated_capabilities(capabilities)),
+    }
     return json.dumps(frame, separators=(",", ":")).encode() + b"\n"
 
 
 def write_ready_frame(
-    writer: BinaryLineWriter, *, protocol_version: int = PROCESS_PROTOCOL_VERSION
+    writer: BinaryLineWriter,
+    *,
+    protocol_version: int = PROCESS_PROTOCOL_VERSION,
+    capabilities: object = ADVERTISED_CAPABILITIES,
 ) -> None:
     """Announce readiness on the child's pipe before any JSON-RPC traffic."""
-    writer.write(encode_ready_frame(protocol_version))
+    writer.write(encode_ready_frame(protocol_version, capabilities=capabilities))
     writer.flush()
 
 
 def parse_ready_frame(
     raw: bytes | str, *, expected_protocol_version: int = PROCESS_PROTOCOL_VERSION
 ) -> ReadyFrame:
-    """Validate a child's first frame against this installation's version."""
+    """Validate a child's first frame against this installation's version.
+
+    A frame that carries no ``capabilities`` member is an older same-version
+    peer and parses with an empty set; a malformed member fails typed.
+    """
     try:
         value: Any = json.loads(raw)
     except (json.JSONDecodeError, UnicodeDecodeError) as exc:
@@ -470,7 +571,17 @@ def parse_ready_frame(
         raise ProtocolVersionMismatchError(
             expected=expected_protocol_version, received=version
         )
-    return ReadyFrame(protocol_version=version)
+    announced = value.get("capabilities")
+    if announced is None:
+        capabilities: frozenset[str] = frozenset()
+    else:
+        try:
+            capabilities = _validated_capabilities(announced)
+        except ValueError as exc:
+            raise ReadyFrameMissingError(
+                "child sent a malformed readiness frame"
+            ) from exc
+    return ReadyFrame(protocol_version=version, capabilities=capabilities)
 
 
 def bootstrap_requested(environ: Mapping[str, str] | None = None) -> bool:
@@ -489,6 +600,7 @@ async def spawn_process(
     env: Mapping[str, str] | None = None,
     cwd: str | os.PathLike[str] | None = None,
     budget: ProcessTreeBudget | None = None,
+    ledger: SpawnLedgerBinding | None = None,
 ) -> SpawnedProcess:
     """Spawn ``command`` and wait for its single readiness frame.
 
@@ -496,6 +608,15 @@ async def spawn_process(
     exhausted cap is the typed denial rather than a started-then-killed
     child. The slot returns to the budget when the handshake fails and again
     when the returned handle retires.
+
+    With a ``ledger`` binding (else the ambient one) the worker process is
+    registered RECORD-BEFORE-SPAWN in the invoking context's allocation
+    ledger: the worker is NOT setsid'd — it inherits the session's process
+    group and is registered by its spawner like any other spawn. The intent
+    is appended before the fork (a typed refusal propagates pre-fork when the
+    ledger cannot record it), a failed Popen retracts it, and a successful
+    spawn completes it with the child's full identity tuple captured
+    synchronously in the spawn frame.
     """
     if not command:
         raise ValueError("command must not be empty")
@@ -503,6 +624,10 @@ async def spawn_process(
     slot = budget.reserve() if budget is not None else None
     child_env = dict(os.environ if env is None else env)
     child_env[BOOTSTRAP_ENV_VAR] = "1"
+    binding = ledger if ledger is not None else ambient_binding()
+    handle = None
+    if binding is not None:
+        handle = binding.begin_spawn(is_leader_group=False)
     try:
         process = subprocess.Popen(
             list(command),
@@ -512,8 +637,14 @@ async def spawn_process(
             cwd=cwd,
         )
     except BaseException:
+        if binding is not None and handle is not None:
+            binding.retract_spawn(handle)
         _release_slot(budget, slot)
         raise
+    if binding is not None and handle is not None:
+        # In-frame capture: no yield between the Popen and this append, so a
+        # fast-exiting child is never left uncompleted.
+        binding.complete_spawn(handle, process.pid, process_identity_tuple(process.pid))
     if budget is not None and slot is not None:
         budget.attach(slot, process)
     reader = process.stdout
@@ -590,3 +721,15 @@ def _validated_timeout(value: float) -> float:
     if not valid:
         raise ValueError("ready_timeout must be a finite positive number")
     return value
+
+
+def _validated_capabilities(capabilities: object) -> frozenset[str]:
+    """Normalize one announced capability set, refusing anything malformed."""
+    if isinstance(capabilities, str | Mapping) or not isinstance(
+        capabilities, Collection
+    ):
+        raise ValueError("capabilities must be a collection of names")
+    names = frozenset(capabilities)
+    if any(not isinstance(name, str) or not name for name in names):
+        raise ValueError("capabilities must be non-empty strings")
+    return names

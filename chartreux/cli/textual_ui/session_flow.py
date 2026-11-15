@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import os
 from typing import TYPE_CHECKING, Any
 
 from textual.widget import Widget
@@ -14,7 +15,18 @@ from chartreux.app_server.models import (
     PublicSession,
     UserQuestionResult,
 )
-from chartreux.app_server.protocol import AppServerResponseError, ProtocolErrorCode
+from chartreux.app_server.protocol import (
+    AppServerResponseError,
+    ProtocolError,
+    ProtocolErrorCode,
+)
+from chartreux.app_server.transport import (
+    IN_PROCESS_TRANSPORT,
+    STDIO_TRANSPORT,
+    TRANSPORT_ENV_VAR,
+    TransportSelectionError,
+    parse_transport_selector,
+)
 from chartreux.cli.textual_ui.bottom_panel import BottomApp
 from chartreux.cli.textual_ui.widgets.branch_created_message import BranchCreatedMessage
 from chartreux.cli.textual_ui.widgets.entry_expansion import EntryExpansionState
@@ -81,6 +93,50 @@ class _PickerState:
         self.previewing = False
         self.preview_session_id = None
         return was_previewing
+
+
+def _active_transport() -> str:
+    """The transport this run resolved, read from the selector the CLI published.
+
+    The CLI resolves and publishes the selector before the harness is built, so
+    reading it here reports the route the session actually takes instead of a
+    second resolution that could disagree with it. An unset selector is the
+    in-process route, exactly as the resolution treats it.
+    """
+    raw = os.environ.get(TRANSPORT_ENV_VAR, "")
+    if not raw.strip():
+        return IN_PROCESS_TRANSPORT
+    try:
+        return parse_transport_selector(raw)
+    except TransportSelectionError:
+        return IN_PROCESS_TRANSPORT
+
+
+def _stdio_refusal(operation: str) -> str | None:
+    """The disabled-affordance message, or ``None`` when this route carries it.
+
+    The stdio route refuses the wire-deferred session operations (fork, the
+    rewind pair, relocate), so the affordance names the route that does carry
+    them rather than letting the transcript binding fail with a wire
+    diagnostic. An in-process run keeps the operation and never renders this.
+    """
+    if _active_transport() != STDIO_TRANSPORT:
+        return None
+    return (
+        f"{operation} is not carried over the stdio transport. Restart with "
+        f"{TRANSPORT_ENV_VAR}={IN_PROCESS_TRANSPORT} to use it."
+    )
+
+
+def _refusal_notice(operation: str, error: ProtocolError) -> str:
+    """The next step a typed refusal names, worded for this run's transport.
+
+    Only a NOT_IMPLEMENTED refusal is an uncarried operation; every other code
+    is a failure of an operation this route does carry and keeps its own text.
+    """
+    if error.code is ProtocolErrorCode.NOT_IMPLEMENTED:
+        return _stdio_refusal(operation) or error.message
+    return error.message
 
 
 class SessionFlowController:  # noqa: PLR0904 - the app's flow surface, one method per flow step
@@ -873,6 +929,12 @@ class SessionFlowController:  # noqa: PLR0904 - the app's flow surface, one meth
         )
 
     async def branch_session(self, cmd_args: str = "", **kwargs: Any) -> None:
+        if (refusal := _stdio_refusal("Branching a session")) is not None:
+            await self._app._mount_and_scroll(
+                ErrorMessage(refusal, collapsed=self._app._tools_collapsed)
+            )
+            return
+
         old_session_id = self._app.app_server.session_id
         try:
             response = await self._app.app_server.resources.sessions.fork(
@@ -918,6 +980,9 @@ class SessionFlowController:  # noqa: PLR0904 - the app's flow surface, one meth
             return
 
         if not self.rewind_mode:
+            if (refusal := _stdio_refusal("Rewinding a session")) is not None:
+                self._app.notify(refusal, severity="warning")
+                return
             self.rewind_mode = True
             target = user_widgets[-1]
         elif self.rewind_highlighted_widget is not None:
@@ -1076,7 +1141,9 @@ class SessionFlowController:  # noqa: PLR0904 - the app's flow surface, one meth
             # The rewind rewrote the history the thinking estimate depends on.
             self._app._refresh_banner()
         except AppServerResponseError as exc:
-            self._app.notify(exc.error.message, severity="error")
+            self._app.notify(
+                _refusal_notice("Rewinding a session", exc.error), severity="error"
+            )
             return
 
         message_content = result.message

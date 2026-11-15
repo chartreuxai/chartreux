@@ -289,6 +289,55 @@ class TestDefaultWithheldSets:
         assert root.child_catalog_withholdings() == frozenset()
         assert _spec_names(root) == set(root.registered_tools)
 
+    def test_a_process_child_is_bounded_without_an_ancestor(
+        self, tmp_path: Path
+    ) -> None:
+        """G5b: a live authority client is what bounds a process child.
+
+        A process child has no in-process ancestor at all, so the old reading
+        -- a ``None`` parent authority means a root -- would advertise it the
+        whole catalog. The live client is the bound: the loop-level rule
+        applies, and the owner's verdict withholds a name it did not allow.
+        """
+
+        class _Owner:
+            def __init__(self, withhold: set[str], *, broken: bool = False) -> None:
+                self._withhold = withhold
+                self._broken = broken
+
+            def catalog_withholds(self, tool_name: str) -> bool:
+                if self._broken:
+                    raise RuntimeError("the catalog cache is unreadable")
+                return tool_name in self._withhold
+
+        def bounded(owner: Any) -> ToolManager:
+            return ToolManager(
+                lambda: _config(),
+                cwd=tmp_path,
+                defer_mcp=True,
+                accepted_token_getter=lambda: "accepted",
+                bound_identity="coder",
+                scratchpad_dir=tmp_path,
+                harness_files=HarnessFilesManager(sources=(), cwd=tmp_path),
+                live_authority_getter=lambda: owner,
+            )
+
+        child = bounded(_Owner({"read_file"}))
+        assert child._parent_authority_getter is None
+        withheld = child.child_catalog_withholdings()
+        assert "read_file" in withheld
+        assert LOOP_LEVEL_NAMES <= withheld
+        assert "read_file" not in _spec_names(child)
+
+        # An unreadable verdict withholds: the narrow surface never advertises
+        # a definition the owner could not vouch for.
+        broken = bounded(_Owner(set(), broken=True))
+        assert "bash" in broken.child_catalog_withholdings()
+        # And a manager with neither an ancestor nor a client is a root.
+        assert _manager(
+            tmp_path, lambda: _config(), "coder"
+        ).child_catalog_withholdings() == (frozenset())
+
     @pytest.mark.timeout(24)
     def test_every_unlisted_tool_is_invocation_possible(self, tmp_path: Path) -> None:
         """AFFIRMATION: not-withheld ⇒ invocable under the default deployment."""

@@ -18,9 +18,11 @@ Covers the three WP3 surfaces:
 from __future__ import annotations
 
 import asyncio
+from collections.abc import AsyncGenerator
 import importlib
 from pathlib import Path
 import re
+from types import SimpleNamespace
 from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock
 
@@ -45,6 +47,9 @@ from chartreux.app_server.models import (
     PublicSessionState,
     TextContentBlock,
 )
+from chartreux.app_server.process_bootstrap import (
+    AGENT_WIRE_CAPABILITY_LIVE_CHILD_AUTHORITY,
+)
 from chartreux.app_server.protocol import (
     SERVER_METHODS,
     AgentsReleaseParams,
@@ -53,18 +58,28 @@ from chartreux.app_server.protocol import (
     ProtocolErrorCode,
     ReleaseOutcome,
 )
+from chartreux.app_server.root_agent import AgentChildHost
 from chartreux.app_server.session import AppServerSession
+from chartreux.app_server.subagent_ports import (
+    TURN_OUTCOME_COMPLETED,
+    SubagentCompletion,
+)
 from chartreux.app_server.transport import memory_transport_pair
 from chartreux.core.agent_loop import AgentLoop
 from chartreux.core.agent_loop.errors import EmptyLLMResponseError
 from chartreux.core.config.harness_files import HarnessFilesManager
+from chartreux.core.config.models import SessionLoggingConfig
+from chartreux.core.events import AssistantEvent
 from chartreux.core.llm_models import LLMMessage, Role
 from chartreux.core.message_list import MessageList
 from chartreux.core.recovery_models import RecoveryEligibility
+from chartreux.core.session_types import CommittedModelIdentity
 from chartreux.core.subagents import (
     AgentAvailability,
     AgentIdentityMismatchError,
     AgentSummary,
+    CancelOutcome,
+    CancelResult,
     EffectVerification,
     ReconcileOutcome,
     ReconcileResult,
@@ -73,13 +88,45 @@ from chartreux.core.subagents import (
     ResumeOutcome,
     RunStatus,
     RunStopReason,
+    SubagentManagementPort,
     TaskArgs,
     TaskResult,
     UnknownAgentError,
     WaitStatus,
     derive_agent_name,
+    still_running_guidance,
 )
-from chartreux.core.tools.base import BaseToolState, InvokeContext
+from chartreux.core.tools.base import BaseToolState, InvokeContext, ToolError
+from chartreux.core.tools.builtins.cancel_agent import (
+    CancelAgent,
+    CancelAgentArgs,
+    CancelAgentConfig,
+)
+from chartreux.core.tools.builtins.check_agents import (
+    CheckAgents,
+    CheckAgentsArgs,
+    CheckAgentsConfig,
+)
+from chartreux.core.tools.builtins.get_agent_result import (
+    GetAgentResult,
+    GetAgentResultArgs,
+    GetAgentResultConfig,
+)
+from chartreux.core.tools.builtins.reconcile_result import (
+    ReconcileResult as ReconcileResultTool,
+    ReconcileResultArgs,
+    ReconcileResultConfig,
+)
+from chartreux.core.tools.builtins.release_agent import (
+    ReleaseAgent,
+    ReleaseAgentArgs,
+    ReleaseAgentConfig,
+)
+from chartreux.core.tools.builtins.resume_agent import (
+    ResumeAgent,
+    ResumeAgentArgs,
+    ResumeAgentConfig,
+)
 from chartreux.core.tools.builtins.wait_for_agent import (
     DEFAULT_WAIT_TIMEOUT_SECONDS,
     WaitForAgent,
@@ -98,7 +145,7 @@ from tests.app_server._subagent_test_support import (
     _tombstone,
     _wait_result,
 )
-from tests.conftest import build_test_agent_loop
+from tests.conftest import build_test_agent_loop, build_test_vibe_config
 from tests.mock.utils import collect_result, mock_llm_chunk
 from tests.stubs.app_server import (
     attach_test_app_server_session,
@@ -477,7 +524,7 @@ async def test_launch_acknowledgment_carries_name_alongside_handle_and_run(
         assert launch.name == expected_name
         assert launch.response.startswith(
             f"Background agent {expected_name} "
-            f"({launch.agent_id}, run {launch.run_id}) launched and running;"
+            f"({launch.agent_id}, run {launch.run_id}) launched and running. "
         )
         summary = (await registry.check_agents())[0]
         assert summary.name == expected_name
@@ -1369,11 +1416,13 @@ async def test_wait_returns_still_running_without_cancelling_the_run() -> None:
     assert disposition.elapsed_seconds >= 0
     assert disposition.turns_used == 0
     guidance = disposition.guidance or ""
-    # Turn-yield guidance: end the turn now, re-invoke in a later turn.
+    # Turn-yield guidance: end the turn now and prefer notification-based
+    # collection; a same-turn re-wait is prohibited, and any later re-wait is
+    # conditional.
     assert "End your turn" in guidance
-    assert "in a later turn" in guidance
+    assert "In a later turn, re-wait only if" in guidance
+    assert "Never re-invoke wait_for_agent in the same turn." in guidance
     assert "check_agents" in guidance
-    assert "same turn" not in guidance.lower()
     assert "immediately" not in guidance.lower()
     # The timeout never cancels the run.
     assert not run.completion_task.cancelled()
@@ -1607,6 +1656,873 @@ async def test_wait_tool_serializes_still_running_as_a_normal_result() -> None:
 
 
 # ---------------------------------------------------------------------------
+# The process-backed root answers the management-surface cast (F6/E1)
+# ---------------------------------------------------------------------------
+
+
+class _RecordingSpawnAdapter:
+    """Records the spawn spec a process-root publish sends (F6/E1 tests)."""
+
+    agent_id = "recorded"
+
+    def __init__(self) -> None:
+        self.specs: list[Any] = []
+
+    async def spawn(self, spec: Any) -> Any:
+        self.specs.append(spec)
+        return SimpleNamespace(
+            agent_id=spec.agent_id,
+            session_id="child-session-1",
+            child_session_dir=None,
+            close=self._close,
+        )
+
+    async def _close(self) -> None:
+        return None
+
+
+def _process_root(tmp_path: Path) -> AgentLoop:
+    """The loop shape a process-owned root actually opens (F6/E1 tests)."""
+    return build_test_agent_loop(
+        config=build_test_vibe_config(
+            session_logging=SessionLoggingConfig(
+                enabled=True,
+                save_dir=str(tmp_path / "sessions"),
+                session_prefix="session",
+            )
+        ),
+        backend=FakeBackend([[mock_llm_chunk(content="ack")]]),
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(60)
+async def test_a_process_root_runner_satisfies_the_full_management_port(
+    tmp_path: Path,
+) -> None:
+    """Every arm of ``SubagentManagementPort`` answers on a process root.
+
+    The loop casts the turn's subagent runner to ``SubagentManagementPort``;
+    a process-owned root supplies ``AgentChildRunner``, which on the pre-F7
+    base answered only ``run`` and ``check_agents`` (F6), so the remaining
+    six control-plane arms raised ``AttributeError`` on a process root (the
+    P1 blocker). The pin walks all seven arms through the cast: on a pre-F7
+    base the first missing one fails with exactly
+    ``AttributeError: 'AgentChildRunner' object has no attribute 'cancel_run'``.
+    """
+    loop = _process_root(tmp_path)
+    host = AgentChildHost(loop, spawn=_RecordingSpawnAdapter())
+    manager = cast(SubagentManagementPort, host.runner)
+    try:
+        assert await manager.check_agents() == []
+        stop = await manager.cancel_run(
+            "agent-9",
+            reason=RunStopReason.ORCHESTRATOR_CANCELLED,
+            requester_session_id="session-1",
+        )
+        assert stop == CancelResult(outcome=CancelOutcome.UNKNOWN_RUN, run_id=None)
+        with pytest.raises(UnknownAgentError):
+            await manager.release_agent("agent-9")
+        resumed = await manager.resume_agent(
+            "agent-9", "run-1", "agent-9:run-1", requester_session_id="session-1"
+        )
+        assert resumed.outcome is ResumeOutcome.NOT_RESUMABLE
+        assert resumed.reason_codes == ["not_suspended"]
+        reconciled = await manager.reconcile_result(
+            "agent-9", "run-1", "boundary-1", [], requester_session_id="session-1"
+        )
+        assert reconciled.outcome is ReconcileOutcome.NOT_PENDING
+        assert reconciled.reason_codes == ["no_reconcile_barrier"]
+        with pytest.raises(UnknownAgentError):
+            await manager.get_agent_result("agent-9")
+        with pytest.raises(UnknownAgentError):
+            await manager.wait_for_agent("agent-9")
+    finally:
+        await host.close()
+        await loop.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(60)
+async def test_check_agents_through_a_process_root_projects_the_host_inventory(
+    tmp_path: Path,
+) -> None:
+    """CheckAgents with a process-root runner returns the host projection.
+
+    Driven with the real tool: an empty host inventory answers no summaries,
+    and one retained handle answers exactly one summary -- the same handle
+    the wire inventory read projects -- carrying its agent id, canonical
+    identity, derived display name and idle availability. The unrepresentable
+    process-backed fields stay unset rather than fabricated.
+    """
+    loop = _process_root(tmp_path)
+    port = _RecordingSpawnAdapter()
+    host = AgentChildHost(loop, spawn=port)
+    tool = CheckAgents(config_getter=lambda: CheckAgentsConfig(), state=BaseToolState())
+    try:
+        empty = await collect_result(
+            tool.run(
+                CheckAgentsArgs(),
+                InvokeContext(
+                    tool_call_id="check-1",
+                    subagent_manager=cast(SubagentManagementPort, host.runner),
+                ),
+            )
+        )
+        assert empty.agents == []
+
+        handle = await host.publish(
+            TaskArgs(task="Inspect the project", identity="coder", retain=True),
+            InvokeContext(tool_call_id="task-1", session_id=loop.session_id),
+            attempt_id="attempt-check-agents-1",
+            retained=True,
+        )
+        one = await collect_result(
+            tool.run(
+                CheckAgentsArgs(),
+                InvokeContext(
+                    tool_call_id="check-2",
+                    subagent_manager=cast(SubagentManagementPort, host.runner),
+                ),
+            )
+        )
+        # Both projections are captured before the teardown so the close that
+        # reaps the retained handle cannot mask the inventory read's shape.
+        wire_agent_ids = [row.agent_id for row in host.inventory_snapshot().agents]
+    finally:
+        await host.close()
+        await loop.aclose()
+
+    assert [summary.agent_id for summary in one.agents] == [handle.agent_id]
+    summary = one.agents[0]
+    assert summary.availability is AgentAvailability.IDLE
+    assert summary.current_run_id is None
+    assert summary.current_run_status is None
+    assert summary.latest_run_id is None
+    assert summary.turns_used is None
+    assert summary.identity == handle.identity
+    # G2: the name is the stable per-root display sequence, never the
+    # handle-derived identity-uuid name (``coder-coder-attempt-...``).
+    assert summary.name == "coder-1"
+    # The tool result and the wire inventory read agree: one handle, one row.
+    assert wire_agent_ids == [handle.agent_id]
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(60)
+async def test_process_topology_names_are_stable_identity_sequences(
+    tmp_path: Path,
+) -> None:
+    """G2: a process-host child is named ``{identity}-{sequence}``.
+
+    The process-path agent_id is the wire handle -- identity plus the attempt
+    uuid -- so deriving the display name from it re-prefixed the identity and
+    printed the uuid (``researcher-researcher-attempt-<hex>``) on every
+    process-topology surface. The host mints a stable per-root sequence at
+    publication instead: two children of one identity stay distinguishable, a
+    different identity keeps its own prefix, and the name never carries the
+    attempt id. The agent_id -- the only programmatic handle -- is untouched,
+    and the in-process derivation pins above stay the source of truth for the
+    registry path's ``{identity}-{model}-{number}`` name.
+    """
+    loop = _process_root(tmp_path)
+    port = _RecordingSpawnAdapter()
+    host = AgentChildHost(loop, spawn=port)
+    try:
+        first = await host.publish(
+            TaskArgs(task="Inspect A", identity="researcher"),
+            InvokeContext(tool_call_id="task-a", session_id=loop.session_id),
+            attempt_id="attempt-a",
+            retained=True,
+        )
+        second = await host.publish(
+            TaskArgs(task="Inspect B", identity="researcher"),
+            InvokeContext(tool_call_id="task-b", session_id=loop.session_id),
+            attempt_id="attempt-b",
+            retained=True,
+        )
+        third = await host.publish(
+            TaskArgs(task="Inspect C", identity="coder"),
+            InvokeContext(tool_call_id="task-c", session_id=loop.session_id),
+            attempt_id="attempt-c",
+            retained=True,
+        )
+        rows = host.inventory_snapshot().agents
+        names = [row.name for row in rows]
+        summaries = await host.check_agents()
+        recorded_attempt = host.attempt("attempt-b")
+    finally:
+        await host.close()
+        await loop.aclose()
+
+    assert names == ["researcher-1", "researcher-2", "coder-3"]
+    assert [summary.name for summary in summaries] == names
+    assert all("attempt" not in name for name in names)
+    # The wire handle keeps its minted shape and stays the resolution key.
+    assert first.agent_id == "researcher-attempt-a"
+    assert second.agent_id == "researcher-attempt-b"
+    assert third.agent_id == "coder-attempt-c"
+    assert [row.agent_id for row in rows] == [
+        first.agent_id,
+        second.agent_id,
+        third.agent_id,
+    ]
+    assert recorded_attempt is second
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(60)
+async def test_process_name_survives_a_re_task_and_the_terminal_row(
+    tmp_path: Path,
+) -> None:
+    """G2: the display sequence is minted once and never renumbered.
+
+    A retained continuation is the same instance, so its re-task keeps the
+    name its publication minted; a non-retained child's closed row keeps that
+    name too, while its result stays keyed by the untouched ``(agent_id,
+    run_id)`` pair.
+    """
+    loop = _process_root(tmp_path)
+    source = _BlockingSource()
+    host = AgentChildHost(
+        loop, spawn=_ScriptingSpawnAdapter(_ScriptedSource([]), source)
+    )
+    try:
+        retained = await host.publish(
+            TaskArgs(task="Resident work", identity="researcher"),
+            InvokeContext(tool_call_id="task-1", session_id=loop.session_id),
+            attempt_id="attempt-resident",
+            retained=True,
+        )
+        before = {row.agent_id: row.name for row in host.inventory_snapshot().agents}
+        reused = await host.publish(
+            TaskArgs(
+                task="Continue", identity="researcher", agent_id=retained.agent_id
+            ),
+            InvokeContext(tool_call_id="task-2", session_id=loop.session_id),
+            attempt_id="attempt-continue",
+            retained=True,
+            reuse=retained,
+        )
+        after_reuse = {
+            row.agent_id: row.name for row in host.inventory_snapshot().agents
+        }
+        assert reused is retained
+
+        second = await host.publish(
+            TaskArgs(task="Transient work", identity="researcher"),
+            InvokeContext(tool_call_id="task-3", session_id=loop.session_id),
+            attempt_id="attempt-transient",
+            retained=False,
+        )
+        host.admit_background(
+            second,
+            TaskArgs(task="Transient work", identity="researcher"),
+            InvokeContext(tool_call_id="task-3", session_id=loop.session_id),
+        )
+        running = {row.agent_id: row.name for row in host.inventory_snapshot().agents}
+        source.complete([
+            AssistantEvent(content="done"),
+            SubagentCompletion(outcome=TURN_OUTCOME_COMPLETED),
+        ])
+        assert second.task is not None
+        await asyncio.gather(second.task, return_exceptions=True)
+        closed_rows = {row.agent_id: row for row in host.inventory_snapshot().agents}
+        closed = closed_rows[second.agent_id]
+        result = await host.get_agent_result(second.agent_id, second.run_id)
+    finally:
+        await host.close()
+        await loop.aclose()
+
+    assert before[retained.agent_id] == "researcher-1"
+    assert after_reuse[retained.agent_id] == "researcher-1"
+    assert running[second.agent_id] == "researcher-2"
+    assert closed.name == "researcher-2"
+    assert closed.availability == AgentAvailability.CLOSED.value
+    assert result is not None
+    assert result.agent_id == second.agent_id
+    assert result.run_id == second.run_id
+
+
+# ---------------------------------------------------------------------------
+# The process-backed runner delegates every remaining port arm (F7/P1)
+# ---------------------------------------------------------------------------
+
+
+async def _close_spawned() -> None:
+    return None
+
+
+class _ScriptedSource:
+    """One scripted completion source: yields its frames, then ends."""
+
+    def __init__(self, frames: list[Any]) -> None:
+        self._frames = frames
+
+    def stream(self, request: Any) -> Any:
+        return self._iter(request)
+
+    async def _iter(self, request: Any) -> AsyncGenerator[Any, None]:
+        for frame in self._frames:
+            yield frame
+
+
+class _BlockingSource:
+    """One completion source whose run blocks until its frames are posted."""
+
+    def __init__(self) -> None:
+        self._release = asyncio.Event()
+        self._frames: list[Any] = []
+
+    def complete(self, frames: list[Any]) -> None:
+        self._frames = frames
+        self._release.set()
+
+    def stream(self, request: Any) -> Any:
+        return self._iter(request)
+
+    async def _iter(self, request: Any) -> AsyncGenerator[Any, None]:
+        await self._release.wait()
+        for frame in self._frames:
+            yield frame
+
+
+class _SnapshottingWireClient:
+    """A spawned child's wire client answering its own session snapshot (G3).
+
+    The host reads the model and the context from the CHILD, so the pin gives
+    it exactly what the child's projection would answer and nothing else.
+    """
+
+    def __init__(
+        self, committed: Any, *, context_tokens: int, context_window: int | None
+    ) -> None:
+        self._committed = committed
+        self._context_tokens = context_tokens
+        self._context_window = context_window
+        # G5: a process child is published only when its ready frame announced
+        # the mandatory live-child-authority capability.
+        self.advertised_capabilities = frozenset({
+            AGENT_WIRE_CAPABILITY_LIVE_CHILD_AUTHORITY
+        })
+
+    async def snapshot(self, *, include_history: bool = True) -> Any:
+        assert include_history is False
+        return SimpleNamespace(
+            committed_model=self._committed,
+            state=SimpleNamespace(session=SimpleNamespace(model=None)),
+            runtime=SimpleNamespace(
+                stats=SimpleNamespace(context_tokens=self._context_tokens),
+                context_window=self._context_window,
+            ),
+        )
+
+
+class _ScriptingSpawnAdapter:
+    """The spawn adapter the F7 pins drive scripted runs through.
+
+    Each spawn consumes the next queued completion source, so one pin can
+    publish a blocking background child and then a scripted foreground
+    one against the same host.
+    """
+
+    agent_id = "recorded"
+
+    def __init__(self, *sources: Any, client: Any = None) -> None:
+        self._sources = list(sources)
+        self._client = client
+        self.specs: list[Any] = []
+
+    async def spawn(self, spec: Any) -> Any:
+        self.specs.append(spec)
+        return SimpleNamespace(
+            agent_id=spec.agent_id,
+            session_id="child-session-1",
+            child_session_dir=None,
+            completion_source=(
+                self._sources.pop(0) if self._sources else _ScriptedSource([])
+            ),
+            wire_client=self._client,
+            close=_close_spawned,
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(60)
+async def test_cancel_agent_through_a_process_root_stops_a_running_run(
+    tmp_path: Path,
+) -> None:
+    """Driven CancelAgent through a process-root runner stops the run in place.
+
+    The tool's manager cast reaches the runner's delegating arm; the host
+    pins the stop to the run the handle recorded, so the disposition answers
+    STOP_REQUESTED with the run id and the tool's ORCHESTRATOR_CANCELLED stop
+    reason, a stale run id answers UNKNOWN_RUN, and the interrupted run keeps
+    its partial result so a repeat answers ALREADY_FINISHING instead of a
+    second stop request.
+    """
+    loop = _process_root(tmp_path)
+    host = AgentChildHost(loop, spawn=_ScriptingSpawnAdapter(_BlockingSource()))
+    tool = CancelAgent(config_getter=lambda: CancelAgentConfig(), state=BaseToolState())
+    args = TaskArgs(task="Slow inspection", identity="coder", retain=True)
+    ctx = InvokeContext(tool_call_id="task-1", session_id=loop.session_id)
+    try:
+        handle = await host.publish(
+            args, ctx, attempt_id="attempt-cancel-1", retained=True
+        )
+        ack = host.admit_background(handle, args, ctx)
+        # One tick so the background run actually starts and blocks on its
+        # source: a cancel that lands before the task's first step wins the
+        # race and the cancellation discards no run bookkeeping at all.
+        await asyncio.sleep(0.05)
+        assert handle.task is not None
+
+        def drive(run_id: str | None) -> Any:
+            return collect_result(
+                tool.run(
+                    CancelAgentArgs(agent_id=handle.agent_id, run_id=run_id),
+                    InvokeContext(
+                        tool_call_id=f"cancel-{run_id}",
+                        session_id=loop.session_id,
+                        subagent_manager=cast(SubagentManagementPort, host.runner),
+                    ),
+                )
+            )
+
+        stop = await drive(None)
+        stale = await drive("run-never")
+        await asyncio.gather(handle.task, return_exceptions=True)
+        settled = await drive(None)
+    finally:
+        await host.close()
+        await loop.aclose()
+
+    assert stop.outcome is CancelOutcome.STOP_REQUESTED
+    assert stop.run_id == ack.run_id
+    assert stop.stop_reason is RunStopReason.ORCHESTRATOR_CANCELLED
+    assert handle.requested_stop_reason is RunStopReason.ORCHESTRATOR_CANCELLED
+    assert stale.outcome is CancelOutcome.UNKNOWN_RUN
+    assert stale.run_id == "run-never"
+    assert handle.result is not None
+    assert handle.result.run_id == ack.run_id
+    assert settled.outcome is CancelOutcome.ALREADY_FINISHING
+    assert settled.stop_reason is RunStopReason.ORCHESTRATOR_CANCELLED
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(60)
+async def test_release_agent_through_a_process_root_reaps_the_handle(
+    tmp_path: Path,
+) -> None:
+    """Driven ReleaseAgent through a process-root runner reaps the child.
+
+    The unguarded release removes the retained handle outright, so the wire
+    inventory reads empty afterwards and a repeat release answers the typed
+    no-such-agent tool error instead of a second release.
+    """
+    loop = _process_root(tmp_path)
+    host = AgentChildHost(loop, spawn=_ScriptingSpawnAdapter())
+    tool = ReleaseAgent(
+        config_getter=lambda: ReleaseAgentConfig(), state=BaseToolState()
+    )
+    try:
+        handle = await host.publish(
+            TaskArgs(task="Idle inspection", identity="coder", retain=True),
+            InvokeContext(tool_call_id="task-1", session_id=loop.session_id),
+            attempt_id="attempt-release-1",
+            retained=True,
+        )
+        released = await collect_result(
+            tool.run(
+                ReleaseAgentArgs(agent_id=handle.agent_id),
+                InvokeContext(
+                    tool_call_id="release-1",
+                    session_id=loop.session_id,
+                    subagent_manager=cast(SubagentManagementPort, host.runner),
+                ),
+            )
+        )
+        inventory_after_release = host.inventory_snapshot().agents
+        with pytest.raises(ToolError) as repeat:
+            await collect_result(
+                tool.run(
+                    ReleaseAgentArgs(agent_id=handle.agent_id),
+                    InvokeContext(
+                        tool_call_id="release-2",
+                        session_id=loop.session_id,
+                        subagent_manager=cast(SubagentManagementPort, host.runner),
+                    ),
+                )
+            )
+    finally:
+        await host.close()
+        await loop.aclose()
+
+    assert released.agent_id == handle.agent_id
+    assert released.message == "Agent released"
+    assert inventory_after_release == []
+    assert "No such agent" in str(repeat.value)
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(60)
+async def test_resume_agent_through_a_process_root_answers_not_resumable(
+    tmp_path: Path,
+) -> None:
+    """Driven ResumeAgent through a process-root runner answers typed.
+
+    The handle's recorded run is set by a real foreground run, so the stale
+    expected-run-id arm is exercised against the host's run pinning: a stale
+    id answers ``stale_expected_run_id`` and the pinned id answers the honest
+    ``not_suspended`` disposition (a process child is never preserved for a
+    warm resume), both through the runner's delegating arm.
+    """
+    loop = _process_root(tmp_path)
+    host = AgentChildHost(
+        loop,
+        spawn=_ScriptingSpawnAdapter(
+            _ScriptedSource([
+                AssistantEvent(content="foreground work"),
+                SubagentCompletion(outcome=TURN_OUTCOME_COMPLETED),
+            ])
+        ),
+    )
+    tool = ResumeAgent(config_getter=lambda: ResumeAgentConfig(), state=BaseToolState())
+    args = TaskArgs(task="Foreground inspection", identity="coder", retain=True)
+    ctx = InvokeContext(tool_call_id="task-1", session_id=loop.session_id)
+    try:
+        handle = await host.publish(
+            args, ctx, attempt_id="attempt-resume-1", retained=True
+        )
+        run = await host.run_child(handle, args, ctx)
+        assert run.run_id is not None
+
+        def drive(expected_run_id: str) -> Any:
+            return collect_result(
+                tool.run(
+                    ResumeAgentArgs(
+                        agent_id=handle.agent_id, expected_run_id=expected_run_id
+                    ),
+                    InvokeContext(
+                        tool_call_id=f"resume-{expected_run_id}",
+                        session_id=loop.session_id,
+                        subagent_manager=cast(SubagentManagementPort, host.runner),
+                    ),
+                )
+            )
+
+        stale = await drive("run-never")
+        pinned = await drive(run.run_id)
+    finally:
+        await host.close()
+        await loop.aclose()
+
+    assert stale.outcome is ResumeOutcome.NOT_RESUMABLE
+    assert stale.reason_codes == ["stale_expected_run_id"]
+    assert pinned.outcome is ResumeOutcome.NOT_RESUMABLE
+    assert pinned.reason_codes == ["not_suspended"]
+    assert pinned.run_id == run.run_id
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(60)
+async def test_reconcile_result_through_a_process_root_answers_not_pending(
+    tmp_path: Path,
+) -> None:
+    """Driven ReconcileResult through a process-root runner answers typed.
+
+    A process-backed child never suspends into a reconcile barrier, so the
+    evidence submission changes nothing and says so: the NOT_PENDING
+    disposition carries the agent, run, boundary and its reason code, and
+    never a fabricated cleared barrier — through the runner's delegating
+    arm.
+    """
+    loop = _process_root(tmp_path)
+    host = AgentChildHost(loop, spawn=_ScriptingSpawnAdapter())
+    tool = ReconcileResultTool(
+        config_getter=lambda: ReconcileResultConfig(), state=BaseToolState()
+    )
+    try:
+        reconciled = await collect_result(
+            tool.run(
+                ReconcileResultArgs(
+                    agent_id="agent-3",
+                    expected_run_id="run-1",
+                    transcript_boundary="boundary-1",
+                    verified_effects=[
+                        EffectVerification(tool_call_id="call-1", disposition="settled")
+                    ],
+                ),
+                InvokeContext(
+                    tool_call_id="reconcile-1",
+                    session_id=loop.session_id,
+                    subagent_manager=cast(SubagentManagementPort, host.runner),
+                ),
+            )
+        )
+    finally:
+        await host.close()
+        await loop.aclose()
+
+    assert reconciled.outcome is ReconcileOutcome.NOT_PENDING
+    assert reconciled.agent_id == "agent-3"
+    assert reconciled.run_id == "run-1"
+    assert reconciled.transcript_boundary == "boundary-1"
+    assert reconciled.reason_codes == ["no_reconcile_barrier"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(60)
+async def test_wait_for_agent_through_a_process_root_returns_both_dispositions(
+    tmp_path: Path,
+) -> None:
+    """Driven WaitForAgent through a process-root runner answers both arms.
+
+    A bounded timeout answers the still_running disposition without
+    cancelling the run (its task stays alive, waiting on its source), and the
+    completed run answers its retained TaskResult once its source posts the
+    terminal frames. The still-running progress carries the run identity,
+    running status and the shared turn-yield guidance.
+    """
+    loop = _process_root(tmp_path)
+    source = _BlockingSource()
+    host = AgentChildHost(loop, spawn=_ScriptingSpawnAdapter(source))
+    tool = WaitForAgent(
+        config_getter=lambda: WaitForAgentConfig(), state=BaseToolState()
+    )
+    args = TaskArgs(task="Slow work", identity="coder", retain=True)
+    ctx = InvokeContext(tool_call_id="task-1", session_id=loop.session_id)
+    try:
+        handle = await host.publish(
+            args, ctx, attempt_id="attempt-wait-1", retained=True
+        )
+        ack = host.admit_background(handle, args, ctx)
+        assert handle.task is not None
+
+        def drive(timeout: float) -> Any:
+            return collect_result(
+                tool.run(
+                    WaitForAgentArgs(agent_id=handle.agent_id, timeout=timeout),
+                    InvokeContext(
+                        tool_call_id=f"wait-{timeout}",
+                        session_id=loop.session_id,
+                        subagent_manager=cast(SubagentManagementPort, host.runner),
+                    ),
+                )
+            )
+
+        first = await drive(0.02)
+        run_task_alive = not handle.task.done()
+        source.complete([
+            AssistantEvent(content="done work"),
+            SubagentCompletion(outcome=TURN_OUTCOME_COMPLETED),
+        ])
+        await asyncio.gather(handle.task, return_exceptions=True)
+        second = await drive(1.0)
+    finally:
+        await host.close()
+        await loop.aclose()
+
+    assert first.status is WaitStatus.STILL_RUNNING
+    assert first.agent_id == handle.agent_id
+    assert first.run_id == ack.run_id
+    assert first.run_status is RunStatus.RUNNING
+    assert first.turns_used == 0
+    assert first.elapsed_seconds is not None
+    assert first.run_id is not None
+    assert first.guidance == still_running_guidance(
+        agent_id=handle.agent_id,
+        run_id=first.run_id,
+        elapsed_seconds=first.elapsed_seconds,
+        run_status=RunStatus.RUNNING,
+        turns_used=0,
+    )
+    assert run_task_alive
+    assert second.status is WaitStatus.COMPLETED
+    assert second.result is not None
+    assert second.result.completed is True
+    assert "done work" in second.result.response
+    assert second.result.run_id == ack.run_id
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(60)
+async def test_get_agent_result_through_a_process_root_pending_then_available(
+    tmp_path: Path,
+) -> None:
+    """Driven GetAgentResult through a process-root runner answers each state.
+
+    A running background run answers the pending fetch (no result, the
+    still-running guidance), the completed run answers its retained
+    TaskResult, and a foreground run — whose result left with its own tool
+    response and is retained nowhere on this host — keeps the typed expired
+    tool error instead of a fabricated copy.
+    """
+    loop = _process_root(tmp_path)
+    background = _BlockingSource()
+    host = AgentChildHost(
+        loop,
+        spawn=_ScriptingSpawnAdapter(
+            background,
+            _ScriptedSource([
+                AssistantEvent(content="foreground work"),
+                SubagentCompletion(outcome=TURN_OUTCOME_COMPLETED),
+            ]),
+        ),
+    )
+    tool = GetAgentResult(
+        config_getter=lambda: GetAgentResultConfig(), state=BaseToolState()
+    )
+    launch_ctx = InvokeContext(tool_call_id="task-1", session_id=loop.session_id)
+
+    def drive(agent_id: str, run_id: str | None) -> Any:
+        return collect_result(
+            tool.run(
+                GetAgentResultArgs(agent_id=agent_id, run_id=run_id),
+                InvokeContext(
+                    tool_call_id=f"get-{agent_id}",
+                    session_id=loop.session_id,
+                    subagent_manager=cast(SubagentManagementPort, host.runner),
+                ),
+            )
+        )
+
+    try:
+        args = TaskArgs(task="Slow work", identity="coder", retain=True)
+        handle = await host.publish(
+            args, launch_ctx, attempt_id="attempt-get-1", retained=True
+        )
+        ack = host.admit_background(handle, args, launch_ctx)
+        assert handle.task is not None
+        pending = await drive(handle.agent_id, None)
+
+        background.complete([
+            AssistantEvent(content="background work"),
+            SubagentCompletion(outcome=TURN_OUTCOME_COMPLETED),
+        ])
+        await asyncio.gather(handle.task, return_exceptions=True)
+        available = await drive(handle.agent_id, ack.run_id)
+
+        foreground_args = TaskArgs(
+            task="Foreground work", identity="coder", retain=True
+        )
+        foreground = await host.publish(
+            foreground_args,
+            InvokeContext(tool_call_id="task-2", session_id=loop.session_id),
+            attempt_id="attempt-get-2",
+            retained=True,
+        )
+        foreground_result = await host.run_child(
+            foreground, foreground_args, launch_ctx
+        )
+        assert foreground_result.run_id is not None
+        with pytest.raises(ToolError) as expired:
+            await drive(foreground.agent_id, foreground_result.run_id)
+    finally:
+        await host.close()
+        await loop.aclose()
+
+    assert pending.result is None
+    assert "still running" in pending.message
+    assert available.result is not None
+    assert available.result.completed is True
+    assert "background work" in available.result.response
+    assert available.result.run_id == ack.run_id
+    assert available.message == "Agent result is available"
+    assert "expired" in str(expired.value)
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(60)
+async def test_a_finished_non_retained_child_projects_a_closed_row_and_result(
+    tmp_path: Path,
+) -> None:
+    """A finished non-retained child stays visible and retrievable (G1a).
+
+    On the pre-G1a base the completion reaped the handle, so CheckAgents
+    reported an empty inventory and GetAgentResult answered the typed unknown
+    error: the run's outcome was lost. The completion now reaps the process
+    but keeps a closed row (availability, last-run status, turns) and the
+    run's exact result, and only an explicit release purges both.
+    """
+    loop = _process_root(tmp_path)
+    host = AgentChildHost(
+        loop,
+        spawn=_ScriptingSpawnAdapter(
+            _ScriptedSource([
+                AssistantEvent(content="background work"),
+                # G3: the closed row's turn count is the child's own carrier
+                # count, so the scripted child reports one logical turn.
+                SubagentCompletion(outcome=TURN_OUTCOME_COMPLETED, turns_used=1),
+            ])
+        ),
+    )
+    launch_ctx = InvokeContext(tool_call_id="task-1", session_id=loop.session_id)
+
+    def management(call_id: str) -> InvokeContext:
+        return InvokeContext(
+            tool_call_id=call_id,
+            session_id=loop.session_id,
+            subagent_manager=cast(SubagentManagementPort, host.runner),
+        )
+
+    async def check(call_id: str) -> Any:
+        return await collect_result(
+            CheckAgents(
+                config_getter=lambda: CheckAgentsConfig(), state=BaseToolState()
+            ).run(CheckAgentsArgs(), management(call_id))
+        )
+
+    async def get(agent_id: str, run_id: str | None) -> Any:
+        return await collect_result(
+            GetAgentResult(
+                config_getter=lambda: GetAgentResultConfig(), state=BaseToolState()
+            ).run(GetAgentResultArgs(agent_id=agent_id, run_id=run_id), management("g"))
+        )
+
+    try:
+        args = TaskArgs(task="Background work", identity="coder")
+        handle = await host.publish(
+            args, launch_ctx, attempt_id="attempt-closed-1", retained=False
+        )
+        ack = host.admit_background(handle, args, launch_ctx)
+        assert handle.task is not None
+        await asyncio.gather(handle.task, return_exceptions=True)
+        closed = await check("check-closed")
+        latest = await get(handle.agent_id, None)
+        pinned = await get(handle.agent_id, ack.run_id)
+        await collect_result(
+            ReleaseAgent(
+                config_getter=lambda: ReleaseAgentConfig(), state=BaseToolState()
+            ).run(ReleaseAgentArgs(agent_id=handle.agent_id), management("release"))
+        )
+        after_release = await check("check-released")
+        with pytest.raises(ToolError) as gone:
+            await get(handle.agent_id, ack.run_id)
+    finally:
+        await host.close()
+        await loop.aclose()
+
+    assert [summary.agent_id for summary in closed.agents] == [handle.agent_id]
+    row = closed.agents[0]
+    assert row.availability is AgentAvailability.CLOSED
+    assert row.last_run_status == RunStatus.COMPLETED.value
+    assert row.turns_used is not None
+    assert row.latest_run_id == ack.run_id
+    # The row is honest about an exited child: no live run is claimed.
+    assert row.current_run_id is None
+    assert row.current_run_status is None
+    for fetched in (latest, pinned):
+        assert fetched.result is not None
+        assert fetched.result.run_id == ack.run_id
+        assert "background work" in fetched.result.response
+    assert after_release.agents == []
+    # The tool layer renders the host's typed unknown, so a purged run reads
+    # as gone rather than as an expired result.
+    assert "No such agent or run" in str(gone.value)
+
+
+# ---------------------------------------------------------------------------
 # Legacy nameless payload acceptance (client-side, design §5)
 # ---------------------------------------------------------------------------
 
@@ -1661,3 +2577,83 @@ def test_agents_update_preserves_name_when_present() -> None:
     assert event.agents[0].name == "coder-base-1"
     # The server payload is not mutated by the client-side normalization.
     assert "name" in params["agents"][0]
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(60)
+async def test_check_agents_carries_the_host_observed_telemetry(tmp_path: Path) -> None:
+    """CheckAgents projects the same host-observed telemetry as the wire row.
+
+    A settled background run reports the run's elapsed time, the task it ran,
+    the turn count the child reported on its terminal carrier, and the model
+    and context the child's own session snapshot answered -- through the tool
+    surface exactly as through the wire inventory read. The pre-G3 base
+    (4c062176) leaves every one of those fields unset.
+    """
+    now = [1_000.0]
+    loop = _process_root(tmp_path)
+    source = _BlockingSource()
+    committed = CommittedModelIdentity(
+        base_model="alpha-model",
+        provider="alpha",
+        wire_name="alpha-wire",
+        catalog_revision="test-fixture",
+    )
+    host = AgentChildHost(
+        loop,
+        spawn=_ScriptingSpawnAdapter(
+            source,
+            client=_SnapshottingWireClient(
+                committed, context_tokens=77, context_window=50_000
+            ),
+        ),
+        clock=lambda: now[0],
+    )
+    tool = CheckAgents(config_getter=lambda: CheckAgentsConfig(), state=BaseToolState())
+    args = TaskArgs(
+        task="Inspect the probe layout", identity="coder", background=True, retain=True
+    )
+    ctx = InvokeContext(tool_call_id="task-1", session_id=loop.session_id)
+    try:
+        handle = await host.publish(
+            args, ctx, attempt_id="attempt-telemetry-1", retained=True
+        )
+        host.admit_background(handle, args, ctx)
+        for _ in range(200):
+            if handle.run_started_at is not None:
+                break
+            await asyncio.sleep(0)
+        now[0] += 4.0
+        source.complete([
+            AssistantEvent(content="inspected"),
+            SubagentCompletion(outcome=TURN_OUTCOME_COMPLETED, turns_used=2),
+        ])
+        assert handle.task is not None
+        await asyncio.gather(handle.task, return_exceptions=True)
+        projected = await collect_result(
+            tool.run(
+                CheckAgentsArgs(),
+                InvokeContext(
+                    tool_call_id="check-telemetry-1",
+                    session_id=loop.session_id,
+                    subagent_manager=cast(SubagentManagementPort, host.runner),
+                ),
+            )
+        )
+    finally:
+        await host.close()
+        await loop.aclose()
+
+    assert [summary.agent_id for summary in projected.agents] == [handle.agent_id]
+    summary = projected.agents[0]
+    assert summary.availability is AgentAvailability.IDLE
+    assert summary.run_elapsed_seconds == 4.0
+    assert summary.idle_seconds == 0.0
+    assert summary.initial_task_summary == "Inspect the probe layout"
+    assert summary.current_task_summary == "Inspect the probe layout"
+    assert summary.turns_used == 2
+    assert summary.effective_model == "alpha/alpha-wire"
+    assert summary.base_model == "alpha-model"
+    assert summary.active_provider == "alpha"
+    assert summary.context_tokens == 77
+    assert summary.context_window == 50_000

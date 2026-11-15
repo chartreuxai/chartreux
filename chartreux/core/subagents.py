@@ -37,13 +37,22 @@ from chartreux.core.recovery_policy import ReplacementDecision
 from chartreux.core.subagent_submission import (
     PRUNED_NAMES,
     UNKNOWN_WRITE_FOOTPRINT,
+    ScanBlockDiagnostics,
     bash_write_paths_from_result_event,
     blocked_submission_response,
+    build_scan_block,
     classify_scan_path,
+    resolve_scan_project_root,
     touched_path_from_result_event,
     transient_skip_notice,
+    verify_admission_policy,
 )
-from chartreux.core.tools.secret_scan import incomplete_finding, scan_paths
+from chartreux.core.tools.secret_scan import (
+    MANIFEST_FILENAME,
+    FindingReason,
+    incomplete_finding,
+    scan_paths,
+)
 from chartreux.core.tools.ui import ToolUIDataAdapter
 from chartreux.observability.logging import logger
 from chartreux.utils.tool_presentation import ToolEffectKind
@@ -231,6 +240,21 @@ class TaskResult(BaseModel):
             "behavior preservation)."
         ),
     )
+    # A3: the bounded, versioned, typed scan-block diagnostics attached to a
+    # scan-blocked result (assembled by build_scan_block). The redacted
+    # response message is unchanged; the typed structure carries the
+    # category-preserving findings, closed reason codes, safe path
+    # identifiers, per-entry manifest identifiers, the fixed remediation
+    # string, and — on a stale freeze — the policy-revision digests. Omitted
+    # from dumps when None (the pre-A3 dump shape is unchanged).
+    scan_block: ScanBlockDiagnostics | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+        description=(
+            "The typed, versioned scan-block diagnostics of a scan-blocked "
+            "result; None for every unblocked result."
+        ),
+    )
 
 
 class RunStopReason(enum.StrEnum):
@@ -288,11 +312,12 @@ class WaitForAgentResult(BaseModel):
     ``completed`` carries the finished run's TaskResult; ``still_running``
     carries the wait progress (agent_id, run_id, elapsed_seconds, run_status,
     turns_used) plus guidance instructing the model to yield its turn —
-    re-invoke wait_for_agent in a later turn to keep waiting, or rely on the
-    completion notification that arrives when the run finishes and fetch the
-    result then (mode "digest" by default, "full" on demand). The variants
-    are mutually exclusive: ``completed`` rejects the progress fields and
-    ``still_running`` rejects ``result``.
+    prefer the completion notification that arrives when the run finishes and
+    fetch the result then (mode "digest" by default, "full" on demand), never
+    re-invoking the wait in the same turn, and re-waiting in a later turn only
+    under the conditional rule. The variants are mutually exclusive:
+    ``completed`` rejects the progress fields and ``still_running`` rejects
+    ``result``.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -603,6 +628,16 @@ class AgentSummary:
     """Terminal outcome of the most recently finalized run, if any."""
     context_tokens: int | None = None
     context_window: int | None = None
+    context_threshold: int | None = None
+    """The agent's own automatic-compaction trigger (H4a).
+
+    The denominator this row's usage is rendered against, so an in-process
+    child row reads ``usage/threshold`` exactly like a process child row
+    instead of measuring against a hard window no compaction protects. A
+    producer applies the strict shape check the main status bar uses; ``None``
+    when it observed no usable trigger, and the wire model normalizes a
+    nonpositive trigger (compaction off) to unknown.
+    """
     compacting: bool = False
     stop_reason: RunStopReason | None = None
     """Current/latest run's structured stop reason, retained after finalization."""
@@ -708,21 +743,25 @@ def still_running_guidance(
     """Turn-yield guidance carried by a ``still_running`` wait (design §6).
 
     A tool result does not end the turn by itself: the model must yield so
-    queued user input can drain between turns. The guidance therefore
-    instructs ending the turn or continuing other work now and re-invoking
-    ``wait_for_agent`` in a later turn — never a same-turn re-invocation —
-    or relying on the completion notification and fetching the result later
-    (digest/full modes).
+    queued user input can drain between turns. The guidance therefore leads
+    with yielding or continuing other work now, forbids a same-turn
+    re-invocation of ``wait_for_agent``, and makes a later-turn re-wait
+    conditional (hard dependency, no independent work, current-turn
+    necessity), preferring the completion notification and a
+    ``get_agent_result`` fetch (digest/full modes).
     """
     turn_word = "turn" if turns_used == 1 else "turns"
     return (
         f"Agent {agent_id} (run {run_id}) is still {run_status.value} after "
         f"{elapsed_seconds:g}s and {turns_used} {turn_word}. End your turn or "
-        "continue other work now: queued user input is only delivered between "
-        "turns. Re-invoke wait_for_agent in a later turn to keep waiting "
-        "(same mode), or end your turn: the completion notification arrives "
-        "when the run finishes — fetch the result then with get_agent_result "
-        '(mode="digest" by default, mode="full" on demand), or call '
+        "continue independent work now: queued user input is only delivered "
+        "between turns. Prefer the completion notification and fetch the "
+        "result then with get_agent_result "
+        '(mode="digest" by default, mode="full" on demand). Never re-invoke '
+        "wait_for_agent in the same turn. In a later turn, re-wait only if "
+        "the result is a hard dependency of your next action, no independent "
+        "work can proceed, and that action must occur in that turn rather "
+        "than after notification; if uncertain, end your turn. Use "
         "check_agents to inspect progress."
     )
 
@@ -1438,12 +1477,33 @@ class SubagentRunAccumulator:
                 transient_paths.append(touched)
             else:
                 repo_paths.append(touched)
+        # A2: the committed-HEAD approved-match policy, frozen on the
+        # contract at admission for ALL runs (never the working tree), is
+        # verified against the CURRENT committed HEAD here at scan time and
+        # fails closed on mismatch or absence — a worker's mid-run manifest
+        # commit drops every approval instead of granting one. Approved hits
+        # are then suppressed inside the scan, keyed by the canonical
+        # project-relative identity both gates derive; an uncanonicalizable
+        # path (a symlink escaping the project, a path outside the root)
+        # yields no key and always blocks, and a scan-incomplete sentinel is
+        # never suppressible.
+        # A3: the stale-freeze verification also reports the mismatch (and the
+        # frozen/current policy-REVISION digests) so the block's typed
+        # diagnostics can surface a policy_mismatch finding alongside any rule
+        # hits — never masking them, never auto-retried.
+        scan_project_root = resolve_scan_project_root(scan_cwd, scan_authorized_roots)
+        # (policy_for_scan, mismatch, frozen_revision, current_revision)
+        admission = verify_admission_policy(
+            getattr(contract, "scan_policy", None), scan_project_root
+        )
         findings = scan_paths(
             repo_paths,
             modified_since_ns=self._scan_cutoff_ns,
             exclude_roots=shared_roots,
             prune_names=PRUNED_NAMES,
             count_qualifying_only=True,
+            project_root=scan_project_root,
+            policy=admission[0],
         )
         if transient_paths:
             logger.info(
@@ -1454,17 +1514,35 @@ class SubagentRunAccumulator:
             # Fail-closed: a shell command whose write surface could not be
             # established leaves an unscannable footprint — scan_paths skips
             # the missing sentinel path itself, so the gate adds the
-            # scan-incomplete finding explicitly.
+            # scan-incomplete finding explicitly, with its closed
+            # unknown_write_footprint reason code.
             findings.append(
                 incomplete_finding(
                     UNKNOWN_WRITE_FOOTPRINT,
                     "the write surface of a shell command could not be established",
+                    reason_code=FindingReason.UNKNOWN_WRITE_FOOTPRINT,
+                )
+            )
+        if admission[1]:
+            # A3: the stale-freeze case — the manifest file changed after this
+            # run's admission froze. The scan above already ran with every
+            # approval dropped, so matches unapproved under BOTH the frozen
+            # and the current policy surface alongside this finding; the
+            # harness never auto-retries it (the remediation text says so).
+            findings.append(
+                incomplete_finding(
+                    MANIFEST_FILENAME,
+                    "the approved-match manifest changed after this run's "
+                    "admission froze",
+                    reason_code=FindingReason.POLICY_MISMATCH,
                 )
             )
         if findings:
             # Secret-scan precedence: the scan's redacted block message
             # wins over any audit rejection — the scan's findings never
-            # leak into another surface.
+            # leak into another surface. The blocked result also carries
+            # the bounded, versioned typed diagnostics (A3) — and never the
+            # worker's report.
             logger.warning(
                 "Subagent submission blocked by the secret scan: %d finding(s) "
                 "over %d touched path(s), rules=%s",
@@ -1477,6 +1555,11 @@ class SubagentRunAccumulator:
                 turns_used=turns_used,
                 completed=False,
                 completion_audit=stamped_audit,
+                scan_block=build_scan_block(
+                    findings,
+                    frozen_revision_digest=admission[2],
+                    current_revision_digest=admission[3],
+                ),
             )
         if blocked_message is not None:
             # P10 enforce mode: a worker-side disposition blocks the
@@ -1519,12 +1602,62 @@ _BRIEF_DISCLOSURE = (
 )
 
 
+# The verification-artifact discipline rides in the same brief, in both
+# dispatch modes: each verification invocation gets a fresh, unique directory
+# under the injected scratchpad for its basetemp, caches, and logs, where the
+# submission scan classifies the content transient and can attribute it.
+# Paths outside the scratchpad stay scanned and still block, and a worker with
+# no scratchpad stops the affected verification instead of choosing a location
+# the scan cannot attribute. Instruction, not enforcement: a non-compliant
+# destination still blocks at the fail-closed scan.
+_SCRATCHPAD_VERIFICATION_DISCIPLINE = (
+    "Verification artifacts: give every verification invocation its own fresh, "
+    "unique directory under this scratchpad directory — basetemps, tool "
+    "caches, and logs go there — so the submission scan can attribute and "
+    "cover the paths you wrote. Paths outside the scratchpad are still "
+    "scanned and still block. Clean up only your own completed invocation's "
+    "directory; never wildcard-remove sibling invocations or any directory a "
+    "still-running job is using."
+)
+_NO_SCRATCHPAD_VERIFICATION_DISCIPLINE = (
+    "Verification artifacts: this run has no scratchpad directory. Do not "
+    "fall back to ~/.cache or any other location outside a scratchpad. Stop "
+    "the affected verification and report the unavailable destination in "
+    "your final report instead of choosing an uninspected location."
+)
+
+
+# The temporary-placement discipline rides in the same brief (point 3, C4
+# chunk ii): every verification invocation names its own fresh, unique
+# invocation directory under the session scratchpad and points its basetemp,
+# pytest cache, uv cache, and ruff cache at it. An explicit destination under
+# the scratchpad takes precedence over the managed run root and is never
+# reaped automatically; a run without one lands under the managed pytest run
+# root, never under the shared /tmp/pytest-of-<user> tree. The repository
+# retains only failed tests' call-phase directories, so copy what deeper
+# debugging needs before teardown — setup/teardown-phase artifacts are not
+# retained.
+_TMP_PLACEMENT_DISCIPLINE = (
+    "Temporary files: give every verification invocation its own fresh, unique "
+    "invocation directory under this scratchpad directory and point its "
+    "basetemp, pytest cache, uv cache, and ruff cache at it — an explicit "
+    "destination under the scratchpad takes precedence and is never removed "
+    "automatically. A run without one lands under the managed pytest run root, "
+    "never under the shared /tmp/pytest-of-<user> tree. Only failed tests keep "
+    "their call-phase directories; copy what deeper debugging needs before "
+    "teardown, because setup/teardown-phase artifacts are not retained."
+)
+
+
 def prepare_subagent_prompt(task: str, ctx: InvokeContext) -> str:
-    brief = f"{_BRIEF_DISCLOSURE}\n\n{task}"
     if ctx.scratchpad_dir is None:
-        return brief
+        return (
+            f"{_BRIEF_DISCLOSURE}\n\n{_NO_SCRATCHPAD_VERIFICATION_DISCIPLINE}\n\n{task}"
+        )
     return (
         f"Scratchpad directory: {ctx.scratchpad_dir}\n"
         "You can read and write files here without permission prompts.\n\n"
-        f"{brief}"
+        f"{_SCRATCHPAD_VERIFICATION_DISCIPLINE}\n\n"
+        f"{_TMP_PLACEMENT_DISCIPLINE}\n\n"
+        f"{_BRIEF_DISCLOSURE}\n\n{task}"
     )

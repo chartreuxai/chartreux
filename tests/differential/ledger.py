@@ -35,6 +35,17 @@ FAMILY_CHILD_CRASH = "child_crash"
 FAMILY_REPLAY = "replay"
 FAMILY_SHUTDOWN = "shutdown"
 
+# Added point-1 §6.3 cases. Their nodes land with the carrier owners listed in
+# ``tests.differential.regressions``; the families are declared here so the
+# ledger and the both-mode gate share one name registry.
+FAMILY_MUTATION_TIMEOUT = "mutation_timeout"
+FAMILY_ROOT_DEATH = "root_death"
+FAMILY_RESUME = "resume"
+FAMILY_STALE_SNAPSHOT = "stale_snapshot"
+FAMILY_CONCURRENT_RECOVERY = "concurrent_recovery_admission"
+FAMILY_REVOCATION_RACE = "revocation_race"
+FAMILY_MCP_CONVERGENCE = "mcp_partial_convergence"
+
 
 def enabled() -> bool:
     """Whether this run records a ledger (the gate's nested runs set the marker)."""
@@ -92,10 +103,17 @@ def families(entries: Mapping[str, Mapping[str, object]]) -> dict[str, int]:
 
 __all__ = [
     "FAMILY_CHILD_CRASH",
+    "FAMILY_CONCURRENT_RECOVERY",
+    "FAMILY_MCP_CONVERGENCE",
+    "FAMILY_MUTATION_TIMEOUT",
     "FAMILY_PRESENTATION",
     "FAMILY_REPLAY",
+    "FAMILY_RESUME",
+    "FAMILY_REVOCATION_RACE",
     "FAMILY_ROOT",
+    "FAMILY_ROOT_DEATH",
     "FAMILY_SHUTDOWN",
+    "FAMILY_STALE_SNAPSHOT",
     "LEDGER_ENV",
     "enabled",
     "families",

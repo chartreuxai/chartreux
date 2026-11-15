@@ -38,7 +38,7 @@ from urllib.parse import urlsplit
 import pytest
 
 from chartreux.app_server.transport import TRANSPORT_ENV_VAR
-from tests.differential import egress, ledger
+from tests.differential import egress, ledger, regressions
 from tests.differential.crash_oracle import SCENARIOS, ChildCrashDriver
 from tests.differential.lifecycle import LEASE_SESSION, LifecycleDriver
 from tests.differential.presentation import (
@@ -95,6 +95,30 @@ TRACE_MODULES = (
     "tests/differential/test_replay_skeleton.py",
     "tests/differential/test_shutdown_nodes.py",
 )
+
+#: The families the base suite must always record, and how many traces each
+#: contributes. The added §6.3 cases extend this through
+#: ``tests.differential.regressions`` once their nodes land.
+BASE_FAMILY_MINIMUMS = {
+    ledger.FAMILY_PRESENTATION: 19,
+    ledger.FAMILY_ROOT: 1,
+    ledger.FAMILY_CHILD_CRASH: 1,
+    ledger.FAMILY_REPLAY: 1,
+    ledger.FAMILY_SHUTDOWN: 1,
+}
+
+
+def _trace_modules() -> tuple[str, ...]:
+    """The trace modules the nested runs execute, plus landed case modules."""
+    extra = tuple(
+        module for module in regressions.landed_modules() if module not in TRACE_MODULES
+    )
+    return (*TRACE_MODULES, *extra)
+
+
+def _family_minimums() -> dict[str, int]:
+    """The base family coverage plus any landed added §6.3 case families."""
+    return regressions.merge_family_minimums(BASE_FAMILY_MINIMUMS)
 
 
 def _host(component: str, topology: str, *, timeout: float = _TRACE_TIMEOUT):
@@ -358,7 +382,7 @@ def _run_trace_suite(mode: str, ledger_dir: Path, basetemp: Path) -> Any:
         sys.executable,
         "-m",
         "pytest",
-        *TRACE_MODULES,
+        *_trace_modules(),
         "-q",
         "-n",
         _SUITE_WORKERS,
@@ -388,14 +412,12 @@ def test_full_differential_suite_digests_match_across_modes(tmp_path: Path) -> N
         )
         entries[mode] = ledger.read(ledger_dir)
 
-    # Every family took part, and all nineteen presentation traces ran.
+    # Every declared family took part, and all nineteen presentation traces ran.
+    minimums = _family_minimums()
     for mode in MODES:
         counts = ledger.families(entries[mode])
-        assert counts.get(ledger.FAMILY_PRESENTATION, 0) >= 19, counts
-        assert counts.get(ledger.FAMILY_ROOT, 0) >= 1, counts
-        assert counts.get(ledger.FAMILY_CHILD_CRASH, 0) >= 1, counts
-        assert counts.get(ledger.FAMILY_REPLAY, 0) >= 1, counts
-        assert counts.get(ledger.FAMILY_SHUTDOWN, 0) >= 1, counts
+        for family, minimum in minimums.items():
+            assert counts.get(family, 0) >= minimum, counts
 
     stdio, in_process = entries[STDIO], entries[IN_PROCESS]
     assert set(stdio) == set(in_process)

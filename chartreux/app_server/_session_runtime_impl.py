@@ -40,7 +40,11 @@ from chartreux.app_server._session_backend_impl import (
 from chartreux.app_server._session_backend_port import ResolvedMCPCatalog
 from chartreux.app_server._session_backend_services import SessionBackendServices
 from chartreux.app_server._session_history import SessionHistory
-from chartreux.app_server._sessions import SessionRuntime, SessionRuntimeRegistry
+from chartreux.app_server._sessions import (
+    InventorySnapshot,
+    SessionRuntime,
+    SessionRuntimeRegistry,
+)
 from chartreux.app_server._tool_io import ClientToolIO
 from chartreux.app_server._turns import (
     ModelChoicePendingError,
@@ -309,6 +313,18 @@ class SessionRuntimeControllerImpl:
                 ],
             ),
         )
+
+    async def read_agent_inventory(self) -> InventorySnapshot:
+        """Read the owner-side joint-acquisition agent inventory (point 5).
+
+        The in-process service entry to the registry's revised fresh
+        inventory read: the snapshot carries the root session incarnation,
+        the monotone inventory revision, and the same wire projection the
+        TUI bar consumes, sampled atomically against every registry mutation
+        and run-state writer (C6b's carriers answer from this read, never a
+        coordinator cache).
+        """
+        return await self._sessions.inventory_snapshot()
 
     def create_host(self) -> SessionBackendHostImpl:
         return SessionBackendHostImpl(

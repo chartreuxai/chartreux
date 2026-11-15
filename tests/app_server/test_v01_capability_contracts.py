@@ -1,11 +1,20 @@
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from chartreux.app_server._dispatch import RequestFailure
+from chartreux.app_server.process_bootstrap import (
+    ADVERTISED_CAPABILITIES,
+    PROCESS_PROTOCOL_VERSION,
+    encode_ready_frame,
+    parse_ready_frame,
+)
 from chartreux.app_server.protocol import (
     AgentConfig,
     AppServerResponseError,
+    ClientCapabilities,
     ClientInfo,
     CompletionConfig,
     EventBatch,
@@ -99,3 +108,25 @@ async def test_events_read_accepts_default_or_omitted_filters(
         await agent_loop.aclose()
 
     assert EventBatch.model_validate(result).events == []
+
+
+def test_the_process_handshake_advertises_capabilities_additively() -> None:
+    # The spawned-process handshake advertises the installation's additive
+    # agent-wire capabilities in its ready frame; the v01 client capability
+    # exchange is a separate, unchanged surface.
+    ready = parse_ready_frame(encode_ready_frame())
+    assert ready.protocol_version == PROCESS_PROTOCOL_VERSION
+    assert ready.capabilities == ADVERTISED_CAPABILITIES
+
+    # Additive: an older same-version peer's frame without the member parses
+    # with an empty set, and the v01 client capabilities stay default-shaped.
+    raw = json.dumps({
+        "chartreuxBootstrap": "ready",
+        "protocolVersion": PROCESS_PROTOCOL_VERSION,
+    })
+    assert parse_ready_frame(raw).capabilities == frozenset()
+    assert ClientCapabilities().model_dump(by_alias=True) == {
+        "callbackKinds": [],
+        "clientTools": [],
+        "disabledNotifications": [],
+    }

@@ -57,9 +57,16 @@ rejected with guidance to launch separate tasks.
 
 A task launches in the background by default (`background: true`). Prefer
 background launches even when you need the result: background agents stay
-inspectable in the agent browser and can be amended mid-flight, and you collect
-the outcome with `wait_for_agent`. Set `background: false` only when blocking
-is truly required. The call returns a successful launch acknowledgment with
+inspectable in the agent browser and can be amended mid-flight. Do independent
+work while the run is active; otherwise end your turn and collect the outcome
+with `get_agent_result` when the completion notification arrives, even if your
+next action depends on it. Use `wait_for_agent` only if the result is a hard
+dependency of your next action, no independent work can proceed, and that
+action must occur in this turn rather than after notification; if any of those
+conditions is uncertain, end your turn, and do not invent work to fill the
+wait. Set `background: false` only when the caller's next action must consume
+the child's result in the current turn and the child cannot run detached. The
+call returns a successful launch acknowledgment with
 `status: "launched"`, non-empty guidance, and stable `agent_id` and `run_id`
 handles rather than waiting for the answer; it is not the subagent's terminal
 result. The acknowledgment also carries the instance's human-facing `name` and
@@ -352,11 +359,12 @@ explicitly defaultable questions can expire unanswered; see
 - `wait_for_agent(agent_id, run_id, timeout=...)` waits for completion. The
   default timeout is 1500 seconds; a timeout returns a `still_running` result —
   a normal outcome, not a failure — reporting the elapsed wait, run status, and
-  turns used, and instructing you to end your turn or continue other work now
-  and re-invoke `wait_for_agent` in a later turn (queued user input is only
-  delivered between turns). A timeout never cancels the subagent. Pass an
-  explicit larger timeout to wait longer, or `timeout: null` to wait
-  indefinitely.
+  turns used, and instructing you to end your turn or continue independent work
+  now and never re-invoke the wait in the same turn (queued user input is only
+  delivered between turns). A later-turn re-wait is conditional, not automatic:
+  re-wait only under the three conditions above. A timeout never cancels the
+  subagent. Pass an explicit larger timeout to wait longer, or `timeout: null`
+  to wait indefinitely.
 - Pass a retained idle instance's `agent_id` to
   `task(agent_id=..., background=true, task=...)` to give it another assignment;
   omit the launch fields to keep its committed identity. Omitting `retain`

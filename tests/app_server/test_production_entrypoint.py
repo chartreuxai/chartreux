@@ -3932,7 +3932,7 @@ _MARKER = Path({marker!r})
 
 child_agent_process.child_agent_command = lambda: [sys.executable, "-c", _CHILD_SCRIPT]
 
-_state = {{"invocations": 0}}
+_state = {{"user_turns": 0}}
 
 
 class _Factory:
@@ -4066,10 +4066,17 @@ _real_start_turn = RootAgentServer._start_turn
 
 
 def _start_turn(self, params):
-    _state["invocations"] += 1
-    if _state["invocations"] == 1:
+    options = params.get("turn_options") or {{}}
+    if options.get("injected"):
+        # A settled background run wakes the parent with an injected turn of
+        # its own (G1b); it is not one of the sequence's user turns and must
+        # not consume a turn position.
+        _real_start_turn(self, params)
+        return
+    _state["user_turns"] += 1
+    if _state["user_turns"] == 1:
         self._track(_sequence(self.child_host))
-    elif _state["invocations"] == 2:
+    elif _state["user_turns"] == 2:
         host = self.child_host
         _record({{
             "budget_after_teardown": host.budget.live_processes,
@@ -4256,7 +4263,11 @@ async def test_a_retained_child_keeps_its_process_and_its_attempt_tombstones(
             report = await backends[0].process.teardown_child_attempt(
                 ChildTeardownRequest(attempt_id=retained["attempt_id"])
             )
-            await _collect_turn(session, "check the budget")
+            # The retained run's completion wakes the parent with an injected
+            # turn of its own (G1b), so the follow-up submission is QUEUED the
+            # way the TUI submits while a turn runs, and its promoted turn is
+            # what records the post-teardown budget.
+            await session.enqueue("check the budget")
             await _wait_for(lambda: "budget_after_teardown" in _marker_state(marker))
             after = _marker_state(marker)
             await session.close()

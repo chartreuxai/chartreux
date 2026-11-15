@@ -401,6 +401,8 @@ async def test_check_agents_returns_agent_summaries() -> None:
         "last_run_status": None,
         "context_tokens": 12_500,
         "context_window": 200_000,
+        # H4a: the agent's own compaction trigger is unknown when unobserved.
+        "context_threshold": None,
         "compacting": False,
         "stop_reason": "budget_exceeded",
         "last_failure": None,
@@ -509,9 +511,13 @@ async def test_get_agent_result_returns_pending_for_running_agent() -> None:
     )
 
     assert result.result is None
-    assert (
-        result.message
-        == "Agent is still running; use wait_for_agent or try again later."
+    assert result.message == (
+        "Agent is still running; fetch the result when the completion "
+        "notification arrives, or collect it by run_id from check_agents' "
+        "uncollected_run_ids. Use wait_for_agent only if the result is a hard "
+        "dependency of your next action, no independent work can proceed, and "
+        "that action must occur in this turn rather than after notification; "
+        "if uncertain, end your turn."
     )
 
 
@@ -658,6 +664,14 @@ async def test_wait_for_agent_timeout_returns_still_running_without_cancelling()
     assert "End your turn" in result.guidance
     assert "later turn" in result.guidance
     assert "check_agents" in result.guidance
+    # Notification-first ordering: the fetch preference precedes the
+    # conditional later-turn re-wait, and a same-turn re-wait is prohibited.
+    assert "Never re-invoke wait_for_agent in the same turn." in result.guidance
+    assert result.guidance.index(
+        "Prefer the completion notification"
+    ) < result.guidance.index("In a later turn, re-wait only if")
+    assert 'mode="digest"' in result.guidance
+    assert 'mode="full"' in result.guidance
 
     # The run was never cancelled: the completion event stays unset.
     assert not manager.completed[("agent-1", "run-1")].is_set()

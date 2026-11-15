@@ -8,6 +8,7 @@ import json
 import logging
 import os
 from pathlib import Path
+import subprocess
 from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock
 
@@ -19,6 +20,10 @@ from chartreux.app_server._sessions import (
     SessionRuntime,
     SessionRuntimeRegistry,
     _AgentState,
+)
+from chartreux.app_server._subagent_execution import (
+    AdmissionContract,
+    freeze_run_admission,
 )
 from chartreux.app_server._turns import TurnController
 from chartreux.app_server.models import (
@@ -60,8 +65,10 @@ from chartreux.core.subagents import (
     TaskResult,
     WaitStatus,
 )
+from chartreux.core.tools import secret_scan
 from chartreux.core.tools.base import InvokeContext
 from chartreux.core.tools.models import ToolPermission
+from chartreux.core.tools.secret_scan import ApprovalKey, committed_scan_policy
 from chartreux.utils.tool_presentation import ToolEffectKind
 from tests.app_server._subagent_test_support import (
     BlockingBackend,
@@ -1191,6 +1198,29 @@ async def test_foreground_submission_blocked_by_secret_scan(
         assert _GATE_GITHUB_TOKEN not in result.response
         assert "github-token" not in result.response
         assert _GATE_SECRET_LINE not in result.response
+        # A3: the foreground result path carries the bounded, versioned
+        # typed scan-block diagnostics alongside the redacted message.
+        block = result.scan_block
+        assert block is not None
+        assert block.version == 1
+        assert block.status == "blocked"
+        assert block.finding_counts == {"rule_hit": 2, "scan_incomplete": 0}
+        assert block.policy is None
+        assert "may never approve its own submission" in block.remediation
+        github_hit = next(
+            finding for finding in block.findings if finding.rule_id == "github-token"
+        )
+        assert github_hit.category == "rule_hit"
+        assert github_hit.reason == "match"
+        assert github_hit.path == str(target)
+        assert github_hit.location is not None and github_hit.location.line == 2
+        # The rule id lives in the typed block, never in the redacted
+        # response; no matched value or report text is anywhere in the dump.
+        dumped = result.model_dump_json()
+        assert "github-token" in dumped
+        assert _GATE_GITHUB_TOKEN not in dumped
+        assert _GATE_SECRET_LINE not in dumped
+        assert "wrote the config" not in dumped
         # The gate blocks the submission, not the write: the artifact is on
         # disk (the pre-commit hook is the commit-boundary backstop).
         assert target.read_text(encoding="utf-8") == _GATE_SECRET_CONTENT
@@ -1271,6 +1301,30 @@ async def test_background_submission_blocked_by_secret_scan(
         assert _GATE_GITHUB_TOKEN not in waited.response
         assert "github-token" not in waited.response
         assert _GATE_SECRET_LINE not in waited.response
+
+        # A3: the background result path carries the same bounded, versioned
+        # typed scan-block diagnostics as the foreground path — on the stored
+        # run result AND on the result surfaced to the waiter.
+        stored_block = run.result.scan_block
+        waited_block = waited.scan_block
+        assert stored_block is not None and waited_block is not None
+        assert stored_block == waited_block
+        assert stored_block.version == 1
+        assert stored_block.status == "blocked"
+        assert stored_block.finding_counts == {"rule_hit": 2, "scan_incomplete": 0}
+        github_hit = next(
+            finding
+            for finding in stored_block.findings
+            if finding.rule_id == "github-token"
+        )
+        assert github_hit.reason == "match"
+        assert github_hit.path == str(target)
+        assert github_hit.location is not None and github_hit.location.line == 2
+        dumped = waited.model_dump_json()
+        assert "github-token" in dumped
+        assert _GATE_GITHUB_TOKEN not in dumped
+        assert _GATE_SECRET_LINE not in dumped
+        assert "edited settings" not in dumped
     finally:
         await registry.drain_children()
         await parent.aclose()
@@ -1349,6 +1403,348 @@ async def test_foreground_submission_passes_a_read_only_bash_command(
 
         assert result.completed is True
         assert result.response == "read the file"
+    finally:
+        await registry.drain_children()
+        await parent.aclose()
+
+
+# --- A2: the admission-frozen committed-HEAD scan policy ----------------------
+#
+# freeze_run_admission freezes the approved-match manifest (committed HEAD
+# blob) on the contract for ALL runs; the foreground and background gates
+# verify it at scan time. Seeded secrets stay concatenation-built so this
+# file itself scans clean.
+
+
+def _policy_git_repo(base: Path) -> Path:
+    """A real git repository with one committed file, as the run's cwd."""
+    repo = base / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q", "-b", "main", str(repo)], check=True)
+    subprocess.run(
+        ["git", "-C", str(repo), "config", "user.email", "p@example.com"], check=True
+    )
+    subprocess.run(["git", "-C", str(repo), "config", "user.name", "P"], check=True)
+    (repo / "tracked.txt").write_text("tracked\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(repo), "add", "-A"], check=True)
+    subprocess.run(["git", "-C", str(repo), "commit", "-q", "-m", "base"], check=True)
+    return repo
+
+
+def _git(repo: Path, *args: str) -> None:
+    subprocess.run(["git", "-C", str(repo), *args], check=True)
+
+
+def _digest_of(line: str, rule_id: str) -> str:
+    keys: list[ApprovalKey] = []
+    secret_scan.scan_text(line + "\n", label="deploy_config.py", keys=keys)
+    return next(key.digest for key in keys if key.rule_id == rule_id)
+
+
+def _commit_scan_manifest(repo: Path, path: str, line: str) -> None:
+    entries = [
+        {
+            "path": path,
+            "rule_id": "github-token",
+            "digest": _digest_of(line, "github-token"),
+        },
+        {
+            "path": path,
+            "rule_id": "generic-keyword-assignment",
+            "digest": _digest_of(line, "generic-keyword-assignment"),
+        },
+    ]
+    (repo / secret_scan.MANIFEST_FILENAME).write_text(
+        json.dumps(
+            {
+                "schema_version": secret_scan.SCAN_POLICY_SCHEMA_VERSION,
+                "approved_matches": entries,
+                "residual_exclusions": [],
+            },
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    _git(repo, "add", "--", secret_scan.MANIFEST_FILENAME)
+    _git(repo, "commit", "-q", "-m", "approve synthetic fixture")
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(60)
+async def test_admission_freezes_the_committed_head_policy_for_every_run(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    repo = _policy_git_repo(tmp_path)
+    _commit_scan_manifest(repo, "deploy_config.py", _GATE_SECRET_LINE)
+    monkeypatch.setattr(
+        "chartreux.core.agent_loop._loop.create_backend", lambda **_: FakeBackend()
+    )
+    parent = build_test_agent_loop(
+        config=_config(enabled_tools=["task", "write_file"]),
+        backend=FakeBackend(),
+        cwd=repo,
+    )
+    registry = _retention_registry()
+    root = registry._build_child_runtime(parent)
+    registry.bind_root(root)
+    try:
+        contract, _ = freeze_run_admission(
+            args=TaskArgs(task="t", identity="coder", background=False),
+            identity="coder",
+            identity_revision=None,
+            tier=None,
+            runtime=root,
+            parent=root,
+        )
+        admission = cast(AdmissionContract, contract)
+        policy = admission.scan_policy
+        assert policy is not None
+        assert policy.revision_digest == committed_scan_policy(repo).revision_digest
+        assert {(key.path, key.rule_id) for key in policy.approved} == {
+            ("deploy_config.py", "github-token"),
+            ("deploy_config.py", "generic-keyword-assignment"),
+        }
+    finally:
+        await registry.drain_children()
+        await parent.aclose()
+
+    # A cwd that is not a repository (or a fresh clone without the manifest)
+    # still freezes a policy for ALL runs — the empty one, fail closed.
+    plain = tmp_path / "plain"
+    plain.mkdir()
+    parent2 = build_test_agent_loop(
+        config=_config(enabled_tools=["task"]), backend=FakeBackend(), cwd=plain
+    )
+    registry2 = _retention_registry()
+    root2 = registry2._build_child_runtime(parent2)
+    registry2.bind_root(root2)
+    try:
+        contract2, _ = freeze_run_admission(
+            args=TaskArgs(task="t", identity="coder", background=False),
+            identity="coder",
+            identity_revision=None,
+            tier=None,
+            runtime=root2,
+            parent=root2,
+        )
+        admission2 = cast(AdmissionContract, contract2)
+        assert admission2.scan_policy is not None
+        assert admission2.scan_policy.approved == frozenset()
+        assert admission2.scan_policy.revision_digest is None
+    finally:
+        await registry2.drain_children()
+        await parent2.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(60)
+async def test_foreground_submission_passes_an_approved_fixture_in_a_git_repo(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # End to end: the manifest committed at HEAD approves the fixture; the
+    # foreground run's admission froze that policy, the gate verifies it, and
+    # the approved synthetic match no longer blocks the submission.
+    repo = _policy_git_repo(tmp_path)
+    _commit_scan_manifest(repo, "deploy_config.py", _GATE_SECRET_LINE)
+    target = repo / "deploy_config.py"
+    backend = FakeBackend([
+        [
+            mock_llm_chunk(
+                content="",
+                tool_calls=[_write_file_call(target, _GATE_SECRET_CONTENT, "write-1")],
+            )
+        ],
+        [mock_llm_chunk(content="wrote the config")],
+    ])
+    registry, parent = await _gate_registry(monkeypatch, backend, cwd=repo)
+    try:
+        result = await _foreground_result(registry, parent)
+
+        assert result.completed is True
+        assert result.response == "wrote the config"
+        assert _GATE_GITHUB_TOKEN not in result.response
+        assert "github-token" not in result.response
+        assert target.read_text(encoding="utf-8") == _GATE_SECRET_CONTENT
+    finally:
+        await registry.drain_children()
+        await parent.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(60)
+async def test_foreground_submission_blocked_when_the_manifest_is_only_staged(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # The approval exists only in the git INDEX (staged, not committed):
+    # admission froze the committed HEAD policy, which has no approval, so
+    # the staged self-approval does not clear the fixture.
+    repo = _policy_git_repo(tmp_path)
+    _commit_scan_manifest(repo, "other.txt", _GATE_SECRET_LINE)
+    (repo / secret_scan.MANIFEST_FILENAME).write_text(
+        json.dumps(
+            {
+                "schema_version": secret_scan.SCAN_POLICY_SCHEMA_VERSION,
+                "approved_matches": [
+                    {
+                        "path": "deploy_config.py",
+                        "rule_id": "github-token",
+                        "digest": _digest_of(_GATE_SECRET_LINE, "github-token"),
+                    },
+                    {
+                        "path": "deploy_config.py",
+                        "rule_id": "generic-keyword-assignment",
+                        "digest": _digest_of(
+                            _GATE_SECRET_LINE, "generic-keyword-assignment"
+                        ),
+                    },
+                ],
+                "residual_exclusions": [],
+            },
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    _git(repo, "add", "--", secret_scan.MANIFEST_FILENAME)
+    target = repo / "deploy_config.py"
+    backend = FakeBackend([
+        [
+            mock_llm_chunk(
+                content="",
+                tool_calls=[_write_file_call(target, _GATE_SECRET_CONTENT, "write-1")],
+            )
+        ],
+        [mock_llm_chunk(content="wrote the config")],
+    ])
+    registry, parent = await _gate_registry(monkeypatch, backend, cwd=repo)
+    try:
+        result = await _foreground_result(registry, parent)
+
+        assert result.completed is False
+        assert "failed the secret scan" in result.response
+        assert str(target) in result.response
+        assert _GATE_GITHUB_TOKEN not in result.response
+        assert "github-token" not in result.response
+    finally:
+        await registry.drain_children()
+        await parent.aclose()
+
+
+class _MidRunManifestCommitBackend(FakeBackend):
+    """A child backend that commits a manifest change while the run is live.
+
+    Admission froze the committed-HEAD policy before the first backend call,
+    so committing here is a mid-run manifest change: the scan-time HEAD no
+    longer matches the admission freeze.
+    """
+
+    def __init__(self, repo: Path, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self._repo = repo
+        self._committed = False
+
+    def _commit_mid_run_manifest(self) -> None:
+        if self._committed:
+            return
+        self._committed = True
+        (self._repo / secret_scan.MANIFEST_FILENAME).write_text(
+            json.dumps(
+                {
+                    "schema_version": secret_scan.SCAN_POLICY_SCHEMA_VERSION,
+                    "approved_matches": [],
+                    "residual_exclusions": [],
+                },
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        _git(self._repo, "add", "--", secret_scan.MANIFEST_FILENAME)
+        _git(self._repo, "commit", "-q", "-m", "mid-run manifest change")
+
+    async def complete(self, **kwargs: Any) -> LLMChunk:
+        self._commit_mid_run_manifest()
+        return await super().complete(**kwargs)
+
+    async def complete_streaming(self, **kwargs: Any) -> AsyncGenerator[LLMChunk, None]:
+        self._commit_mid_run_manifest()
+        async for chunk in super().complete_streaming(**kwargs):
+            yield chunk
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(60)
+async def test_foreground_submission_policy_mismatch_coexists_with_rule_hits(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # A3: end to end on the foreground path — the manifest committed at HEAD
+    # approves the fixture, admission froze that policy, and a MID-RUN
+    # manifest commit makes the scan-time HEAD diverge: the block carries a
+    # policy_mismatch finding ALONGSIDE the independent rule hits (the
+    # dropped approvals surface them), exposes only the policy-revision
+    # digests, and never auto-retries.
+    repo = _policy_git_repo(tmp_path)
+    _commit_scan_manifest(repo, "deploy_config.py", _GATE_SECRET_LINE)
+    frozen_digest = committed_scan_policy(repo).revision_digest
+    assert frozen_digest is not None
+    target = repo / "deploy_config.py"
+    backend = _MidRunManifestCommitBackend(
+        repo,
+        [
+            [
+                mock_llm_chunk(
+                    content="",
+                    tool_calls=[
+                        _write_file_call(target, _GATE_SECRET_CONTENT, "write-1")
+                    ],
+                )
+            ],
+            [mock_llm_chunk(content="wrote the config")],
+        ],
+    )
+    registry, parent = await _gate_registry(monkeypatch, backend, cwd=repo)
+    try:
+        result = await _foreground_result(registry, parent)
+
+        assert result.completed is False
+        assert _GATE_GITHUB_TOKEN not in result.response
+        assert "wrote the config" not in result.response
+        block = result.scan_block
+        assert block is not None
+        assert block.status == "blocked"
+        assert {finding.reason for finding in block.findings} == {
+            "match",
+            "policy_mismatch",
+        }
+        assert block.finding_counts == {"rule_hit": 2, "scan_incomplete": 1}
+        # The mismatch never masks the rule hits: both rule hits surface.
+        rule_hits = [f for f in block.findings if f.category == "rule_hit"]
+        assert {f.rule_id for f in rule_hits} == {
+            "github-token",
+            "generic-keyword-assignment",
+        }
+        mismatch = next(f for f in block.findings if f.reason == "policy_mismatch")
+        assert mismatch.path == secret_scan.MANIFEST_FILENAME
+        assert mismatch.location is None
+        # Only policy-REVISION digests are exposed — of the manifest file,
+        # never entry digests.
+        assert block.policy is not None
+        assert block.policy.frozen_revision_digest == frozen_digest
+        assert (
+            block.policy.current_revision_digest
+            == committed_scan_policy(repo).revision_digest
+        )
+        assert block.policy.current_revision_digest != frozen_digest
+        assert "never retries" in block.remediation
+        assert "self-approval" in block.remediation
+        assert "may never approve its own submission" in block.remediation
+        dumped = result.model_dump_json()
+        assert _GATE_GITHUB_TOKEN not in dumped
+        assert _GATE_SECRET_LINE not in dumped
+        assert "wrote the config" not in dumped
+        for key in committed_scan_policy(repo).approved:
+            assert key.digest not in dumped
     finally:
         await registry.drain_children()
         await parent.aclose()

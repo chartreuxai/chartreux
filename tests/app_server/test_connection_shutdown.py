@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from typing import Any, cast
 from unittest.mock import AsyncMock
 
@@ -231,3 +231,99 @@ async def test_unexpected_errors_remain_observable() -> None:
 
     with pytest.raises(RuntimeError, match="programming bug"):
         _ = [event async for event in session.events()]
+
+
+def _connection_for_reconnect(
+    failed_client: AppServerClient, client_factory: Callable[[], AppServerClient]
+) -> AppServerConnection:
+    connection = cast(AppServerConnection, object.__new__(AppServerConnection))
+    connection._client = failed_client
+    connection._client_factory = client_factory
+    connection._presentation_handler = None
+    connection._attached_session_id = "attached"
+    connection._lock = asyncio.Lock()
+    connection._closed = False
+    return connection
+
+
+@pytest.mark.asyncio
+async def test_refusing_client_factory_ends_reconnect_as_false() -> None:
+    """The stdio route's factory raises by design (terminal disconnect); the
+    reconnect contract must observe that as False, never as an escape.
+    """
+    failed_client = _BlockingCloseClient()
+    factory_calls = 0
+
+    def client_factory() -> AppServerClient:
+        nonlocal factory_calls
+        factory_calls += 1
+        raise RuntimeError("This app-server transport cannot reconnect")
+
+    connection = _connection_for_reconnect(
+        cast(AppServerClient, failed_client), client_factory
+    )
+
+    assert await connection.reconnect(cast(AppServerClient, failed_client)) is False
+
+    assert factory_calls == 1
+    assert connection.current is None
+    assert failed_client.closed
+
+
+@pytest.mark.asyncio
+async def test_refusing_reconnect_takes_the_typed_close_path_via_pump() -> None:
+    """With the refusal observed as False, the pump takes the designed typed
+    close: both event streams settle with AppServerConnectionClosed instead of
+    the pump task faulting unretrieved.
+    """
+    failed_client = _EofClient()
+
+    def client_factory() -> AppServerClient:
+        raise RuntimeError("This app-server transport cannot reconnect")
+
+    connection = _connection_for_reconnect(
+        cast(AppServerClient, failed_client), client_factory
+    )
+    session = _session_for_close(failed_client)
+    session._connection = connection  # type: ignore[assignment]
+    session._connection_lost = False
+    session._connection_listeners = []
+    session._reconnect_backoff_seconds = 0.01
+
+    pump = asyncio.create_task(session._pump_messages())
+    try:
+        await asyncio.wait_for(pump, timeout=2)
+
+        for queue in (session._events, session._unsolicited_events):
+            item = queue.get_nowait()
+            assert isinstance(item, _StreamClosed)
+            assert isinstance(item.error, AppServerConnectionClosed)
+            assert "App-server connection closed" in str(item.error)
+        assert connection.current is None
+    finally:
+        if not pump.done():
+            pump.cancel()
+        await asyncio.gather(pump, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_replacement_client_factory_reconnects_successfully() -> None:
+    """A factory returning a fresh client (the in-process route) still
+    reconnects: True installs the replacement and invalidates the attachment.
+    """
+    failed_client = _BlockingCloseClient()
+    replacement = _BlockingCloseClient()
+
+    def client_factory() -> AppServerClient:
+        return cast(AppServerClient, replacement)
+
+    connection = _connection_for_reconnect(
+        cast(AppServerClient, failed_client), client_factory
+    )
+
+    assert await connection.reconnect(cast(AppServerClient, failed_client)) is True
+
+    assert connection.current is replacement
+    assert connection.attached is False
+    assert failed_client.closed
+    assert not replacement.closed

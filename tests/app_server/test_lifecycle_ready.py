@@ -19,6 +19,7 @@ import pytest
 
 from chartreux.app_server.child_agent_process import ProcessSubagentSpawn
 from chartreux.app_server.process_bootstrap import (
+    ADVERTISED_CAPABILITIES,
     DEFAULT_MAX_CHILD_PROCESSES,
     DEFAULT_MAX_PROCESS_TREE_SIZE,
     DEFAULT_SPAWN_READY_TIMEOUT,
@@ -348,13 +349,15 @@ def test_the_ready_frame_publishes_no_directory_claims() -> None:
     """S9-C4: the jobs directory publishes in the open reply, not the ready frame.
 
     Jobs cannot spawn before the session is open, so the startup frame carries
-    the installed protocol version and nothing else; the open reply (and the
-    identity-transition replies after it) is where the directories travel.
+    the installed protocol version and its advertised capabilities, and no
+    directory claims; the open reply (and the identity-transition replies after
+    it) is where the directories travel.
     """
     payload = json.loads(encode_ready_frame().decode())
 
     assert payload == {
         "chartreuxBootstrap": "ready",
         "protocolVersion": PROCESS_PROTOCOL_VERSION,
+        "capabilities": sorted(ADVERTISED_CAPABILITIES),
     }
     assert not {"jobs_dir", "session_dir", "jobs"} & payload.keys()

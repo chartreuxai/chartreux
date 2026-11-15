@@ -39,6 +39,7 @@ from typing import TYPE_CHECKING, cast
 from chartreux.app_server.events import TurnCompleted
 from chartreux.app_server.models import PublicTurnStatus
 from chartreux.app_server.session import AppServerTurnError
+from chartreux.cli.textual_ui.program_status_composition import ReleaseOutcome
 from chartreux.observability.logging import logger
 
 if TYPE_CHECKING:
@@ -353,7 +354,13 @@ class RootRecoveryController:
             and pending.session_id == live_session_id
             and pending.record_epoch == self._app._record_epoch
         ):
-            self._app._program_status.emit("idle")
+            # The session conjunct keeps this a still-current-session settle:
+            # recovery ownership is preserved and the idle settles through the
+            # shared recompute (design §3.3).
+            self._app._settle_composed_status(
+                outcome=ReleaseOutcome("idle"),
+                turn_active=self._app._agent_job_active(),
+            )
         try:
             asyncio.create_task(
                 self._app.app_server.cancel_root_recovery(

@@ -1017,6 +1017,9 @@ class _StubResultsView:
     def _note_uncollected_change_locked(self, agent_id: str) -> None:
         return None
 
+    def _advance_inventory_revision_locked(self) -> None:
+        return None
+
 
 def _publication_context(
     agent_id: str, run_id: str, *, record: Any, runtime: Any, token: object

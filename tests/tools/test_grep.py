@@ -23,6 +23,16 @@ from tests.conftest import build_test_vibe_config
 from tests.mock.utils import collect_result
 
 
+def _unallocatable_pid() -> int:
+    """A pid the kernel never hands out (PID_MAX_LIMIT is 2**22), so the spawn
+    ledger's in-frame identity read records a no-tuple completion and a spawn
+    double can never be mistaken for a real unrelated process.
+    """
+    pid = (1 << 22) + 1
+    assert not Path(f"/proc/{pid}").exists()
+    return pid
+
+
 @pytest.fixture
 def grep(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
@@ -49,6 +59,7 @@ def grep_gnu_only(tmp_path, monkeypatch):
 async def test_cancellation_kills_search_subprocess(grep, monkeypatch):
     class SlowProcess:
         returncode = None
+        pid = _unallocatable_pid()
 
         async def communicate(self):
             await asyncio.Event().wait()
@@ -584,7 +595,7 @@ async def test_cancellation_during_worker_never_publishes_or_spawns_later(
     spawns = []
     execute = grep._execute_search
 
-    async def record(cmd):
+    async def record(cmd, *, ledger: object = None):
         spawns.append(cmd)
         return await execute(cmd)
 
@@ -703,6 +714,7 @@ async def test_run_cancellation_during_subprocess_prevents_next_spawn_and_public
 
     class SlowProcess:
         returncode = None
+        pid = _unallocatable_pid()
 
         async def communicate(self):
             started.set()

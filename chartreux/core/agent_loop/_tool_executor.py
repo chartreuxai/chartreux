@@ -32,6 +32,7 @@ from chartreux.core.agent_loop._dangerous_command_grants import (
 )
 from chartreux.core.agent_loop._execution_admission import (
     ExecutionAdmission,
+    live_authority_admission_denial,
     revalidate_execution_admission,
 )
 from chartreux.core.agent_loop._loop_types import ToolDecision, ToolExecutionResponse
@@ -341,6 +342,35 @@ class ToolExecutor:
         )
         if snapshot is not None:
             self._checkpoint_recorder.add_snapshot(snapshot)
+
+        # G5b: a process child's ceiling lives in the process that spawned it,
+        # so it is asked AGAIN here -- after the snapshot await, which is the
+        # window in which the owner can tighten or revoke, and before the
+        # synchronous revalidation whose decision the invocation executes on.
+        # Nothing awaits between this answer and ``invoke``, so the call cannot
+        # slip past a revocation ordered before it. A root or in-process child
+        # has no client and this is a no-op.
+        live_denial = await live_authority_admission_denial(
+            tool_instance, tool_call.validated_args, self._tool_manager_getter()
+        )
+        if live_denial is not None:
+            self._stats_getter().tool_calls_agreed -= 1
+            logger.info(
+                "Tool call denied by live authority tool=%s tool_call_id=%s "
+                "outcome=denied",
+                tool_call.tool_name,
+                tool_call.call_id,
+            )
+            async for ev in self._handle_tool_skip(
+                tool_call,
+                ToolDecision(
+                    verdict=ToolExecutionResponse.SKIP,
+                    approval_type=ToolPermission.NEVER,
+                    feedback=live_denial,
+                ),
+            ):
+                yield ev
+            return
 
         # The snapshot await is a world-change window: dangerous-command
         # authority — or any other permission dimension — may have been

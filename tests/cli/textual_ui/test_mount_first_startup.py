@@ -140,8 +140,10 @@ async def test_registry_swapped_after_session_ready() -> None:
         banner = app.query_one(Banner)
         assert banner.state.active_model != ""
         context_progress = app.query_one(SessionStatusLine)
-        assert context_progress.state.auto_compact_threshold is not None
-        assert context_progress.state.auto_compact_threshold > 0
+        # H3: the mounted row starts at the deployment's compaction trigger,
+        # never at the hard window the runtime read reports beside it.
+        assert context_progress.state.auto_compact_threshold == 500_000
+        assert app.app_server.resources.runtime.context_window == 1_000_000
 
 
 @pytest.mark.asyncio
@@ -157,16 +159,19 @@ async def test_stats_update_keeps_context_progress_visible() -> None:
                     session_id="session-1",
                     emitted_at=0,
                     stats=AgentStatsSnapshot(context_tokens=12_500),
-                    context_window=200_000,
+                    context_window=1_000_000,
                 )
             )
         )
         await pilot.pause()
 
         context_progress = app.query_one(SessionStatusLine)
-        assert context_progress.state.auto_compact_threshold == 200_000
+        # The event's window is the model's hard cap; the denominator stays the
+        # configured trigger (500k) that automatic compaction fires at.
+        assert context_progress.state.auto_compact_threshold == 500_000
         assert context_progress.state.context_tokens == 12_500
-        assert "12k/200k (6%)" in context_progress.render().plain
+        assert "12k/500k (2%)" in context_progress.render().plain
+        assert "12k/1.0M" not in context_progress.render().plain
 
 
 @pytest.mark.asyncio
@@ -189,13 +194,13 @@ async def test_stats_update_while_modal_is_open_updates_main_progress() -> None:
                     session_id="session-1",
                     emitted_at=0,
                     stats=AgentStatsSnapshot(context_tokens=12_500),
-                    context_window=200_000,
+                    context_window=1_000_000,
                 )
             )
         )
         await pilot.pause()
 
-        assert context_progress.state.auto_compact_threshold == 200_000
+        assert context_progress.state.auto_compact_threshold == 500_000
         assert context_progress.state.context_tokens == 12_500
 
 

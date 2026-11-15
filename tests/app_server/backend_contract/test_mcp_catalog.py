@@ -11,6 +11,7 @@ from typing import Any, cast
 import pytest
 import tomli_w
 
+from chartreux.app_server import root_agent as root_agent_module
 from chartreux.app_server._mcp_auth import MCPAuthenticationService
 from chartreux.app_server._runtime import HarnessProcess, create_harness_server
 from chartreux.app_server._session_backend_impl import SessionBackendImpl
@@ -20,6 +21,8 @@ from chartreux.app_server._session_backend_port import (
 )
 from chartreux.app_server.client import AppServerClient
 from chartreux.app_server.events import MCPAuthorizationRequiredEvent
+from chartreux.app_server.host import AppServerHost
+from chartreux.app_server.mcp_catalog import AgentLoopMCPCatalogRoot
 from chartreux.app_server.models import MCPSourceStatus
 from chartreux.app_server.protocol import (
     AppServerResponseError,
@@ -37,13 +40,27 @@ from chartreux.app_server.protocol import (
     MCPRemoveResponse,
     MCPToggleParams,
     ProtocolErrorCode,
+    SessionOptions,
     SessionStartParams,
     SessionStartResponse,
     SessionStopParams,
 )
 from chartreux.app_server.session import AppServerSession
-from chartreux.app_server.transport import JsonRpcTransport, memory_transport_pair
-from tests.app_server.backend_contract.conftest import BackendContractConnection
+from chartreux.app_server.transport import (
+    IN_PROCESS_TRANSPORT,
+    STDIO_TRANSPORT,
+    JsonRpcTransport,
+    memory_transport_pair,
+)
+from chartreux.core.agent_loop import AgentLoop
+from chartreux.core.config import build_default_orchestrator
+from tests.app_server.backend_contract.conftest import (
+    BACKEND_CONTRACT_TRANSPORTS,
+    BackendContractConnection,
+    install_memory_root_agent,
+)
+from tests.stubs.fake_backend import FakeBackend
+from tests.stubs.fake_mcp_registry import FakeMCPRegistry
 
 _HEALTHY_SERVER = "healthy"
 _OAUTH_SERVER = "oauth"
@@ -641,3 +658,368 @@ def _assert_login_wire_order(timeline: list[tuple[str, dict[str, Any]]]) -> None
     )
     assert runtime_updated < auth_url
     assert auth_url < response
+
+
+# ---------------------------------------------------------------------------
+# C1h: the MCP owner-key lifecycle as typed carriers on both transports.
+#
+# The stdio leg runs the root agent over a memory wire whose loop is built on a
+# real orchestrator over the same config dir the in_process leg's harness
+# loads, so both legs own the same catalog shape and the session-scoped
+# mcp_catalog/* calls cross the agent wire with the typed owner key.
+
+
+@dataclass(slots=True)
+class _TransportRecording:
+    client: AppServerClient
+    host: AppServerHost
+    transport: _RecordingTransport
+    harness: Any
+    loop: Any = None
+
+    async def close(self) -> None:
+        await self.client.close()
+        await self.host.close()
+        if self.loop is not None:
+            await self.loop.aclose()
+
+
+async def _connect_mcp_transport(
+    mode: str, monkeypatch: pytest.MonkeyPatch
+) -> _TransportRecording:
+    """One recording connection on ``mode`` with the config-dir MCP servers."""
+    client_transport, server_transport = memory_transport_pair()
+    recording = _RecordingTransport(cast(JsonRpcTransport, client_transport))
+    loop: AgentLoop | None = None
+    if mode == STDIO_TRANSPORT:
+        loop = AgentLoop(
+            config_orchestrator=await build_default_orchestrator(),
+            backend=FakeBackend(),
+            enable_streaming=False,
+            mcp_registry=FakeMCPRegistry(),
+        )
+        install_memory_root_agent(monkeypatch, loop)
+        harness = await create_harness_server(server_transport, transport_kind="stdio")
+    else:
+        harness = await create_harness_server(
+            server_transport, transport_kind=IN_PROCESS_TRANSPORT
+        )
+    client = AppServerClient(recording, run_peer=harness.serve)
+    host = await AppServerHost.connect(
+        client,
+        client_info=ClientInfo(name="mcp-transport-test", version="0"),
+        capabilities=ClientCapabilities(),
+        session_options=SessionOptions(),
+        client_factory=harness.connect_client,
+    )
+    return _TransportRecording(
+        client=client, host=host, transport=recording, harness=harness, loop=loop
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "mode", BACKEND_CONTRACT_TRANSPORTS, ids=BACKEND_CONTRACT_TRANSPORTS
+)
+async def test_mcp_catalog_owner_side_carriers_on_both_transports(
+    mode: str, monkeypatch: pytest.MonkeyPatch, backend_contract_mistral_api: Any
+) -> None:
+    """Read/refresh/toggle/remove answer from the owner on both transports.
+
+    On stdio every call crosses the agent wire carrying the typed owner key;
+    the reply's runtime is adopted by the coordinator, so the public
+    projection and the revision-stamped mutation receipts match the
+    in_process leg's exactly.
+    """
+    del backend_contract_mistral_api
+    connection = await _connect_mcp_transport(mode, monkeypatch)
+    try:
+        session = await connection.host.open_session()
+        session_id = session.session_id
+
+        read = MCPReadResponse.model_validate(
+            await connection.client.request(
+                "mcp_catalog/read", MCPReadParams(session_id=session_id)
+            )
+        )
+        assert _source(read, _OAUTH_SERVER).status is MCPSourceStatus.DISABLED
+
+        refresh = MCPCatalogMutationResponse.model_validate(
+            await connection.client.request(
+                "mcp_catalog/refresh", MCPRefreshParams(session_id=session_id)
+            )
+        )
+        assert refresh.runtime is not None
+        assert (
+            _source(MCPReadResponse(mcp=refresh.runtime.mcp), _HEALTHY_SERVER).status
+            is MCPSourceStatus.ENABLED
+        )
+
+        disabled = MCPCatalogMutationResponse.model_validate(
+            await connection.client.request(
+                "mcp_catalog/toggle",
+                MCPToggleParams(
+                    session_id=session_id, name=_HEALTHY_SERVER, disabled=True
+                ),
+            )
+        )
+        assert disabled.runtime is not None
+        assert disabled.runtime.mcp.statuses[_HEALTHY_SERVER] == "disabled"
+        enabled = MCPCatalogMutationResponse.model_validate(
+            await connection.client.request(
+                "mcp_catalog/toggle",
+                MCPToggleParams(
+                    session_id=session_id, name=_HEALTHY_SERVER, disabled=False
+                ),
+            )
+        )
+        assert enabled.runtime is not None
+        assert enabled.runtime.mcp.statuses[_HEALTHY_SERVER] == "enabled"
+
+        removed = MCPRemoveResponse.model_validate(
+            await connection.client.request(
+                "mcp_catalog/remove",
+                MCPRemoveParams(session_id=session_id, name=_OAUTH_SERVER),
+            )
+        )
+        assert removed.name == _OAUTH_SERVER
+        assert removed.removed is True
+        assert removed.runtime is not None
+        assert _OAUTH_SERVER not in removed.runtime.mcp.statuses
+
+        await session.close()
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "mode", BACKEND_CONTRACT_TRANSPORTS, ids=BACKEND_CONTRACT_TRANSPORTS
+)
+async def test_mcp_catalog_login_relays_auth_url_on_both_transports(
+    mode: str, monkeypatch: pytest.MonkeyPatch, backend_contract_mistral_api: Any
+) -> None:
+    """The login's authUrl crosses agent -> coordinator -> client on both legs."""
+    del backend_contract_mistral_api
+
+    async def login(
+        service: MCPAuthenticationService,
+        name: str,
+        *,
+        on_url,
+        owner: object | None = None,
+    ) -> str:
+        await on_url("https://auth.example.test/authorize")
+        return service.descriptor_revision(name)
+
+    async def logout(
+        service: MCPAuthenticationService, name: str, *, owner: object | None = None
+    ) -> str:
+        return service.descriptor_revision(name)
+
+    async def keep_current_state(backend: Any, *args: object, **kwargs: object):
+        del args, kwargs
+        return await backend.read_mcp()
+
+    monkeypatch.setattr(MCPAuthenticationService, "login", login)
+    monkeypatch.setattr(MCPAuthenticationService, "logout", logout)
+    if mode == STDIO_TRANSPORT:
+        monkeypatch.setattr(
+            AgentLoopMCPCatalogRoot, "reconfigure_mcp", keep_current_state
+        )
+        monkeypatch.setattr(
+            AgentLoopMCPCatalogRoot, "authorization_changed", keep_current_state
+        )
+        monkeypatch.setattr(AgentLoopMCPCatalogRoot, "suspend_mcp", keep_current_state)
+    else:
+        monkeypatch.setattr(SessionBackendImpl, "reconfigure_mcp", keep_current_state)
+        monkeypatch.setattr(
+            SessionBackendImpl, "authorization_changed", keep_current_state
+        )
+        monkeypatch.setattr(SessionBackendImpl, "suspend_mcp", keep_current_state)
+
+    connection = await _connect_mcp_transport(mode, monkeypatch)
+    try:
+        session = await connection.host.open_session()
+        session_id = session.session_id
+        start = len(connection.transport.timeline)
+
+        logged_in = MCPCatalogMutationResponse.model_validate(
+            await connection.client.request(
+                "mcp_catalog/login",
+                MCPLoginParams(session_id=session_id, name=_OAUTH_SERVER),
+            )
+        )
+        assert logged_in.runtime is not None
+        await connection.transport.wait_for(
+            lambda timeline: (
+                _received_method_count(timeline[start:], "mcp_catalog/authUrl") == 1
+            )
+        )
+        auth_url = next(
+            message
+            for direction, message in connection.transport.timeline[start:]
+            if direction == "received"
+            and message.get("method") == "mcp_catalog/authUrl"
+        )
+        assert auth_url["params"]["name"] == _OAUTH_SERVER
+        assert auth_url["params"]["url"] == "https://auth.example.test/authorize"
+        if mode == IN_PROCESS_TRANSPORT:
+            # The relayed authUrl lands before the login response, and the
+            # mutation receipt's runtime/updated follows it.
+            await connection.transport.wait_for(
+                lambda timeline: (
+                    _received_method_count(timeline[start:], "runtime/updated") == 1
+                )
+            )
+            exchange = connection.transport.timeline[start:]
+            login_request = next(
+                message
+                for direction, message in exchange
+                if direction == "sent" and message.get("method") == "mcp_catalog/login"
+            )
+            auth_index = next(
+                index
+                for index, (direction, message) in enumerate(exchange)
+                if direction == "received"
+                and message.get("method") == "mcp_catalog/authUrl"
+            )
+            response_index = next(
+                index
+                for index, (direction, message) in enumerate(exchange)
+                if direction == "received" and message.get("id") == login_request["id"]
+            )
+            assert auth_index < response_index
+
+        logged_out = MCPCatalogMutationResponse.model_validate(
+            await connection.client.request(
+                "mcp_catalog/logout",
+                MCPLogoutParams(session_id=session_id, name=_OAUTH_SERVER),
+            )
+        )
+        assert logged_out.runtime is not None
+        await session.close()
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "mode", BACKEND_CONTRACT_TRANSPORTS, ids=BACKEND_CONTRACT_TRANSPORTS
+)
+@pytest.mark.parametrize("change", ["additive", "restrictive"])
+async def test_mcp_convergence_failure_preserves_safe_public_state_on_both_transports(
+    mode: str,
+    change: str,
+    monkeypatch: pytest.MonkeyPatch,
+    backend_contract_mistral_api: Any,
+) -> None:
+    """A fenced convergence failure leaves the same partial state on both legs."""
+    del backend_contract_mistral_api
+
+    async def fail_convergence(*args: object, **kwargs: object):
+        del args, kwargs
+        raise SessionBackendError(
+            ProtocolErrorCode.INTERNAL_ERROR, "injected backend convergence failure"
+        )
+
+    if mode == STDIO_TRANSPORT:
+        monkeypatch.setattr(
+            AgentLoopMCPCatalogRoot, "reconfigure_mcp", fail_convergence
+        )
+    else:
+        monkeypatch.setattr(SessionBackendImpl, "reconfigure_mcp", fail_convergence)
+
+    connection = await _connect_mcp_transport(mode, monkeypatch)
+    try:
+        session = await connection.host.open_session()
+        session_id = session.session_id
+        with pytest.raises(AppServerResponseError) as exc_info:
+            if change == "additive":
+                await connection.client.request(
+                    "mcp_catalog/add",
+                    MCPAddParams(
+                        session_id=session_id,
+                        url="https://drift.example.test/mcp",
+                        name="drift",
+                        scopes=[],
+                        transport="streamable-http",
+                    ),
+                )
+            else:
+                await connection.client.request(
+                    "mcp_catalog/toggle",
+                    MCPToggleParams(
+                        session_id=session_id, name=_HEALTHY_SERVER, disabled=True
+                    ),
+                )
+        assert exc_info.value.error.code is ProtocolErrorCode.INTERNAL_ERROR
+
+        read = MCPReadResponse.model_validate(
+            await connection.client.request(
+                "mcp_catalog/read", MCPReadParams(session_id=session_id)
+            )
+        )
+        affected = "drift" if change == "additive" else _HEALTHY_SERVER
+        assert _source(read, affected).status is MCPSourceStatus.UNAVAILABLE
+        assert "did not converge" in read.mcp.discovery_errors[affected]
+        assert _source(read, _OAUTH_SERVER).status is MCPSourceStatus.DISABLED
+        await session.close()
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_mcp_owner_key_released_on_session_shutdown(
+    monkeypatch: pytest.MonkeyPatch, backend_contract_mistral_api: Any
+) -> None:
+    """The typed owner key is released explicitly when the session ends.
+
+    The stdio leg mints the key coordinator-side and the agent files its auth
+    bindings under the matching handle; session stop releases the key over the
+    wire, so no handle survives the shutdown (never a GC-timed drop).
+    """
+    del backend_contract_mistral_api
+    servers: list[Any] = []
+    real_server_cls = root_agent_module.RootAgentServer
+
+    class _CapturingRootAgentServer(real_server_cls):  # type: ignore[misc, valid-type]
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            super().__init__(*args, **kwargs)
+            servers.append(self)
+
+    monkeypatch.setattr(root_agent_module, "RootAgentServer", _CapturingRootAgentServer)
+    connection = await _connect_mcp_transport(STDIO_TRANSPORT, monkeypatch)
+    try:
+        session = await connection.host.open_session()
+        session_id = session.session_id
+        await connection.client.request(
+            "mcp_catalog/read", MCPReadParams(session_id=session_id)
+        )
+        assert len(servers) == 1
+        agent_server = servers[0]
+        authentication = agent_server._mcp_service().authentication
+        root = connection.harness._server._root
+        assert list(authentication._owner_keys) == [root._mcp_owner_key]
+
+        await session.close()
+        assert authentication._owner_keys == {}
+    finally:
+        await connection.close()
+
+
+def test_owner_key_rekey_is_atomic_and_release_drops_bindings() -> None:
+    """Unit pin for the typed owner key: re-key keeps the handle, release drops it."""
+    service = MCPAuthenticationService()
+    handle = service.acquire_owner_key("key-a")
+    assert service.owner_key_is_live("key-a")
+    assert service.acquire_owner_key("key-a") is handle
+
+    rekeyed = service.rekey_owner_key("key-a", "key-b")
+    assert rekeyed is handle
+    assert not service.owner_key_is_live("key-a")
+    assert service.owner_key_is_live("key-b")
+
+    assert service.release_owner_key("key-b") is True
+    assert not service.owner_key_is_live("key-b")
+    assert service.release_owner_key("key-b") is False

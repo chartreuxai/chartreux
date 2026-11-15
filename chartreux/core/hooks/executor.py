@@ -8,6 +8,11 @@ import shlex
 from chartreux.core.hooks.config import HookConfig
 from chartreux.core.hooks.models import HookExecutionResult, HookInvocation
 from chartreux.core.job_launcher import JobLaunchPlan
+from chartreux.core.tmp_ownership import (
+    SpawnLedgerBinding,
+    SpawnRefusedError,
+    ambient_binding,
+)
 from chartreux.core.tools.secret_redaction import scrub_child_env
 from chartreux.core.utils import kill_async_subprocess
 from chartreux.core.utils.async_subprocess import spawn_registered_process
@@ -38,13 +43,20 @@ async def _read_capped(
 
 class HookExecutor:
     def __init__(
-        self, *, cwd: Path | None = None, launch: JobLaunchPlan | None = None
+        self,
+        *,
+        cwd: Path | None = None,
+        launch: JobLaunchPlan | None = None,
+        ledger: SpawnLedgerBinding | None = None,
     ) -> None:
         self._cwd = (cwd or Path.cwd()).resolve()
         # A hook may outlive the root, so a session that runs jobs under the
         # launcher binds its plan here: the hook argv keeps its stdin=PIPE
         # contract because the shim only prefixes the argv and execs into it.
         self._launch = launch
+        # The invoking context's allocation ledger binding; when absent, the
+        # process's ambient binding applies at run time.
+        self._ledger = ledger
 
     async def run(  # noqa: PLR0911 - one refusal per hook-spawn failure mode
         self, hook: HookConfig, invocation: HookInvocation
@@ -91,6 +103,7 @@ class HookExecutor:
                     timed_out=False,
                 )
 
+        binding = self._ledger if self._ledger is not None else ambient_binding()
         try:
             process = await spawn_registered_process(
                 asyncio.create_subprocess_exec(
@@ -101,7 +114,18 @@ class HookExecutor:
                     start_new_session=True,
                     cwd=self._cwd,
                     env=env,
-                )
+                ),
+                ledger=binding,
+            )
+        except SpawnRefusedError as e:
+            # Typed pre-fork refusal: the ledger could not record the spawn and
+            # the dirty flag could not flip either; no hook process started.
+            return HookExecutionResult(
+                hook_name=hook.name,
+                exit_code=1,
+                stdout="",
+                stderr=f"Spawn refused: {e}",
+                timed_out=False,
             )
         except (OSError, ValueError) as e:
             return HookExecutionResult(

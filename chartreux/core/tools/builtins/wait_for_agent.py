@@ -42,11 +42,16 @@ class WaitForAgentArgs(BaseModel):
         default=DEFAULT_WAIT_TIMEOUT_SECONDS,
         gt=0,
         description=(
-            "Maximum seconds to wait without cancelling the agent run. "
+            "Maximum seconds to wait without cancelling the agent run; the "
+            "wait keeps this turn open. "
             f"Defaults to {DEFAULT_WAIT_TIMEOUT_SECONDS:g}s; pass null explicitly "
             "to wait indefinitely. On timeout the wait returns a still_running "
-            "result (a normal outcome, not a failure) whose guidance tells you "
-            "to end your turn and re-invoke the wait in a later turn."
+            "result (a normal outcome, not a failure): end your turn or continue "
+            "independent work, and never re-invoke the wait in the same turn. A "
+            "later re-wait is conditional, not automatic: re-wait only if the "
+            "result is a hard dependency of your next action, no independent work "
+            "can proceed, and that action must occur in that turn rather than "
+            "after notification."
         ),
     )
     mode: ResultDeliveryMode = Field(

@@ -158,11 +158,13 @@ enable_notifications = false
 While the interactive interface runs, Chartreux reports what the program is doing to
 terminals that implement the
 [OSC 7501 program status protocol](https://www.superlogical.com/rex/docs/build/program-status):
-`idle` at the prompt, `working` during an agent turn, `blocked` while waiting on a
-question or a permission prompt, and `done` or `error` at the end of a turn. A
-`blocked` report also names the reason (`question` or `permission`) and carries a short
-message. Presentation stays with the terminal; Chartreux draws no progress indicator of
-its own.
+`idle` means the main turn is idle and no active background subagent is known to be
+working. `working` means the main turn or an active background subagent is working.
+`blocked` takes precedence while a question or permission prompt needs attention.
+After a completed turn, `done` is deferred until its background work is no longer
+active; after an interrupted turn, the corresponding report is `idle`. An error
+remains `error` until a later owner replaces it. Reports depend on a live,
+responsive session and may lag a subagent transition.
 
 Chartreux writes each report as the terminal's root record — `state`, an optional
 `kind`, `app=chartreux`, and an optional `msg`, with no `id` pair — which is what a

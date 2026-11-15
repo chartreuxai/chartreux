@@ -11,6 +11,12 @@ import time
 from weakref import WeakKeyDictionary, WeakSet
 
 from chartreux.core.job_launcher import JOB_OWNER_MARKER_ENV, JobGroupRecord
+from chartreux.core.tmp_ownership import (
+    IdentityTuple,
+    SpawnLedgerBinding,
+    boot_id,
+    process_identity_tuple,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -42,7 +48,20 @@ class ProcessGroupOwnership:
     valid: bool = True
     witnessed: dict[int, tuple[int, int, int]] = field(default_factory=dict, repr=False)
     spawn_started: int | None = None
+    boot_id: str = ""
     _lock: threading.RLock = field(default_factory=threading.RLock, repr=False)
+
+    @property
+    def full_identity(self) -> IdentityTuple | None:
+        """The leader's full {pid, pgid, starttime, boot_id} identity tuple."""
+        if self.leader is None:
+            return None
+        return IdentityTuple(
+            pid=self.pgid,
+            pgid=self.leader[1],
+            starttime=self.leader[0],
+            boot_id=self.boot_id,
+        )
 
     def _identity_changed(self) -> None:
         self.valid = False
@@ -419,24 +438,48 @@ def register_process_group(
     if leader is not None:
         spawn_started = leader[0]
     _GROUP_OWNERS[proc] = ProcessGroupOwnership(
-        proc.pid, leader, spawn_started=spawn_started
+        proc.pid, leader, spawn_started=spawn_started, boot_id=boot_id() or ""
     )
 
 
 async def spawn_registered_process(
     spawn: Coroutine[object, object, asyncio.subprocess.Process],
+    *,
+    ledger: SpawnLedgerBinding | None = None,
+    invocation_dir: str | None = None,
+    is_leader_group: bool = True,
 ) -> asyncio.subprocess.Process:
     """Finish an isolated spawn and reclaim its group if the caller cancels.
 
     Shield only the factory and registration, not subsequent process execution.
     Cancelling the factory itself can lose the handle after the OS spawn, leaving
     asyncio to kill just the leader rather than its descendants.
+
+    With a ``ledger`` binding the spawn is registered RECORD-BEFORE-SPAWN: the
+    intent entry is appended before the fork (a typed :class:`SpawnRefusedError`
+    propagates pre-fork when neither the append nor the dirty-flag flip can
+    land), a failed spawn retracts the intent, and a successful spawn completes
+    it with the child's full identity tuple captured synchronously in the spawn
+    frame — never across an event-loop yield, so a fast-exiting child is never
+    left uncompleted.
     """
 
     async def spawn_and_register() -> asyncio.subprocess.Process:
         spawn_started = _start_ticks()
-        proc = await spawn
+        handle = None
+        if ledger is not None:
+            handle = ledger.begin_spawn(
+                is_leader_group=is_leader_group, invocation_dir=invocation_dir
+            )
+        try:
+            proc = await spawn
+        except BaseException:
+            if ledger is not None and handle is not None:
+                ledger.retract_spawn(handle)
+            raise
         register_process_group(proc, spawn_started=spawn_started)
+        if ledger is not None and handle is not None:
+            ledger.complete_spawn(handle, proc.pid, process_identity_tuple(proc.pid))
         return proc
 
     spawn_task = asyncio.create_task(spawn_and_register())

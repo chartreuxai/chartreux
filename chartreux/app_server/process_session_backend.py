@@ -19,6 +19,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import (
     AsyncIterator,
+    Awaitable,
     Callable,
     Collection,
     Coroutine,
@@ -29,14 +30,18 @@ from contextlib import aclosing, suppress
 from dataclasses import dataclass, replace as dataclass_replace
 import os
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol, cast
 from uuid import uuid4
 
-from pydantic import TypeAdapter
+from pydantic import TypeAdapter, ValidationError
 
 from chartreux.app_server._dispatch import DispatchResult
 from chartreux.app_server._execution import cancel_tasks
-from chartreux.app_server._model import validate_wire
+from chartreux.app_server._handler import (
+    session_fenced_backend_error,
+    version_skew_backend_error,
+)
+from chartreux.app_server._model import ProtocolModel, validate_wire
 from chartreux.app_server._policy_tree import (
     ManifestPolicyTreeJournal,
     PolicyChange,
@@ -45,6 +50,10 @@ from chartreux.app_server._policy_tree import (
     ProcessPolicyNode,
 )
 from chartreux.app_server._projector import EventProjector, ProjectedUpdate
+from chartreux.app_server._root_recovery import (
+    RootRecoveryGate,
+    RootRecoverySessionView,
+)
 from chartreux.app_server._session_backend_port import (
     SessionBackendError,
     SessionBackendEvent,
@@ -53,6 +62,7 @@ from chartreux.app_server._session_backend_port import (
     SessionForkResult,
     SessionLifecycleResult,
 )
+from chartreux.app_server._state import turns_page
 from chartreux.app_server._streaming import finish_event_queue
 from chartreux.app_server._tool_io import ClientToolIO
 from chartreux.app_server._turn_input import vibe_content_blocks
@@ -63,7 +73,11 @@ from chartreux.app_server._turn_queue import (
     TurnQueueIdempotencyConflictError,
     TurnQueueItemNotFoundError,
 )
-from chartreux.app_server._turns import CallbackRejectedError, _record_retry_message_id
+from chartreux.app_server._turns import (
+    CallbackClosedError,
+    CallbackRejectedError,
+    _record_retry_message_id,
+)
 from chartreux.app_server._utils import (
     DecodedInput,
     decode_content_blocks,
@@ -73,8 +87,15 @@ from chartreux.app_server._utils import (
 )
 from chartreux.app_server._workspace import PromptPreparationError, WorkspaceTrustError
 from chartreux.app_server.agent_snapshot import AgentSessionSnapshot
-from chartreux.app_server.agent_wire import ShellRunRequest
+from chartreux.app_server.agent_wire import (
+    AgentAuthorityChanged,
+    AgentRecoveryEvidence,
+    AgentRunCompletion,
+    ShellRunRequest,
+    decode_turn_failure,
+)
 from chartreux.app_server.events import (
+    AppServerEvent,
     CallbackRequested,
     ClientProjection,
     EventSequenceError,
@@ -96,26 +117,65 @@ from chartreux.app_server.models import (
     UserInputCallbackOutput,
 )
 from chartreux.app_server.protocol import (
+    AgentsCancelParams,
+    AgentsInventoryReadParams,
+    AgentsInventoryReadResponse,
+    AgentsReconcileParams,
+    AgentsReleaseParams,
+    AgentsResumeParams,
+    AgentsUpdateParams,
+    AgentTranscriptGetParams,
     CallbackKeepWaitingParams,
     CallbackKeepWaitingResponse,
     CallbackOutput,
     CallbackResultError,
     CallbackResultParams,
     CallbackResultResponse,
+    ConfigFieldsReadParams,
     ConfigMutationResponse,
+    ConfigProxyReadParams,
+    ConfigProxyWriteParams,
     ConfigReloadParams,
     ConfigWriteParams,
     ConfigWriteResponse,
     ContextInjectParams,
     ContextInjectResponse,
+    DangerousCommandAuthorityReadParams,
+    DangerousCommandAuthorityReadResponse,
+    DangerousCommandRevokeParams,
+    DangerousCommandRevokeResponse,
+    DiagnosticsListParams,
+    DiagnosticsLogsReadParams,
     EmptyResponse,
+    IdentityReadParams,
     JsonPatchOperation,
+    LoopsClearParams,
+    LoopsCreateParams,
+    LoopsDeleteParams,
+    LoopsListParams,
+    MCPAddParams,
+    MCPAuthRequiredParams,
+    MCPAuthUrlParams,
+    MCPLoginParams,
+    MCPLogoutParams,
+    MCPReadParams,
+    MCPRefreshParams,
+    MCPRemoveParams,
+    MCPToggleParams,
     Notification,
     PolicyReadParams,
     PolicyReadResponse,
     PolicyReplaceParams,
     PolicyReplaceResponse,
     ProtocolErrorCode,
+    ReviewBaselineParams,
+    ReviewHunksParams,
+    ReviewMutationParams,
+    ReviewStateParams,
+    ReviewTurnDiffParams,
+    RootRecoveryAdmitParams,
+    RootRecoveryCancelParams,
+    RootRecoveryScheduleParams,
     RootsReadParams,
     RootsReadResponse,
     RootsReplaceParams,
@@ -124,6 +184,7 @@ from chartreux.app_server.protocol import (
     RootsSaveResponse,
     RuntimeReadParams,
     RuntimeReadResponse,
+    RuntimeSnapshot,
     RuntimeUpdatedParams,
     SessionCompactParams,
     SessionCompactResponse,
@@ -131,10 +192,14 @@ from chartreux.app_server.protocol import (
     SessionForkParams,
     SessionHistoryClearParams,
     SessionHistoryClearResponse,
+    SessionHistoryListParams,
     SessionListParams,
     SessionListResponse,
     SessionLogReadParams,
     SessionLogReadResponse,
+    SessionMemorialItem,
+    SessionPlanHandoffParams,
+    SessionPlanHandoffResponse,
     SessionPlanRecord,
     SessionPlanRecordWriteParams,
     SessionPlanRecordWriteResponse,
@@ -149,9 +214,17 @@ from chartreux.app_server.protocol import (
     SessionShellCommandParams,
     SessionShellCommandResponse,
     SessionStartParams,
+    SessionStopParams,
+    SessionStopResponse,
     SessionTitleUpdateParams,
     SessionTitleUpdateResponse,
+    SessionTurnsListParams,
     SessionUpdatedParams,
+    SettingsReadParams,
+    SkillsInstalledParams,
+    SkillsListParams,
+    StatsReadParams,
+    ToolsListParams,
     TurnCompletedParams,
     TurnContextInputEntry,
     TurnEnqueueParams,
@@ -174,6 +247,7 @@ from chartreux.app_server.protocol import (
     TurnSteerParams,
     TurnSteerResponse,
     TurnUserInputEntry,
+    WorkspacePromptPrepareParams,
 )
 from chartreux.app_server.registry_manifest import RegistryManifest
 from chartreux.app_server.root_agent_process import (
@@ -186,6 +260,7 @@ from chartreux.app_server.root_agent_process import (
     RootAgentReplaceConflict,
     RootAgentRequestError,
     RootAgentSessionNotFound,
+    RootFailureSignature,
     root_agent_command,
     spawn_root_agent_process,
 )
@@ -204,6 +279,7 @@ from chartreux.core.agent_loop._request_broker import (
     EXPIRED_CALLBACK_REASON,
     UserInputSettlement,
 )
+from chartreux.core.config.models import RootRecoveryConfig
 from chartreux.core.events import (
     AssistantEvent,
     SessionTitleUpdatedEvent,
@@ -211,12 +287,15 @@ from chartreux.core.events import (
 )
 from chartreux.core.job_launcher import JOB_GROUP_RECORD_SUFFIX, read_job_group_record
 from chartreux.core.llm_models import ManualShellContext
+from chartreux.core.model_catalog.availability import AvailabilitySnapshot
 from chartreux.core.session.image_snapshot import ImageSnapshotError
+from chartreux.core.subagents import AgentAvailability, RunStatus, RunStopReason
 from chartreux.core.utils.async_subprocess import (
     ProcessGroupSettlement,
     RecordedJobGroup,
     settle_recorded_job_group,
 )
+from chartreux.observability.logging import logger
 from chartreux.questions import UserQuestionRequest, UserQuestionResult
 
 type SessionBackendServicesRef = Any
@@ -225,7 +304,18 @@ type SessionBackendServicesRef = Any
 #: How long one spawned root agent gets to answer its own readiness frame.
 DEFAULT_READY_TIMEOUT = 30.0
 #: How long one ordinary agent request may take before it is a typed timeout.
-DEFAULT_REQUEST_TIMEOUT = 60.0
+#: The shared 30-second ordinary-request default: the stdio route answers with
+#: the same bound the client and the root port already use, not a private 60s.
+DEFAULT_REQUEST_TIMEOUT = 30.0
+
+STOP_SETTLE_TIMEOUT = 60.0
+"""How long the coordinator's stop may spend settling callbacks and queued work.
+
+The stop is a long operation: the server-side receipt budget for bringing open
+callbacks and the turn queue to a terminal state BEFORE the ack. A stop whose
+settlement outlives this bound is an unknown outcome -- reconciled through
+``session/resume``, never resent.
+"""
 
 
 @dataclass(frozen=True, slots=True)
@@ -236,11 +326,40 @@ class TrackedJobOutcome:
     settlement: ProcessGroupSettlement
 
 
+@dataclass(frozen=True, slots=True)
+class _SequenceAdvance:
+    """Cursor-only echo of one event the projection drained.
+
+    The projection consumed the notification and advanced its sequence
+    cursor without materializing an event, so the stream's cursor must
+    advance with it or the next queued publication reads as a gap.
+    """
+
+    event_id: int
+    session_id: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _ForwardedNotification(SessionBackendEvent):
+    """A drained notification the stream forwards to its subscriber.
+
+    A drain means this backend's projection no longer indexes the entry,
+    not that the wire client lost its copy: the client can hold older
+    entries via Load-More backfill, so the drained update still belongs
+    on the wire. The envelope rides behind the cursor echo and yields
+    unnumbered -- a plain routing delivery with no event of its own.
+    """
+
+    # The widened type IS the class's purpose: this envelope has no event of
+    # its own, only the raw routed notification.
+    event: AppServerEvent | None = None  # pyright: ignore[reportIncompatibleVariableOverride]
+
+
 class _StreamClosed:
     """Terminal marker for one backend event stream."""
 
 
-type _QueuedEvent = SessionBackendEvent | _StreamClosed
+type _QueuedEvent = SessionBackendEvent | _StreamClosed | _SequenceAdvance
 
 
 @dataclass(frozen=True, slots=True)
@@ -318,6 +437,42 @@ def _uncovered(operation: str) -> SessionBackendError:
     )
 
 
+# The parameter model each carried review and catalog read validates with. Both
+# groups cross to the owner as typed requests, so the coordinator's parse is the
+# same one the in-process route applies before the owner ever sees the request.
+_REVIEW_CARRIER_PARAMS: Mapping[str, type[ProtocolModel]] = {
+    "review/state": ReviewStateParams,
+    "review/baseline": ReviewBaselineParams,
+    "review/turnDiff": ReviewTurnDiffParams,
+    "review/hunks": ReviewHunksParams,
+    "review/approve": ReviewMutationParams,
+    "review/revert": ReviewMutationParams,
+}
+
+_CATALOG_CARRIER_PARAMS: Mapping[str, type[ProtocolModel]] = {
+    "skills/list": SkillsListParams,
+    "skills/installed": SkillsInstalledParams,
+    "tools/list": ToolsListParams,
+    "stats/read": StatsReadParams,
+    "identity/read": IdentityReadParams,
+}
+
+
+class _CarrierParams(Protocol):
+    """The one field every carried request in these sets is scoped by."""
+
+    session_id: str
+
+
+def _carrier_session_id(params: ProtocolModel) -> str:
+    """The session a validated carried request names.
+
+    Every request in the carried sets is session-scoped and models that field,
+    so the validated model is the single place the name is taken from.
+    """
+    return cast(_CarrierParams, params).session_id
+
+
 def _retained_public_turn(retained: _PromotedShellRecord) -> PublicQueuedTurn:
     """The pending queue entry a retained record is publicly visible as."""
     return PublicQueuedTurn(
@@ -338,6 +493,66 @@ def _shell_input_entry(record: QueuedTurnRecord) -> TurnShellInputEntry | None:
         if isinstance(entry, TurnShellInputEntry):
             return entry
     return None
+
+
+def _queued_turn_text(turn: PublicQueuedTurn) -> str | None:
+    """The user-typed text a public queue item carries, if any."""
+    texts: list[str] = []
+    for entry in turn.entries:
+        if isinstance(entry, TurnShellInputEntry):
+            texts.append(entry.command)
+        else:
+            texts.extend(
+                block.text
+                for block in entry.content
+                if isinstance(block, SessionTextContentBlock) and block.text
+            )
+    return "\n".join(texts) or None
+
+
+def _completion_status_word(completion: AgentRunCompletion) -> str:
+    """The completion-notification status word for one settled run.
+
+    Mirrors ``_subagent_execution._completion_status_word`` exactly: the stop
+    reason outranks the status for a budget stop, and the user cancellation
+    outranks the plain "cancelled" the remaining terminal statuses read as.
+    """
+    stop_reason = completion.stop_reason
+    return (
+        "budget-stopped (budget exceeded)"
+        if stop_reason == RunStopReason.BUDGET_EXCEEDED.value
+        else "budget-stopped (budget unverifiable)"
+        if stop_reason == RunStopReason.BUDGET_UNVERIFIABLE.value
+        else "completed"
+        if completion.status == RunStatus.COMPLETED.value
+        else "failed"
+        if completion.status == RunStatus.FAILED.value
+        else "cancelled (by user)"
+        if stop_reason == RunStopReason.USER_CANCELLED.value
+        else "retasked"
+        if stop_reason == RunStopReason.RETASKED.value
+        else "cancelled"
+    )
+
+
+def completion_notification_text(completion: AgentRunCompletion) -> str:
+    """The model-facing text one settled background run is announced with.
+
+    Byte-identical in wording to the in-process registry's delivered
+    notification (``_subagent_execution``'s completion builder): the agent's
+    display name, its id, the run id, the observed status word, and the same
+    two instructions -- fetch this run by its id, and keep working or end the
+    turn rather than waiting.
+    """
+    return (
+        f"Background agent {completion.name} "
+        f"({completion.agent_id}, run {completion.run_id})"
+        f" {_completion_status_word(completion)}."
+        " Use get_agent_result to retrieve the result."
+        " Retrieve this run by its run_id; continue independent work"
+        " or end your turn for other running agents rather than"
+        " waiting by default."
+    )
 
 
 class ProcessSessionBackendHost:
@@ -364,14 +579,66 @@ class ProcessSessionBackendHost:
         self._request_timeout = request_timeout
         self._host_handler = host_handler
         self._backends: dict[str, ProcessSessionBackend] = {}
+        # Session ids with a respawn in flight: a second resume for a dead
+        # generation is fenced instead of spawning a second replacement.
+        self._respawns: set[str] = set()
         self._closed = False
 
     async def start(self, params: SessionStartParams) -> SessionLifecycleResult:
         return await self._open(params, session_id=None, continue_latest=False)
 
     async def resume(self, params: SessionResumeParams) -> SessionLifecycleResult:
-        return await self._open(
-            params, session_id=params.session_id, continue_latest=False
+        """Resume a stored session, respawning a confirmed-dead root once.
+
+        After confirmed root death an explicit resume retires the dead
+        backend, spawns and handshakes exactly one replacement, and restores
+        only durable session state; the dead generation's coordinator-owned
+        queue and shell records travel as memorial state in the result,
+        never re-admitted for execution. A resume against a still-live
+        generation is an idempotent re-attach (the in-process arm's same-id
+        behavior), which is also the reconcile path after an unknown outcome:
+        resume is not a mutation, so retrying it never replays one.
+        """
+        session_id = params.session_id
+        existing = self._backend_for(session_id)
+        if existing is not None and not existing.is_dead:
+            return SessionLifecycleResult(backend=existing)
+        if session_id in self._respawns:
+            raise SessionBackendError(
+                ProtocolErrorCode.CONFLICT,
+                f"A respawn of session {session_id} is already in flight; its "
+                "resume receipt settles it — reconcile by resuming again or "
+                "reading the session, never by resending a mutation",
+            )
+        memorial: tuple[SessionMemorialItem, ...] = ()
+        death_receipt: str | None = None
+        if existing is not None:
+            # Confirmed root death: capture the dead generation's memorial
+            # state and its typed death receipt, then fence the old generation
+            # so nothing still addressed to it executes.
+            memorial = existing.memorial_items()
+            death = existing.process.death
+            death_receipt = (
+                death.diagnostic
+                if death is not None
+                else (
+                    f"{RootFailureSignature.DEATH_RECEIPT.value}: the root agent "
+                    f"generation serving session {session_id} is retired"
+                )
+            )
+            existing.retire()
+        self._respawns.add(session_id)
+        try:
+            result = await self._open(
+                params, session_id=session_id, continue_latest=False
+            )
+        finally:
+            self._respawns.discard(session_id)
+        return SessionLifecycleResult(
+            backend=result.backend,
+            after_response=result.after_response,
+            memorial=memorial,
+            death_receipt=death_receipt,
         )
 
     async def continue_latest(
@@ -388,6 +655,10 @@ class ProcessSessionBackendHost:
     ) -> SessionLifecycleResult:
         if self._closed:
             raise RuntimeError("The process session backend host is closed")
+        from chartreux.app_server.process_bootstrap import (
+            AGENT_WIRE_CAPABILITY_LIVE_CHILD_AUTHORITY,
+        )
+
         try:
             process = await spawn_root_agent_process(
                 session_options=params.agent_config,
@@ -405,6 +676,23 @@ class ProcessSessionBackendHost:
             # spawn_root_agent_process closes the partial tree on a failed
             # handshake or open; nothing survives to be adopted here.
             raise _spawn_diagnostic("the root agent", exc) from exc
+        # G5: live child authority is MANDATORY on the agent-wire peers, so a
+        # root that does not announce it is refused here instead of being
+        # served: on such a root a process child would run on the static
+        # inherited policy with no live ceiling and no revocation, which is
+        # exactly the fail-open this carrier closes. The refusal is a version
+        # skew -- both ends restart on the same chartreux build.
+        if (
+            AGENT_WIRE_CAPABILITY_LIVE_CHILD_AUTHORITY
+            not in process.advertised_capabilities
+        ):
+            await process.close()
+            raise SessionBackendError(
+                ProtocolErrorCode.CONFLICT,
+                "the root agent does not announce the mandatory live-child-authority "
+                "capability; restart both ends on the same chartreux version -- no "
+                "session was opened",
+            )
         try:
             backend = ProcessSessionBackend(
                 process, services=self._services, state=await self._open_state(process)
@@ -439,8 +727,18 @@ class ProcessSessionBackendHost:
         )
         return dispatched.response
 
+    def _backend_for(self, session_id: str) -> ProcessSessionBackend | None:
+        backend = self._backends.get(session_id)
+        if backend is None:
+            # A handoff rotates the backend's own id after it was keyed here,
+            # so a read addressed to the rotated id still finds its backend.
+            backend = next(
+                (b for b in self._backends.values() if b.session_id == session_id), None
+            )
+        return backend
+
     async def read(self, params: SessionReadParams) -> SessionReadResponse:
-        backend = self._backends.get(params.session_id)
+        backend = self._backend_for(params.session_id)
         if backend is None:
             raise SessionBackendError(
                 ProtocolErrorCode.NOT_FOUND, f"Session not found: {params.session_id}"
@@ -450,7 +748,7 @@ class ProcessSessionBackendHost:
     async def rename(
         self, params: SessionTitleUpdateParams
     ) -> SessionTitleUpdateResponse:
-        backend = self._backends.get(params.session_id)
+        backend = self._backend_for(params.session_id)
         if backend is None:
             raise SessionBackendError(
                 ProtocolErrorCode.NOT_FOUND, f"Session not found: {params.session_id}"
@@ -481,7 +779,7 @@ class ProcessSessionBackendHost:
 class ProcessSessionBackend:  # noqa: PLR0904 - the session port surface
     """One live root agent process, seen through the app server's session port."""
 
-    def __init__(
+    def __init__(  # noqa: PLR0915 - one install step per bound port
         self,
         process: RootAgentProcess,
         *,
@@ -499,7 +797,17 @@ class ProcessSessionBackend:  # noqa: PLR0904 - the session port surface
         self._turn_task: asyncio.Task[None] | None = None
         self._notices_task: asyncio.Task[None] | None = None
         self._active_turn: PublicTurn | None = None
+        # The turns this end published, keyed by turn id and in start order.
+        # The agent mints no turn projection of its own -- every agent-built
+        # state answers an empty turn list -- so these records are the only
+        # copy of the live turn view, and an adoption that replaces the
+        # projection wholesale re-seeds from them instead of wiping it.
+        self._turn_records: dict[str, PublicTurn] = {}
         self._closed = False
+        # Set when this generation is retired by a resume respawn: every
+        # request and event still addressed to the old generation then answers
+        # the typed death receipt instead of executing (old-generation fence).
+        self._retired = False
         # The client's own file and terminal surface travels as the turn's
         # host tool-I/O port: the agent asks for it over the same pipe, so a
         # client that declared these capabilities keeps serving them exactly
@@ -539,15 +847,107 @@ class ProcessSessionBackend:  # noqa: PLR0904 - the session port surface
         # ran in between (R3-A2): the record text then becomes the retried
         # turn's own user input instead of running on the later transcript.
         self._turn_starts = 0
+        # Session rotations this end adopted or is awaiting: a settled plan
+        # handoff maps the superseded id to the rotated one, and an in-flight
+        # handoff names its source id, so a request addressed to either is
+        # fenced instead of forwarded against the pre-rotation session.
+        self._rotations: dict[str, str] = {}
+        self._pending_handoffs: set[str] = set()
+        # R2/OD3: the root automatic-recovery gate stays coordinator-local on
+        # this topology too. Its loop-owned predicate inputs (live config,
+        # transcript-integrity verdict, availability) cross the agent wire as
+        # one evidence bundle per decision (primed into _recovery_evidence by
+        # the recovery/root/* arms below); its session view is this end's own
+        # coordinator state; the typed terminal projection arrives on the
+        # agent/turn/ended frames and is captured into the gate by _drive_turn.
+        self._recovery_evidence: AgentRecoveryEvidence | None = None
+        self._recovery_notices: EventProjector | None = None
+        self._recovery_notice_tasks: set[asyncio.Task[None]] = set()
+        self._recovery_gate = RootRecoveryGate(
+            config=self._recovery_config,
+            session_view=self._recovery_session_view,
+            availability=self._recovery_availability,
+            stage_notice=self._stage_recovery_notice,
+            emit_projected=self._emit_recovery_notice,
+            transcript_integrity_verdict=self._recovery_integrity_verdict,
+        )
         # What cleanup established about the job groups this session recorded;
         # empty until the shutdown consults the jobs directory.
         self.tracked_job_outcomes: tuple[TrackedJobOutcome, ...] = ()
         self._runtime = state.runtime
         self._log = state.log
+        # The shared agent-sequence cursor this end has adopted so far: the
+        # coordinator's own watermark numbers its publications, not the
+        # agent's events, so adoption ordering keys on the agent's cursor.
+        self._adopted_agent_sequence = state.agent_sequence
         # The agent settles a user-input request where its record lives; the
         # terminal projection is this end's, so the agent asks this backend to
         # publish it before its waiter unblocks.
         self._process.bind_callback_settlement_sink(self._publish_callback_settlement)
+        # The agent emits the MCP auth notifications (authUrl, authRequired)
+        # owner-side; this end relays them onto the coordinator's notification
+        # pump so the client-facing mcp_catalog/* notifications keep their
+        # in-process shape on this topology.
+        self._process.bind_mcp_notification_sink(self._relay_mcp_notification)
+        # F10: the root's ready frame advertised the update capability, so
+        # the owner's child-inventory snapshots relay onto the client-facing
+        # agents/update exactly as the in-process registry emits its own -- a
+        # peer that did not announce the capability never has the sink bound.
+        from chartreux.app_server.process_bootstrap import (
+            AGENT_WIRE_CAPABILITY_ROOT_AGENTS_UPDATE,
+            AGENT_WIRE_CAPABILITY_ROOT_RUN_COMPLETIONS,
+        )
+
+        if (
+            AGENT_WIRE_CAPABILITY_ROOT_AGENTS_UPDATE
+            in self._process.advertised_capabilities
+        ):
+            self._process.bind_agents_update_sink(self._relay_agents_update)
+        # G1b: the parent wake is coordinator-owned. The owner reports each
+        # settled background run over its completion carrier and this backend
+        # drives the parent's next turn (or steers the one in flight); a root
+        # that did not advertise the carrier never has the sink bound, so no
+        # wake is ever reconstructed from a frame it cannot vouch for.
+        self._wake_capable = (
+            AGENT_WIRE_CAPABILITY_ROOT_RUN_COMPLETIONS
+            in self._process.advertised_capabilities
+        )
+        if self._wake_capable:
+            self._process.bind_run_completion_sink(self._handle_run_completion)
+        # G5: the owner reports each authority revision it commits. This sink is
+        # OBSERVABILITY only -- no decision and no enforcement rides it, because
+        # the decision itself is the owner-side ``agent/authority/check`` its
+        # children ask. The root always advertises the capability (a peer that
+        # does not is refused at open), so the sink is bound unconditionally.
+        self.authority_incarnation: str | None = None
+        self.authority_revision: dict[str, int] | None = None
+        self.authority_change_count = 0
+        self._process.bind_authority_changed_sink(self._observe_authority_changed)
+        # The runs this generation already woke for, keyed as the owner keys
+        # its result store. At-most-once per settled run: a duplicate
+        # notification, a release/resume race and a recovery sweep all read
+        # this set, and the sweep re-derives a baseline before it diffs.
+        self._delivered_wakes: set[tuple[str, str]] = set()
+        # The baseline is read once, at install, before this end can admit a
+        # turn: a generation installed over a root that already holds settled
+        # runs must never re-wake them.
+        self._wake_baseline: asyncio.Task[None] | None = (
+            asyncio.create_task(
+                self._capture_wake_baseline(), name="process-wake-baseline"
+            )
+            if self._wake_capable
+            else None
+        )
+        # Wake text that could not start a turn of its own (the parent was
+        # busy, had queued work, or the run was user-cancelled) rides the next
+        # promoted turn instead of being dropped -- the in-process pending
+        # injected message, carried by this end's own promotion.
+        self._pending_wake_texts: list[str] = []
+        # The typed owner key every session-scoped mcp_catalog carrier sends
+        # with its request: the agent files the auth bindings under a handle
+        # held for exactly as long as this key lives, released explicitly on
+        # shutdown and re-keyed atomically across a plan-handoff rotation.
+        self._mcp_owner_key = f"mcp-owner-{uuid4().hex}"
         self._adopt_state(state.state)
         self._events_idle.set()
 
@@ -563,6 +963,84 @@ class ProcessSessionBackend:  # noqa: PLR0904 - the session port surface
         """The spawned root agent handle this backend drives."""
         return self._process
 
+    @property
+    def is_dead(self) -> bool:
+        """Whether this generation is retired or its root is confirmed dead."""
+        return self._retired or self._process.death is not None
+
+    def retire(self) -> None:
+        """Fence this generation: it was retired by a resume respawn.
+
+        Every request still addressed to the old generation answers the typed
+        death receipt, and no old-generation event is published any more; the
+        replacement generation serves the session from here on.
+        """
+        self._retired = True
+
+    def _generation_fence(self) -> SessionBackendError | None:
+        """The typed death receipt a dead or retired generation answers with."""
+        if not self.is_dead:
+            return None
+        death = self._process.death
+        if death is not None:
+            return SessionBackendError(
+                ProtocolErrorCode.INTERNAL_ERROR, death.diagnostic
+            )
+        return SessionBackendError(
+            ProtocolErrorCode.INTERNAL_ERROR,
+            f"{RootFailureSignature.DEATH_RECEIPT.value}: this root agent "
+            "generation is retired; resume the session explicitly",
+        )
+
+    def memorial_items(self) -> tuple[SessionMemorialItem, ...]:
+        """The coordinator-durable user-visible state of this generation.
+
+        The turn queue and the shell records are coordinator-owned, so they
+        survive a root death as MEMORIAL STATE ONLY: the resume receipt lists
+        them here and the replacement generation never re-admits them for
+        execution — the user re-submits from the receipt.
+        """
+        items: list[SessionMemorialItem] = []
+        for turn in self._turn_queue.state.items:
+            items.append(
+                SessionMemorialItem(
+                    kind="queued_turn",
+                    id=turn.id,
+                    created_at=turn.created_at,
+                    text=_queued_turn_text(turn),
+                )
+            )
+        for item_id, record in self._shell_records.items():
+            items.append(
+                SessionMemorialItem(
+                    kind="queued_shell_record",
+                    id=item_id,
+                    text=record.text,
+                    committed=record.committed,
+                )
+            )
+        for record in self._promoted_shell_records.values():
+            items.append(
+                SessionMemorialItem(
+                    kind="promoted_shell_record",
+                    id=record.entry_id,
+                    created_at=record.created_at,
+                    text=record.text,
+                    committed=True,
+                )
+            )
+        for record in self._shell_retained.values():
+            items.append(
+                SessionMemorialItem(
+                    kind="retained_shell_record",
+                    id=record.entry_id,
+                    created_at=record.created_at,
+                    text=record.text,
+                    committed=True,
+                )
+            )
+        return tuple(items)
+
     # -- state -----------------------------------------------------------
 
     def _adopt_state(self, state: PublicSessionState) -> None:
@@ -570,13 +1048,56 @@ class ProcessSessionBackend:  # noqa: PLR0904 - the session port surface
 
         Event ids are the app server's to mint: the agent numbers its own
         states, so the watermark the coordinator has published is stamped onto
-        the adopted state and every later notification continues from it.
+        the adopted state and every later notification continues from it. The
+        turns are this end's to retain: an agent-built state carries none, so
+        adopting one as-is would wipe the live turn page, and the published
+        records are re-seeded in the same stamp.
         """
         watermark = self._services.event_watermark(state.session.id)
         self._projection = ClientProjection(
-            state.model_copy(
-                update={"event_id": watermark, "turn_queue": self._public_queue_state()}
+            self._historyless_view(state).model_copy(
+                update={
+                    "event_id": watermark,
+                    "turn_queue": self._public_queue_state(),
+                    "turns": self._turn_records_for(state.session.id),
+                }
             )
+        )
+
+    def _turn_records_for(self, session_id: str) -> list[PublicTurn]:
+        """The turns published for ``session_id``, in the order they started.
+
+        A settled turn REPLACES its record in place, so the page keeps the
+        position its start took; a rotation leaves its predecessor's records
+        behind and they are filtered out rather than served on the new id. An
+        instance built without ``__init__`` (the stream tests build one from
+        ``object.__new__``) has published nothing, so the store reads empty
+        instead of raising.
+        """
+        records: dict[str, PublicTurn] = self.__dict__.get("_turn_records") or {}
+        return [turn for turn in records.values() if turn.session_id == session_id]
+
+    def _historyless_view(self, state: PublicSessionState) -> PublicSessionState:
+        """Keep the subscribed history a history-less snapshot would drop.
+
+        A read built with include_history=False answers a view choice, not an
+        empty history: adopting it as-is would rebuild the projection's entry
+        index from nothing, so every later history/entryUpdated for a
+        pre-existing entry would drain (consume returns None while still
+        advancing the cursor) and desynchronize the event stream. The
+        retained history keeps that index alive; a snapshot that carries its
+        own history still replaces it wholesale.
+        """
+        if state.history is not None:
+            return state
+        projection = self._projection
+        if projection is None or projection.state.session.id != state.session.id:
+            return state
+        return state.model_copy(
+            update={
+                "history": projection.state.history,
+                "history_before_cursor": projection.state.history_before_cursor,
+            }
         )
 
     def _stamped(self, state: PublicSessionState) -> PublicSessionState:
@@ -612,10 +1133,7 @@ class ProcessSessionBackend:  # noqa: PLR0904 - the session port surface
         )
 
     async def read(self, params: SessionReadParams) -> SessionReadResponse:
-        if params.session_id != self.session_id:
-            raise SessionBackendError(
-                ProtocolErrorCode.NOT_FOUND, f"Session not found: {params.session_id}"
-            )
+        self._require_session(params.session_id)
         snapshot = await self._process.snapshot(
             history_limit=params.history_limit, include_history=params.include_history
         )
@@ -626,10 +1144,7 @@ class ProcessSessionBackend:  # noqa: PLR0904 - the session port surface
         return SessionReadResponse(state=state, last_event_id=state.event_id)
 
     async def subscribe(self, params: SessionReadParams) -> SessionEventSubscription:
-        if params.session_id != self.session_id:
-            raise SessionBackendError(
-                ProtocolErrorCode.NOT_FOUND, f"Session not found: {params.session_id}"
-            )
+        self._require_session(params.session_id)
         self._ensure_notices_drained()
         async with self._events_lock:
             if self._events_subscribed:
@@ -663,7 +1178,9 @@ class ProcessSessionBackend:  # noqa: PLR0904 - the session port surface
                         return
                     event_id = queued.event_id
                     if event_id is None:
-                        yield queued
+                        # A cursor-only echo is always numbered, so the
+                        # unnumbered yield is a plain backend event.
+                        yield cast(SessionBackendEvent, queued)
                         continue
                     if queued.session_id is None:
                         raise RuntimeError("Numbered backend event has no session ID")
@@ -676,13 +1193,18 @@ class ProcessSessionBackend:  # noqa: PLR0904 - the session port surface
                     if event_id != expected_event_id:
                         raise SessionBackendError(
                             ProtocolErrorCode.STALE_CURSOR,
-                            "The session event stream has a gap",
+                            "The session event stream has a gap: expected event"
+                            f" {expected_event_id}, received event {event_id}",
                             data={
                                 "expectedEventId": expected_event_id,
                                 "receivedEventId": event_id,
                             },
                         )
                     after_event_id = event_id
+                    if isinstance(queued, _SequenceAdvance):
+                        # The projection drained the event behind this echo:
+                        # the cursor moves on, nothing is yielded.
+                        continue
                     yield queued
                 finally:
                     if self._events.empty():
@@ -694,15 +1216,22 @@ class ProcessSessionBackend:  # noqa: PLR0904 - the session port surface
 
     async def publish_notification(self, method: str, params: Any) -> bool:
         async with self._events_lock:
-            if self._events_closed.is_set() or not self._events_subscribed:
-                return False
-            if self._projection is None:
+            # A retired or dead generation publishes no old-generation events;
+            # the replacement generation owns the stream now.
+            if (
+                self.is_dead
+                or self._events_closed.is_set()
+                or not self._events_subscribed
+                or self._projection is None
+            ):
                 return False
             notification = Notification(
                 method=method, params=params.model_dump(mode="json", by_alias=True)
             )
             event = parse_server_event(notification)
+            cursor_before: int | None = None
             if event is None:
+                cursor_before = self._projection.last_event_id
                 try:
                     event = self._projection.consume(
                         notification, dedupe_history_additions=False
@@ -715,19 +1244,47 @@ class ProcessSessionBackend:  # noqa: PLR0904 - the session port surface
                     finish_event_queue(self._events, _StreamClosed())
                     return False
             if event is None:
-                return False
-            self._events_idle.clear()
-            return await self._put_event(
-                SessionBackendEvent(
+                if (
+                    cursor_before is None
+                    or self._projection.last_event_id <= cursor_before
+                ):
+                    return False
+                # A drained event consumed cleanly: the projection's cursor
+                # advanced without materializing an event, so the stream
+                # consumes the same advance instead of the coordinator
+                # routing the numbered publication around a queue whose
+                # subscriber is now one behind.
+                advance = _SequenceAdvance(
+                    event_id=self._projection.last_event_id,
+                    session_id=getattr(params, "session_id", None),
+                )
+                self._events_idle.clear()
+                if not await self._put_event(advance):
+                    return False
+                # The drain still swallowed a notification the wire client
+                # owns a copy of -- its projection can hold the entry via
+                # Load-More backfill -- so a forwarded envelope rides behind
+                # the echo and the stream yields it unnumbered: the client
+                # keeps the update instead of keeping a stale copy.
+                queued: _QueuedEvent = _ForwardedNotification(
+                    method=method,
+                    params=params,
+                    session_id=getattr(params, "session_id", None),
+                )
+            else:
+                queued = SessionBackendEvent(
                     event=event,
                     method=method,
                     params=params,
                     session_id=getattr(params, "session_id", None),
                     event_id=getattr(params, "event_id", None),
                 )
-            )
+            self._events_idle.clear()
+            return await self._put_event(queued)
 
     async def _put_event(self, event: _QueuedEvent) -> bool:
+        if self.is_dead:
+            return False
         put = asyncio.create_task(self._events.put(event))
         closed = asyncio.create_task(self._events_closed.wait())
         try:
@@ -787,7 +1344,11 @@ class ProcessSessionBackend:  # noqa: PLR0904 - the session port surface
         )
 
     def guard_request(self) -> None:
-        return None
+        fence = self._generation_fence()
+        if fence is not None:
+            # A dead or retired generation fails every in-flight request with
+            # the typed death receipt instead of serving stale state.
+            raise fence
 
     def runtime_updated_params(self) -> RuntimeUpdatedParams:
         return RuntimeUpdatedParams(session_id=self.session_id, runtime=self._runtime)
@@ -802,7 +1363,11 @@ class ProcessSessionBackend:  # noqa: PLR0904 - the session port surface
         Answers whether the stream carried it: a client that is not subscribed
         gets the shipped direct delivery instead, exactly as on the in-process
         route. The projection is this end's, so the entry is already in it.
+        A retired or dead generation publishes nothing: the old-generation
+        fence refuses its callbacks with the death receipt.
         """
+        if self.is_dead:
+            return False
         async with self._events_lock:
             if not self._events_subscribed or self._projection is None:
                 return False
@@ -1003,15 +1568,116 @@ class ProcessSessionBackend:  # noqa: PLR0904 - the session port surface
     # -- turns -----------------------------------------------------------
 
     def _require_session(self, session_id: str) -> None:
-        if session_id != self.session_id:
-            raise SessionBackendError(
-                ProtocolErrorCode.NOT_FOUND, f"Session not found: {session_id}"
+        fence = self._generation_fence()
+        if fence is not None:
+            # Old-generation fence: a request still addressed to a retired or
+            # dead generation gets the death receipt, never a stale answer.
+            raise fence
+        if session_id == self.session_id:
+            return
+        rotated_to = self._rotations.get(session_id)
+        if rotated_to is not None:
+            # The id was superseded by a rotation this end adopted: fence the
+            # request with the rotated identity instead of a bare not-found.
+            raise session_fenced_backend_error(session_id, rotated_to)
+        raise SessionBackendError(
+            ProtocolErrorCode.NOT_FOUND, f"Session not found: {session_id}"
+        )
+
+    async def plan_handoff(self, params: SessionPlanHandoffParams) -> DispatchResult:
+        """Carry the consented plan handoff to the agent and adopt the rotation.
+
+        The wire leg runs the full consent fence in the agent process, which
+        rotates the session inside the operation; the reply's snapshot is the
+        rotated identity this end adopts, and the dispatch flags are set for
+        stdio explicitly (``session/fork``'s pattern) so the server resubscribes
+        to the rotated session once the response has been sent.
+        """
+        self._require_session(params.session_id)
+        source_id = params.session_id
+        self._pending_handoffs.add(source_id)
+        try:
+            try:
+                reply = await self._process.plan_handoff(params)
+            except RootAgentProcessError as exc:
+                raise _wire_failure(exc) from exc
+            state = self._adopt_snapshot(reply.snapshot)
+            if state is None:
+                raise SessionBackendError(
+                    ProtocolErrorCode.INTERNAL_ERROR,
+                    "The plan handoff settled without the state it left behind",
+                )
+        finally:
+            self._pending_handoffs.discard(source_id)
+        rotated_id = self.session_id
+        if rotated_id != source_id:
+            self._rotations[source_id] = rotated_id
+            # The rotation is a new session generation: the recovery gate's
+            # episodes and projections belong to the superseded one, so they
+            # are invalidated, never silently rearmed.
+            self._recovery_gate.invalidate_all()
+            # The typed MCP owner key atomically re-keys across the rotation:
+            # the agent-side handle is unchanged, so the auth bindings survive
+            # the rotation instead of being silently dropped mid-session.
+            old_owner_key = self._mcp_owner_key
+            new_owner_key = f"mcp-owner-{uuid4().hex}"
+            try:
+                await self._process.rekey_mcp_owner_key(
+                    rotated_id, old_owner_key, new_owner_key
+                )
+            except RootAgentProcessError as exc:
+                raise _wire_failure(exc) from exc
+            self._mcp_owner_key = new_owner_key
+        return DispatchResult(
+            SessionPlanHandoffResponse(state=state, session_log=self._log),
+            session_attached=rotated_id != source_id,
+        )
+
+    async def rotated_session_id_for(self, session_id: str) -> str | None:
+        """The rotated identity a superseded ``session_id`` maps to, if known.
+
+        A settled handoff records the mapping directly. One still in flight is
+        resolved from the agent's own snapshot, because the agent rotates inside
+        the operation before its reply lands; a peer that cannot report a
+        rotation (an older build without the fence) answers None, and the caller
+        answers the version-skew error instead of a bare not-found.
+        """
+        rotated = self._rotations.get(session_id)
+        if rotated is not None:
+            return rotated
+        if session_id in self._pending_handoffs:
+            try:
+                snapshot = await self._process.snapshot()
+            except RootAgentProcessError:
+                return None
+            rotated = snapshot.state.session.id
+            if rotated != session_id:
+                return rotated
+        return None
+
+    async def _require_forwardable_session(self, session_id: str) -> None:
+        """Fence a submit addressed to a session whose rotation is in flight.
+
+        Between handoff-send and settlement the source id is still this end's
+        current id, so the ordinary check passes; forwarding the submit would
+        run it against the pre-rotation session, so a pending rotation fences
+        it instead, with the rotated identity the agent's own snapshot reports.
+        A peer that cannot report one is a version skew, never a bare
+        not-found and never a silent retry.
+        """
+        if session_id in self._pending_handoffs:
+            rotated = await self.rotated_session_id_for(session_id)
+            if rotated is not None:
+                raise session_fenced_backend_error(session_id, rotated)
+            raise version_skew_backend_error(
+                session_id, "the agent cannot report the rotated identity"
             )
+        self._require_session(session_id)
 
     async def start_turn(
         self, params: TurnStartParams
     ) -> SessionBackendResult[TurnStartResponse]:
-        self._require_session(params.session_id)
+        await self._require_forwardable_session(params.session_id)
         if self._active_turn is not None:
             raise SessionBackendError(
                 ProtocolErrorCode.CONFLICT,
@@ -1023,6 +1689,10 @@ class ProcessSessionBackend:  # noqa: PLR0904 - the session port surface
                 "Resume queued turns before starting a new turn",
             )
         decoded = decode_input(params, session_dir=self._session_dir())
+        # G1b: a held wake rides the next turn whatever started it -- the
+        # client's own start as much as a promoted queue item -- because the
+        # in-process pending injected message has no other delivery point.
+        await self._deliver_pending_wakes()
         turn = self._build_turn()
         self._active_turn = turn
         request = self._turn_request(
@@ -1034,7 +1704,7 @@ class ProcessSessionBackend:  # noqa: PLR0904 - the session port surface
             injected=params.injected,
             user_initiated_retry=params.user_initiated_retry,
         )
-        await self._launch_turn(turn, request)
+        await self._launch_turn(turn, request, idempotency_key=params.idempotency_key)
         return SessionBackendResult(
             TurnStartResponse(turn=turn, last_event_id=self._watermark())
         )
@@ -1083,10 +1753,18 @@ class ProcessSessionBackend:  # noqa: PLR0904 - the session port surface
         )
 
     async def _launch_turn(
-        self, turn: PublicTurn, request: ExecutionTurnRequest
+        self,
+        turn: PublicTurn,
+        request: ExecutionTurnRequest,
+        *,
+        idempotency_key: str | None = None,
     ) -> None:
         """Publish the start frame, then run the turn in the agent process."""
         await self._notify_turn("turn/started", turn)
+        # R2: a start carrying an admitted continuation's idempotency key
+        # links the successor to its episode; any other start is a user
+        # takeover that cancels a pending schedule.
+        self._observe_recovery_turn_started(turn.id, idempotency_key)
         self._turn_starts += 1
         self._turn_task = asyncio.create_task(
             self._drive_turn(turn, request), name=f"process-turn-{turn.id}"
@@ -1133,6 +1811,12 @@ class ProcessSessionBackend:  # noqa: PLR0904 - the session port surface
             status = PublicTurnStatus.FAILED
             error = exc
         finally:
+            if status is PublicTurnStatus.FAILED:
+                # R2: capture the typed terminal projection the agent attached
+                # to its turn/ended frame (built agent-side BEFORE callback
+                # cancellation) before the finish transition is observed.
+                self._capture_recovery_turn_failure(turn.id)
+            await self._observe_recovery_turn_finished(turn.id, status)
             completed = turn.model_copy(
                 update={
                     "status": status,
@@ -1152,6 +1836,14 @@ class ProcessSessionBackend:  # noqa: PLR0904 - the session port surface
                 self._spawn_queue_task(self._after_turn_terminal(status, completed.id))
 
     async def _notify_turn(self, method: str, turn: PublicTurn) -> None:
+        """Publish one turn frame and record the turn it projects.
+
+        Both turn frames -- a start and its settlement -- are published here
+        and nowhere else, so this is where the record store is kept: a start
+        takes its place in publish order and a settlement replaces the same
+        id in the same position.
+        """
+        self._turn_records[turn.id] = turn
         params_class = (
             TurnStartedParams if method == "turn/started" else TurnCompletedParams
         )
@@ -1190,7 +1882,7 @@ class ProcessSessionBackend:  # noqa: PLR0904 - the session port surface
     async def inject_context(
         self, params: ContextInjectParams
     ) -> SessionBackendResult[ContextInjectResponse]:
-        self._require_session(params.session_id)
+        await self._require_forwardable_session(params.session_id)
         if self._active_turn is not None:
             raise SessionBackendError(
                 ProtocolErrorCode.CONFLICT, "Use turn/steer while a turn is active"
@@ -1468,7 +2160,7 @@ class ProcessSessionBackend:  # noqa: PLR0904 - the session port surface
     async def enqueue_turn(
         self, params: TurnEnqueueParams
     ) -> SessionBackendResult[TurnEnqueueResponse]:
-        self._require_session(params.session_id)
+        await self._require_forwardable_session(params.session_id)
         try:
             result = self._turn_queue.enqueue(
                 params, validate=self._validate_queued_input
@@ -1641,6 +2333,12 @@ class ProcessSessionBackend:  # noqa: PLR0904 - the session port surface
             else:
                 self._promoted_shell_records.pop(turn_id, None)
                 self._flush_retained_shell_records()
+            # G1b: the terminal turn is the sweep's own admission point -- a
+            # completion whose frame was lost wakes the parent here, before the
+            # queue's next turn is admitted. A wake that starts a turn makes
+            # the promote pass below a no-op, and a wake that cannot start one
+            # is held for that promoted turn.
+            await self._sweep_wake_gaps()
             await self._promote_next()
 
     def _retain_failed_shell_record(self, turn_id: str) -> str | None:
@@ -1776,6 +2474,11 @@ class ProcessSessionBackend:  # noqa: PLR0904 - the session port surface
             and shell_record is not None
             and self._turn_starts > shell_record.starts_at
         )
+        # G1b: the queued-turn arm of the wake. A completion that could not
+        # start a turn of its own rides THIS turn, delivered where the loop
+        # lives before the user's own input is launched -- the in-process
+        # pending injected message's semantics.
+        await self._deliver_pending_wakes()
         turn = self._build_turn(queue_item_id=record.queued_turn.id)
         self._active_turn = turn
         try:
@@ -1794,7 +2497,9 @@ class ProcessSessionBackend:  # noqa: PLR0904 - the session port surface
                     ),
                 )
             )
-            await self._launch_turn(turn, request)
+            await self._launch_turn(
+                turn, request, idempotency_key=queued.idempotency_key
+            )
         except BaseException:
             self._active_turn = None
             raise
@@ -1875,14 +2580,34 @@ class ProcessSessionBackend:  # noqa: PLR0904 - the session port surface
 
         A reconfigure reply's snapshot is built agent-side at reply time, so it
         carries the agent's own event numbering; the state this stream projects
-        takes the coordinator's watermark instead, exactly as a read does.
+        takes the coordinator's watermark instead, exactly as a read does. The
+        adopted agent-sequence cursor only ever moves forward.
         """
         if snapshot is None:
             return None
+        self._adopted_agent_sequence = max(
+            self._adopted_agent_sequence, snapshot.agent_sequence
+        )
         self._adopt_state(snapshot.state)
         self._runtime = snapshot.runtime
         self._log = snapshot.log
         return self._stamped(snapshot.state)
+
+    def _adopt_read_snapshot(self, snapshot: AgentSessionSnapshot) -> bool:
+        """Adopt one fresh read snapshot, monotone against relayed events.
+
+        A read's snapshot can be built before an event the agent relays next,
+        so it can be older than events already relayed; the coordinator's
+        watermark cannot establish that ordering, so the shared agent-sequence
+        cursor does: a snapshot older than any relayed event (or than the
+        cursor already adopted) is never adopted, and the adopted state can
+        never present older than events already relayed.
+        """
+        relayed = max(self._adopted_agent_sequence, self._process.last_agent_sequence)
+        if snapshot.agent_sequence < relayed:
+            return False
+        self._adopt_snapshot(snapshot)
+        return True
 
     async def update_settings(
         self, params: SessionSettingsUpdateParams
@@ -2061,11 +2786,493 @@ class ProcessSessionBackend:  # noqa: PLR0904 - the session port surface
         except RootAgentProcessError as exc:
             raise _wire_failure(exc) from exc
 
-    async def read_dangerous_command_authority(self, params: Any) -> Any:
-        raise _uncovered("The dangerous-command authority read")
+    async def read_dangerous_command_authority(
+        self, params: DangerousCommandAuthorityReadParams
+    ) -> DangerousCommandAuthorityReadResponse:
+        """Inspect the dangerous-command authority where the session's store lives.
 
-    async def revoke_dangerous_command_grant(self, params: Any) -> Any:
-        raise _uncovered("A dangerous-command grant revocation")
+        The live grants, the accepted saved grants, the fresh disk read and
+        the authority generation belong to the agent's own loop, so the read
+        is carried there and this end only forwards the reply — a
+        coordinator copy of the authority is never read.
+        """
+        self._require_session(params.session_id)
+        try:
+            return await self._process.read_dangerous_command_authority(params)
+        except RootAgentProcessError as exc:
+            raise _wire_failure(exc) from exc
+
+    async def revoke_dangerous_command_grant(
+        self, params: DangerousCommandRevokeParams
+    ) -> DangerousCommandRevokeResponse:
+        """Revoke live and saved authority where the CAS judge lives.
+
+        The revoke names the authority generation the read observed, and the
+        agent checks it against its own store: a superseded generation is
+        reported as the conflict outcome in the reply, never a false ack
+        from a coordinator copy. The request is sent exactly once.
+        """
+        self._require_session(params.session_id)
+        try:
+            return await self._process.revoke_dangerous_command_grant(params)
+        except RootAgentProcessError as exc:
+            raise _wire_failure(exc) from exc
+
+    # -- R2 root automatic recovery (coordinator-local gate) --------------
+
+    def _recovery_config(self) -> RootRecoveryConfig:
+        """The live [recovery.root] config from the primed wire evidence.
+
+        Fail closed when no evidence is primed (a decision outside the
+        recovery/root/* arms never reaches the gate): a disabled policy
+        declines every schedule instead of guessing one.
+        """
+        evidence = self._recovery_evidence
+        if evidence is None:
+            return RootRecoveryConfig(enabled=False)
+        return evidence.config
+
+    def _recovery_availability(self) -> AvailabilitySnapshot:
+        """The non-mutating availability snapshot from the primed evidence.
+
+        Missing evidence never blocks on its own — the admission itself is
+        the authority — exactly as the in-process read degrades.
+        """
+        evidence = self._recovery_evidence
+        if evidence is None:
+            return AvailabilitySnapshot(
+                available=True,
+                permanent=False,
+                endpoint_blocked=False,
+                probe_in_flight=False,
+                next_check_delay=0.0,
+            )
+        return evidence.availability
+
+    def _recovery_integrity_verdict(self) -> str | None:
+        """The transcript-integrity decline reason carried on the wire."""
+        evidence = self._recovery_evidence
+        return evidence.integrity if evidence is not None else None
+
+    def _recovery_session_view(self) -> RootRecoverySessionView:
+        """The live coordinator-side interaction state the gate decides on
+        (read at every decision, never snapshotted at construction).
+        """
+        return RootRecoverySessionView(
+            session_id=self.session_id,
+            active_turn_id=(
+                self._active_turn.id if self._active_turn is not None else None
+            ),
+            queued_work=bool(self._turn_queue),
+            open_callbacks=bool(self._open_callbacks),
+            stop_requested=(
+                self._turn_task is not None and self._turn_task.cancelling() > 0
+            ),
+            handoff_pending=bool(self._pending_handoffs),
+            # Session lifecycle reservations (start/resume/continue) are served
+            # by the backend host, not this attached backend, so none is
+            # reserved here; the closing flag below covers this end's own
+            # shutdown.
+            lifecycle_reserved=False,
+            closing=self._closed,
+        )
+
+    def _stage_recovery_notice(
+        self, detail: Any, message: str
+    ) -> ProjectedUpdate | None:
+        """Stage one root-recovery milestone notice, exactly once.
+
+        The deterministic entry id (``root-recovery:{milestone}:
+        {episode_id}:{attempt}``) makes the emission idempotent at both the
+        gate and this end's notice projector, mirroring the in-process
+        staging.
+        """
+        if self._recovery_notices is None:
+            self._recovery_notices = EventProjector(self.session_id, None)
+        entry_id = (
+            f"root-recovery:{detail.milestone}:{detail.episode_id}:{detail.attempt}"
+        )
+        if any(entry.id == entry_id for entry in self._recovery_notices.history):
+            return None
+        return self._recovery_notices.add_notice(
+            entry_id, message=message, detail=detail
+        )
+
+    async def _emit_recovery_notice(self, update: ProjectedUpdate) -> None:
+        """Deliver one staged recovery notice on this session's event stream."""
+        await self._services.notify(update.method, update.params)
+
+    def _deliver_recovery_notices(self, updates: list[ProjectedUpdate]) -> None:
+        """Deliver staged notice updates (sync context: best-effort delivery,
+        exactly as the in-process controller delivers them).
+        """
+        if not updates:
+            return
+
+        async def deliver() -> None:
+            for update in updates:
+                with suppress(Exception):
+                    await self._emit_recovery_notice(update)
+
+        task = asyncio.create_task(deliver())
+        self._recovery_notice_tasks.add(task)
+        task.add_done_callback(self._recovery_notice_tasks.discard)
+
+    def _observe_recovery_turn_started(
+        self, turn_id: str, idempotency_key: str | None
+    ) -> None:
+        """Feed one turn start to the gate (sync context). Total by contract:
+        an observation failure never masks the turn start.
+        """
+        try:
+            updates = self._recovery_gate.observe_turn_started(turn_id, idempotency_key)
+        except Exception:
+            logger.exception("root recovery turn-start observation failed")
+            return
+        self._deliver_recovery_notices(updates)
+
+    async def _observe_recovery_turn_finished(
+        self, turn_id: str, status: PublicTurnStatus
+    ) -> None:
+        """Feed one turn's terminal transition to the gate (async context).
+        Total by contract: an observation failure never masks the
+        terminalization it observes.
+        """
+        try:
+            await self._recovery_gate.observe_turn_finished(turn_id, status)
+        except Exception:
+            logger.exception("root recovery turn-finish observation failed")
+
+    def _capture_recovery_turn_failure(self, turn_id: str) -> None:
+        """Capture the typed terminal projection the agent attached to its
+        turn/ended frame (captured agent-side before callback cancellation)
+        into the coordinator-local gate. Total by contract.
+        """
+        try:
+            terminal = self._process.turn_terminal(turn_id)
+            if terminal is None:
+                return
+            failure = decode_turn_failure(terminal)
+            if failure is not None:
+                self._recovery_gate.capture_terminal(failure)
+        except Exception:
+            logger.exception("root recovery projection capture failed")
+
+    async def _decide_recovery(
+        self, decide: Callable[[RootRecoveryGate], Awaitable[Any]]
+    ) -> Any:
+        """Run one gate decision with a freshly fetched evidence bundle.
+
+        The loop-owned predicate inputs cross the agent wire once per
+        decision — nothing is cached across a decision, and all predicates
+        are rechecked at admission. A dead root answers the death receipt
+        before any frame is sent; the request is never resent on an
+        ambiguous outcome.
+        """
+        try:
+            self._recovery_evidence = await self._process.recovery_evidence(
+                self.session_id
+            )
+        except RootAgentProcessError as exc:
+            raise _wire_failure(exc) from exc
+        try:
+            return await decide(self._recovery_gate)
+        finally:
+            self._recovery_evidence = None
+
+    def update_mcp_projection(self, state: Any) -> None:
+        """Fold one agent-resolved MCP projection into this end's runtime view.
+
+        The coordinator holds only the projected view the owner returned: no
+        orchestrator or catalog owner exists here to re-derive it from.
+        """
+        self._runtime = self._runtime.model_copy(update={"mcp": state})
+
+    async def _relay_mcp_notification(
+        self, method: str, payload: Mapping[str, Any]
+    ) -> None:
+        """Relay one agent-emitted MCP auth notification to the client.
+
+        The agent emits ``agent/mcp/catalog/authUrl`` (the login's URL) and
+        ``agent/mcp/catalog/authRequired`` (the owner-side gated handshake);
+        this end publishes them under the client-facing method names on the
+        coordinator's notification pump, exactly as the in-process route does.
+        """
+        from chartreux.app_server.agent_wire import (
+            AGENT_MCP_AUTH_REQUIRED_METHOD,
+            AGENT_MCP_AUTH_URL_METHOD,
+        )
+
+        if method == AGENT_MCP_AUTH_URL_METHOD:
+            await self._services.notify(
+                "mcp_catalog/authUrl", MCPAuthUrlParams.model_validate(dict(payload))
+            )
+            return
+        if method == AGENT_MCP_AUTH_REQUIRED_METHOD:
+            await self._services.notify(
+                "mcp_catalog/authRequired",
+                MCPAuthRequiredParams.model_validate(dict(payload)),
+            )
+            return
+        logger.warning("unhandled agent MCP notification method %r", method)
+
+    async def _relay_agents_update(
+        self, method: str, payload: Mapping[str, Any]
+    ) -> None:
+        """Relay one owner-side child-inventory snapshot to the client (F10).
+
+        The payload is the same ``AgentsInventoryReadResponse`` the inventory
+        read serves, so the client-facing ``agents/update`` carries the
+        process owner's honest subset verbatim: rows appear on spawn, states
+        update with the run records, and a release or cancel removes the row
+        -- while a mutation moment a process-backed handle cannot represent
+        (an eviction tombstone above all) is never fabricated into one. An
+        undecodable frame, or one that names anything other than this
+        backend's session, is dropped as a presentation delta: the next
+        mutation always carries a fresher full snapshot.
+        """
+        try:
+            snapshot = AgentsInventoryReadResponse.model_validate(dict(payload))
+        except ValidationError as exc:
+            logger.warning("dropped an undecodable agent/agents/update: %s", exc)
+            return
+        if snapshot.session_id is None or snapshot.session_id != self.session_id:
+            return
+        await self._services.notify(
+            "agents/update",
+            AgentsUpdateParams(
+                event_id=0,
+                session_id=snapshot.session_id,
+                emitted_at=now_ms(),
+                agents=list(snapshot.agents),
+                evictions=[],
+            ),
+        )
+
+    # -- the parent wake for a settled child run (G1b) ----------------------
+    #
+    # The in-process route synthesizes the model-facing completion text and
+    # either starts the parent's next turn (idle) or leaves it as a pending
+    # injected message. On this topology the root process owns the children
+    # and this backend owns turn admission, so the wake is driven here: the
+    # owner's completion frame, the same text, and the same two arms.
+
+    async def _observe_authority_changed(self, changed: AgentAuthorityChanged) -> None:
+        """Record one owner authority-change snapshot (G5, observability).
+
+        Nothing is enforced through this record: it states that the authority
+        vector this end last saw is stale, names the owner incarnation that
+        superseded it, and counts the changes so a diagnostic surface can tell
+        a quiet owner from one whose policy is moving. A snapshot for another
+        session is dropped -- a rebind never rewrites another session's record.
+        """
+        if changed.session_id != self.session_id:
+            return
+        self.authority_incarnation = changed.incarnation
+        self.authority_revision = dict(changed.revision)
+        self.authority_change_count += 1
+        logger.debug(
+            "root authority revision advanced: session=%s incarnation=%s vector=%s",
+            changed.session_id,
+            changed.incarnation,
+            dict(changed.revision),
+        )
+
+    async def _handle_run_completion(self, completion: AgentRunCompletion) -> None:
+        """Wake the parent for one background child run the owner settled.
+
+        A foreign-session frame names another session and is dropped, a dead or
+        retired generation wakes nothing, and a run wakes at most once per
+        generation. ``USER_CANCELLED`` is not a wake -- the in-process registry
+        still tells the parent the run stopped, but it never starts a turn for
+        a stop the user asked for, and neither does this end.
+        """
+        if not self._wake_capable or self.is_dead:
+            return
+        if completion.session_id != self.session_id:
+            return
+        key = (completion.agent_id, completion.run_id)
+        if key in self._delivered_wakes:
+            return
+        self._delivered_wakes.add(key)
+        text = completion_notification_text(completion)
+        if completion.stop_reason == RunStopReason.USER_CANCELLED.value:
+            self._pending_wake_texts.append(text)
+            return
+        await self._drive_wake_text(text)
+
+    async def _drive_wake_text(self, text: str) -> None:
+        """Deliver one wake text: steer the live turn, else start an idle one.
+
+        A turn in flight is steered, and a steer the agent refuses because its
+        turn settled underneath the request falls back to the idle arm instead
+        of dropping the wake. A turn started meanwhile, a non-empty queue, or a
+        failed turn start leaves the text for the next promoted turn.
+        """
+        if self._active_turn is not None:
+            if await self._steer_wake(text):
+                return
+        if self._active_turn is not None or self._turn_queue:
+            self._pending_wake_texts.append(text)
+            return
+        try:
+            await self._start_wake_turn(text)
+        except (SessionBackendError, RootAgentProcessError) as exc:
+            logger.warning("A completion wake could not start a turn: %s", exc)
+            self._pending_wake_texts.append(text)
+
+    async def _steer_wake(self, text: str) -> bool:
+        """Steer one wake text into the turn in flight; False if it refused."""
+        turn = self._active_turn
+        if turn is None:
+            return False
+        try:
+            settlement = await self._process.steer(
+                TurnSteerParams(
+                    session_id=self.session_id,
+                    expected_turn_id=turn.id,
+                    message=vibe_content_blocks([SessionTextContentBlock(text=text)]),
+                    idempotency_key=f"run-completion-{uuid4().hex}",
+                )
+            )
+        except RootAgentProcessError:
+            return False
+        return settlement.committed
+
+    async def _start_wake_turn(self, text: str) -> None:
+        """Run one wake text as an injected turn under the idle admission.
+
+        The wake is the harness's own turn, not the user's: it carries the
+        injected marker, no client message id and no idempotency key, so a
+        reconnect never replays it and the client sees an ordinary turn
+        (``turn/started`` then the run's own events).
+        """
+        turn = self._build_turn()
+        self._active_turn = turn
+        request = self._turn_request(
+            turn,
+            DecodedInput(prompt=text, input_text=text, images=[], resources=[]),
+            client_message_id=None,
+            auto_title=None,
+            user_display_content=None,
+            injected=True,
+        )
+        try:
+            await self._launch_turn(turn, request)
+        except BaseException:
+            self._active_turn = None
+            raise
+
+    async def _deliver_pending_wakes(self) -> None:
+        """Carry the held wake texts into the turn the queue is about to run.
+
+        This is the queued-turn decision: a wake that could not start a turn
+        of its own rides the next promoted turn as an injected user message,
+        delivered before that turn launches -- the in-process pending injected
+        message's own semantics. It is never a queue item the user would see
+        and never a turn of its own. A failed delivery keeps the text for the
+        next promotion; the contract is at-most-once plus the sweep, so a
+        retry is preferred over a silently dropped wake.
+        """
+        pending = self._pending_wake_texts
+        self._pending_wake_texts = []
+        while pending:
+            text = pending[0]
+            try:
+                await self.inject_context(
+                    ContextInjectParams(
+                        session_id=self.session_id,
+                        input=vibe_content_blocks([SessionTextContentBlock(text=text)]),
+                    )
+                )
+            except asyncio.CancelledError:
+                self._pending_wake_texts = pending + self._pending_wake_texts
+                raise
+            except Exception as exc:
+                logger.warning(
+                    "A completion wake could not ride the promoted turn: %s", exc
+                )
+                self._pending_wake_texts = pending + self._pending_wake_texts
+                return
+            pending.pop(0)
+
+    async def _sweep_wake_gaps(self) -> None:
+        """Wake every settled run this generation has not woken yet (G1b).
+
+        The notification carrier is at-most-once: a frame lost between the
+        owner and this end would otherwise strand the parent's wake. The sweep
+        re-derives the delivered set's baseline once, then diffs the owner's
+        ledger of settled background runs against it, so a lost final frame
+        costs at most one sweep. It runs at every turn terminal -- a point
+        where this end is about to admit the next turn anyway.
+        """
+        if not self._wake_capable or self.is_dead:
+            return
+        baseline = self._wake_baseline
+        if baseline is not None and not baseline.done():
+            with suppress(BaseException):
+                await baseline
+        try:
+            ledger = await self._process.read_run_completions(self.session_id)
+        except (RootAgentProcessError, SessionBackendError) as exc:
+            logger.warning("A completion sweep could not read the ledger: %s", exc)
+            return
+        for completion in ledger:
+            await self._handle_run_completion(completion)
+
+    async def _capture_wake_baseline(self) -> None:
+        """Seed the delivered set from what the owner already settled (G1b).
+
+        A generation installed over a root that already holds terminal child
+        runs must not wake for them, so the terminal rows the inventory
+        projection carries and the completions the ledger already holds are
+        marked delivered without waking anything. The baseline is read once at
+        install, before this end can admit a turn; a baseline that cannot be
+        read marks nothing (waking a run twice is the safe direction, never
+        waking it is not).
+        """
+        try:
+            snapshot = await self._process.read_agent_inventory(
+                self.session_id, AgentsInventoryReadParams()
+            )
+            ledger = await self._process.read_run_completions(self.session_id)
+        except (RootAgentProcessError, SessionBackendError) as exc:
+            logger.warning("A completion-wake baseline could not be read: %s", exc)
+            return
+        terminal = {AgentAvailability.CLOSED.value, AgentAvailability.EVICTED.value}
+        for row in snapshot.agents:
+            if row.availability in terminal and row.latest_run_id is not None:
+                self._delivered_wakes.add((row.agent_id, row.latest_run_id))
+        for completion in ledger:
+            self._delivered_wakes.add((completion.agent_id, completion.run_id))
+
+    async def prepare_mcp_reload(self) -> Any:
+        """Run the config-reload prepare leg (restrictive suspensions) agent-side."""
+        try:
+            return await self._process.mcp_reload_prepare(
+                self.session_id, self._mcp_owner_key
+            )
+        except RootAgentProcessError as exc:
+            raise _wire_failure(exc) from exc
+
+    async def finish_mcp_reload(self) -> Any:
+        """Run the config-reload finish leg agent-side; adopt its runtime."""
+        try:
+            receipt = await self._process.mcp_reload_finish(
+                self.session_id, self._mcp_owner_key
+            )
+        except RootAgentProcessError as exc:
+            raise _wire_failure(exc) from exc
+        if receipt.runtime is not None:
+            self._runtime = RuntimeSnapshot.model_validate(receipt.runtime)
+        return receipt
+
+    async def fail_mcp_reload(self) -> None:
+        """Run the config-reload failure-restoration leg agent-side."""
+        try:
+            await self._process.mcp_reload_fail(self.session_id, self._mcp_owner_key)
+        except RootAgentProcessError as exc:
+            raise _wire_failure(exc) from exc
 
     async def read_mcp(self) -> Any:
         raise _uncovered("MCP state")
@@ -2085,41 +3292,90 @@ class ProcessSessionBackend:  # noqa: PLR0904 - the session port surface
     ) -> Any:
         raise _uncovered("MCP suspension")
 
-    async def dispatch_extension(self, method: str, raw_params: dict[str, Any]) -> Any:
+    async def _mcp_catalog_carrier(
+        self, forward: Callable[..., Awaitable[Any]], params: Any
+    ) -> DispatchResult:
+        """Forward one session-scoped mcp_catalog call to the agent owner.
+
+        The typed owner key travels with the request, and the reply's runtime
+        (when the mutation carries one) is adopted into this end's projection
+        before the response is published, so the runtime/updated notification
+        the server sends after the response carries the owner's own state.
+        """
+        addressed = getattr(params, "session_id", None)
+        if addressed is not None:
+            self._require_session(addressed)
+        try:
+            response = await forward(self.session_id, self._mcp_owner_key, params)
+        except RootAgentProcessError as exc:
+            raise _wire_failure(exc) from exc
+        runtime = getattr(response, "runtime", None)
+        if runtime is not None:
+            self._runtime = runtime
+            return DispatchResult(response, runtime_updated=True)
+        return DispatchResult(response)
+
+    async def dispatch_extension(  # noqa: PLR0911, PLR0912, PLR0915 - one arm per extension method
+        self, method: str, raw_params: dict[str, Any]
+    ) -> Any:
+        if method == "session/plan/handoff":
+            # The routing arm the stdio topology was missing: the consent
+            # fence runs in the agent process over the existing reconfigure
+            # carrier, and the reply's rotated identity is adopted here with
+            # the attachment flag set, so the server resubscribes to the
+            # rotated session once the response has been sent.
+            return await self.plan_handoff(
+                validate_wire(SessionPlanHandoffParams, raw_params)
+            )
         # The runtime view is the one extension the agent's own snapshot
         # answers: it is resolved against the agent process's config and tool
-        # manager, so it travels in the payload rather than being assembled
-        # here from a coordinator copy that would not exist.
+        # manager, so every read asks the agent for a FRESH snapshot and the
+        # reply travels in the payload rather than being assembled here from a
+        # coordinator copy that would not exist -- and that a dead root would
+        # otherwise keep answering from stale. The read is adopted with
+        # monotone ordering against the events already relayed, and a dead
+        # root answers the death receipt instead of a cached ready=True.
         if method == "runtime/read":
             params = RuntimeReadParams.model_validate(raw_params)
-            if params.session_id != self.session_id:
-                raise SessionBackendError(
-                    ProtocolErrorCode.NOT_FOUND,
-                    f"Session not found: {params.session_id}",
-                )
+            self._require_session(params.session_id)
+            try:
+                snapshot = await self._process.snapshot(include_history=False)
+            except RootAgentProcessError as exc:
+                raise _wire_failure(exc) from exc
+            if self._adopt_read_snapshot(snapshot):
+                runtime, log = snapshot.runtime, snapshot.log
+            else:
+                # Older than events already relayed: the adopted view stands,
+                # never a stale read.
+                runtime, log = self._runtime, self._log
             return DispatchResult(
-                RuntimeReadResponse(
-                    runtime=self._runtime, session_log=self._log, ready=True
-                )
+                RuntimeReadResponse(runtime=runtime, session_log=log, ready=True)
             )
         if method in {"session/ready/wait", "session/ready/read"}:
             # Readiness is established by the open itself: the agent answers
             # its open reply only once the loop it owns exists, and this
-            # backend is constructed from a snapshot of that loop. A read is
-            # therefore trivially ready, and a wait has nothing left to wait
-            # for -- the coordinator's own construction elapsed it.
+            # backend is constructed from a snapshot of that loop, so while
+            # the current generation is known live and open a read is
+            # immediately ready and a wait has nothing left to wait for.
+            # After a declared root death the read answers the death receipt
+            # instead -- never a stale ready from a dead generation.
             if method == "session/ready/wait":
                 params = SessionReadyWaitParams.model_validate(raw_params)
                 response_class: Any = SessionReadyWaitResponse
             else:
                 params = SessionReadyReadParams.model_validate(raw_params)
                 response_class = SessionReadyReadResponse
-            if params.session_id != self.session_id:
-                raise SessionBackendError(
-                    ProtocolErrorCode.NOT_FOUND,
-                    f"Session not found: {params.session_id}",
+            self._require_session(params.session_id)
+            death = self._process.death
+            if death is not None:
+                raise _wire_failure(
+                    RootAgentExitedError(
+                        death.reason,
+                        exit_code=death.exit_code,
+                        signature=death.signature,
+                    )
                 )
-            return DispatchResult(response_class())
+            return DispatchResult(response_class(ready=True))
         if method == "session/log/read":
             # The snapshot payload carries the agent's own session-log
             # projection, so the read is answered from where the log lives
@@ -2148,6 +3404,310 @@ class ProcessSessionBackend:  # noqa: PLR0904 - the session port surface
             return DispatchResult(
                 SessionHistoryClearResponse(state=state, session_log=self._log)
             )
+        if method == "session/history/list":
+            # The attached session's live history is the agent's own
+            # projection: the host reads persisted messages only, so a host
+            # answer for an attached id would be stale or missing. The page
+            # crosses to the loop that owns it; saved/non-attached ids still
+            # reach the host through the server's narrowed not-found
+            # fallback, and a dead-but-attached root answers the death
+            # receipt, never the persisted projection.
+            params = validate_wire(SessionHistoryListParams, raw_params)
+            self._require_session(params.session_id)
+            try:
+                response = await self._process.history_list(self.session_id, params)
+            except RootAgentProcessError as exc:
+                raise _wire_failure(exc) from exc
+            return DispatchResult(response)
+        if method == "loops/list":
+            # The schedule lives in the agent's own loop manager -- the one its
+            # scheduler reads -- so the list is answered there. A coordinator
+            # copy would be a second schedule with its own drift, and this end
+            # adds no scheduler of its own.
+            params = validate_wire(LoopsListParams, raw_params)
+            self._require_session(params.session_id)
+            try:
+                response = await self._process.list_loops(self.session_id, params)
+            except RootAgentProcessError as exc:
+                raise _wire_failure(exc) from exc
+            return DispatchResult(response)
+        if method == "loops/create":
+            # The create parses the interval, applies the per-session limit and
+            # persists the new fire time where the schedule is kept; the reply
+            # is the loop the owner recorded. It crosses once: a create that
+            # timed out is an unknown outcome, never a blind retry.
+            params = validate_wire(LoopsCreateParams, raw_params)
+            self._require_session(params.session_id)
+            try:
+                response = await self._process.create_loop(self.session_id, params)
+            except RootAgentProcessError as exc:
+                raise _wire_failure(exc) from exc
+            return DispatchResult(response)
+        if method == "loops/delete":
+            # An id the owner's schedule does not carry is its typed param
+            # refusal, answered where the schedule is read.
+            params = validate_wire(LoopsDeleteParams, raw_params)
+            self._require_session(params.session_id)
+            try:
+                response = await self._process.delete_loop(self.session_id, params)
+            except RootAgentProcessError as exc:
+                raise _wire_failure(exc) from exc
+            return DispatchResult(response)
+        if method == "loops/clear":
+            # The clear counts and persists where the schedule is kept, so the
+            # reply is the owner's own count.
+            params = validate_wire(LoopsClearParams, raw_params)
+            self._require_session(params.session_id)
+            try:
+                response = await self._process.clear_loops(self.session_id, params)
+            except RootAgentProcessError as exc:
+                raise _wire_failure(exc) from exc
+            return DispatchResult(response)
+        if method == "diagnostics/list":
+            # The issues and hook count are projected from the loop and hooks
+            # the agent owns, so the read is answered there instead of being
+            # assembled here from a coordinator copy that does not exist.
+            params = validate_wire(DiagnosticsListParams, raw_params)
+            self._require_session(params.session_id)
+            try:
+                response = await self._process.read_diagnostics(self.session_id, params)
+            except RootAgentProcessError as exc:
+                raise _wire_failure(exc) from exc
+            return DispatchResult(response)
+        if method == "diagnostics/logs/read":
+            # The page is read through the owner's own log reader, so the
+            # request's limit and offset and the shipped projection's
+            # redaction apply unchanged; this end carries the page back and
+            # merges nothing into it.
+            params = validate_wire(DiagnosticsLogsReadParams, raw_params)
+            self._require_session(params.session_id)
+            try:
+                response = await self._process.read_diagnostics_logs(
+                    self.session_id, params
+                )
+            except RootAgentProcessError as exc:
+                raise _wire_failure(exc) from exc
+            return DispatchResult(response)
+        if method in _REVIEW_CARRIER_PARAMS:
+            # Review checkpoints are session-local, memory-only state that the
+            # loop's own recorder made, so the review manager holding them is
+            # in the agent process: the request crosses and the owner's own
+            # projection comes back. A mutation keeps the owner's idle
+            # admission, and a session this backend does not hold is refused
+            # before anything crosses.
+            params = validate_wire(_REVIEW_CARRIER_PARAMS[method], raw_params)
+            self._require_session(_carrier_session_id(params))
+            try:
+                response = await self._process.review(method, params)
+            except RootAgentProcessError as exc:
+                raise _wire_failure(exc) from exc
+            return DispatchResult(response)
+        if method in _CATALOG_CARRIER_PARAMS:
+            # The skill and tool inventories, the live counters and the
+            # session's identity are all resolved against the agent's own
+            # config, tool manager and loop, so each read crosses and the
+            # owner's projection comes back unchanged.
+            params = validate_wire(_CATALOG_CARRIER_PARAMS[method], raw_params)
+            self._require_session(_carrier_session_id(params))
+            try:
+                response = await self._process.catalog_read(method, params)
+            except RootAgentProcessError as exc:
+                raise _wire_failure(exc) from exc
+            return DispatchResult(response)
+        if method == "session/turns/list":
+            # The live turn projection is this end's own: it is built from the
+            # turn frames this end published, so the page is served from that
+            # record store rather than from a projection a later adoption may
+            # have replaced. A saved id is not this backend's, so it is
+            # not-found here and the server's narrowed fallback serves it from
+            # the host projection, exactly as a saved session read is served.
+            params = validate_wire(SessionTurnsListParams, raw_params)
+            self._require_session(params.session_id)
+            return DispatchResult(
+                turns_page(self._turn_records_for(params.session_id), params)
+            )
+        if method == "mcp_catalog/read":
+            # The catalog projection is resolved where the orchestrator and
+            # the auth bindings live -- in the agent process -- so the read
+            # crosses with the typed owner key and the reply is the owner's
+            # own projected view, never a coordinator re-derivation.
+            return await self._mcp_catalog_carrier(
+                self._process.mcp_catalog_read, validate_wire(MCPReadParams, raw_params)
+            )
+        if method == "mcp_catalog/refresh":
+            # The refresh re-resolves servers and tools through the agent's
+            # own orchestrator; this end adopts the runtime the owner returns.
+            return await self._mcp_catalog_carrier(
+                self._process.mcp_catalog_refresh,
+                validate_wire(MCPRefreshParams, raw_params),
+            )
+        if method == "mcp_catalog/add":
+            # A persisted add runs where the config orchestrator can reserve
+            # and save; the mutation's runtime crosses back with the reply.
+            return await self._mcp_catalog_carrier(
+                self._process.mcp_catalog_add, validate_wire(MCPAddParams, raw_params)
+            )
+        if method == "mcp_catalog/toggle":
+            # The enable/disable flip is revision-stamped by the owner's
+            # orchestrator, so the toggle crosses instead of forking a copy.
+            return await self._mcp_catalog_carrier(
+                self._process.mcp_catalog_toggle,
+                validate_wire(MCPToggleParams, raw_params),
+            )
+        if method == "mcp_catalog/remove":
+            # The removal also drops the server's stored credentials, which
+            # only the owner-side auth service can reach under the key.
+            return await self._mcp_catalog_carrier(
+                self._process.mcp_catalog_remove,
+                validate_wire(MCPRemoveParams, raw_params),
+            )
+        if method == "mcp_catalog/login":
+            # The OAuth login runs where the binding is filed under the owner
+            # key; the authUrl it emits crosses as an agent notification and
+            # is relayed to the client by the bound sink.
+            return await self._mcp_catalog_carrier(
+                self._process.mcp_catalog_login,
+                validate_wire(MCPLoginParams, raw_params),
+            )
+        if method == "mcp_catalog/logout":
+            # The logout removes the owner-side credentials under the same key.
+            return await self._mcp_catalog_carrier(
+                self._process.mcp_catalog_logout,
+                validate_wire(MCPLogoutParams, raw_params),
+            )
+        if method == "workspace/prompt/prepare":
+            # Prompt preparation is agent-side: it reads the live model, the
+            # session's cwd and session directory and writes attachment
+            # snapshots, none of which a coordinator copy could answer for.
+            # The request crosses to the agent that owns the loop and the
+            # reply is its own prepared prompt; a preparation that times out
+            # is an unknown outcome and is never resent here.
+            params = validate_wire(WorkspacePromptPrepareParams, raw_params)
+            self._require_session(params.session_id)
+            try:
+                response = await self._process.prepare_prompt(params)
+            except RootAgentProcessError as exc:
+                raise _wire_failure(exc) from exc
+            return DispatchResult(response)
+        if method == "config/fields/read":
+            # The field wires pair the agent's effective config with its
+            # layered sources and their save revisions, so the read is
+            # answered where the loop's orchestrator lives and this end only
+            # carries the reply.
+            params = validate_wire(ConfigFieldsReadParams, raw_params)
+            self._require_session(params.session_id)
+            try:
+                return DispatchResult(await self._process.read_config_fields(params))
+            except RootAgentProcessError as exc:
+                raise _wire_failure(exc) from exc
+        if method == "config/settings/read":
+            # The settings leaves are paired with the user revision the
+            # agent's own layers carry; a coordinator copy holds neither.
+            params = validate_wire(SettingsReadParams, raw_params)
+            self._require_session(params.session_id)
+            try:
+                return DispatchResult(await self._process.read_settings(params))
+            except RootAgentProcessError as exc:
+                raise _wire_failure(exc) from exc
+        if method == "config/proxy/read":
+            # The proxy view is read from the env file the agent process
+            # resolves, so the value shown is the value that process uses.
+            params = validate_wire(ConfigProxyReadParams, raw_params)
+            self._require_session(params.session_id)
+            try:
+                return DispatchResult(await self._process.read_proxy_settings(params))
+            except RootAgentProcessError as exc:
+                raise _wire_failure(exc) from exc
+        if method == "config/proxy/write":
+            # The write lands in the env file the agent process resolves; a
+            # refused value keeps the in-process param refusal, and a busy
+            # session the same conflict, because the agent's owner judged it.
+            params = validate_wire(ConfigProxyWriteParams, raw_params)
+            self._require_session(params.session_id)
+            try:
+                return DispatchResult(await self._process.write_proxy_settings(params))
+            except RootAgentProcessError as exc:
+                raise _wire_failure(exc) from exc
+        if method == "agents/cancel":
+            # A run-pinned stop is the owner's decision: the process that
+            # spawned the child holds its run handle, so the typed disposition
+            # is answered there. The request is sent exactly once — a cancel
+            # that times out is an unknown outcome, never a blind resend.
+            params = validate_wire(AgentsCancelParams, raw_params)
+            self._require_session(self.session_id)
+            try:
+                return DispatchResult(
+                    await self._process.cancel_agent_run(self.session_id, params)
+                )
+            except RootAgentProcessError as exc:
+                raise _wire_failure(exc) from exc
+        if method == "agents/release":
+            # The guarded release keeps the registry's rails: an active or
+            # run-mismatched agent is a conflict that released nothing.
+            params = validate_wire(AgentsReleaseParams, raw_params)
+            self._require_session(self.session_id)
+            try:
+                return DispatchResult(
+                    await self._process.release_agent(self.session_id, params)
+                )
+            except RootAgentProcessError as exc:
+                raise _wire_failure(exc) from exc
+        if method == "agents/resume":
+            # Warm resume is answered by the process that keeps the child's
+            # run records; a disposition it cannot honor is typed, not a
+            # scheduled run this end would have to fake.
+            params = validate_wire(AgentsResumeParams, raw_params)
+            self._require_session(self.session_id)
+            try:
+                return DispatchResult(
+                    await self._process.resume_agent(self.session_id, params)
+                )
+            except RootAgentProcessError as exc:
+                raise _wire_failure(exc) from exc
+        if method == "agents/reconcile":
+            # The barrier belongs to the failed run's owner, so the evidence
+            # is submitted there and its typed disposition carried back.
+            params = validate_wire(AgentsReconcileParams, raw_params)
+            self._require_session(self.session_id)
+            try:
+                return DispatchResult(
+                    await self._process.reconcile_agent_result(self.session_id, params)
+                )
+            except RootAgentProcessError as exc:
+                raise _wire_failure(exc) from exc
+        if method == "agents/inventory/read":
+            # The live inventory is read where the children live: the owner
+            # answers one fresh typed request with the revision and the
+            # projection it sampled together, so this end never serves a
+            # coordinator copy of the inventory, and a dead root answers the
+            # death receipt through the process failure instead of a stale
+            # snapshot -- exactly like the runtime/read arm. The read is
+            # control-class: a relay delta never sheds it.
+            params = validate_wire(AgentsInventoryReadParams, raw_params)
+            self._require_session(self.session_id)
+            try:
+                response = await self._process.read_agent_inventory(
+                    self.session_id, params
+                )
+            except RootAgentProcessError as exc:
+                raise _wire_failure(exc) from exc
+            return DispatchResult(response)
+        if method == "agent/transcript/get":
+            # A child transcript is scoped to the root session and lives where
+            # the child runs: the owner reads the live page through the child's
+            # own reader, or its saved transcript once the process is gone.
+            params = validate_wire(AgentTranscriptGetParams, raw_params)
+            self._require_session(self.session_id)
+            try:
+                response = await self._process.read_child_transcript_page(
+                    self.session_id,
+                    params.agent_id,
+                    before=params.before,
+                    limit=params.limit,
+                )
+            except RootAgentProcessError as exc:
+                raise _wire_failure(exc) from exc
+            return DispatchResult(response)
         if method == "callback/keepWaiting":
             # The deadline decision is the agent's, taken under the request
             # record's lock, so this end only carries the answer back.
@@ -2174,6 +3734,44 @@ class ProcessSessionBackend:  # noqa: PLR0904 - the session port surface
                 validate_wire(SessionShellCommandParams, raw_params)
             )
             return DispatchResult(result.response)
+        if method == "recovery/root/schedule":
+            # The gate stays coordinator-local: this end owns the authoritative
+            # eligibility, episode accounting and single-flight admission, and
+            # re-reads the loop-owned evidence (live config, transcript
+            # integrity, availability) over the agent wire once for this
+            # decision. The typed terminal projection arrived on the agent's
+            # turn/ended frame. A dead root answers the death receipt.
+            params = validate_wire(RootRecoveryScheduleParams, raw_params)
+            self._require_session(params.session_id)
+            response = await self._decide_recovery(lambda gate: gate.schedule(params))
+            return DispatchResult(response)
+        if method == "recovery/root/admit":
+            # Single-flight admission with every predicate rechecked at
+            # admission against a freshly fetched evidence bundle — a read-only
+            # availability wait never consumes a retry, and an ambiguous
+            # redelivery reconciles to the original successor, never a second
+            # one. Never auto-replayed on an uncertain outcome.
+            params = validate_wire(RootRecoveryAdmitParams, raw_params)
+            self._require_session(params.session_id)
+            response = await self._decide_recovery(lambda gate: gate.admit(params))
+            return DispatchResult(response)
+        if method == "recovery/root/cancel":
+            # Cancelling a pending schedule reads only the coordinator-local
+            # session view and episode, so no wire evidence is needed; it
+            # never cancels an already-admitted successor.
+            params = validate_wire(RootRecoveryCancelParams, raw_params)
+            self._require_session(params.session_id)
+            return DispatchResult(await self._recovery_gate.cancel(params))
+        if method == "session/stop":
+            # The coordinator stop lifecycle: answered here, in the
+            # coordinator that owns the turn queue and the callback
+            # projection, instead of the wire-declared refusal. Death is
+            # checked first, callbacks and queued work settle before the ack,
+            # and the root's termination and persistence run in the server's
+            # close-attached-runtime step, ordered ahead of the ack frame.
+            params = validate_wire(SessionStopParams, raw_params)
+            self._require_session(params.session_id)
+            return await self.stop_session(params)
         raise _uncovered(f"The {method} extension")
 
     async def rename(
@@ -2241,11 +3839,80 @@ class ProcessSessionBackend:  # noqa: PLR0904 - the session port surface
 
     # -- lifecycle -------------------------------------------------------
 
+    async def stop_session(self, params: SessionStopParams) -> DispatchResult:
+        """The coordinator's stop, answered before the ack frame leaves.
+
+        Death is checked first -- a dead-but-undetected root is re-declared
+        through the liveness watcher and answers the typed death receipt
+        instead of hanging to the request timeout. Open callbacks and the
+        queued work then settle BEFORE the ack, under the stop's long-op
+        budget; the root's termination and persistence run afterwards, in the
+        server's close-attached-runtime step. A stop whose settlement
+        outlives the budget is an unknown outcome: reconcile via
+        ``session/resume``, never resend.
+        """
+        self._process.recheck_liveness()
+        fence = self._generation_fence()
+        if fence is not None:
+            raise fence
+        try:
+            async with asyncio.timeout(STOP_SETTLE_TIMEOUT):
+                await self._settle_open_callbacks_for_stop()
+                await self._settle_turn_queue_for_stop()
+        except TimeoutError as exc:
+            raise SessionBackendError(
+                ProtocolErrorCode.INTERNAL_ERROR,
+                f"session/stop settlement did not finish within "
+                f"{STOP_SETTLE_TIMEOUT:g}s; the stop outcome is unknown -- "
+                "reconcile with session/resume, never resend",
+            ) from exc
+        return DispatchResult(SessionStopResponse())
+
+    async def _settle_open_callbacks_for_stop(self) -> None:
+        """Close every open callback before the stop ack, where its record lives."""
+        for request_id in list(self._open_callbacks):
+            try:
+                await self._process.cancel_user_input(
+                    request_id, CallbackClosedError("the session is stopping")
+                )
+            except RootAgentProcessError:
+                # The root died under the settle: the generation fence above
+                # already answers the death receipt, and the shutdown publishes
+                # the terminal projection.
+                return
+        await self._emit_status("idle")
+
+    async def _settle_turn_queue_for_stop(self) -> None:
+        """Pause the coordinator-owned queue and stop in-flight promotions.
+
+        The queue pauses instead of promoting over the stop; the queued items
+        stay visible as memorial state. No second promote pass runs.
+        """
+        async with self._queue_lock:
+            paused = self._turn_queue.pause()
+            tasks = [*self._queue_tasks]
+        if paused:
+            await self._emit_queue_updated()
+        if tasks:
+            # A queue task mid-promotion holds an agent request; stopping it
+            # keeps the pipe's teardown ordered behind its own callers.
+            with suppress(Exception):
+                await cancel_tasks(tasks, label="turn queue stop")
+
     async def shutdown(self) -> None:
         if self._closed:
             return
         self._closed = True
         self._events_closed.set()
+        # The wake baseline is a startup read nothing waits on past teardown.
+        baseline = self._wake_baseline
+        if baseline is not None and not baseline.done():
+            baseline.cancel()
+            with suppress(asyncio.CancelledError):
+                await baseline
+        # The session is going away: the recovery gate's references are
+        # invalidated, never silently rearmed.
+        self._recovery_gate.invalidate_all()
         turn = self._turn_task
         if turn is not None and not turn.done():
             turn.cancel()
@@ -2256,6 +3923,10 @@ class ProcessSessionBackend:  # noqa: PLR0904 - the session port surface
             notices.cancel()
             with suppress(asyncio.CancelledError):
                 await notices
+        recovery_notices = [*self._recovery_notice_tasks]
+        if recovery_notices:
+            with suppress(Exception):
+                await cancel_tasks(recovery_notices, label="root recovery notices")
         queue_tasks = [*self._queue_tasks]
         if queue_tasks:
             # A queue task mid-promotion holds an agent request; stopping it
@@ -2265,6 +3936,13 @@ class ProcessSessionBackend:  # noqa: PLR0904 - the session port surface
         if self._events_subscribed:
             self._events_idle.clear()
             finish_event_queue(self._events, _StreamClosed())
+        # The session end releases the typed MCP owner key explicitly: the
+        # agent-side auth bindings filed under it are removed deterministically
+        # now, never dropped mid-session by GC timing, before the pipe closes.
+        with suppress(Exception):
+            await self._process.release_mcp_owner_key(
+                self.session_id, self._mcp_owner_key
+            )
         await self._process.close()
         # The root is gone, so the groups its launcher shims started are
         # orphans: cleanup consults the jobs directory this session last
@@ -2283,6 +3961,10 @@ _AGENT_REFUSAL_CODES: Mapping[str, ProtocolErrorCode] = {
     # A manual command refused before it would execute is the same param
     # refusal the in-process handler answers, whichever route runs it.
     "AgentShellRefusedError": ProtocolErrorCode.INVALID_PARAMS,
+    # A prompt preparation the agent's own validation refused (too many or
+    # unsupported images, an unreadable attachment) is the same param refusal
+    # the in-process handler answers, whichever route runs it.
+    "PromptPreparationError": ProtocolErrorCode.INVALID_PARAMS,
 }
 
 

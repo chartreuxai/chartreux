@@ -17,10 +17,13 @@ from __future__ import annotations
 import asyncio
 import codecs
 from collections import deque
-from collections.abc import Callable
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
+import os
 from pathlib import Path
+import shutil
 import threading
+import time
 from typing import Any, Literal
 import uuid
 
@@ -35,6 +38,17 @@ from pydantic import (
 
 from chartreux.core.env import project_env_for_cwd
 from chartreux.core.events import BackgroundJobsChangedEvent
+from chartreux.core.tmp_ownership import (
+    IdentityTuple,
+    Ledger,
+    ReapResult,
+    SpawnLedgerBinding,
+    ambient_binding,
+    boot_id,
+    evaluate_worker_scoped_gates,
+    parent_lock,
+    process_identity_tuple,
+)
 from chartreux.core.tools import secret_redaction
 from chartreux.core.tools.builtins._remote_exec import RemoteExecDenial
 from chartreux.core.tools.builtins._remote_transfer import (
@@ -60,6 +74,7 @@ from chartreux.core.utils.async_subprocess import (
     terminate_process_group,
 )
 from chartreux.core.utils.shell import spawn_shell_command
+from chartreux.observability.logging import logger
 
 MAX_ALLOCATIONS = 8
 MAX_JOBS = 32
@@ -248,6 +263,12 @@ class BackgroundJob:
     stop_task: asyncio.Task[None] | None = field(default=None, repr=False)
     stop_requested: bool = False
     admission: asyncio.Task[StartResult] | None = field(default=None, repr=False)
+    # Point-3 run contract (C4 chunk i): the ledger binding of the invoking
+    # context and the invocation directories recorded at invocation time, so
+    # session-observed worker death can enumerate the worker's reap candidates
+    # structurally (never name-parsed).
+    tmp_ledger_binding: SpawnLedgerBinding | None = field(default=None, repr=False)
+    run_contract: dict[str, Any] | None = field(default=None, repr=False)
     mask_cache: tuple[int, int, frozenset[str], frozenset[str], bool] | None = field(
         default=None, repr=False
     )
@@ -255,6 +276,110 @@ class BackgroundJob:
     @property
     def first_cursor(self) -> int:
         return self.records[0].sequence if self.records else self.end_cursor
+
+
+# --- C4 chunk (iii): session-observed worker death -> worker-scoped reap ------
+#
+# The trigger is a session-observed worker death (the coordinator's
+# RootAgentProcess death observation, or a managed job's settlement here). The
+# worker's reap candidates are enumerated STRUCTURALLY from the run-contract
+# records — never name-parsed — and go through the worker-scoped gate variant
+# (S1a-S1c): the enclosing live session's allocation is never a candidate, and
+# only the candidate subtree is ever removed.
+
+_CONTROL_FLOW = (asyncio.CancelledError, KeyboardInterrupt, SystemExit)
+
+
+def reap_worker_invocation_dirs(
+    binding: SpawnLedgerBinding, worker: IdentityTuple, candidate_dirs: Sequence[str]
+) -> list[ReapResult]:
+    """Place one dead worker's recorded invocation dirs through the
+    worker-scoped gates and remove ONLY the candidate subtrees when every
+    gate passes.
+
+    Candidates must live strictly inside the bound allocation (the allocation
+    itself is never a candidate); anything outside is ignored. Retain on
+    ambiguity: a gate failure or a removal failure keeps the subtree.
+    """
+    alloc = binding.allocation
+    root = str(alloc.path)
+    candidates: list[Path] = []
+    for raw in candidate_dirs:
+        if isinstance(raw, str) and raw.startswith(root + os.sep):
+            candidates.append(Path(raw))
+    if not candidates:
+        return []
+    results: list[ReapResult] = []
+    with parent_lock(alloc.parent):
+        gates = evaluate_worker_scoped_gates(alloc, worker, candidates)
+        if not gates.reapable:
+            return [ReapResult(False, gates.reasons)]
+        for path in candidates:
+            try:
+                shutil.rmtree(path)
+            except OSError as exc:
+                results.append(
+                    ReapResult(False, ("quarantine-residue", f"rmtree-failed: {exc}"))
+                )
+                continue
+            results.append(ReapResult(True, (f"reaped-worker-subtree:{path}",)))
+    return results
+
+
+def enqueue_worker_death_reap(
+    worker_pid: int, *, binding: SpawnLedgerBinding | None = None
+) -> list[ReapResult]:
+    """Enqueue the worker-scoped reap candidate for one session-observed
+    worker death, from the run contract.
+
+    The worker's identity tuple comes from its ledger completion entry (the
+    spawner recorded it in-frame at spawn); its invocation dirs are the
+    ``invocation_dir`` bindings of the ledger entries attributed to the worker
+    — enumerated structurally, never parsed from names. With no bound ledger
+    or no attributable record the candidate is retained (fail-closed).
+    """
+    binding = binding if binding is not None else ambient_binding()
+    if binding is None:
+        return []
+    alloc = binding.allocation
+    try:
+        entries = Ledger(alloc).entries()
+    except OSError:
+        return [ReapResult(False, ("retained-ledger-missing",))]
+    worker_json: dict[str, Any] | None = None
+    for entry in entries:
+        if entry.get("kind") == "completion" and entry.get("pid") == worker_pid:
+            if entry.get("no_tuple"):
+                worker_json = {"pid": worker_pid}
+            else:
+                worker_json = {
+                    key: entry[key]
+                    for key in ("pid", "pgid", "starttime", "boot_id")
+                    if key in entry
+                }
+            break
+    if worker_json is None:
+        live = process_identity_tuple(worker_pid)
+        worker_json = live.to_json() if live is not None else {"pid": worker_pid}
+    worker = IdentityTuple.from_json(worker_json)
+    if worker is None:
+        # NO-TUPLE record: synthesize a tuple that can never match a live pid
+        # (starttime -1 is not a kernel value), so a live or reused pid
+        # adjudicates dead-for-the-record and a gone pid adjudicates dead.
+        worker = IdentityTuple(
+            pid=worker_pid, pgid=worker_pid, starttime=-1, boot_id=boot_id() or ""
+        )
+    candidates = [
+        entry["invocation_dir"]
+        for entry in entries
+        if isinstance(entry.get("invocation_dir"), str)
+        and (
+            entry.get("appender") == worker_json or entry.get("spawner") == worker_json
+        )
+    ]
+    if not candidates:
+        return []
+    return reap_worker_invocation_dirs(binding, worker, candidates)
 
 
 def _chunks(text: str) -> list[str]:
@@ -421,6 +546,7 @@ class BackgroundJobRegistry:
         # args.command; A1's StartResult footprint fields (write_paths,
         # mutation_roots) ride the result exactly as before.
         job_id = self.reserve(port, args)
+        self._record_run_contract(job_id, cwd)
         task = asyncio.create_task(
             self._launch(job_id, execute_command or args.command, cwd)
         )
@@ -444,6 +570,38 @@ class BackgroundJobRegistry:
             if not task.cancelled():
                 task.exception()
             raise
+
+    def _record_run_contract(self, job_id: str, cwd: Path | None) -> None:
+        """Record the point-3 run contract v1 on the job at invocation time:
+        the invoking context's ledger binding and the invocation directories
+        that live under the bound allocation (structural, never name-parsed).
+        """
+        with self._lock:
+            job = self._jobs.get(job_id)
+            if job is None:
+                return
+            binding = ambient_binding()
+            job.tmp_ledger_binding = binding
+            if binding is None:
+                return
+            alloc_path = str(binding.allocation.path)
+            invocation_dirs: list[str] = []
+            if cwd is not None:
+                cwd_str = str(cwd)
+                if cwd_str == alloc_path or cwd_str.startswith(alloc_path + os.sep):
+                    invocation_dirs.append(cwd_str)
+            job.run_contract = {
+                "schema": 1,
+                "job_id": job_id,
+                "context": {
+                    "alloc_id": binding.allocation.alloc_id,
+                    "ledger_path": str(binding.allocation.ledger_path),
+                },
+                "invocation_dirs": invocation_dirs,
+                "worker": None,
+                "command_redacted_summary": job.command,
+                "created_epoch": time.time(),
+            }
 
     def _admission_done(self, job_id: str, task: asyncio.Task[StartResult]) -> None:
         with self._lock:
@@ -546,6 +704,13 @@ class BackgroundJobRegistry:
         job = self._jobs[job_id]
         job.process = proc
         job.owner = registered_process_group(proc)
+        if job.run_contract is not None:
+            # C4 chunk (iii): the run contract carries the worker (the job
+            # leader as the sub-candidate's creator) so the death observation
+            # at settlement can enumerate this job's invocation dirs.
+            leader_identity = getattr(job.owner, "full_identity", None)
+            if leader_identity is not None:
+                job.run_contract["worker"] = leader_identity.to_json()
         if self._closed:
             # Close may have sealed admission while the spawn was completing.
             # Retain the allocation until this recovered handle is reclaimed.
@@ -857,6 +1022,9 @@ class BackgroundJobRegistry:
         with self._lock:
             job = self._jobs[job_id]
             policy = job.policy
+            death_binding = job.tmp_ledger_binding
+            death_contract = job.run_contract
+            death_owner = job.owner
         with bind_policy(ScrubPolicy.for_redaction((policy,), current_policy())):
             safe_error = _metadata(error, 256) if error is not None else None
         with self._lock:
@@ -875,6 +1043,48 @@ class BackgroundJobRegistry:
             job.allocated = False
             self._notify(revision=True)
             self._publish_state()
+        self._observe_job_death(death_binding, death_contract, death_owner)
+
+    def _observe_job_death(
+        self,
+        binding: SpawnLedgerBinding | None,
+        run_contract: dict[str, Any] | None,
+        owner: ProcessGroupOwnership | None,
+    ) -> None:
+        """C4 chunk (iii): the managed job's death is observed at settlement —
+        its recorded invocation dirs go through the worker-scoped gates with
+        the job leader as the sub-candidate's owner. Retain-on-ambiguity: this
+        observation never raises into settlement.
+        """
+        if binding is None or run_contract is None:
+            return
+        dirs = run_contract.get("invocation_dirs") or []
+        if not isinstance(dirs, list) or not dirs:
+            return
+        worker: IdentityTuple | None = None
+        raw_worker = run_contract.get("worker")
+        if isinstance(raw_worker, Mapping):
+            worker = IdentityTuple.from_json(raw_worker)
+        if worker is None and owner is not None:
+            worker = getattr(owner, "full_identity", None)
+        if worker is None:
+            return
+        try:
+            results = reap_worker_invocation_dirs(binding, worker, dirs)
+        except BaseException as exc:
+            if isinstance(exc, _CONTROL_FLOW):
+                raise
+            logger.warning(
+                "Worker-death reap of job invocation dirs failed; retained: %r", exc
+            )
+            return
+        for result in results:
+            if result.reaped:
+                logger.info("Worker-death reap removed %s", result.reasons)
+            else:
+                logger.info(
+                    "Worker-death reap retained invocation dirs: %s", result.reasons
+                )
 
     @staticmethod
     def _snapshot(job: BackgroundJob) -> JobSummary:

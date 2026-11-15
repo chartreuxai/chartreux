@@ -191,8 +191,12 @@ only directory, PID, and context. At narrow widths, PID yields first, then
 optional segments from the end, so place Jobs earlier if it should outlast other
 optional details.
 
-Context displays as, for example, `135k/400k (34%)`; the denominator is the
-effective automatic-compaction threshold, not the model's maximum context window.
+Context displays as, for example, `45k/500k (9%)`: usage over the effective
+automatic-compaction threshold, so the percentage says how close the session is
+to compacting, not how much of the model's maximum context window is gone. Every
+subagent row in the agent browser reads the same way against that agent's own
+threshold, and a row whose threshold is unknown or off shows `—` as the
+denominator instead of the window.
 Git branch lookup is asynchronous and cached. Enable `spend-today`, `spend-week`,
 or `spend-month` to show recorded USD spend across **all projects**, for example
 `Today $12.34`, `Week $12.34`, or `Month $12.34`. Windows are local calendar day,

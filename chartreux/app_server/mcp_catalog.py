@@ -3,13 +3,13 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Awaitable, Callable, Mapping
-from contextlib import AbstractContextManager, nullcontext
-from dataclasses import dataclass
+from collections.abc import Awaitable, Callable, Iterator, Mapping
+from contextlib import AbstractContextManager, contextmanager, nullcontext
+from dataclasses import dataclass, replace
 import hashlib
 import json
 from pathlib import Path
-from typing import Any, Protocol, TypeGuard, runtime_checkable
+from typing import TYPE_CHECKING, Any, Protocol, TypeGuard, cast, runtime_checkable
 
 from chartreux.app_server._dispatch import (
     DispatchResult,
@@ -19,12 +19,15 @@ from chartreux.app_server._dispatch import (
 from chartreux.app_server._mcp_auth import MCPAuthenticationService
 from chartreux.app_server._model import ProtocolModel, validate_wire
 from chartreux.app_server._session_backend_port import (
+    MCPAuthorizationProvider,
+    MCPAuthorizationRequired,
     ResolvedMCPCatalog,
     ResolvedMCPServerConfig,
     SessionBackend,
     SessionBackendError,
     SessionMCPSourceState,
     SessionMCPState,
+    SessionMCPToolDescriptor,
 )
 from chartreux.app_server.models import (
     MCPSourceStatus,
@@ -66,8 +69,16 @@ from chartreux.core.config.mcp_servers import (
 )
 from chartreux.core.config.orchestrator import ConfigOrchestrator
 from chartreux.core.config.types import ConcurrencyConflictError, ConfigSaveResult
+from chartreux.core.tools.mcp.authorization import (
+    MCPAuthorizationRequired as MCPAuthorizationRequiredImpl,
+)
 from chartreux.core.tools.mcp_settings import persist_mcp_toggle
 from chartreux.utils.mcp import format_tool_display_description
+
+if TYPE_CHECKING:
+    from chartreux.app_server._resources import ResourceRequestHandler
+    from chartreux.core.agent_loop import AgentLoop
+    from chartreux.core.agent_loop._loop import _PreparedReload
 
 type Notify = Callable[[str, ProtocolModel], Awaitable[None]]
 type SessionlessCatalogFactory = Callable[
@@ -143,8 +154,18 @@ class MCPCatalogService:
             )
         return await self._sessionless_catalog_factory()
 
+    def _owner_handle(self, owner_key: str | None) -> object:
+        """Resolve one typed wire owner key to the handle it strong-holds."""
+        if owner_key is None:
+            return _OWNED_BY_ORCHESTRATOR
+        return self._authentication.acquire_owner_key(owner_key)
+
     async def accept_auth_required(
-        self, params: MCPAuthRequiredParams, root: SessionBackend | None
+        self,
+        params: MCPAuthRequiredParams,
+        root: SessionBackend | None,
+        *,
+        owner_key: str | None = None,
     ) -> RuntimeUpdatedParams | None:
         if (
             root is None
@@ -172,18 +193,18 @@ class MCPCatalogService:
         if key in self._auth_required_seen:
             return None
         self._auth_required_seen.add(key)
-        context = _CatalogContext.for_session(root)
+        context = _CatalogContext.for_session(root, owner=self._owner_handle(owner_key))
         self._runtime(
             context, self._project(context, state), preserve_auth_required=key
         )
         return root.runtime_updated_params()
 
     async def prepare_config_reload(
-        self, root: SessionBackend
+        self, root: SessionBackend, *, owner_key: str | None = None
     ) -> _CatalogReloadPlan | None:
         if not isinstance(root, SessionMCPCatalogBinding):
             return None
-        context = _CatalogContext.for_session(root)
+        context = _CatalogContext.for_session(root, owner=self._owner_handle(owner_key))
         previous = await self._resolved(
             context.orchestrator, owner=context.catalog_owner
         )
@@ -197,11 +218,15 @@ class MCPCatalogService:
         return _CatalogReloadPlan(previous=previous, restrictive_names=restrictive)
 
     async def finish_config_reload(
-        self, root: SessionBackend, plan: _CatalogReloadPlan | None
+        self,
+        root: SessionBackend,
+        plan: _CatalogReloadPlan | None,
+        *,
+        owner_key: str | None = None,
     ) -> RuntimeSnapshot | None:
         if plan is None or not isinstance(root, SessionMCPCatalogBinding):
             return None
-        context = _CatalogContext.for_session(root)
+        context = _CatalogContext.for_session(root, owner=self._owner_handle(owner_key))
         candidate = await self._resolved(
             context.orchestrator, owner=context.catalog_owner
         )
@@ -222,13 +247,17 @@ class MCPCatalogService:
         return self._runtime(context, self._project(context, state))
 
     async def fail_config_reload(
-        self, root: SessionBackend, plan: _CatalogReloadPlan | None
+        self,
+        root: SessionBackend,
+        plan: _CatalogReloadPlan | None,
+        *,
+        owner_key: str | None = None,
     ) -> None:
         if plan is None or not plan.restrictive_names:
             return
         if not isinstance(root, SessionMCPCatalogBinding):
             return
-        context = _CatalogContext.for_session(root)
+        context = _CatalogContext.for_session(root, owner=self._owner_handle(owner_key))
         await self._restore_after_restrictive_failure(
             context, plan.previous, affected_names=plan.restrictive_names
         )
@@ -240,11 +269,13 @@ class MCPCatalogService:
         *,
         root: SessionBackend | None,
         notify: Notify,
+        owner_key: str | None = None,
     ) -> DispatchResult:
+        owner = self._owner_handle(owner_key)
         match method:
             case "mcp_catalog/read":
                 params = validate_wire(MCPReadParams, raw_params)
-                context = await self._target(params.session_id, root)
+                context = await self._target(params.session_id, root, owner=owner)
                 session_state = await context.require_control().read_mcp()
                 response: ProtocolModel = MCPReadResponse(
                     mcp=self._project(context, session_state)
@@ -252,7 +283,7 @@ class MCPCatalogService:
                 runtime_updated = False
             case "mcp_catalog/refresh":
                 params = validate_wire(MCPRefreshParams, raw_params)
-                context = await self._target(params.session_id, root)
+                context = await self._target(params.session_id, root, owner=owner)
                 await context.orchestrator.reload()
                 state = await self._converge(
                     context,
@@ -270,20 +301,29 @@ class MCPCatalogService:
                 runtime_updated = True
             case "mcp_catalog/toggle" | "mcp_catalog/add" | "mcp_catalog/remove":
                 response, runtime_updated = await self._config_mutation(
-                    method, raw_params, root
+                    method, raw_params, root, owner=owner
                 )
             case "mcp_catalog/login":
                 params = validate_wire(MCPLoginParams, raw_params)
-                response, runtime_updated = await self._login(params, root, notify)
+                response, runtime_updated = await self._login(
+                    params, root, notify, owner=owner
+                )
             case "mcp_catalog/logout":
                 params = validate_wire(MCPLogoutParams, raw_params)
-                response, runtime_updated = await self._logout(params, root)
+                response, runtime_updated = await self._logout(
+                    params, root, owner=owner
+                )
             case _:
                 raise method_not_found(method)
         return DispatchResult(response=response, runtime_updated=runtime_updated)
 
     async def _config_mutation(
-        self, method: str, raw_params: dict[str, Any], root: SessionBackend | None
+        self,
+        method: str,
+        raw_params: dict[str, Any],
+        root: SessionBackend | None,
+        *,
+        owner: object = _OWNED_BY_ORCHESTRATOR,
     ) -> tuple[ProtocolModel, bool]:
         params = (
             validate_wire(MCPAddParams, raw_params)
@@ -292,7 +332,7 @@ class MCPCatalogService:
             if method == "mcp_catalog/remove"
             else validate_wire(MCPToggleParams, raw_params)
         )
-        context = await self._mutation_target(params.session_id, root)
+        context = await self._mutation_target(params.session_id, root, owner=owner)
         if context.control is not None and not isinstance(
             context.control, SessionMCPConfigSave
         ):
@@ -454,12 +494,17 @@ class MCPCatalogService:
         )
 
     async def _login(
-        self, params: MCPLoginParams, root: SessionBackend | None, notify: Notify
+        self,
+        params: MCPLoginParams,
+        root: SessionBackend | None,
+        notify: Notify,
+        *,
+        owner: object = _OWNED_BY_ORCHESTRATOR,
     ) -> tuple[MCPCatalogMutationResponse, bool]:
-        context = await self._mutation_target(params.session_id, root)
-        owner = context.catalog_owner
+        context = await self._mutation_target(params.session_id, root, owner=owner)
+        catalog_owner = context.catalog_owner
         await self._authentication.bind_catalog(
-            context.orchestrator.config.mcp_servers, owner=owner
+            context.orchestrator.config.mcp_servers, owner=catalog_owner
         )
 
         async def publish_url(url: str) -> None:
@@ -468,7 +513,7 @@ class MCPCatalogService:
 
         try:
             descriptor_revision = await self._authentication.login(
-                params.name, on_url=publish_url, owner=owner
+                params.name, on_url=publish_url, owner=catalog_owner
             )
         except (MCPOAuthError, ValueError) as exc:
             raise RequestFailure(ProtocolErrorCode.INVALID_PARAMS, str(exc)) from exc
@@ -490,12 +535,16 @@ class MCPCatalogService:
         return MCPCatalogMutationResponse(runtime=runtime), state is not None
 
     async def _logout(
-        self, params: MCPLogoutParams, root: SessionBackend | None
+        self,
+        params: MCPLogoutParams,
+        root: SessionBackend | None,
+        *,
+        owner: object = _OWNED_BY_ORCHESTRATOR,
     ) -> tuple[MCPCatalogMutationResponse, bool]:
-        context = await self._mutation_target(params.session_id, root)
-        owner = context.catalog_owner
+        context = await self._mutation_target(params.session_id, root, owner=owner)
+        catalog_owner = context.catalog_owner
         await self._authentication.bind_catalog(
-            context.orchestrator.config.mcp_servers, owner=owner
+            context.orchestrator.config.mcp_servers, owner=catalog_owner
         )
         original = (
             await self._resolved(context.orchestrator, owner=context.catalog_owner)
@@ -508,7 +557,7 @@ class MCPCatalogService:
             )
         try:
             descriptor_revision = await self._authentication.logout(
-                params.name, owner=owner
+                params.name, owner=catalog_owner
             )
         except (MCPOAuthError, ValueError) as exc:
             await self._restore_after_restrictive_failure(
@@ -709,19 +758,27 @@ class MCPCatalogService:
         )
 
     async def _target(
-        self, session_id: str, root: SessionBackend | None
+        self,
+        session_id: str,
+        root: SessionBackend | None,
+        *,
+        owner: object = _OWNED_BY_ORCHESTRATOR,
     ) -> _CatalogContext:
         if root is None or root.session_id != session_id:
             raise RequestFailure(
                 ProtocolErrorCode.NOT_FOUND, f"Session not found: {session_id}"
             )
-        return _CatalogContext.for_session(root)
+        return _CatalogContext.for_session(root, owner=owner)
 
     async def _mutation_target(
-        self, session_id: str | None, root: SessionBackend | None
+        self,
+        session_id: str | None,
+        root: SessionBackend | None,
+        *,
+        owner: object = _OWNED_BY_ORCHESTRATOR,
     ) -> _CatalogContext:
         if session_id is not None:
-            return await self._target(session_id, root)
+            return await self._target(session_id, root, owner=owner)
         if root is not None:
             raise RequestFailure(
                 ProtocolErrorCode.CONFLICT,
@@ -851,22 +908,27 @@ class _CatalogContext:
         orchestrator: ConfigOrchestrator[ChartreuxConfigSchema],
         control: SessionBackend | None,
         root: SessionBackend | None,
+        *,
+        owner: object = _OWNED_BY_ORCHESTRATOR,
     ) -> None:
         self.orchestrator = orchestrator
         self.control = control
         self.root = root
+        self._owner = owner
         self.preflight: MCPPreflight | None = None
         self.apply: MCPApply | None = None
         self.save_result: ConfigSaveResult | None = None
 
     @classmethod
-    def for_session(cls, root: SessionBackend) -> _CatalogContext:
+    def for_session(
+        cls, root: SessionBackend, *, owner: object = _OWNED_BY_ORCHESTRATOR
+    ) -> _CatalogContext:
         if not isinstance(root, SessionMCPCatalogBinding):
             raise RequestFailure(
                 ProtocolErrorCode.NOT_IMPLEMENTED,
                 "The selected session backend does not support MCP catalog control",
             )
-        return cls(root.mcp_config_orchestrator, root, root)
+        return cls(root.mcp_config_orchestrator, root, root, owner=owner)
 
     def require_control(self) -> SessionBackend:
         if self.control is None:
@@ -879,6 +941,10 @@ class _CatalogContext:
         # servers under. None for a sessionless mutation: its orchestrator is
         # built fresh per call, so keying on it would file the binding under
         # something nothing holds, and it has no session to be confused with.
+        # A wire owner names its typed key's handle instead of the orchestrator
+        # object: the handle is held strongly for exactly as long as the key.
+        if self._owner is not _OWNED_BY_ORCHESTRATOR:
+            return self._owner
         return self.orchestrator if self.root is not None else None
 
 
@@ -990,7 +1056,294 @@ async def _remove_server_with_credentials(
     raise saved_error
 
 
+class AgentLoopMCPCatalogRoot:
+    """The agent process's own loop as the MCP catalog's control port.
+
+    On the stdio topology the coordinator proxies ``mcp_catalog/*`` control
+    over the agent wire and every leg runs here against the loop this process
+    owns, so no coordinator-side orchestrator or catalog owner exists to
+    drift. The typed owner key the wire carries files the auth bindings under
+    a handle held for exactly as long as the key lives, never dropped by GC
+    timing mid-session.
+    """
+
+    def __init__(
+        self,
+        loop: AgentLoop,
+        *,
+        resources: ResourceRequestHandler,
+        authorization_provider: MCPAuthorizationProvider,
+        is_busy: Callable[[], bool],
+        authorization_required_sink: (
+            Callable[
+                [str, MCPAuthorizationRequired | MCPAuthorizationRequiredImpl],
+                Awaitable[None],
+            ]
+            | None
+        ) = None,
+        descriptor_cache_root: Path | None = None,
+    ) -> None:
+        self._loop = loop
+        self._resources = resources
+        self._authorization_provider = authorization_provider
+        self._is_busy = is_busy
+        self._authorization_required_sink = authorization_required_sink
+        self._descriptor_cache_root = descriptor_cache_root
+        self.mcp_catalog: ResolvedMCPCatalog | None = None
+        self._mcp_catalog_revision = ""
+        self._mcp_route_revision = 0
+        self._mcp_save_task: asyncio.Task[Any] | None = None
+        self._projection: MCPState | None = None
+
+    @property
+    def session_id(self) -> str:
+        return self._loop.session_id
+
+    @property
+    def mcp_config_orchestrator(self) -> ConfigOrchestrator[ChartreuxConfigSchema]:
+        return self._loop.config_orchestrator
+
+    def _configure_mcp_registry(self) -> None:
+        from chartreux.app_server._session_backend_impl import (
+            configure_mcp_registry_impl,
+        )
+        from chartreux.core.tools.mcp.registry import MCPRegistry
+
+        catalog = self.mcp_catalog
+        if catalog is None:
+            return
+        registry = self._loop.mcp_registry
+        if registry is None and self._loop.config.mcp_servers:
+            registry = MCPRegistry()
+            self._loop.mcp_registry = registry
+            self._loop.tool_manager.set_mcp_registry(registry)
+        if registry is None:
+            return
+        configure_mcp_registry_impl(
+            registry,
+            catalog,
+            self._authorization_provider,
+            required_sink=self._authorization_required_sink,
+            descriptor_cache_root=self._descriptor_cache_root,
+        )
+
+    @contextmanager
+    def reserve_mcp_config(self) -> Iterator[tuple[MCPPreflight, MCPApply]]:
+        """Stage one checked MCP save against the loop this process owns.
+
+        Preparation may discover configured endpoints, so it runs against a
+        fresh registry that never mutates the accepted one; application swaps
+        that registry in, exactly as the in-process save does.
+        """
+        from chartreux.core.tools.mcp.registry import MCPRegistry
+
+        loop = self._loop
+        prepared: _PreparedReload | None = None
+        registry = MCPRegistry()
+
+        async def prepare(candidate: Any) -> None:
+            nonlocal prepared
+            prepared = loop._prepare_reload(
+                candidate.config, True, mcp_registry=registry
+            )
+
+        def apply(candidate: Any) -> None:
+            assert prepared is not None
+            loop._commit_reload(prepared, True)
+            loop.mcp_registry = registry
+
+        self._mcp_save_task = asyncio.current_task()
+        try:
+            yield prepare, apply
+        finally:
+            self._mcp_save_task = None
+            if prepared is not None and prepared.backend is not loop.backend:
+                loop._backend_lifetime.retire(
+                    prepared.backend, whole_turn_active=loop._active_turn is not None
+                )
+
+    async def read_mcp(self) -> SessionMCPState:
+        return self._session_mcp_state()
+
+    async def reconfigure_mcp(
+        self, configuration: ResolvedMCPCatalog, *, force_remote_discovery: bool
+    ) -> SessionMCPState:
+        self._require_mcp_idle()
+        current_names = tuple(server.name for server in self._loop.config.mcp_servers)
+        if current_names != tuple(server.name for server in configuration.servers):
+            raise SessionBackendError(
+                ProtocolErrorCode.CONFLICT,
+                "The resolved MCP catalog does not match the session configuration",
+            )
+        self.mcp_catalog = configuration
+        self._configure_mcp_registry()
+        self._mcp_catalog_revision = configuration.revision
+        manager = self._loop.tool_manager
+
+        async def converge() -> None:
+            if force_remote_discovery:
+                await manager.refresh_remote_tools_async()
+            else:
+                await manager.reconfigure_mcp_async()
+            await self._loop.refresh_system_prompt()
+
+        if self._mcp_save_task is asyncio.current_task():
+            # A replaced source must not outlive its admission reservation
+            # while endpoint/cache work is still running. Join, never retry.
+            pending = asyncio.create_task(converge())
+            while True:
+                try:
+                    await asyncio.shield(pending)
+                    break
+                except asyncio.CancelledError:
+                    if pending.cancelled():
+                        raise
+        else:
+            await converge()
+        self._mcp_route_revision += 1
+        return self._session_mcp_state()
+
+    async def authorization_changed(
+        self, *, name: str, descriptor_revision: str
+    ) -> SessionMCPState:
+        self._require_mcp_idle()
+        registry = self._loop.mcp_registry
+        if registry is None:
+            raise SessionBackendError(
+                ProtocolErrorCode.NOT_FOUND, "No MCP servers are configured"
+            )
+        catalog = self.mcp_catalog
+        resolved = (
+            next((server for server in catalog.servers if server.name == name), None)
+            if catalog is not None
+            else None
+        )
+        if catalog is None or resolved is None:
+            raise SessionBackendError(
+                ProtocolErrorCode.NOT_FOUND, f"MCP server not found: {name}"
+            )
+        resolved = replace(
+            resolved,
+            authorization=replace(
+                resolved.authorization, descriptor_revision=descriptor_revision
+            ),
+        )
+        self.mcp_catalog = replace(
+            catalog,
+            servers=tuple(
+                resolved if server.name == name else server
+                for server in catalog.servers
+            ),
+        )
+        self._configure_mcp_registry()
+        manager = self._loop.tool_manager
+        if resolved.disabled:
+            registry.record_disabled_authorization(name, descriptor_revision)
+            manager.suspend_mcp(name)
+            await self._loop.refresh_system_prompt()
+            self._mcp_route_revision += 1
+            return self._session_mcp_state()
+        authorization = await self._authorization_provider.resolve(
+            resolved.authorization
+        )
+        if authorization.descriptor_revision != descriptor_revision:
+            raise SessionBackendError(
+                ProtocolErrorCode.CONFLICT,
+                "The MCP authorization descriptor revision is stale",
+            )
+        if isinstance(authorization, MCPAuthorizationRequired):
+            registry.mark_needs_auth(name, descriptor_revision)
+            manager.suspend_mcp(name)
+            if self._authorization_required_sink is not None:
+                await self._authorization_required_sink(name, authorization)
+            await self._loop.refresh_system_prompt()
+            self._mcp_route_revision += 1
+            return self._session_mcp_state()
+        registry.invalidate(name)
+        await manager.reconfigure_mcp_async()
+        await self._loop.refresh_system_prompt()
+        self._mcp_route_revision += 1
+        return self._session_mcp_state()
+
+    async def suspend_mcp(
+        self, *, name: str, tool_name: str | None, reason: str
+    ) -> SessionMCPState:
+        if reason not in {"logout", "remove", "disable", "replace"}:
+            raise SessionBackendError(
+                ProtocolErrorCode.INVALID_PARAMS, "Invalid MCP suspension reason"
+            )
+        self._require_mcp_idle()
+        self._loop.tool_manager.suspend_mcp(name, tool_name)
+        await self._loop.refresh_system_prompt()
+        self._mcp_route_revision += 1
+        return self._session_mcp_state()
+
+    def _require_mcp_idle(self) -> None:
+        # Convergence against an active turn (mid-tool-call) is fenced: the
+        # owner knows its own live turn, and reconfiguring under one would race
+        # the run in flight, so the carrier answers the partial receipt.
+        if (
+            self._mcp_save_task is not None
+            and self._mcp_save_task is asyncio.current_task()
+        ):
+            return
+        if self._is_busy():
+            raise SessionBackendError(
+                ProtocolErrorCode.CONFLICT,
+                "Session is busy running a turn; MCP convergence is fenced "
+                "until it settles",
+            )
+
+    def update_mcp_projection(self, state: MCPState) -> None:
+        self._projection = state
+
+    def runtime_updated_params(self) -> RuntimeUpdatedParams:
+        runtime = self._resources.runtime_snapshot()
+        if self._projection is not None:
+            runtime = runtime.model_copy(update={"mcp": self._projection})
+        return RuntimeUpdatedParams(session_id=self.session_id, runtime=runtime)
+
+    def _session_mcp_state(self) -> SessionMCPState:
+        public = self._resources.runtime_snapshot().mcp
+        registry = self._loop.mcp_registry
+        transports = {
+            server.name: server.transport for server in self._loop.config.mcp_servers
+        }
+        sources = tuple(
+            SessionMCPSourceState(
+                name=source.name,
+                transport=cast(Any, transports[source.name]),
+                status=cast(Any, source.status.value),
+                tools=tuple(
+                    SessionMCPToolDescriptor(
+                        remote_name=tool.name,
+                        description=tool.description,
+                        enabled=tool.enabled,
+                        display_name=f"{source.name}_{tool.name}",
+                    )
+                    for tool in source.tools
+                ),
+                descriptor_revision=(
+                    registry.descriptor_revision(source.name)
+                    if registry is not None
+                    else ""
+                ),
+                error=public.discovery_errors.get(source.name),
+            )
+            for source in public.sources
+            if source.name in transports
+        )
+        return SessionMCPState(
+            catalog_revision=self._mcp_catalog_revision,
+            # Preserve this persisted route-revision prefix for compatibility.
+            route_revision=f"legacy-mcp-routes:{self._mcp_route_revision}",
+            sources=sources,
+            discovery_errors=public.discovery_errors,
+        )
+
+
 __all__ = [
+    "AgentLoopMCPCatalogRoot",
     "MCPCatalogService",
     "SessionMCPCatalogBinding",
     "SessionMCPConfigSave",

@@ -289,6 +289,44 @@ async def test_statusline_counts_active_only_and_rows_show_names() -> None:
 
 
 @pytest.mark.asyncio
+async def test_main_row_stays_main_scoped_while_a_child_drives_osc_working() -> None:
+    """v0.7.9 point 5 (C7c): the Main row keeps ``Running``/``Idle`` scoped
+    to the main agent. The State metadata is what the app computes from the
+    main turn alone (`_refresh_main_agent_details`), so a running child — the
+    same child that composes the OSC report to ``working`` — must never make
+    the row read as the main agent running.
+    """
+    app = _BrowserApp()
+    async with app.run_test(size=(80, 12)) as pilot:
+        # An idle main turn while the child runs: app.py passes State "Idle".
+        app.bar.update_main_details({
+            "Session": "session",
+            "Directory": "/tmp",
+            "State": "Idle",
+        })
+        app.bar.update_agents((
+            _agent("child", availability="running", current_run_status="running"),
+        ))
+        app.bar.open_browser()
+        await pilot.pause()
+        rendered = _content(app.bar)
+        assert "Main agent" in rendered
+        main_detail = str(app.bar.query_one("#agent-bar-detail", Static).render())
+        assert "Idle" in main_detail
+        assert "Running" not in main_detail
+        # The running activity is the child's own row, next to the Main row.
+        assert "Running" in rendered
+        # Selecting the child shows its running state; Main stays untouched.
+        app.bar.action_cursor_down()
+        await pilot.pause()
+        child_detail = str(app.bar.query_one("#agent-bar-detail", Static).render())
+        assert "Running" in child_detail
+        app.bar.action_cursor_up()
+        await pilot.pause()
+        assert "Idle" in str(app.bar.query_one("#agent-bar-detail", Static).render())
+
+
+@pytest.mark.asyncio
 async def test_collapsed_agent_bar_skips_unchanged_content_updates() -> None:
     app = _BrowserApp()
     async with app.run_test() as pilot:
@@ -956,7 +994,11 @@ async def test_all_state_labels_and_full_context_metadata(
     app = _BrowserApp()
     async with app.run_test() as pilot:
         agent = _agent(
-            "identity", context_tokens=135_000, context_window=400_000, **values
+            "identity",
+            context_tokens=135_000,
+            context_window=1_000_000,
+            context_threshold=400_000,
+            **values,
         )
         with patch.object(
             app.bar, "set_interval", wraps=app.bar.set_interval
@@ -975,6 +1017,10 @@ async def test_all_state_labels_and_full_context_metadata(
         if agent.availability in {"evicted", "closed"}:
             expected += " (last recorded)"
         assert "\n" + expected in metadata
+        # H3: the row's denominator is the agent's own compaction trigger, and
+        # the window it also reports is a separate fact.
+        assert "Auto-compact threshold: 400000" in metadata
+        assert "Context window: 1000000" in metadata
         if agent.stop_reason:
             assert f"Stop reason: {agent.stop_reason}" in metadata
 
@@ -990,7 +1036,8 @@ async def test_closed_tombstone_details_and_duration() -> None:
             run_elapsed_seconds=252,
             idle_seconds=62,
             context_tokens=135_000,
-            context_window=400_000,
+            context_window=1_000_000,
+            context_threshold=400_000,
         )
         app.bar.update_agents((agent,))
         app.bar.open_browser()
@@ -1894,3 +1941,27 @@ async def test_uncollected_runs_label_stays_distinct_from_result_status() -> Non
         expired_details = app.bar._agent_details(expired)
         assert "result expired" in expired_details
         assert "Uncollected runs: older-run" in expired_details
+
+
+@pytest.mark.asyncio
+async def test_row_without_a_usable_threshold_renders_an_unknown_denominator() -> None:
+    """H3: a child row never falls back to the hard window as its denominator.
+
+    A pre-H3 peer omits the key, and a malformed value (a bool, a string, a
+    float, a nonpositive count) states no trigger a row may render: both read
+    as unknown while the window stays a separate, known fact.
+    """
+    app = _BrowserApp()
+    async with app.run_test():
+        agent = _agent("no-threshold", context_tokens=45_000, context_window=1_000_000)
+        assert agent.context_threshold is None
+        detail = app.bar._agent_details(agent)
+        assert "45k/—" in detail
+        assert "45k/1.0M" not in detail
+        metadata = app.bar.full_metadata(agent)
+        assert "Auto-compact threshold" not in metadata
+        assert "Context window: 1000000" in metadata
+        for malformed in (True, "500000", -1, 0, 1.5):
+            assert (
+                _agent("garbage", context_threshold=malformed).context_threshold is None
+            )

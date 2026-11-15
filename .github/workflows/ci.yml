@@ -166,3 +166,57 @@ jobs:
         run: |
           echo "Snapshot tests failed, failing job."
           exit 1
+
+  stdio-isolation:
+    name: Spawned stdio gates (isolated)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Install uv with caching
+        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
+        with:
+          version: "latest"
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Sync dependencies
+        run: uv sync --locked --dev
+
+      # Every spawned stdio/PTY leg runs through tests/pty/run_gate.sh, which
+      # refuses (fail-closed) rather than run unisolated. These two steps make
+      # the gate's kernel mechanism available on the runner; the gate's own
+      # pre-launch probes and tests/pty/test_isolation_receipts.py then prove
+      # the isolation really is in effect for this job.
+      - name: Relax Ubuntu 24.04 AppArmor unprivileged-userns restriction
+        run: |
+          if sysctl kernel.apparmor_restrict_unprivileged_userns >/dev/null 2>&1; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          else
+            echo "No AppArmor unprivileged-userns restriction on this kernel."
+          fi
+
+      - name: Install the isolation mechanism
+        run: |
+          if ! command -v bwrap >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install -y bubblewrap
+          fi
+          bwrap --version
+
+      - name: Backend-contract stdio gate (spawned transports, isolated)
+        env:
+          PYTEST_CHARTREUX_RECEIPT_GATE: stdio
+        run: bash tests/pty/run_gate.sh "uv run --no-sync pytest tests/app_server/backend_contract -k stdio"
+
+      - name: PTY smoke gate (spawned TUI, isolated)
+        run: bash tests/pty/run_gate.sh "uv run --no-sync pytest tests/pty"

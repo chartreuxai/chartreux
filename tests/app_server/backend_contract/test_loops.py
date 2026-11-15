@@ -5,11 +5,14 @@ from collections.abc import Callable
 import json
 from pathlib import Path
 import time
+from typing import Any, cast
 
 import httpx
 import pytest
 import respx
 
+from chartreux.app_server._runtime import create_harness_server
+from chartreux.app_server.client import AppServerClient
 from chartreux.app_server.models import (
     PublicMessageEntry,
     PublicNoticeEntry,
@@ -22,52 +25,130 @@ from chartreux.app_server.protocol import (
     SessionOptions,
 )
 from chartreux.app_server.session import AppServerSession
+from chartreux.app_server.transport import memory_transport_pair
 from tests.app_server.backend_contract.conftest import (
     BackendContractConnection,
     connect_backend_contract_host,
+    install_memory_root_agent,
 )
+from tests.conftest import build_test_agent_loop
+from tests.mock.utils import mock_llm_chunk
+from tests.stubs.app_server import attach_test_app_server_session
+from tests.stubs.fake_backend import FakeBackend
 
 
 @pytest.mark.asyncio
 async def test_loop_resource_supports_crud(
-    backend_contract_session: AppServerSession,
+    backend_contract_transport_session: AppServerSession,
 ) -> None:
-    """*Prepare*: An attached session with no scheduled loops.
+    """*Prepare*: An attached session with no scheduled loops, on either transport.
     *Do*: Create, list, delete, and clear loops through the public resource.
     *Assert*: Every mutation returns the typed loop state shared by both backends.
     """
     # Prepare
-    assert await backend_contract_session.resources.loops.list() == []
+    assert await backend_contract_transport_session.resources.loops.list() == []
 
     # Do
-    first = await backend_contract_session.resources.loops.create("30s", "first")
-    second = await backend_contract_session.resources.loops.create("1m", "second")
-    listed = await backend_contract_session.resources.loops.list()
-    deleted = await backend_contract_session.resources.loops.delete(first.id)
-    cleared = await backend_contract_session.resources.loops.clear()
+    first = await backend_contract_transport_session.resources.loops.create(
+        "30s", "first"
+    )
+    second = await backend_contract_transport_session.resources.loops.create(
+        "1m", "second"
+    )
+    listed = await backend_contract_transport_session.resources.loops.list()
+    deleted = await backend_contract_transport_session.resources.loops.delete(first.id)
+    cleared = await backend_contract_transport_session.resources.loops.clear()
 
     # Assert
     assert listed == [first, second]
     assert deleted == first
     assert cleared == 1
-    assert await backend_contract_session.resources.loops.list() == []
+    assert await backend_contract_transport_session.resources.loops.list() == []
 
 
 @pytest.mark.asyncio
 async def test_loop_resource_returns_typed_validation_errors(
-    backend_contract_session: AppServerSession,
+    backend_contract_transport_session: AppServerSession,
 ) -> None:
     """*Prepare*: An attached session accepting loop resource requests.
-    *Do*: Create a loop with an invalid interval.
-    *Assert*: Both backends return the public invalid-params error.
+    *Do*: Create a loop with an invalid interval, then delete an unknown id.
+    *Assert*: Both backends return the same typed refusals and change nothing.
     """
     # Prepare / Do
     with pytest.raises(AppServerResponseError) as exc_info:
-        await backend_contract_session.resources.loops.create("invalid", "prompt")
+        await backend_contract_transport_session.resources.loops.create(
+            "invalid", "prompt"
+        )
 
     # Assert
     assert exc_info.value.error.code is ProtocolErrorCode.INVALID_PARAMS
     assert "Invalid interval" in exc_info.value.error.message
+
+    with pytest.raises(AppServerResponseError) as delete_info:
+        await backend_contract_transport_session.resources.loops.delete("no-such-loop")
+
+    assert delete_info.value.error.code is ProtocolErrorCode.INVALID_PARAMS
+    assert "No scheduled loop with id" in delete_info.value.error.message
+    assert await backend_contract_transport_session.resources.loops.list() == []
+
+
+@pytest.mark.asyncio
+async def test_loop_carrier_answers_from_the_process_that_holds_the_schedule(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The stdio route crosses to the agent's own schedule, never a coordinator copy.
+
+    The process-session backend holds no loop manager, so any of these four
+    requests answered here would have to invent one -- a second schedule with
+    its own fire times. Each public call is observed crossing to the owner, and
+    the owner's reply is the state the public resource returns.
+    """
+    owned_loop = build_test_agent_loop(
+        backend=FakeBackend([[mock_llm_chunk(content="one")]])
+    )
+    install_memory_root_agent(monkeypatch, owned_loop)
+    client_transport, server_transport = memory_transport_pair()
+    harness = await create_harness_server(server_transport, transport_kind="stdio")
+    client = AppServerClient(client_transport, run_peer=harness.serve)
+    session = await attach_test_app_server_session(client)
+    try:
+        process = cast(Any, harness._server._root)._process
+        crossings: list[str] = []
+
+        def recorded(name: str, owner: Callable[..., Any]) -> Callable[..., Any]:
+            async def crossed(*args: Any, **kwargs: Any) -> Any:
+                crossings.append(name)
+                return await owner(*args, **kwargs)
+
+            return crossed
+
+        for name in ("list_loops", "create_loop", "delete_loop", "clear_loops"):
+            owner = getattr(process, name)
+            monkeypatch.setattr(process, name, recorded(name, owner))
+
+        created = await session.resources.loops.create("30s", "carried")
+        listed = await session.resources.loops.list()
+        deleted = await session.resources.loops.delete(created.id)
+        cleared = await session.resources.loops.clear()
+        remaining = await session.resources.loops.list()
+
+        assert crossings == [
+            "create_loop",
+            "list_loops",
+            "delete_loop",
+            "clear_loops",
+            "list_loops",
+        ]
+        assert listed == [created]
+        assert created.prompt == "carried"
+        assert deleted == created
+        assert cleared == 0
+        assert remaining == []
+    finally:
+        await session.close()
+        await client.close()
+        await harness.close()
+        await owned_loop.aclose()
 
 
 @pytest.mark.asyncio

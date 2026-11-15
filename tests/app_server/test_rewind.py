@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Callable
 from contextlib import aclosing, suppress
 from pathlib import Path
 from typing import Any
@@ -169,15 +170,28 @@ async def test_fork_rewind_ignores_a_read_answered_after_the_session_changed(
         reading = asyncio.Event()
 
         async def delayed_read(
-            method: str, params: Any = None, *, wait_for_incoming: bool = False
+            method: str,
+            params: Any = None,
+            *,
+            wait_for_incoming: bool = False,
+            response_boundary: Callable[[dict[str, Any]], None] | None = None,
+            timeout: float | None = None,
         ) -> dict[str, Any]:
             if method != "session/read":
                 return await request(
-                    method, params, wait_for_incoming=wait_for_incoming
+                    method,
+                    params,
+                    wait_for_incoming=wait_for_incoming,
+                    response_boundary=response_boundary,
+                    timeout=timeout,
                 )
             reading.set()
             response = await request(
-                method, params, wait_for_incoming=wait_for_incoming
+                method,
+                params,
+                wait_for_incoming=wait_for_incoming,
+                response_boundary=response_boundary,
+                timeout=timeout,
             )
             await forked.wait()
             return response
@@ -252,15 +266,28 @@ async def test_inplace_rewind_ignores_a_read_answered_before_the_truncation(
         reading = asyncio.Event()
 
         async def delayed_read(
-            method: str, params: Any = None, *, wait_for_incoming: bool = False
+            method: str,
+            params: Any = None,
+            *,
+            wait_for_incoming: bool = False,
+            response_boundary: Callable[[dict[str, Any]], None] | None = None,
+            timeout: float | None = None,
         ) -> dict[str, Any]:
             if method != "session/read":
                 return await request(
-                    method, params, wait_for_incoming=wait_for_incoming
+                    method,
+                    params,
+                    wait_for_incoming=wait_for_incoming,
+                    response_boundary=response_boundary,
+                    timeout=timeout,
                 )
             reading.set()
             response = await request(
-                method, params, wait_for_incoming=wait_for_incoming
+                method,
+                params,
+                wait_for_incoming=wait_for_incoming,
+                response_boundary=response_boundary,
+                timeout=timeout,
             )
             await rewound.wait()
             return response

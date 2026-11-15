@@ -5,9 +5,9 @@ from __future__ import annotations
 from collections.abc import Mapping
 from functools import cache
 from types import MappingProxyType
-from typing import ClassVar, Literal
+from typing import Annotated, ClassVar, Literal
 
-from pydantic import AwareDatetime, Field
+from pydantic import AwareDatetime, BeforeValidator, Field
 
 from chartreux.app_server._model import ProtocolModel
 from chartreux.app_server.models import (
@@ -95,6 +95,21 @@ class TurnCompletedParams(EventNotificationParams):
     turn: PublicTurn
 
 
+def _row_compact_threshold(value: object) -> int | None:
+    """An agent row's compaction trigger, only when the peer states a usable one.
+
+    A row measures its usage against a positive token count, so a bool, a
+    string, a float, a nonpositive value or an absent key states no
+    denominator this row may render: it reads as unknown (fail-closed) instead
+    of being coerced into a number no child committed to. This mirrors the
+    strictness of the child run-progress carrier, which treats the same shapes
+    as unknown rather than trusting them.
+    """
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        return None
+    return value
+
+
 class AgentSummaryModel(ProtocolModel):
     agent_id: str
     identity: str | None = Field(default=None, exclude_if=lambda value: value is None)
@@ -112,6 +127,13 @@ class AgentSummaryModel(ProtocolModel):
     stop_reason: RunStopReason | None = None
     context_tokens: int | None = None
     context_window: int | None = None
+    # The agent's own automatic-compaction trigger (H3): the denominator this
+    # row's usage is rendered against, so a child row never measures itself
+    # against a hard window no compaction protects. None when the producer
+    # observed no usable trigger -- a pre-H3 peer omits the key entirely.
+    context_threshold: Annotated[
+        int | None, BeforeValidator(_row_compact_threshold)
+    ] = None
     compacting: bool = False
     initial_task_summary: str | None = None
     current_task_summary: str | None = None

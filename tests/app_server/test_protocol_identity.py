@@ -527,13 +527,18 @@ class _PreChangeAgentSummaryModel(ProtocolModel):
 
 
 def test_frozen_pre_change_model_mirrors_the_current_field_set() -> None:
-    """U2/A3: the frozen model is the live model minus exactly the new field.
+    """The frozen model is the live model minus exactly the later fields.
 
     This guards the freeze against drift: a later field added to the live
     model without updating the mirror fails here instead of silently
-    weakening the old-client rejection test.
+    weakening the old-client rejection test. The subtracted fields are the
+    ones this freeze predates: the always-emitted uncollected-run list (U2)
+    and the row's compaction trigger (H3).
     """
-    current = set(AgentSummaryModel.model_fields) - {"uncollected_run_ids"}
+    current = set(AgentSummaryModel.model_fields) - {
+        "uncollected_run_ids",
+        "context_threshold",
+    }
 
     assert set(_PreChangeAgentSummaryModel.model_fields) == current
 

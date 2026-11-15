@@ -130,6 +130,7 @@ from chartreux.app_server.agent_wire import (
     TURN_OUTCOME_FAILED,
     TURN_OUTCOME_INTERRUPTED,
 )
+from chartreux.app_server.config import stated_compact_threshold
 from chartreux.app_server.models import (
     CallbackOutput,
     OpenCallbackState,
@@ -264,6 +265,24 @@ def _public_completion_audit(
     return PublicCompletionAudit.model_validate(audit.model_dump(mode="json"))
 
 
+def _record_compact_threshold(record: AgentRecord) -> int | None:
+    """The retained in-process agent's own automatic-compaction trigger (H4a).
+
+    The trigger is read from the SAME active-model projection the main status
+    bar renders against -- the child loop's resolved model -- so an in-process
+    row measures usage where that child would actually compact, never at the
+    hard window beside it. An unresolvable active model and a value the strict
+    shape check cannot vouch for both leave the denominator unknown
+    (fail-closed); the wire model normalizes a nonpositive trigger (compaction
+    off) to unknown rather than rendering a percentage against it.
+    """
+    try:
+        active = record.runtime.agent_loop.config.get_active_model()
+    except (ValueError, AttributeError):
+        return None
+    return stated_compact_threshold(getattr(active, "auto_compact_threshold", None))
+
+
 @dataclass(slots=True)
 class SessionRuntime:
     agent_loop: AgentLoop
@@ -341,6 +360,33 @@ class QuiescenceSnapshot:
             not self.active_dependency_runs
             and not self.pending_notifications
             and not self.unnotified_unfetched_results
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class InventorySnapshot:
+    """One joint-acquisition read of the live agent inventory (v0.7.9 point 5).
+
+    The revision and the projected inventory are read together under the same
+    joint acquisition as the quiescence precedent (``_registry_lock`` AND the
+    run-state acquisition), so the revision describes EXACTLY the returned
+    inventory. The identity is the ROOT incarnation ``(session_id,
+    generation)``: the revision floor is compared only within one identical
+    pair — a new generation of the same session id is a NEW incarnation and
+    establishes a fresh floor (the counter itself never resets).
+    """
+
+    session_id: str | None
+    generation: int | None
+    revision: int
+    agents: tuple[AgentSummaryModel, ...]
+
+    @property
+    def incarnation(self) -> tuple[str, int] | None:
+        return (
+            (self.session_id, self.generation)
+            if self.session_id is not None and self.generation is not None
+            else None
         )
 
 
@@ -474,6 +520,13 @@ class SessionRuntimeRegistry(SubagentRunnerPort):  # noqa: PLR0904
             idle_ttl_seconds=0, max_idle_agents=0, retain_agents=False
         )
         self._generation_identity: tuple[str, int] | None = None
+        # v0.7.9 point 5 (C6a): the monotone inventory revision. One
+        # synchronous increment per registry mutation (see
+        # _advance_inventory_revision_locked); the joint inventory snapshot
+        # reads it together with the projection, so a returned revision always
+        # describes exactly the returned inventory. The counter never resets;
+        # consumer revision floors reset with the generation identity.
+        self._inventory_revision: int = 0
         self._draining_children = False
         # Set while draining when an outstanding inventory publication is
         # suppressed or cancelled (a reaper pruning across the drain
@@ -491,9 +544,13 @@ class SessionRuntimeRegistry(SubagentRunnerPort):  # noqa: PLR0904
         self._admission_closed = False
         self._next_agent_seq = 0
         self._dangerous_command_authority = DangerousCommandAuthority(
-            resolve_live_session=self._require_live_session,
+            resolve_live_loop=lambda session_id: (
+                self._require_live_session(session_id).agent_loop
+            ),
             resolve_session_loop=self._resolve_session_loop,
-            resolve_root=lambda: self._root,
+            resolve_root_loop=lambda: (
+                self._root.agent_loop if self._root is not None else None
+            ),
         )
         self._transcript_reads = TranscriptReads(self)
         self._launch_admission = ChildLaunchAdmission(self)
@@ -625,6 +682,49 @@ class SessionRuntimeRegistry(SubagentRunnerPort):  # noqa: PLR0904
             if snapshot.quiescent:
                 self._termination_declared = True
             return snapshot
+
+    def _advance_inventory_revision_locked(self) -> None:
+        """Advance the monotone inventory revision (v0.7.9 point 5; held region).
+
+        The caller must hold the mutation's serialization region — (a) every
+        registry-locked mutation calls this under ``_registry_lock``, (b)
+        every run-state transition calls it inside its ``acquire_run_state``
+        region, and (c) synchronous record-flag writes call it in the write's
+        no-await window. The single event loop makes the increment atomic and
+        the joint inventory snapshot (``inventory_snapshot``) excludes (a) and
+        (b) completely and cannot interleave inside (c), so the returned
+        revision always describes exactly the returned inventory, and any
+        post-snapshot mutation yields a strictly higher revision. Bare
+        registries built without ``__init__`` fall back to a lazily created
+        counter (the ``_agents_update_guard`` precedent).
+        """
+        self._inventory_revision = getattr(self, "_inventory_revision", 0) + 1
+
+    async def inventory_snapshot(self) -> InventorySnapshot:
+        """Read the live agent inventory as ONE consistent snapshot (point 5).
+
+        Holds the SAME joint acquisition as the quiescence precedent —
+        ``_registry_lock`` AND the run-state acquisition — so the read is
+        mutually exclusive with every registry-locked mutation and every
+        run-state writer: the revision and the projected inventory are
+        sampled together, never torn across a transition. The projection is
+        the same predicate-relevant one the TUI bar consumes
+        (``_agents_update_payload`` over ``_visible_summaries``), and lazy
+        result expiry runs first exactly like ``check_agents``, keeping the
+        in-process read identical to the fresh snapshot carrier.
+        """
+        async with self._registry_lock, self.acquire_run_state():
+            self._expire_results_locked()
+            revision = getattr(self, "_inventory_revision", 0)
+            identity = getattr(self, "_generation_identity", None)
+            agents = tuple(self._agents_update_payload())
+        session_id, generation = identity if identity is not None else (None, None)
+        return InventorySnapshot(
+            session_id=session_id,
+            generation=generation,
+            revision=revision,
+            agents=agents,
+        )
 
     def _policy_runtimes(self, root: SessionRuntime) -> tuple[SessionRuntime, ...]:
         """Include detached runtimes until their outstanding turns have settled."""
@@ -1140,6 +1240,10 @@ class SessionRuntimeRegistry(SubagentRunnerPort):  # noqa: PLR0904
             max_tombstones=config.max_tombstones,
         )
         self._generation_identity = identity
+        # The generation identity and the effective retention policy feed the
+        # inventory projection (the global idle-TTL branch), so the
+        # re-established generation advances the revision (point 5).
+        self._advance_inventory_revision_locked()
 
     def _acquire_notification_suppression(self, agent_id: str) -> None:
         self._suppression_owners[agent_id] = (
@@ -1225,6 +1329,11 @@ class SessionRuntimeRegistry(SubagentRunnerPort):  # noqa: PLR0904
                 teardown_retired(),
                 name=f"vibe-subagent-generation-drain:{record.agent_id}",
             )
+        # The retired records, tombstones, and readable snapshots leave the
+        # projection together with the retiring identity, in the same
+        # synchronous sequence (no await separates the removals), so the
+        # rotation advances the revision exactly once here (point 5).
+        self._advance_inventory_revision_locked()
         self._rearm_reaper_locked()
         if removed_tombstones or records:
             # Publish the new inventory whenever anything was removed —
@@ -1259,6 +1368,9 @@ class SessionRuntimeRegistry(SubagentRunnerPort):  # noqa: PLR0904
             self._runtime_factory.release_writer_fence(runtime.agent_loop)
             self._root = None
             self._generation_identity = None
+            # The identity reset changes the projection's global-TTL branch and
+            # the snapshot's identity half; the revision must describe it.
+            self._advance_inventory_revision_locked()
 
     def resolve_child(
         self, session_id: str
@@ -1531,6 +1643,9 @@ class SessionRuntimeRegistry(SubagentRunnerPort):  # noqa: PLR0904
         for record in self._agent_records.values():
             if record.session_id == old_session_id:
                 record.session_id = new_session_id
+        # The record session-id rewrite is inventory-adjacent registry state;
+        # it lands in the same synchronous window as the map rebinds above.
+        self._advance_inventory_revision_locked()
         runtime.history.replace(rebind_history(runtime.history.base, new_session_id))
         for child in self._children.values():
             if child.agent_loop.parent_session_id == old_session_id:
@@ -2491,6 +2606,10 @@ class SessionRuntimeRegistry(SubagentRunnerPort):  # noqa: PLR0904
                 effective_thinking=record.effective_thinking,
                 context_tokens=record.context_tokens,
                 context_window=record.context_window,
+                # H4a: the in-process row's own compaction trigger, read from
+                # the child loop's active model -- the same denominator the
+                # main status bar uses, never the window beside it.
+                context_threshold=_record_compact_threshold(record),
                 compacting=record.compacting,
                 stop_reason=record.stop_reason,
                 last_failure=last_failure,
@@ -2681,6 +2800,7 @@ class SessionRuntimeRegistry(SubagentRunnerPort):  # noqa: PLR0904
                 effective_thinking=summary.effective_thinking,
                 context_tokens=summary.context_tokens,
                 context_window=summary.context_window,
+                context_threshold=summary.context_threshold,
                 compacting=summary.compacting,
                 stop_reason=(
                     PublicRunStopReason(summary.stop_reason.value)
@@ -2864,6 +2984,9 @@ class SessionRuntimeRegistry(SubagentRunnerPort):  # noqa: PLR0904
             record.current_run.run_id if record.current_run is not None else None
         )
         record.stop_reason = reason
+        # The cancelled barrier's stop reason changes the projected row; the
+        # caller holds the registry lock (point 5 held-region rule (a)).
+        self._advance_inventory_revision_locked()
         self._recovery_controller.cancel_pending(record.agent_id)
         self._suspension_expire_record_locked(record)
         return CancelResult(
@@ -2898,6 +3021,11 @@ class SessionRuntimeRegistry(SubagentRunnerPort):  # noqa: PLR0904
             tombstone = self._evicted_agents.get(agent_id)
             if tombstone is None or self._tombstone_expired(tombstone, self._clock()):
                 return
+        # A confirmed visible change to the agent's uncollected list advances
+        # the revision in the caller's held region before publication is
+        # scheduled — the revision is never laundered through the emission
+        # queue (point 5).
+        self._advance_inventory_revision_locked()
         self._schedule_agents_update_locked()
 
     async def get_agent_result(

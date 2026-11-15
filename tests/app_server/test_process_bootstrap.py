@@ -16,6 +16,7 @@ import pytest
 from chartreux.app_server import stdio
 from chartreux.app_server._runtime import HarnessServer
 from chartreux.app_server.process_bootstrap import (
+    ADVERTISED_CAPABILITIES,
     BOOTSTRAP_ENV_VAR,
     PROCESS_PROTOCOL_VERSION,
     ProtocolVersionMismatchError,
@@ -210,6 +211,7 @@ def test_write_ready_frame_emits_exactly_one_json_line() -> None:
     assert json.loads(lines[0]) == {
         "chartreuxBootstrap": "ready",
         "protocolVersion": PROCESS_PROTOCOL_VERSION,
+        "capabilities": sorted(ADVERTISED_CAPABILITIES),
     }
 
 

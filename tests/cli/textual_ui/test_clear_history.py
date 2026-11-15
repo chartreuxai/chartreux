@@ -16,7 +16,8 @@ from tests.cli.textual_ui.test_history_grouping import _message
 from tests.conftest import build_test_chartreux_app
 
 _SPENT_TOKENS = 50_000
-_CONTEXT_WINDOW = 200_000
+_CONTEXT_WINDOW = 1_000_000
+_COMPACT_THRESHOLD = 200_000
 
 
 @pytest.fixture
@@ -42,6 +43,9 @@ def _fill_context_gauge(chartreux_app: ChartreuxApp) -> None:
         context_tokens=_SPENT_TOKENS, session_prompt_tokens=_SPENT_TOKENS
     )
     state.context_window = _CONTEXT_WINDOW
+    # The denominator is the deployment's configured trigger, never the window
+    # this read reports.
+    chartreux_app.config.active_model.auto_compact_threshold = _COMPACT_THRESHOLD
     chartreux_app._refresh_context_progress()
 
 
@@ -174,7 +178,7 @@ async def test_clear_history_empties_the_context_gauge(
         # Assert
         widget = chartreux_app.query_one(SessionStatusLine)
         assert widget.state.context_tokens == 0
-        assert widget.state.auto_compact_threshold == _CONTEXT_WINDOW
+        assert widget.state.auto_compact_threshold == _COMPACT_THRESHOLD
         assert "0/200k (0%)" in widget.render().plain
 
 

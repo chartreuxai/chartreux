@@ -85,6 +85,7 @@ from chartreux.app_server.models import (
     WaitingForInputNoticeDetail,
 )
 from chartreux.app_server.protocol import (
+    AgentsInventoryReadResponse,
     AgentSummaryModel,
     AppServerResponseError,
     ConfigFieldWire,
@@ -102,6 +103,11 @@ from chartreux.cli.textual_ui.agent_browser import (
     AgentBrowserController,
     _AgentTranscriptSource as _AgentTranscriptSource,
     _markdown_literal,
+)
+from chartreux.cli.textual_ui.agent_liveness import (
+    AgentLivenessPoller,
+    LivenessSnapshot,
+    is_terminal_state,
 )
 from chartreux.cli.textual_ui.bottom_panel import (
     DOUBLE_ESC_DELAY as DOUBLE_ESC_DELAY,
@@ -174,6 +180,12 @@ from chartreux.cli.textual_ui.plan_mode import (
     surviving_snapshot_path,
 )
 from chartreux.cli.textual_ui.program_status import ProgramStatusEmitter
+from chartreux.cli.textual_ui.program_status_composition import (
+    CallbackOwner,
+    ComposedDecision,
+    ProgramStatusComposition,
+    ReleaseOutcome,
+)
 from chartreux.cli.textual_ui.provider_services import (
     _ProviderConfigService,
     _ProviderCredentials,
@@ -211,7 +223,11 @@ from chartreux.cli.textual_ui.usage_controller import (
     _USAGE_POLL_INTERVAL_SECONDS,
     UsageController,
 )
-from chartreux.cli.textual_ui.widgets.agent_bar import AgentBar, agent_is_active
+from chartreux.cli.textual_ui.widgets.agent_bar import (
+    AgentBar,
+    agent_is_active,
+    short_agent_display_id,
+)
 from chartreux.cli.textual_ui.widgets.agent_transcript import AgentTranscriptViewer
 from chartreux.cli.textual_ui.widgets.banner.banner import Banner
 from chartreux.cli.textual_ui.widgets.chat_input import (
@@ -851,6 +867,23 @@ class ChartreuxApp(App):  # noqa: PLR0904
         # record. Every transition that can change the owner advances the epoch,
         # and a turn's own start either claims the acceptance-time epoch through
         # the pending slot or bumps one of its own.
+        # The composed-ownership record (v0.7.9 point 5 C7a): the state holder
+        # of the one shared status recompute. Its composed epoch is the
+        # deferral clock for deferred terminal outcomes; the record epoch
+        # keeps its own protocol (error-token fencing) and the emitter's
+        # generation keeps its own (caller ownership).
+        self._status_composition = ProgramStatusComposition()
+        # The reliable liveness observation the composition's child-activity
+        # input reads (v0.7.9 point 5 C7b): a one-second control-class poller
+        # over the agents/inventory/read carrier. Attached where the prompt
+        # returns; every callable is late-bound so the poller follows the
+        # app's own attachment lifecycle without owning any of it.
+        self._agent_liveness = AgentLivenessPoller(
+            read=self._read_agent_liveness,
+            current_session_id=self._liveness_session_id,
+            is_active=self._agent_is_active,
+            on_accept=self._reconcile_liveness_snapshot,
+        )
         self._record_epoch = 0
         self._turn_started_count = 0
         # Retired ids never re-bind: the duplicate-binding guard below reads
@@ -899,9 +932,200 @@ class ChartreuxApp(App):  # noqa: PLR0904
         self._session_ready.set()
         self._sync_usage_subscription()
         self._sync_terminal_title()
-        # Ready means the prompt is back: five call sites collapse onto one
-        # byte-identical idle report, and none of them changes ownership.
-        self._program_status.emit("idle")
+        # The liveness poller attaches wherever the prompt returns; from here
+        # on the composition's child-activity input is snapshot-carried.
+        self._attach_agent_liveness()
+        # Ready means the prompt is back, but the idle report rides the
+        # composed emission rule (design §3.3): with initial liveness known —
+        # a qualifying settlement input — the settle stands exactly as
+        # before; otherwise the startup record holds until the pending read
+        # reconciles.
+        view = self._agent_liveness.settlement_input()
+        if view.qualified:
+            self._settle_composed_status(
+                outcome=ReleaseOutcome("idle"),
+                turn_active=self._agent_job_active(),
+                child_active=view.child_active,
+            )
+        else:
+            self._agent_liveness.request_refresh()
+
+    def _attach_agent_liveness(self) -> None:
+        """Attach the poller while a session backend exists."""
+        if self._app_server is not None:
+            self._agent_liveness.attach()
+
+    async def _read_agent_liveness(self) -> AgentsInventoryReadResponse:
+        """The C6b client leg: one control-class inventory read."""
+        return await self.app_server.read_agent_inventory()
+
+    def _liveness_session_id(self) -> str | None:
+        """The session the poller's acceptance floor compares within."""
+        if self._app_server is None:
+            return None
+        try:
+            return self._app_server.session_id
+        except Exception:
+            return None
+
+    def _reconcile_liveness_snapshot(self, snapshot: LivenessSnapshot) -> None:
+        """One accepted poll result re-emits through the shared recompute.
+
+        The recompute reads the current owners fresh (prompt, error, main
+        turn) immediately before emission; a snapshot that fails the
+        in-flight-response legs is a RETAIN-INPUT ONLY — it may not drive a
+        terminal emission, so the recompute holds the current non-terminal
+        status by presuming child activity and the pending refresh or the
+        next scheduled read resolves the outcome (design §3.2).
+        """
+        child_active = any(self._agent_is_active(agent) for agent in snapshot.agents)
+        callback_owner = self._composed_callback_owner()
+        turn_active = self._agent_job_active()
+        decision = self._status_composition.decision(
+            callback_owner=callback_owner,
+            turn_active=turn_active,
+            child_active=child_active,
+        )
+        if is_terminal_state(decision.state) and not (
+            self._agent_liveness.completion_qualifies()
+        ):
+            decision = self._status_composition.decision(
+                callback_owner=callback_owner,
+                turn_active=turn_active,
+                child_active=True,
+            )
+        self._emit_composed_decision(decision)
+
+    def _composed_callback_owner(self) -> CallbackOwner | None:
+        """Rule-1 gather: the presented callback when it owns ``blocked``."""
+        callback = self._turn_supervisor.active_callback
+        if callback is None:
+            return None
+        kind = TurnSupervisor._callback_kind(callback)
+        if kind is None:
+            # An origin with no OSC kind never owned blocked.
+            return None
+        return CallbackOwner(
+            kind=kind, message=TurnSupervisor._blocked_message(callback, kind)
+        )
+
+    def _composed_child_active(self) -> bool:
+        """The composition's child-activity input: snapshot-carried only.
+
+        The C7b liveness poller's accepted inventory is the one input (design
+        §3.2): the event-populated ``_agent_summaries`` remains a refresh hint
+        for the browser and never an emission input.
+        """
+        snapshot = self._agent_liveness.accepted
+        if snapshot is None:
+            return False
+        return any(self._agent_is_active(agent) for agent in snapshot.agents)
+
+    def _settle_composed_status(
+        self,
+        *,
+        outcome: ReleaseOutcome | None,
+        turn_active: bool,
+        child_active: bool | None = None,
+        durable: bool = False,
+    ) -> None:
+        """A settling site's release through the one shared recompute.
+
+        ``note_release`` applies release precedence (a dismissal restores the
+        saved record; a settle replaces it with its own outcome — the
+        error-kind outcome takes the record as the persistent rule-2 owner).
+        ``durable`` marks the durable settlement class (explicit resets, the
+        root-turn error): the composed epoch advances first and any deferred
+        record dies.
+
+        The composed emission rule (design §3.2) gates the terminal emissions
+        only: when the child-activity input is resolved from the liveness
+        poller and the accepted snapshot fails either leg, the outcome is
+        stored (masked behind the retain) but the emission may not report
+        ``done``/``idle`` from it — the current non-terminal status holds and
+        a pending refresh resolves the deferred outcome. Durable takings emit
+        by their own ownership; a confirmed-dead or unattached poller makes
+        no liveness claim, so those emissions stand. Non-terminal emissions
+        are never gated here.
+        """
+        if durable:
+            self._status_composition.take(
+                error=outcome.message
+                if outcome is not None and outcome.state == "error"
+                else None
+            )
+        self._status_composition.note_release(outcome)
+        if child_active is None:
+            if durable:
+                # Durable takings emit by their own ownership: the reset
+                # replaced the record outright, so no liveness leg can gate
+                # its emission (the invalidate above already dropped the old
+                # reads and a fresh read is pending).
+                child_active = False
+                view = None
+            else:
+                view = self._agent_liveness.settlement_input()
+                child_active = view.child_active
+        else:
+            view = None
+        decision = self._status_composition.decision(
+            callback_owner=self._composed_callback_owner(),
+            turn_active=turn_active,
+            child_active=child_active,
+        )
+        if (
+            view is not None
+            and not view.qualified
+            and is_terminal_state(decision.state)
+        ):
+            # Retain-input only: an unqualified snapshot may retain the
+            # current non-terminal status, never drive the terminal emission.
+            decision = self._status_composition.decision(
+                callback_owner=self._composed_callback_owner(),
+                turn_active=turn_active,
+                child_active=True,
+            )
+            self._agent_liveness.request_refresh()
+        self._emit_composed_decision(decision)
+
+    def _refresh_composed_status(
+        self, *, turn_active: bool, child_active: bool | None = None
+    ) -> None:
+        """A taking site's recompute: emit only what the shared table decides."""
+        self._emit_composed_decision(
+            self._status_composition.decision(
+                callback_owner=self._composed_callback_owner(),
+                turn_active=turn_active,
+                child_active=(
+                    self._composed_child_active()
+                    if child_active is None
+                    else child_active
+                ),
+            )
+        )
+
+    def _emit_composed_decision(self, decision: ComposedDecision) -> None:
+        """Emit one composed decision; a no-change refresh never calls emit.
+
+        Emitting the same state again writes nothing (the emitter dedups) but
+        still advances ``generation``, the fence the await-crossing sites
+        read, so the real emitter is asked for the wire truth first. A test
+        double has no wire, so its call shapes stay exactly today's.
+        """
+        emitter = self._program_status
+        # An exact-type check, not isinstance: a MagicMock(spec=...) stands in
+        # for the emitter in tests and would pass isinstance, so the wire
+        # question would return a truthy mock and mute every emission.
+        if type(emitter) is ProgramStatusEmitter and emitter.reports_state(
+            state=decision.state, kind=decision.kind, msg=decision.message
+        ):
+            return
+        if decision.kind is not None:
+            emitter.emit(decision.state, kind=decision.kind, msg=decision.message)
+        elif decision.message is not None:
+            emitter.emit(decision.state, msg=decision.message)
+        else:
+            emitter.emit(decision.state)
 
     def _advance_record_epoch(self, *, clear_retired: bool = False) -> None:
         """Change the record's owner and invalidate any outstanding start slot.
@@ -933,6 +1157,9 @@ class ChartreuxApp(App):  # noqa: PLR0904
         if self._turn_started_count != started_count:
             return
         self._advance_record_epoch()
+        # A main-turn start is a durable composed taking: any deferred record
+        # dies with the epoch it was keyed to (design §3.1).
+        self._status_composition.take()
         self._pending_start_epoch = self._record_epoch
 
     def _record_turn_owner(self, turn_id: str) -> int:
@@ -963,6 +1190,9 @@ class ChartreuxApp(App):  # noqa: PLR0904
             self._turn_started_count += 1
         else:
             self._advance_record_epoch()
+            # A main-turn start is a durable composed taking: any deferred
+            # record dies with the epoch it was keyed to (design §3.1).
+            self._status_composition.take()
             epoch = self._record_epoch
             self._turn_started_count += 1
         self.turn_epoch_map[turn_id] = epoch
@@ -1932,6 +2162,18 @@ class ChartreuxApp(App):  # noqa: PLR0904
         gc.collect()
         gc.freeze()
 
+    def _compaction_threshold(self) -> int | None:
+        """The active deployment's automatic-compaction trigger, from config.
+
+        The context denominator is the token count compaction actually fires
+        at, never the model's hard context window: the window is a cap the
+        provider documents, while the trigger is the point this session has to
+        compact at, so measuring usage against the window reports headroom that
+        does not exist. An unresolvable threshold stays unknown (rendered as
+        ``—``) instead of quietly falling back to the window.
+        """
+        return self.config.active_model.auto_compact_threshold
+
     def _update_context_progress(self, event: StatsUpdated) -> None:
         self._root_context_unknown = False
         self._refresh_context_progress()
@@ -1940,7 +2182,10 @@ class ChartreuxApp(App):  # noqa: PLR0904
                 replace(
                     self._status_line.state,
                     context_tokens=event.params.stats.context_tokens,
-                    auto_compact_threshold=event.params.context_window,
+                    # The stats event carries the usage and the model's hard
+                    # window; the denominator stays the configured compaction
+                    # trigger, never the window the event reports.
+                    auto_compact_threshold=self._compaction_threshold(),
                 )
             )
             self._refresh_main_agent_details()
@@ -2221,7 +2466,7 @@ class ChartreuxApp(App):  # noqa: PLR0904
         if self._queue.paused:
             if not await self._try_side_channel_command(value, input_widget):
                 if not await self._handle_paused_submit(value):
-                    self._restore_input_if_empty(input_widget, value)
+                    input_widget.restore_draft(value)
             return
 
         if self._is_busy():
@@ -2229,7 +2474,7 @@ class ChartreuxApp(App):  # noqa: PLR0904
                 if not await self._handle_queue_submit(
                     value, reject_hint=_REJECT_HINT_BUSY, allow_waiting_only=True
                 ):
-                    self._restore_input_if_empty(input_widget, value)
+                    input_widget.restore_draft(value)
             return
 
         await self._dispatch_idle_input(value)
@@ -2353,11 +2598,6 @@ class ChartreuxApp(App):  # noqa: PLR0904
     ) -> None:
         self._clear_queue_selection()
 
-    @staticmethod
-    def _restore_input_if_empty(input_widget: ChatInputContainer, value: str) -> None:
-        if not input_widget.value:
-            input_widget.value = value
-
     def _warn_not_queueable(self, message: str) -> None:
         self.notify(message, severity="warning", markup=False)
 
@@ -2375,7 +2615,7 @@ class ChartreuxApp(App):  # noqa: PLR0904
             self._warn_not_queueable(
                 "A slash command is already running — wait for it to finish."
             )
-            self._restore_input_if_empty(input_widget, value)
+            input_widget.restore_draft(value)
         return True
 
     async def _dispatch_idle_input(self, value: str) -> None:
@@ -2403,8 +2643,11 @@ class ChartreuxApp(App):  # noqa: PLR0904
     def _start_bash_command(self, command: str) -> None:
         # A shell run has no turn id and never enters the epoch map, but it does
         # own the record: the bump is what keeps a detached predecessor failure
-        # from reporting over it.
+        # from reporting over it. The composed ownership is TRANSIENT: the
+        # deferred record is saved, not discarded — release precedence on the
+        # settle restores or replaces it (design §3.1).
         self._advance_record_epoch()
+        self._status_composition.begin_transient()
         self._bash_task = asyncio.create_task(self._handle_bash_command(command))
         self._queue.notify_busy_changed()
 
@@ -3096,12 +3339,18 @@ class ChartreuxApp(App):  # noqa: PLR0904
 
         Synchronous on purpose: every caller settles before it awaits, so a
         cancellation arriving inside a later await cannot displace the outcome
-        the user already saw.
+        the user already saw. The settle is a composed release: the terminal
+        state replaces the saved owner-outcome record (deferred while a child
+        is active) and the error-kind outcome takes the record as the
+        persistent error owner; it composes, never emits a literal.
         """
         if settlement.settled:
             return
         settlement.settled = True
-        self._program_status.emit(state, msg=msg)
+        self._settle_composed_status(
+            outcome=ReleaseOutcome(state, message=msg),
+            turn_active=self._agent_job_active(),
+        )
 
     def _report_shell_effect(
         self, settlement: _BashSettlement, entry: PublicHistoryEntry
@@ -3147,7 +3396,7 @@ class ChartreuxApp(App):  # noqa: PLR0904
         try:
             await self._ensure_loading_widget("Running command")
             bash_loading_widget = self._loading_widget
-            self._program_status.emit("working")
+            self._refresh_composed_status(turn_active=True)
             self._queue.notify_busy_changed()
             async for event in self.app_server.resources.shell.run(command):
                 if settlement.entry_id is None:
@@ -3194,24 +3443,26 @@ class ChartreuxApp(App):  # noqa: PLR0904
                 # report land together and a detached fallback cannot slip in
                 # between them.
                 self._record_accepted_start(started_count)
-                self._program_status.emit("working")
+                self._refresh_composed_status(turn_active=True)
                 return
         except BaseException:
             self._turn_supervisor._clear_pending_turn()
             self._clear_active_turn_pins()
             if self._program_status.generation == generation:
-                self._program_status.emit("idle")
+                self._settle_composed_status(
+                    outcome=ReleaseOutcome("idle"), turn_active=self._agent_job_active()
+                )
             raise
         # Enqueue was rejected (e.g. prompt prep aborted): leave the in-flight
         # state so the UI returns to idle instead of a stuck spinner.
         self._turn_supervisor._clear_pending_turn()
         self._clear_active_turn_pins()
         if self._program_status.generation == generation:
-            self._program_status.emit("idle")
+            self._settle_composed_status(
+                outcome=ReleaseOutcome("idle"), turn_active=self._agent_job_active()
+            )
         await self._remove_loading_widget()
-        input_widget = self.query_one(ChatInputContainer)
-        if not input_widget.value:
-            input_widget.value = message
+        self.query_one(ChatInputContainer).restore_draft(message)
 
     def _reset_ui_state(self) -> None:
         self._transcript_presenter.reset_ui_state()
@@ -3382,6 +3633,10 @@ class ChartreuxApp(App):  # noqa: PLR0904
     async def _handle_agents_update(
         self, event: AgentsUpdate, received_at: float
     ) -> None:
+        # The event is a refresh hint, never a composition input: its arrival
+        # bumps the poller's fence (disqualifying any in-flight response for
+        # a terminal emission) and marks a pending refresh (design §3.2).
+        self._agent_liveness.note_event()
         await self._agent_browser.handle_agents_update(event, received_at)
 
     async def _handle_turn_event(self, event: AppServerEvent) -> None:
@@ -3446,6 +3701,9 @@ class ChartreuxApp(App):  # noqa: PLR0904
             self._sync_retry_command_availability()
 
     async def _shutdown(self) -> None:
+        # The liveness poller stops before anything tears down: no snapshot
+        # may reconcile against a closing tree.
+        self._agent_liveness.detach()
         # First, so a later teardown step can neither skip nor delay the clear.
         self._program_status.clear_record()
         # Stop consuming app-server events before Textual tears down the DOM.
@@ -3854,7 +4112,7 @@ class ChartreuxApp(App):  # noqa: PLR0904
         else:
             for agent in agents:
                 name = _markdown_literal(agent.name or agent.agent_id)
-                handle = _markdown_literal(agent.agent_id)
+                handle = _markdown_literal(short_agent_display_id(agent.agent_id))
                 run_ids = ", ".join(
                     _markdown_literal(run_id) for run_id in agent.uncollected_run_ids
                 )
@@ -4251,7 +4509,15 @@ class ChartreuxApp(App):  # noqa: PLR0904
     async def _resume_local_session(self, session_id: str) -> None:
         # A resume replaces the session, so the record changes owner here; the
         # bump precedes the cancellation so it cannot emit an idle of its own.
+        # The composed taking is durable and ownership-replacing idleness: no
+        # deferred record survives the rotation and the taking site emits
+        # nothing (design §3.3).
         self._advance_record_epoch(clear_retired=True)
+        self._status_composition.take()
+        # A resume re-arms the liveness poller with the new incarnation: a
+        # fresh floor and a fresh snapshot — the dead or retired generation's
+        # reads can never feed the new session (design §3.2).
+        self._agent_liveness.rearm()
         # R2/OD3: a session change invalidates any pending automatic
         # continuation synchronously (the schedule belongs to the old
         # session's episode; the gate is invalidated server-side too).
@@ -4549,8 +4815,14 @@ class ChartreuxApp(App):  # noqa: PLR0904
 
         # /clear starts a fresh conversation: the record changes owner and the
         # prompt is back, so the terminal hears idle rather than the old turn.
+        # The reset also invalidates old-session liveness reads (design §3.3).
         self._advance_record_epoch(clear_retired=True)
-        self._program_status.emit("idle")
+        self._agent_liveness.invalidate()
+        self._settle_composed_status(
+            outcome=ReleaseOutcome("idle"),
+            turn_active=self._agent_job_active(),
+            durable=True,
+        )
 
         if prompt:
             await self._handle_user_message(prompt)
@@ -5296,7 +5568,15 @@ class ChartreuxApp(App):  # noqa: PLR0904
         self._chat_widget.scroll_home(animate=False)
         self._sync_terminal_title()
         self._advance_record_epoch(clear_retired=True)
-        self._program_status.emit("idle")
+        # A plan-accept start is the same durable reset class as /clear: the
+        # new owner is the idle prompt, and old-session liveness reads are
+        # invalidated with it (design §3.3).
+        self._agent_liveness.invalidate()
+        self._settle_composed_status(
+            outcome=ReleaseOutcome("idle"),
+            turn_active=self._agent_job_active(),
+            durable=True,
+        )
 
     async def _plan_cancel(self) -> None:
         """Cancel: abort a held claim, or cancel the episode with pin restore."""
@@ -5705,6 +5985,30 @@ class ChartreuxApp(App):  # noqa: PLR0904
             )
         )
 
+    async def _show_tmp_residue(self, **kwargs: Any) -> None:
+        residue_command = import_module("chartreux.cli.tmp_residue_command")
+        inventory = residue_command.build_inventory()
+        if not inventory:
+            await self._mount_and_scroll(
+                UserCommandMessage(
+                    "## Temp residue\n\nNo residue trees under the temp root."
+                )
+            )
+            return
+        lines = ["## Temp residue (preview only — nothing is deleted here)", ""]
+        for entry in inventory:
+            count = "?" if entry.entries is None else str(entry.entries)
+            lines.append(
+                f"- `{entry.kind}` entries={count} `{entry.path}` — {entry.detail}"
+            )
+        lines += [
+            "",
+            "Removal happens only via `chartreux tmp-residue remove <path>...` "
+            "run from a terminal, after an interactive confirmation that names "
+            "the exact paths.",
+        ]
+        await self._mount_and_scroll(UserCommandMessage("\n".join(lines)))
+
     async def _loop_command(self, cmd_args: str = "", **kwargs: Any) -> None:
         widget = await self._loop_commands.handle_command(cmd_args)
         await self._mount_and_scroll(widget)
@@ -5753,9 +6057,17 @@ class ChartreuxApp(App):  # noqa: PLR0904
             self._refresh_banner()
             compact_msg.set_complete()
             # Compaction rewrote the context: the record changes owner back to
-            # an idle prompt instead of leaving the pre-compaction state.
+            # an idle prompt instead of leaving the pre-compaction state. The
+            # durable reset class composes its idleness (design §3.3).
             self._advance_record_epoch(clear_retired=True)
-            self._program_status.emit("idle")
+            # The durable reset invalidates old liveness reads with the owner
+            # change (design §3.3).
+            self._agent_liveness.invalidate()
+            self._settle_composed_status(
+                outcome=ReleaseOutcome("idle"),
+                turn_active=self._agent_job_active(),
+                durable=True,
+            )
 
         except asyncio.CancelledError:
             compact_msg.set_error("Compaction interrupted")
@@ -6142,7 +6454,7 @@ class ChartreuxApp(App):  # noqa: PLR0904
                 context_tokens=(
                     None if self._root_context_unknown else runtime.stats.context_tokens
                 ),
-                auto_compact_threshold=runtime.context_window,
+                auto_compact_threshold=self._compaction_threshold(),
                 compacting=self._root_compacting,
                 ascii_chrome=self.config.ascii_chrome,
                 active_background_job_count=self.app_server.state.active_background_job_count,

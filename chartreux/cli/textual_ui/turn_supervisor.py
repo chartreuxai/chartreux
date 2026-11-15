@@ -29,6 +29,7 @@ from chartreux.app_server.models import (
 )
 from chartreux.app_server.protocol import AppServerResponseError, ProtocolErrorCode
 from chartreux.cli.textual_ui.notifications import NotificationContext
+from chartreux.cli.textual_ui.program_status_composition import ReleaseOutcome
 from chartreux.cli.textual_ui.widgets.chat_input.text_area import ChatTextArea
 from chartreux.cli.textual_ui.widgets.loading import (
     DEFAULT_LOADING_STATUS,
@@ -355,9 +356,13 @@ class TurnSupervisor:
                 if turn_id is not None and self._app._active_turn_id == turn_id:
                     self._app.turn_epoch_map.pop(turn_id, None)
                 if outcome is TurnOutcome.COMPLETED:
-                    self._app._program_status.emit("done")
+                    self._app._settle_composed_status(
+                        outcome=ReleaseOutcome("done"), turn_active=False
+                    )
                 elif outcome is TurnOutcome.INTERRUPTED:
-                    self._app._program_status.emit("idle")
+                    self._app._settle_composed_status(
+                        outcome=ReleaseOutcome("idle"), turn_active=False
+                    )
             if self._app._loading_widget:
                 await self._app._loading_widget.remove()
             self._app._loading_widget = None
@@ -446,7 +451,12 @@ class TurnSupervisor:
             self._app.turn_epoch_map.pop(retired_turn_id, None)
         self._app._active_turn_id = None
         self._app._advance_record_epoch()
-        self._app._program_status.emit("idle")
+        # The interrupt's owned idle settles through the shared recompute:
+        # deferred while children remain active, emitted at once otherwise
+        # (design §3.3).
+        self._app._settle_composed_status(
+            outcome=ReleaseOutcome("idle"), turn_active=False
+        )
 
         # Invariant: a turn is driven EITHER by a client task (``_agent_task``,
         # used for retry/auto-retry) OR by the server promoting an enqueued turn
@@ -714,7 +724,7 @@ class TurnSupervisor:
             )
             self._app._queue.notify_busy_changed()
             if not self.interrupt_requested and self._app._record_epoch == bound_epoch:
-                self._app._program_status.emit("working")
+                self._app._refresh_composed_status(turn_active=True)
 
     async def _complete_unsolicited_turn(self, event: TurnCompleted) -> None:
         from chartreux.app_server.session import AppServerTurnError
@@ -815,7 +825,9 @@ class TurnSupervisor:
                     prompt
                 )
                 if prepared is None:
-                    self._app._program_status.emit("idle")
+                    self._app._settle_composed_status(
+                        outcome=ReleaseOutcome("idle"), turn_active=False
+                    )
                     return
                 prompt_text = prepared.prompt_text
                 auto_title = prepared.auto_title
@@ -868,7 +880,9 @@ class TurnSupervisor:
             # and told the user to exit -- don't duplicate the message, but do
             # account for the record acceptance put into `working`.
             if self._app._fatal_init_error:
-                self._app._program_status.emit("idle")
+                self._app._settle_composed_status(
+                    outcome=ReleaseOutcome("idle"), turn_active=False
+                )
                 return
 
             # R2/OD3: the one terminal observation path — the app-server
@@ -959,7 +973,14 @@ class TurnSupervisor:
                 return
             if live_session != token_session:
                 return
-        self._app._program_status.emit("error", msg=message)
+        # The root-turn error is a durable composed taking: the epoch it
+        # advances invalidates any deferred record and the message persists
+        # as the rule-2 owner (design §3.1).
+        self._app._settle_composed_status(
+            outcome=ReleaseOutcome("error", message=message),
+            turn_active=self._app._agent_job_active(),
+            durable=True,
+        )
 
     def _resolve_turn_error_message(self, e: Exception) -> str:
         from chartreux.app_server.session import AppServerTurnError
@@ -1056,7 +1077,7 @@ class TurnSupervisor:
         # together. No await sits between the count snapshot and the bump.
         self._app._record_accepted_start(self._app._started_count_snapshot())
         self.agent_task = asyncio.current_task()
-        self._app._program_status.emit("working")
+        self._app._refresh_composed_status(turn_active=True)
         self._app._queue.notify_busy_changed()
         await self._app._handle_turn(
             build_retry_prompt(""),
@@ -1098,7 +1119,7 @@ class TurnSupervisor:
                 incomplete_stream_retries=incomplete_stream_retries,
             )
         )
-        self._app._program_status.emit("working")
+        self._app._refresh_composed_status(turn_active=True)
         self._app._queue.notify_busy_changed()
 
     async def question_answered(self, message: QuestionApp.Answered) -> None:
@@ -1264,10 +1285,12 @@ class TurnSupervisor:
         # An active turn resumes after its question closes; without one the
         # prompt is back. The switch awaits, so a turn that finished in the gap
         # has already settled a durable outcome: report only while this return
-        # still owns the record.
+        # still owns the record. The dismissal carries no outcome of its own —
+        # the shared recompute restores the saved deferred record (design
+        # §3.1: a post-turn open–dismiss cycle yields the deferred done).
         if self._app._program_status.generation == generation:
-            self._app._program_status.emit(
-                "working" if self.agent_job_active() else "idle"
+            self._app._settle_composed_status(
+                outcome=None, turn_active=self.agent_job_active()
             )
 
     def _prune_expired_pending(self) -> None:
@@ -1377,9 +1400,10 @@ class TurnSupervisor:
         kind = self._callback_kind(callback)
         if kind is None:
             return
-        self._app._program_status.emit(
-            "blocked", kind=kind, msg=self._blocked_message(callback, kind)
-        )
+        # Opening a callback is a TRANSIENT composed taking: the presented
+        # prompt owns blocked while it shows, and the saved deferred record
+        # waits masked behind it (design §3.1).
+        self._app._refresh_composed_status(turn_active=self.agent_job_active())
 
     async def show_callback(self, callback: PublicCallbackEntry) -> None:
         if (
@@ -1509,10 +1533,12 @@ class TurnSupervisor:
             # Only the actual return-to-input path reports: the early return
             # above shows the next pending callback, which owns the record. And
             # only while this return still owns it: both awaits above let a
-            # turn finish, which already settled a durable outcome.
+            # turn finish, which already settled a durable outcome. The
+            # dismissal restores the saved deferred record through the shared
+            # recompute (design §3.1).
             if self._app._program_status.generation == generation:
-                self._app._program_status.emit(
-                    "working" if self.agent_job_active() else "idle"
+                self._app._settle_composed_status(
+                    outcome=None, turn_active=self.agent_job_active()
                 )
 
     async def wait_for_typing_pause(self) -> None:

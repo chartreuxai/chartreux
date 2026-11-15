@@ -1340,23 +1340,35 @@ def test_composed_orchestrator_prompt_carries_the_protected_failures(
     )
 
 
-def test_composed_orchestrator_prompt_carries_the_notification_first_wait_rule(
+def test_composed_orchestrator_prompt_carries_the_v0_7_9_wait_rule(
     build_config: ConfigBuilder,
     load_orchestrator: OrchestratorLoader[ChartreuxConfigSchema],
 ) -> None:
-    """v0.7.8 item 6: the orchestrator's lifecycle paragraph is notification-
-    first — collect on the completion notification, wait only on a hard
-    dependency — with its pinned lifecycle substrings preserved.
+    """v0.7.9 point 4: the orchestrator's lifecycle paragraph is notification-
+    first even when the next substantive action depends on the result, with the
+    three wait conditions, the uncertain-case tie-break and the anti-invention
+    clause, while its three pinned lifecycle substrings stay verbatim.
+
+    The two v0.7.8 clause assertions this test previously carried (collect on
+    the completion notification; wait only on a hard dependency and no other
+    work) are superseded by this rule and updated here in the same package.
     """
     prompt = _compose_orchestrator_prompt(build_config, load_orchestrator)
 
     assert (
-        "and collect it on the completion notification with `get_agent_result`"
-        in prompt
+        "end your turn and collect its result with `get_agent_result` when the "
+        "completion notification arrives, even if your next substantive action "
+        "depends on it" in prompt
     )
     assert (
-        "wait with `wait_for_agent` only when the result is a hard dependency of "
-        "the next action and no other work can proceed" in prompt
+        "Use `wait_for_agent` only if the result is a hard dependency of your "
+        "next action, no independent work can proceed, and that action must "
+        "occur in this turn rather than after notification" in prompt
+    )
+    assert "If any of those conditions is uncertain, end your turn." in prompt
+    assert (
+        "Do not invent independent work or dispatch unnecessary tasks to fill "
+        "the wait; if there is nothing real to do, end your turn." in prompt
     )
     assert "Manage delegated work through the agent-lifecycle tools" in prompt
     assert "Launch in the background even when the result is a dependency" in prompt

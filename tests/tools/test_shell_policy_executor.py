@@ -1073,7 +1073,10 @@ async def test_the_completion_check_spawn_uses_the_resolved_executor(
         spawned.append(kwargs["executable"])
         return _FakeProcess()
 
-    async def spawn_registered_process(spawn: object) -> object:
+    async def spawn_registered_process(
+        spawn: object, *, ledger: object = None
+    ) -> object:
+        del ledger
         await spawn  # type: ignore[misc]
         return _FakeProcess()
 

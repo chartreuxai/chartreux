@@ -9,6 +9,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 from chartreux.app_server._execution import SessionExecutionKind
+from chartreux.app_server._runtime import create_harness_server
 from chartreux.app_server.client import AppServerClient
 from chartreux.app_server.models import (
     CompletedEffectState,
@@ -24,14 +25,20 @@ from chartreux.app_server.protocol import (
     ProtocolErrorCode,
     SessionHistoryListParams,
     SessionHistoryListResponse,
+    SessionReadResponse,
     SessionShellCommandParams,
     SessionShellCommandResponse,
     WorkspaceBranchReadParams,
     WorkspaceBranchReadResponse,
 )
 from chartreux.app_server.session import AppServerSession
-from chartreux.app_server.transport import memory_transport_pair
+from chartreux.app_server.transport import (
+    STDIO_TRANSPORT,
+    TRANSPORT_ENV_VAR,
+    memory_transport_pair,
+)
 from chartreux.core.subagents import CancelOutcome, CancelResult, RunStopReason
+from tests.app_server.backend_contract.conftest import install_memory_root_agent
 from tests.conftest import build_test_agent_loop, build_test_vibe_config
 from tests.mock.utils import mock_llm_chunk
 from tests.stubs.app_server import (
@@ -104,6 +111,70 @@ async def test_agents_cancel_lifecycle_allow_policy(
         root.handler._closed = False
         root.session.execution.finish(owner)
         await session.close()
+
+
+@pytest.mark.asyncio
+async def test_agents_inventory_read_carries_the_registry_revision_in_process() -> None:
+    """C6b: the typed client reads the in-process registry's revised snapshot.
+
+    The control-class read samples the C6a registry counter and the wire
+    projection together under the registry's joint acquisition, so an
+    advance the registry records between two reads is carried as the
+    strictly higher revision on the very next read, with the ROOT
+    incarnation the revision floor compares within.
+    """
+    parent = build_test_agent_loop()
+    client_transport, server_transport = memory_transport_pair()
+    server = build_test_app_server(parent, server_transport)
+    client = AppServerClient(client_transport, run_peer=server.serve)
+    session = await attach_test_app_server_session(client)
+    root = legacy_backend(server)
+    try:
+        first = await session.read_agent_inventory()
+        assert first.session_id == parent.session_id
+        assert isinstance(first.generation, int)
+        assert first.revision >= 0
+        assert first.agents == []
+
+        root.children._advance_inventory_revision_locked()
+        second = await session.read_agent_inventory()
+        assert second.session_id == first.session_id
+        assert second.generation == first.generation
+        assert second.revision > first.revision
+    finally:
+        await session.close()
+
+
+@pytest.mark.asyncio
+async def test_agents_inventory_read_is_carried_on_stdio(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """C6b: the stdio topology answers the read from the owner over the wire.
+
+    The process-session backend carries the control request to the root
+    agent over the agent wire: the answer names the loop incarnation the
+    memory-wire root owns, and an owner that installed no child host owns
+    no children on stdio, so its honest inventory is the empty one.
+    """
+    loop = build_test_agent_loop()
+    install_memory_root_agent(monkeypatch, loop)
+    client_transport, server_transport = memory_transport_pair()
+    harness = await create_harness_server(
+        server_transport, transport_kind=STDIO_TRANSPORT
+    )
+    client = AppServerClient(client_transport, run_peer=harness.serve)
+    session = await attach_test_app_server_session(client)
+    try:
+        snapshot = await session.read_agent_inventory()
+        assert snapshot.session_id == loop.session_id
+        assert snapshot.generation == loop.session_generation
+        assert snapshot.revision == 0
+        assert snapshot.agents == []
+    finally:
+        await session.close()
+        await client.close()
+        await harness.close()
+        await loop.aclose()
 
 
 @pytest.mark.asyncio
@@ -342,6 +413,75 @@ async def test_session_archive_is_not_in_the_cli_contract() -> None:
         await session.close()
 
     assert excinfo.value.error.code is ProtocolErrorCode.METHOD_NOT_FOUND
+
+
+async def _assert_title_update_is_unsupported(
+    client: AppServerClient, session_id: str
+) -> None:
+    with pytest.raises(AppServerResponseError) as excinfo:
+        await client.request(
+            "session/title/update", {"sessionId": session_id, "title": "renamed"}
+        )
+    error = excinfo.value.error
+    assert error.code is ProtocolErrorCode.NOT_IMPLEMENTED
+    assert "session/rename" in error.message
+    # The in_process escape does not carry the alias either, so the refusal
+    # must never send the caller down that route.
+    assert TRANSPORT_ENV_VAR not in error.message
+    assert error.data == {"alias": "session/title/update", "method": "session/rename"}
+
+
+@pytest.mark.asyncio
+async def test_session_title_update_alias_is_typed_unsupported_in_process() -> None:
+    """C2f: the dead title alias answers typed, not unknown, on in-process.
+
+    The alias stays in the catalogue so a client that still sends it is told
+    the operation was renamed: the wire method is session/rename. The session
+    the request named is untouched -- the refusal never reaches it.
+    """
+    assert "session/title/update" in SERVER_METHODS
+    client, session = await _session_with_history()
+    try:
+        await _assert_title_update_is_unsupported(client, session.session_id)
+        read = SessionReadResponse.model_validate(
+            await client.request("session/read", {"sessionId": session.session_id})
+        )
+        assert read.state.session.id == session.session_id
+    finally:
+        await session.close()
+
+
+@pytest.mark.asyncio
+async def test_session_title_update_alias_is_typed_unsupported_on_stdio(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """C2f: the same typed answer on the stdio topology.
+
+    Over the process backend the alias used to fall through to the
+    uncarried-operation refusal, which named the in_process escape instead of
+    the method that actually carries a title. The stdio leg here drives the
+    process-session backend over a memory-wire root; the spawned-child legs
+    land with the PTY harness.
+    """
+    loop = build_test_agent_loop()
+    install_memory_root_agent(monkeypatch, loop)
+    client_transport, server_transport = memory_transport_pair()
+    harness = await create_harness_server(
+        server_transport, transport_kind=STDIO_TRANSPORT
+    )
+    client = AppServerClient(client_transport, run_peer=harness.serve)
+    session = await attach_test_app_server_session(client)
+    try:
+        await _assert_title_update_is_unsupported(client, session.session_id)
+        read = SessionReadResponse.model_validate(
+            await client.request("session/read", {"sessionId": session.session_id})
+        )
+        assert read.state.session.id == session.session_id
+    finally:
+        await session.close()
+        await client.close()
+        await harness.close()
+        await loop.aclose()
 
 
 @pytest.mark.asyncio

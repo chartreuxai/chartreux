@@ -12,9 +12,12 @@ lockfile, and the release-note heading.
 
 from __future__ import annotations
 
+import datetime
 from pathlib import Path
 import re
 import tomllib
+
+import pytest
 
 _DOCS = Path(__file__).parents[1] / "docs"
 CONFIGURATION = (_DOCS / "reference" / "configuration.md").read_text()
@@ -22,6 +25,71 @@ TOOLS_SAFETY = (_DOCS / "guides" / "tools-safety.md").read_text()
 SUBAGENTS = (_DOCS / "guides" / "subagents.md").read_text()
 RELEASE_NOTES = (Path(__file__).parents[1] / "CHANGELOG.md").read_text()
 RELEASE_NOTES_FLAT = " ".join(RELEASE_NOTES.split())
+
+_RELEASE_HEADING = re.compile(r"^## (\S+) \(([^)]*)\)$", re.MULTILINE)
+_ISO_DATE = re.compile(r"\d{4}-\d{2}-\d{2}")
+_UNRELEASED = "unreleased"
+
+
+def _release_headings(text: str) -> list[tuple[str, str]]:
+    """Return the changelog version headings as (version, label) pairs."""
+    return [(m.group(1), m.group(2)) for m in _RELEASE_HEADING.finditer(text)]
+
+
+def _version_mismatch(
+    pyproject_version: str, module_version: str, lock_version: str
+) -> str | None:
+    """Describe a disagreement across the version locations, else None."""
+    if pyproject_version != module_version or pyproject_version != lock_version:
+        return (
+            f"pyproject {pyproject_version!r} != module {module_version!r} "
+            f"!= lock {lock_version!r}"
+        )
+    return None
+
+
+def _is_calendar_date(label: str) -> bool:
+    """Return whether ``label`` is a real calendar date in ISO form."""
+    if _ISO_DATE.fullmatch(label) is None:
+        return False
+    try:
+        return datetime.date.fromisoformat(label).isoformat() == label
+    except ValueError:
+        return False
+
+
+def _release_heading_mismatch(
+    headings: list[tuple[str, str]], version: str
+) -> str | None:
+    """Describe why the release headings are invalid for ``version``, else None.
+
+    At most one ``unreleased`` heading may appear anywhere in the changelog:
+    the release transition is a single enforceable flip. The leading
+    ``unreleased`` heading may be the current version's own or a pre-staged
+    next version, and those two allowances cannot stack. Otherwise the
+    current-version heading must carry a real calendar ISO date.
+    """
+    if sum(label == _UNRELEASED for _, label in headings) > 1:
+        return "more than one unreleased heading"
+    current = next(
+        (
+            index
+            for index, (heading_version, _) in enumerate(headings)
+            if heading_version == version
+        ),
+        None,
+    )
+    if current is None:
+        return f"no heading names version {version}"
+    current_label = headings[current][1]
+    current_unreleased = current_label == _UNRELEASED
+    if current_unreleased:
+        if current == 0:
+            return None
+        return "the unreleased heading must lead the changelog"
+    if not _is_calendar_date(current_label):
+        return f"current-version heading lacks an ISO date: {current_label!r}"
+    return None
 
 
 def test_root_budget_interval_is_explicitly_documented() -> None:
@@ -163,7 +231,73 @@ def test_version_locations_and_release_heading_agree() -> None:
         for package in lock["package"]
         if package["name"] == "chartreux"
     )
-    heading = re.search(r"^## (\S+ \([^)]*\))", RELEASE_NOTES, re.MULTILINE)
-    assert heading is not None
-    assert pyproject_version == chartreux.__version__ == lock_version
-    assert heading.group(1) == f"{pyproject_version} (2026-11-07)"
+    version_problem = _version_mismatch(
+        pyproject_version, chartreux.__version__, lock_version
+    )
+    assert version_problem is None, version_problem
+    heading_problem = _release_heading_mismatch(
+        _release_headings(RELEASE_NOTES), pyproject_version
+    )
+    assert heading_problem is None, heading_problem
+
+
+def test_version_locations_must_agree() -> None:
+    assert _version_mismatch("0.7.8", "0.7.8", "0.7.8") is None
+    assert _version_mismatch("0.7.8", "0.7.9", "0.7.8") is not None
+    assert _version_mismatch("0.7.8", "0.7.8", "0.7.9") is not None
+
+
+@pytest.mark.parametrize(
+    ("headings", "version"),
+    [
+        ([("0.7.9", "unreleased"), ("0.7.8", "2026-11-12")], "0.7.8"),
+        ([("0.7.8", "unreleased")], "0.7.8"),
+        ([("0.7.8", "2026-11-12")], "0.7.8"),
+        ([("0.7.8", "2028-02-29")], "0.7.8"),
+        (
+            [("0.7.9", "unreleased"), ("0.7.8", "2026-11-12"), ("0.4.0", "2026-10-02")],
+            "0.7.9",
+        ),
+    ],
+    ids=[
+        "next-unreleased",
+        "current-unreleased",
+        "released",
+        "leap-day",
+        "historical-dated",
+    ],
+)
+def test_release_heading_shapes_are_accepted(
+    headings: list[tuple[str, str]], version: str
+) -> None:
+    assert _release_heading_mismatch(headings, version) is None
+
+
+@pytest.mark.parametrize(
+    ("headings", "version"),
+    [
+        ([("0.7.7", "2026-11-11")], "0.7.8"),
+        ([("0.7.8", "2026-1-7")], "0.7.8"),
+        ([("0.7.8", "2026-99-99")], "0.7.8"),
+        ([("0.7.8", "2026-02-30")], "0.7.8"),
+        ([("0.7.9", "unreleased"), ("0.7.8", "unreleased")], "0.7.8"),
+        ([("0.7.9", "unreleased"), ("0.7.8", "unreleased")], "0.7.9"),
+        (
+            [("0.7.9", "unreleased"), ("0.7.8", "2026-11-12"), ("0.4.0", "unreleased")],
+            "0.7.9",
+        ),
+    ],
+    ids=[
+        "missing-heading",
+        "malformed-date",
+        "impossible-month",
+        "impossible-day",
+        "two-unreleased",
+        "two-unreleased-lead",
+        "historical-unreleased",
+    ],
+)
+def test_release_heading_shapes_are_rejected(
+    headings: list[tuple[str, str]], version: str
+) -> None:
+    assert _release_heading_mismatch(headings, version) is not None

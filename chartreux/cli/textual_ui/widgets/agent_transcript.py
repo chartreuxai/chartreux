@@ -46,6 +46,7 @@ from chartreux.app_server.protocol import (
     AgentTranscriptState,
     AgentTranscriptToolStatus,
 )
+from chartreux.cli.textual_ui.widgets.agent_bar import short_agent_display_id
 from chartreux.cli.textual_ui.widgets.inline_notice import InlineNotice
 from chartreux.cli.textual_ui.widgets.messages import (
     AssistantMessage,
@@ -324,7 +325,12 @@ class AgentTranscriptViewer(Vertical):
         # display name may contain markup-looking characters.
         segment = self._identity if self._identity is not None else "unknown"
         if self._name:
-            return f"Subagent: {self._name} ({self._agent_id}) · {segment}"
+            # Display-only: the viewer's requests still address the full
+            # handle, so only the parenthetical is shortened (R2).
+            return (
+                f"Subagent: {self._name} "
+                f"({short_agent_display_id(self._agent_id)}) · {segment}"
+            )
         return f"Subagent: {self._agent_id} · {segment}"
 
     def set_header(self, name: str, identity: str | None = None) -> None:

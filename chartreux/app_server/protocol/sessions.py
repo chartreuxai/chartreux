@@ -170,6 +170,29 @@ class SessionPlanRecordWriteResponse(ProtocolModel):
     record: SessionPlanRecord | None = None
 
 
+class SessionMemorialItem(ProtocolModel):
+    """One coordinator-durable user-visible item preserved across a respawn.
+
+    After a confirmed root death an explicit ``session/resume`` retires the
+    dead generation and spawns one replacement; the coordinator-owned turn
+    queue and retained shell records of the dead generation survive as
+    MEMORIAL STATE ONLY — listed here in the resume receipt, never
+    re-admitted for execution on the new generation. The user re-submits
+    from the receipt.
+    """
+
+    kind: Literal[
+        "queued_turn",
+        "queued_shell_record",
+        "promoted_shell_record",
+        "retained_shell_record",
+    ]
+    id: str
+    created_at: int = 0
+    text: str | None = None
+    committed: bool = False
+
+
 class SessionResumeResponse(EventWatermarkResponse):
     state: PublicSessionState
     # Carried with the adopted state rather than fetched afterwards: the
@@ -177,6 +200,12 @@ class SessionResumeResponse(EventWatermarkResponse):
     # a separate read would land after the point the mode must already be in
     # place.
     plan_record: SessionPlanRecord | None = None
+    # Memorial state surfaced when the resume respawned a dead generation:
+    # the retired generation's queue and shell records, never re-admitted.
+    memorial: list[SessionMemorialItem] = Field(default_factory=list)
+    # The retired generation's typed death receipt, when the resume
+    # respawned a confirmed-dead root (``None`` on an ordinary resume).
+    death_receipt: str | None = None
 
 
 class SessionContinueParams(SessionOpenParams):

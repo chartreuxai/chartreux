@@ -38,12 +38,16 @@ from chartreux.app_server._subagent_transcript import (
     root_session_dir_from_spec,
 )
 from chartreux.app_server.agent_wire import (
+    AGENT_AUTHORITY_CHANGED_METHOD,
     SUBAGENT_OPEN_METHOD,
     TURN_OUTCOME_COMPLETED,
     TURN_OUTCOME_FAILED,
     TURN_OUTCOME_INTERRUPTED,
 )
-from chartreux.app_server.child_agent import CHILD_AGENT_MODULE
+from chartreux.app_server.child_agent import (
+    CHILD_AGENT_MODULE,
+    CHILD_TURNS_USED_FRAME_KEY,
+)
 from chartreux.app_server.process_bootstrap import (
     DEFAULT_SPAWN_READY_TIMEOUT,
     ProcessTreeBudget,
@@ -126,6 +130,18 @@ class ChildAgentProcess(RootAgentProcess):
         )
         return session_id
 
+    async def notify_authority_changed(self, params: dict[str, Any]) -> None:
+        """Hand this child one owner authority-change snapshot (G5b).
+
+        The owner pushes the invalidation down the child's own pipe: it is the
+        only signal the child gets that the vector it last saw moved, so it
+        clears the child's catalog cache and refreshes it. The frame carries no
+        policy and grants nothing -- a child that misses one asks again on its
+        next decision -- and a dead pipe simply raises to the caller, which
+        logs it rather than failing the owner's pass.
+        """
+        await self._notify(AGENT_AUTHORITY_CHANGED_METHOD, params)
+
 
 class ProcessSubagentCompletionSource:
     """Stream one child run over the wire, ending with the completion frame."""
@@ -152,7 +168,10 @@ class ProcessSubagentCompletionSource:
                 async for event in events:
                     yield event
         except asyncio.CancelledError:
-            yield SubagentCompletion(outcome=TURN_OUTCOME_INTERRUPTED)
+            yield SubagentCompletion(
+                outcome=TURN_OUTCOME_INTERRUPTED,
+                turns_used=self._reported_turns_used(turn_id),
+            )
             return
         except AgentProcessTurnFailed as exc:
             # A failed run's typed failure evidence rides the child's terminal
@@ -162,9 +181,24 @@ class ProcessSubagentCompletionSource:
                 outcome=TURN_OUTCOME_FAILED,
                 error=str(exc),
                 failure=terminal_failure(self._process, turn_id),
+                turns_used=self._reported_turns_used(turn_id),
             )
             return
-        yield SubagentCompletion(outcome=TURN_OUTCOME_COMPLETED)
+        yield SubagentCompletion(
+            outcome=TURN_OUTCOME_COMPLETED,
+            turns_used=self._reported_turns_used(turn_id),
+        )
+
+    def _reported_turns_used(self, turn_id: str | None) -> int | None:
+        """The turn count the child published on this run's terminal frame.
+
+        Only the owner can count its run: the frames relayed here are not a
+        turn stream, so an unreported (or malformed) count stays unknown
+        rather than being derived from them.
+        """
+        if turn_id is None:
+            return None
+        return reported_turns_used(self._process.turn_terminal(turn_id))
 
 
 class ProcessSpawnedSubagent:
@@ -379,6 +413,21 @@ def terminal_failure(
     if terminal is None:
         return None
     return decode_child_failure(terminal.get(CHILD_FAILURE_FRAME_KEY))
+
+
+def reported_turns_used(terminal: Mapping[str, Any] | None) -> int | None:
+    """The logical turn count a child's terminal frame reported, when usable.
+
+    The field is optional and the peer owns its meaning: a frame that carries
+    none, or carries anything but a non-negative integer, leaves the count
+    unknown instead of failing the run's whole completion.
+    """
+    if terminal is None:
+        return None
+    value = terminal.get(CHILD_TURNS_USED_FRAME_KEY)
+    if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+        return value
+    return None
 
 
 def persisted_child_failure(

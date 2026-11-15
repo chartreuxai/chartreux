@@ -15,7 +15,11 @@ from unittest.mock import AsyncMock
 import pytest
 
 from chartreux.app_server import stdio
-from chartreux.app_server._runtime import HarnessServer, RootOpenRequest
+from chartreux.app_server._runtime import (
+    HarnessServer,
+    RootOpenRequest,
+    create_harness_server,
+)
 from chartreux.app_server.client import AppServerClient
 from chartreux.app_server.events import HistoryEntryAdded
 from chartreux.app_server.models import PublicMessageEntry
@@ -32,6 +36,7 @@ from chartreux.app_server.transport import (
     StdioJsonRpcTransport,
 )
 from chartreux.utils.terminal import TerminalEmulator
+from tests.app_server.backend_contract.conftest import install_memory_root_agent
 from tests.conftest import build_test_agent_loop
 from tests.mock.utils import mock_llm_chunk
 from tests.stubs.app_server import build_test_app_server, create_legacy_app_server
@@ -513,3 +518,85 @@ def test_stdio_session_start_maps_agent_config_workdir_to_runtime_cwd() -> None:
     assert request.client_info.terminal_emulator == "ghostty"
     assert request.session_id is None
     assert request.continue_latest is False
+
+
+@pytest.mark.asyncio
+async def test_agents_inventory_read_round_trips_the_typed_snapshot_over_stdio(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """C6b: the typed inventory carrier crosses the stdio JSON-RPC pipe.
+
+    The raw JSON lines carry the read end to end: the client frame names the
+    registered method, the server routes it through the process-session
+    backend to the memory-wire root agent, and the response payload carries
+    the OWNER's revised snapshot -- the loop incarnation the floor compares
+    within, the monotone revision, and the agent summaries.
+    """
+    agent_loop = build_test_agent_loop()
+    install_memory_root_agent(monkeypatch, agent_loop)
+    client_socket, server_socket = socket.socketpair()
+    client_reader = client_socket.makefile("rb")
+    client_writer = client_socket.makefile("wb")
+    server_reader = server_socket.makefile("rb")
+    server_writer = server_socket.makefile("wb")
+    harness = await create_harness_server(
+        StdioJsonRpcTransport(server_reader, server_writer), transport_kind="stdio"
+    )
+    serve_task = asyncio.create_task(harness.serve())
+
+    async def send(message: dict[str, object]) -> None:
+        await asyncio.to_thread(
+            client_writer.write, json.dumps(message).encode() + b"\n"
+        )
+        await asyncio.to_thread(client_writer.flush)
+
+    async def receive() -> dict[str, Any]:
+        raw = await asyncio.wait_for(
+            asyncio.to_thread(client_reader.readline), timeout=5
+        )
+        return json.loads(raw)
+
+    try:
+        await send({
+            "jsonrpc": "2.0",
+            "id": "initialize",
+            "method": "initialize",
+            "params": {
+                "clientInfo": {"name": "test", "version": "1"},
+                "capabilities": {"callbackKinds": ["user_input"]},
+            },
+        })
+        await receive()
+        await send({"jsonrpc": "2.0", "method": "initialized", "params": {}})
+        await send({
+            "jsonrpc": "2.0",
+            "id": "start",
+            "method": "session/start",
+            "params": {"agentConfig": {"cwd": str(agent_loop.cwd)}},
+        })
+        await receive()
+        await send({
+            "jsonrpc": "2.0",
+            "id": "inventory",
+            "method": "agents/inventory/read",
+            "params": {},
+        })
+        response = await receive()
+    finally:
+        client_socket.shutdown(socket.SHUT_WR)
+        await asyncio.wait_for(serve_task, timeout=5)
+        for sock in (client_socket, server_socket):
+            with suppress(OSError):
+                sock.shutdown(socket.SHUT_RDWR)
+        for stream in (client_reader, client_writer, server_reader, server_writer):
+            stream.close()
+        client_socket.close()
+        server_socket.close()
+        await agent_loop.aclose()
+        await harness.close()
+
+    assert response["id"] == "inventory"
+    assert response["result"]["sessionId"] == agent_loop.session_id
+    assert response["result"]["generation"] == agent_loop.session_generation
+    assert response["result"]["revision"] == 0
+    assert response["result"]["agents"] == []

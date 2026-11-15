@@ -17,6 +17,7 @@ from chartreux.app_server.protocol import (
     SessionResumeParams,
     SessionResumeResponse,
 )
+from chartreux.observability.logging import logger
 
 
 @dataclass(frozen=True, slots=True)
@@ -129,7 +130,7 @@ class AppServerConnection:
         self._snapshot = None
         return snapshot
 
-    async def reconnect(
+    async def reconnect(  # noqa: PLR0911
         self, failed_client: AppServerClient, *, preserve_attached: bool = False
     ) -> bool:
         async with self._lock:
@@ -151,7 +152,15 @@ class AppServerConnection:
             if self._client_factory is None:
                 self._client = None
                 return False
-            self._client = self._client_factory()
+            try:
+                self._client = self._client_factory()
+            except Exception as exc:
+                # The stdio route's factory refuses reconnect by design (stdio-parity
+                # design §5: terminal disconnect). Observed here as a terminal
+                # reconnect failure, never an escape into the pump task.
+                logger.warning("App-server client factory refused reconnect: %s", exc)
+                self._client = None
+                return False
             self._attach_presentation(self._client)
             self._initialized = False
             self._attached_session_id = None

@@ -232,6 +232,9 @@ Session creation and user execution are separate:
 - `session/resume` loads saved state and attaches it;
 - `session/continue` resolves and attaches the latest eligible session;
 - `session/read`, `session/list`, and `session/history/list` are passive reads;
+- `session/rename` sets one manual session title; `session/title/update` is a
+  retained alias for it and answers a typed unsupported error on every
+  transport instead of a bare unknown-method error;
 - `session/fork` creates a session from an existing public boundary;
 - `session/stop` flushes and shuts down the attached runtime;
 - `turn/start` begins structured user input and may mark harness instructions as
