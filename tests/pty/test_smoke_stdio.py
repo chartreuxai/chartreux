@@ -288,14 +288,11 @@ def test_failed_send_restoration_keeps_the_draft_distinct(
     _assert_no_wire_errors(driver, mark)
 
 
-def test_safety_dangerous_opens_the_ceremony_warning_screen(pty_driver) -> None:
-    """`/safety dangerous` opens the non-dismissible warning screen (v0.8.0 A-P1).
+def test_safety_dangerous_transitions_directly_without_ceremony(pty_driver) -> None:
+    """`/safety dangerous` transitions directly with no ceremony modal (v0.8.2 W2).
 
-    The ceremony renders over the stdio topology with the typed-phrase gate
-    visible, no wire refusal fires, and no DANGEROUS banner appears (the
-    transition needs the full ceremony, which the pilot tests in
-    tests/cli/test_safety_command.py drive through the phrase and confirm
-    screens).
+    The DANGEROUS banner and the success marker render over the stdio
+    topology with no typed-phrase gate, and no wire refusal fires.
     """
     driver = pty_driver
     _settle_to_prompt(driver)
@@ -303,9 +300,8 @@ def test_safety_dangerous_opens_the_ceremony_warning_screen(pty_driver) -> None:
     driver.send("/safety dangerous")
     time.sleep(PALETTE_SETTLE_S)
     driver.send("\r")
-    time.sleep(PALETTE_SETTLE_S)
-    driver.send("\r")
-    driver.wait_for("suspends every Chartreux guard", 40)
-    driver.wait_for("ENABLE DANGEROUS MODE", 40)
-    assert "DANGEROUS MODE ACTIVE" not in driver.text()
+    driver.wait_for("DANGEROUS MODE ACTIVE", 40)
+    driver.wait_for("all guards are suspended", 40)
+    assert "suspends every Chartreux guard" not in driver.text()
+    assert "ENABLE DANGEROUS MODE" not in driver.text()
     _assert_no_wire_errors(driver, mark)

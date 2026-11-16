@@ -426,7 +426,7 @@ async def test_background_jobs_settings_toggle_reorder_preview_and_save() -> Non
         await pilot.press("space")
         assert "background-jobs" not in screen.draft.segments
         assert "Jobs" not in str(preview.content)
-        await pilot.press("space", *(["alt+up"] * 6))
+        await pilot.press("space", *(["alt+up"] * 7))
         assert screen._selected() == "background-jobs"
         assert screen.draft.segments == [
             "directory",

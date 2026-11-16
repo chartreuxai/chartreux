@@ -100,8 +100,9 @@ def test_existing_token_abbreviation_convention(tokens, expected):
     assert format_context(tokens, None) == f"{expected}/—"
 
 
-def test_formatter_has_only_standard_library_dependencies():
-    source_path = Path(__file__).parents[2] / "chartreux" / "ui" / "context_display.py"
+@pytest.mark.parametrize("module", ["context_display", "cache_display"])
+def test_formatter_has_only_standard_library_dependencies(module: str):
+    source_path = Path(__file__).parents[2] / "chartreux" / "ui" / f"{module}.py"
     tree = ast.parse(source_path.read_text())
     imports = [
         node.module for node in ast.walk(tree) if isinstance(node, ast.ImportFrom)

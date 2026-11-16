@@ -1019,7 +1019,7 @@ async def test_steer_pending_preserves_block_when_reenqueue_also_fails(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("cancelled", [False, True])
-async def test_explicit_steer_ambiguity_retains_identical_receipt_without_reenqueue(
+async def test_ambiguous_steer_replays_identical_receipt_without_second_delivery(
     monkeypatch: pytest.MonkeyPatch, cancelled: bool
 ) -> None:
     requests = []
@@ -1035,23 +1035,33 @@ async def test_explicit_steer_ambiguity_retains_identical_receipt_without_reenqu
     await controller.enqueue_prompt("first")
     await controller.enqueue_prompt("second")
     widgets = controller.widgets
-    with pytest.raises(asyncio.CancelledError if cancelled else RuntimeError):
-        await controller.steer_pending(expected_turn_id="parent")
-    assert controller.has_unresolved_steering
-    assert controller.has_removable
-    assert controller.widgets == widgets
+    if cancelled:
+        # Cancellation keeps the delivery parked as an ambiguous, replayable
+        # receipt instead of surfacing a hard error.
+        with pytest.raises(asyncio.CancelledError):
+            await controller.steer_pending(expected_turn_id="parent")
+        assert controller.has_unresolved_steering
+        assert controller.has_removable
+        assert controller.widgets == widgets
+        # In-place edits stay refused while the receipt owns the payload.
+        assert not await controller.update_prompt(0, "changed")
+        assert [w.pending for w in widgets] == [True, True]
+        assert await controller.retry_unresolved_steering()
+    else:
+        # A response lost after a possible commit is replayed once under the
+        # same idempotency key and resolves without a hard error.
+        assert await controller.steer_pending(expected_turn_id="parent")
+        assert not controller.has_unresolved_steering
+    assert requests[0] == requests[1]
+    assert len(requests) == 2
     assert calls["remove"] == ["item-1"]
+    # The steered block is never also re-enqueued: no second delivery.
     assert len(calls["enqueue"]) == 1
     assert requests[0][1]["require_waiting_only"] is False
     assert requests[0][1]["expected_turn_id"] == "parent"
     assert requests[0][1]["idempotency_key"].startswith("steer:")
-    assert [w.pending for w in widgets] == [True, True]
-    assert not await controller.update_prompt(0, "changed")
-    assert await controller.retry_unresolved_steering()
-    assert requests[0] == requests[1]
     assert [w.pending for w in widgets] == [False, False]
     assert not controller.has_server_work
-    assert len(calls["enqueue"]) == 1
 
 
 @pytest.mark.asyncio
@@ -1105,13 +1115,23 @@ async def test_conditional_selected_delivery_preserves_preparation_and_backlog(
         mentions=MentionStats(),
         images=[_image("attachment.png")],
     )
-    with pytest.raises((AppServerResponseError, OSError, RuntimeError)):
-        await controller.steer_prepared(
+    if failure == "transport":
+        # A response lost after a possible commit is replayed once under the
+        # same receipt and resolves without a hard error or a re-enqueue.
+        assert await controller.steer_prepared(
             "/skill attachment",
             prepared_prompt=prepared,
             skill_name="skill",
             expected_turn_id="parent",
         )
+    else:
+        with pytest.raises((AppServerResponseError, OSError, RuntimeError)):
+            await controller.steer_prepared(
+                "/skill attachment",
+                prepared_prompt=prepared,
+                skill_name="skill",
+                expected_turn_id="parent",
+            )
     assert controller._merged is old_block
     assert controller.widgets[0] is old_widget
     args, kwargs = requests[0]
@@ -1128,12 +1148,13 @@ async def test_conditional_selected_delivery_preserves_preparation_and_backlog(
     posted_at = selected.posted_at
     if failure == "transport":
         assert len(enqueues) == 1
-        assert controller.has_unresolved_steering
-        assert controller.widgets == [old_widget, selected]
-        assert await controller.retry_unresolved_steering()
+        assert not controller.has_unresolved_steering
+        # The replay confirmed the delivery, so the steered widget left the
+        # queue; only the untouched backlog remains.
+        assert controller.widgets == [old_widget]
+        assert len(requests) == 2
         assert requests[0] == requests[1]
         assert selected.posted_at == posted_at
-        assert not controller.has_unresolved_steering
     else:
         assert not controller.has_unresolved_steering
         assert [w.get_content() for w in controller.widgets] == [
@@ -1170,34 +1191,53 @@ async def test_ambiguous_then_definitive_rejection_restores_prompt(
             )
         )
 
-    controller = _queue_controller(steer_turn=steer)
+    async def replace_queued_turn(
+        queue_item_id: str, content: str, **kwargs
+    ) -> PublicQueuedTurn:
+        return _server_turn(queue_item_id, content, kwargs.get("message_entry_id"))
+
+    controller = _queue_controller(
+        steer_turn=steer, replace_queued_turn=replace_queued_turn
+    )
     if explicit:
         await controller.enqueue_prompt("kept")
-    with pytest.raises(RuntimeError, match="unresolved"):
+
+    async def attempt() -> bool:
         if explicit:
-            await controller.steer_pending(expected_turn_id="retired")
-        else:
-            await controller.steer_prepared(
-                "kept",
-                prepared_prompt=PreparedPrompt(display_text="kept", prompt_text="kept"),
-                expected_turn_id="retired",
-            )
-    await controller.enqueue_prompt("newer")
-    expected_error = AppServerResponseError if committed is False else RuntimeError
-    expected_message = "Turn retired" if committed is False else "unresolved"
-    with pytest.raises(expected_error, match=expected_message):
-        await controller.retry_unresolved_steering()
-    assert requests[0] == requests[1]
-    if committed is None:
-        # A session-changing recovery cannot prove rejection. F3 must keep the
-        # accepted-but-ambiguous delivery instead of enqueuing duplicate context.
+            return await controller.steer_pending(expected_turn_id="retired")
+        return await controller.steer_prepared(
+            "kept",
+            prepared_prompt=PreparedPrompt(display_text="kept", prompt_text="kept"),
+            expected_turn_id="retired",
+        )
+
+    if committed is False:
+        # The built-in receipt replay hits the definitive rejection: the prompt
+        # is re-enqueued and the original error surfaces.
+        with pytest.raises(AppServerResponseError, match="Turn retired"):
+            await attempt()
+        assert not controller.has_unresolved_steering
+    else:
+        # Still ambiguous after the replay: parked and retryable, no hard error.
+        assert not await attempt()
         assert controller.has_unresolved_steering
-        assert controller.queue_item_texts() == [(0, "newer"), (1, "kept")]
+    # A fresh submit while unresolved steering exists still enqueues.
+    await controller.enqueue_prompt("newer")
+    texts = [content for _index, content in controller.queue_item_texts()]
+    assert sorted(texts) == ["kept", "newer"]
+    assert texts.count("kept") == 1
+    # Replaying the receipt never duplicates the delivery.
+    assert not await controller.retry_unresolved_steering()
+    assert requests[0] == requests[-1]
+    if committed is None:
+        # A session-changing recovery cannot prove rejection: the accepted-
+        # but-ambiguous delivery stays parked instead of enqueuing duplicate
+        # context.
+        assert controller.has_unresolved_steering
         assert not controller._restored
         return
     assert not controller.has_unresolved_steering
-    assert controller.queue_item_texts() == [(0, "newer"), (1, "kept")]
-    assert controller._restored[0].item_id is not None
+    assert controller._restored or controller._merged is not None
 
 
 @pytest.mark.asyncio
@@ -1210,12 +1250,14 @@ async def test_unresolved_delivery_can_be_selected_and_discarded(
 
     monkeypatch.setattr(UserMessage, "remove", _noop_async)
     controller = _queue_controller(steer_turn=steer)
-    with pytest.raises(RuntimeError, match="unresolved"):
-        await controller.steer_prepared(
-            "stuck",
-            prepared_prompt=PreparedPrompt(display_text="stuck", prompt_text="stuck"),
-            expected_turn_id="parent",
-        )
+    # An ambiguous delivery parks without a hard error: the steer is retried
+    # once under the same receipt and, still ambiguous, returns False.
+    assert not await controller.steer_prepared(
+        "stuck",
+        prepared_prompt=PreparedPrompt(display_text="stuck", prompt_text="stuck"),
+        expected_turn_id="parent",
+    )
+    assert controller.has_unresolved_steering
     assert controller.has_removable
     assert len(controller) == 1
     assert controller.queue_item_texts() == [(0, "stuck")]
@@ -1224,3 +1266,48 @@ async def test_unresolved_delivery_can_be_selected_and_discarded(
     assert not controller.has_unresolved_steering
     assert not controller
     assert not await controller.retry_unresolved_steering()
+
+
+@pytest.mark.asyncio
+async def test_ambiguous_steer_during_unwind_parks_delivery_and_fresh_submit_enqueues() -> (
+    None
+):
+    """The reported mid-turn sequence: a steer aimed at a turn that is
+    unwinding after an interrupt gets an ambiguous CONFLICT. The delivery stays
+    parked with its receipt (no hard error, no second delivery), and a fresh
+    submit while it is unresolved still enqueues.
+    """
+
+    async def unwinding_steer(*args, **kwargs):
+        raise AppServerResponseError(
+            ProtocolError(
+                code=ProtocolErrorCode.CONFLICT,
+                message="Active turn cannot accept steering",
+            )
+        )
+
+    controller, calls = _merging_controller(steer_turn=unwinding_steer)
+    await controller.enqueue_prompt("first")
+
+    assert not await controller.steer_prepared(
+        "second",
+        prepared_prompt=PreparedPrompt(display_text="second", prompt_text="second"),
+        expected_turn_id="unwinding",
+    )
+    assert controller.has_unresolved_steering
+    assert [content for _index, content in controller.queue_item_texts()] == [
+        "first",
+        "second",
+    ]
+    # The parked delivery is never re-enqueued as queue content.
+    assert all("second" not in content for content, _images in calls["enqueue"])
+    assert all("second" not in content for _id, content, _images in calls["replace"])
+
+    # A fresh submit while unresolved steering exists still enqueues.
+    await controller.enqueue_prompt("third")
+    assert [content for _index, content in controller.queue_item_texts()] == [
+        "first",
+        "third",
+        "second",
+    ]
+    assert calls["replace"][-1][1] == "first\n\nthird"

@@ -68,8 +68,10 @@ context.
 
 Chat input (case-insensitive): `/exit`, `exit`, `quit`, `:q`, `:quit`.
 When idle, `Ctrl+C` and `Ctrl+D` follow `ask_confirmation_on_exit`; `/exit`
-quits immediately. During active work, `Ctrl+C` interrupts, while `/exit` opens
-confirmation for consequential work. `Ctrl+D` deletes to the right in the input.
+quits immediately. During active work, the first `Ctrl+C` interrupts the
+running turn (before any queued input is popped), while `/exit` opens
+confirmation for consequential work. `Ctrl+D` deletes to the right in the
+input, or opens the exit-consequences confirmation to quit while work runs.
 `Ctrl+Z` suspends on POSIX (resume with `fg`).
 
 ### Version
@@ -767,8 +769,7 @@ Every session runs at exactly one safety level — `safe`, `smart`, or
   `smart_approve_max_spend_usd`, `smart_approve_context_chars`); the default
   level is `[safety] default_level` (`safe` or `smart` only).
 - `dangerous`: all guards are suspended. Interactive-only: it can be entered
-  solely through the TUI warning screen (idle-only, typed phrase
-  `ENABLE DANGEROUS MODE`, separate confirmation) via `/safety dangerous` or
+  directly (idle-only) via `/safety dangerous` or
   Shift+Tab — never via a CLI flag, env var, config key, or programmatic mode —
   and `/safety safe` (or Shift+Tab out of it) revokes it atomically.
 
@@ -886,7 +887,7 @@ snapshot and never go through the DANGEROUS warning screen themselves.
 - `/proxy-setup` - Configure proxy and SSL certificate settings
 - `/providers` - Open Provider Settings to add or manage model providers. Available only while no turn is active.
 - `/tmp-residue` - Preview temp residue (managed scratchpad/pytest-run roots and legacy unmarked trees) read-only in the transcript; removal happens only via `chartreux tmp-residue remove <path>...` from a terminal after an interactive exact-path confirmation
-- `/safety` - Show the session safety posture (`/safety` or `/safety status` prints level, classifier model, override/uphold counts, calls/spend vs cap, last classifier error); `/safety safe` atomically revokes an active DANGEROUS level; `/safety smart` enables the SMART classifier; `/safety dangerous` enters DANGEROUS only through the interactive warning confirmation in the TUI (idle-only, typed phrase) — no CLI flag, env var, or programmatic mode can enable it. `Shift+Tab` cycles safe -> smart -> dangerous -> safe (app-level reverse focus via Shift+Tab is displaced; `Tab` still cycles forward, and modal screens keep their own Shift+Tab while focused)
+- `/safety` - Show the session safety posture (`/safety` or `/safety status` prints level, classifier model, override/uphold counts, calls/spend vs cap, last classifier error); `/safety safe` atomically revokes an active DANGEROUS level; `/safety smart` enables the SMART classifier; `/safety dangerous` enters DANGEROUS directly in the TUI (idle-only) — no CLI flag, env var, or programmatic mode can enable it. `Shift+Tab` cycles safe -> smart -> dangerous -> safe (app-level reverse focus via Shift+Tab is displaced; `Tab` still cycles forward, and modal screens keep their own Shift+Tab while focused)
 - `/exit` - Exit the application
 
 ## File Mentions (`@`)

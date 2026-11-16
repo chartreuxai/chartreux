@@ -2,6 +2,21 @@
 
 All notable changes to Chartreux are documented in this file.
 
+## 0.8.2 (2026-11-16)
+
+### Added
+- **Live context counter**: session/statsUpdated now fires per LLM call mid-turn (deduped on the full projected stats snapshot), so the status-bar context counter ticks during a turn, not only at turn end.
+- **Cache-hit percentages**: new optional `cache` status-line segment showing the per-LLM-call cache-hit rate next to the context counter, also on subagent stat surfaces; hidden when the provider does not report cache usage. Configurable via the status-line segment settings.
+- **Smart-approve observability**: every classifier adjudication now leaves a durable `purpose:"smart-approve"` usage record (a missing usage attribution had silently dropped them all), logs a structured per-gate outcome line, and renders a green "allowed by smart approve" / red "denied by smart approve" transcript marker in the agent view.
+
+### Fixed
+- **The safety-level border label now renders at startup** (previously only the tint showed until the level was changed).
+- **Ctrl-C interrupts an active turn first**; idle double-Ctrl-C-to-quit and the Ctrl+D quit path are unchanged.
+- **Messages submitted mid-turn enqueue reliably**, including after an interrupt with a queued item: ambiguous steering replays by receipt instead of raising a hard error, edits of unresolved items append as new prompts, and turn-boundary conflicts show a benign "queued" notice.
+
+### Removed
+- **The dangerous-mode entry ceremony is gone**: `/safety dangerous` and Shift+Tab transition directly; the banner, idle-only gate, and server-side gates remain.
+
 ## 0.8.1 (2026-11-15)
 
 ### Fixed

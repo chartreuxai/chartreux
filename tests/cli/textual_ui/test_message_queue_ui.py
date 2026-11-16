@@ -5,6 +5,7 @@ from collections.abc import Iterator
 from dataclasses import replace
 from datetime import UTC, datetime
 import time
+from typing import Any
 
 import pytest
 from textual.app import App
@@ -559,31 +560,32 @@ async def test_submit_during_queue_promotion_enqueues_behind_promoted_turn(
 
 
 @pytest.mark.asyncio
-async def test_ctrl_c_removes_newest_server_prompt() -> None:
+async def test_ctrl_c_interrupts_active_turn_before_popping_queue() -> None:
+    """W4: with an active agent job, the first Ctrl+C interrupts the turn; the
+    queue-pop rung only applies once no agent job is active.
+    """
     app, backend = _blocked_app()
     async with app.run_test() as pilot:
         chat_input = app.query_one(ChatInputContainer)
         chat_input.post_message(ChatInputContainer.Submitted("block queue"))
         assert await _wait_until(pilot, backend.started.is_set)
+        assert await _wait_until(pilot, app._agent_job_active)
         chat_input.post_message(ChatInputContainer.Submitted("first queued"))
         chat_input.post_message(ChatInputContainer.Submitted("second queued"))
         await _wait_for_queued(pilot, app, ["first queued\n\nsecond queued"])
 
+        # First Ctrl+C interrupts the running turn; the queue is not popped.
+        await pilot.press("ctrl+c")
+        assert await _wait_until(
+            pilot, lambda: not app._agent_job_active(), timeout=5.0
+        )
+        assert _queued_texts(app) == ["first queued\n\nsecond queued"]
+
+        # With no agent job active, Ctrl+C pops the newest queued prompt.
         await pilot.press("ctrl+c")
         await _wait_for_queued(pilot, app, ["first queued"])
 
         backend.release.set()
-        assert await _wait_until(pilot, lambda: len(backend.requests_messages) == 2)
-        assert await _wait_until(
-            pilot,
-            lambda: (
-                not app._agent_job_active()
-                and len(app._queue) == 0
-                and len(app.query(AssistantMessage)) == 2
-            ),
-        )
-
-    assert backend.requests_messages[-1][-1].content == "first queued"
 
 
 @pytest.mark.asyncio
@@ -1596,35 +1598,57 @@ async def test_steer_requests_invoked_skill_injection() -> None:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("size", [(80, 24), (120, 36)])
-async def test_unresolved_steering_queue_edit_does_not_copy_and_remove_discards(
+async def test_unresolved_steering_queue_edit_appends_new_prompt_and_remove_discards(
     size: tuple[int, int],
 ) -> None:
-    app = build_test_chartreux_app()
+    app, backend = _blocked_app()
 
     async def disconnected(*args, **kwargs):
         raise OSError("delivery unknown")
 
     async with app.run_test(size=size) as pilot:
-        app._queue._ports = replace(app._queue._ports, steer_turn=disconnected)
-        with pytest.raises(RuntimeError, match="unresolved"):
-            await app._queue.steer_prepared(
-                "stuck",
-                prepared_prompt=PreparedPrompt(
-                    display_text="stuck", prompt_text="stuck"
-                ),
-                expected_turn_id="retired",
-            )
         chat_input = app.query_one(ChatInputContainer)
+        chat_input.post_message(ChatInputContainer.Submitted("block queue"))
+        assert await _wait_until(pilot, backend.started.is_set)
+        app._queue._ports = replace(app._queue._ports, steer_turn=disconnected)
+        # An ambiguous steer parks the delivery without a hard error.
+        assert not await app._queue.steer_prepared(
+            "stuck",
+            prepared_prompt=PreparedPrompt(display_text="stuck", prompt_text="stuck"),
+            expected_turn_id="retired",
+        )
+        assert app._queue.has_unresolved_steering
+        assert not app.query(ErrorMessage)
         app.query_one(ChatTextArea).focus()
         await pilot.press("up")
         assert await _wait_until(pilot, lambda: app._queue_selected_widget is not None)
         chat_input.post_message(ChatInputContainer.QueueEditSubmitted("changed"))
-        assert await _wait_until(pilot, lambda: bool(app.query(ErrorMessage)))
-        assert app._queue.queue_item_texts() == [(0, "stuck")]
-        assert not app.app_server.turn_queue.items
+        # The edit of an unresolved delivery appends as a NEW prompt (the
+        # receipt payload is immutable); no error banner is shown.
+        assert await _wait_until(
+            pilot,
+            lambda: (
+                {content for _index, content in app._queue.queue_item_texts()}
+                == {"stuck", "changed"}
+            ),
+        )
+        assert not app.query(ErrorMessage)
+        assert app._queue.has_unresolved_steering
+        assert app._queue.is_unresolved_prompt(
+            [content for _index, content in app._queue.queue_item_texts()].index(
+                "stuck"
+            )
+        )
+        # Removing the unresolved item discards the whole delivery.
+        stuck_index = [
+            content for _index, content in app._queue.queue_item_texts()
+        ].index("stuck")
+        app._queue_selected_widget = app._queue.widgets[stuck_index]
         chat_input.post_message(ChatInputContainer.QueueRemoveRequested())
-        assert await _wait_until(pilot, lambda: not app._queue)
-        assert not app._queue.has_unresolved_steering
+        assert await _wait_until(pilot, lambda: not app._queue.has_unresolved_steering)
+        assert [content for _index, content in app._queue.queue_item_texts()] == [
+            "changed"
+        ]
 
 
 @pytest.mark.asyncio
@@ -1651,3 +1675,95 @@ async def test_empty_steer_is_noop_while_navigating_queue() -> None:
 
         backend.release.set()
         assert await _wait_until(pilot, lambda: not app.app_server.turn_active)
+
+
+@pytest.mark.asyncio
+async def test_ambiguous_steer_mid_unwind_enqueues_without_error_banner() -> None:
+    """The reported sequence: a second message submitted while the LLM is
+    unwinding after an interrupt gets an ambiguous steer outcome. It must be
+    kept in the queue with its receipt — no hard error, no locked input.
+    """
+    app = build_test_chartreux_app()
+    enqueued: list[str] = []
+
+    async def unwinding_steer(*args, **kwargs):
+        # Interrupt-unwind: CONFLICT without a steerCommitted marker.
+        raise AppServerResponseError(
+            ProtocolError(
+                code=ProtocolErrorCode.CONFLICT,
+                message="Active turn cannot accept steering",
+            )
+        )
+
+    async def recording_enqueue(content, **kwargs):
+        enqueued.append(content)
+        return await app._enqueue_queued_turn(content, **kwargs)
+
+    async with app.run_test() as pilot:
+        await app._session_ready.wait()
+        await app.app_server.resources.runtime.wait_until_ready()
+        app._queue._ports = replace(
+            app._queue._ports,
+            steer_turn=unwinding_steer,
+            enqueue_turn=recording_enqueue,
+        )
+
+        assert not await app._steer_queued_now(
+            content="second message",
+            prepared_prompt=PreparedPrompt(
+                display_text="second message", prompt_text="second message"
+            ),
+            expected_turn_id="unwinding",
+        )
+        assert app._queue.has_unresolved_steering
+        assert [content for _index, content in app._queue.queue_item_texts()] == [
+            "second message"
+        ]
+        # No hard error banner; the prompt is kept, not lost or locked.
+        assert not app.query(ErrorMessage)
+        # The parked delivery was never re-enqueued as a second delivery.
+        assert enqueued == []
+
+        # A fresh submit while unresolved steering exists still enqueues.
+        chat_input = app.query_one(ChatInputContainer)
+        chat_input.post_message(ChatInputContainer.Submitted("third message"))
+        assert await _wait_until(pilot, lambda: "third message" in enqueued)
+        assert not app.query(ErrorMessage)
+
+
+@pytest.mark.asyncio
+async def test_turn_boundary_conflict_at_submit_shows_queued_notice_not_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A turn-start CONFLICT ("A turn is already running" / "Resume queued
+    turns...") maps to a benign queued notice, not an error banner.
+    """
+    app = build_test_chartreux_app()
+    notices: list[tuple[str, dict[str, Any]]] = []
+    original_notify = ChartreuxApp.notify
+
+    def spy_notify(self: ChartreuxApp, message: str, **kwargs: Any) -> Any:
+        notices.append((message, kwargs))
+        return original_notify(self, message, **kwargs)
+
+    monkeypatch.setattr(ChartreuxApp, "notify", spy_notify)
+
+    async def conflict_enqueue(*args, **kwargs):
+        raise AppServerResponseError(
+            ProtocolError(
+                code=ProtocolErrorCode.CONFLICT, message="A turn is already running"
+            )
+        )
+
+    async with app.run_test():
+        await app._session_ready.wait()
+        await app.app_server.resources.runtime.wait_until_ready()
+        app._queue._ports = replace(app._queue._ports, enqueue_turn=conflict_enqueue)
+
+        accepted = await app._enqueue_prompt_with_resources("hello")
+        assert accepted
+        assert not app.query(ErrorMessage)
+        assert any(
+            "queued" in message.lower() and kwargs.get("severity") == "information"
+            for message, kwargs in notices
+        )

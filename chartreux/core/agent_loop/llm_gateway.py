@@ -310,6 +310,7 @@ def apply_usage(
         stats.last_turn_prompt_tokens = usage.prompt_tokens
         stats.last_turn_completion_tokens = usage.completion_tokens
         stats.last_turn_cached_tokens = usage.cached_tokens
+        stats.last_turn_cached_tokens_reported = usage.cached_tokens_reported
     if keepalive:
         stats.keepalive_prompt_tokens += usage.prompt_tokens
         stats.keepalive_completion_tokens += usage.completion_tokens

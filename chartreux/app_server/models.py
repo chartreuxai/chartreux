@@ -438,6 +438,9 @@ class AgentStatsSnapshot(ProtocolModel):
     last_turn_prompt_tokens: int = 0
     last_turn_completion_tokens: int = 0
     last_turn_cached_tokens: int = 0
+    # False when the provider did not report cache fields: the cached count is
+    # then unknown, not a reported zero, and cache-hit displays stay hidden.
+    last_turn_cached_tokens_reported: bool = False
     last_turn_duration: float = 0.0
     tokens_per_second: float = 0.0
 

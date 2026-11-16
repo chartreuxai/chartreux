@@ -3762,6 +3762,12 @@ class AgentChildHandle:
     effective_thinking: str | None = None
     context_tokens: int | None = None
     context_window: int | None = None
+    # Per-call (last LLM call) cache measurements from the same snapshot.
+    # reported False means the child's provider did not report cache fields, so
+    # the counts are unknown and the row's cache display stays hidden.
+    last_turn_prompt_tokens: int | None = None
+    last_turn_cached_tokens: int | None = None
+    last_turn_cached_tokens_reported: bool = False
     # The child's OWN automatic-compaction trigger, read from the same snapshot
     # (H3). The row renders usage against it, never against the window: the
     # child's compaction fires there. Unset when the child reported none.
@@ -4892,6 +4898,9 @@ class AgentChildHost:  # noqa: PLR0904 - the child-host port surface
         stats = observed.runtime.stats
         handle.context_tokens = stats.context_tokens
         handle.context_window = observed.runtime.context_window
+        handle.last_turn_prompt_tokens = stats.last_turn_prompt_tokens
+        handle.last_turn_cached_tokens = stats.last_turn_cached_tokens
+        handle.last_turn_cached_tokens_reported = stats.last_turn_cached_tokens_reported
         # The child's own compaction trigger rides the config view it publishes
         # with the same snapshot, so a row measures usage at the point this
         # child would compact -- not at the window this host cannot claim.
@@ -5272,6 +5281,9 @@ class AgentChildHost:  # noqa: PLR0904 - the child-host port surface
             effective_thinking=handle.effective_thinking,
             context_tokens=handle.context_tokens,
             context_window=handle.context_window,
+            last_turn_prompt_tokens=handle.last_turn_prompt_tokens,
+            last_turn_cached_tokens=handle.last_turn_cached_tokens,
+            last_turn_cached_tokens_reported=handle.last_turn_cached_tokens_reported,
             context_threshold=handle.context_threshold,
         )
 
@@ -5382,6 +5394,9 @@ class AgentChildHost:  # noqa: PLR0904 - the child-host port surface
                 effective_thinking=summary.effective_thinking,
                 context_tokens=summary.context_tokens,
                 context_window=summary.context_window,
+                last_turn_prompt_tokens=summary.last_turn_prompt_tokens,
+                last_turn_cached_tokens=summary.last_turn_cached_tokens,
+                last_turn_cached_tokens_reported=summary.last_turn_cached_tokens_reported,
                 context_threshold=summary.context_threshold,
             )
             for summary in (

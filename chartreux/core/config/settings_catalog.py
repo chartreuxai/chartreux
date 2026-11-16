@@ -187,8 +187,11 @@ EDITABLE_SETTINGS: tuple[SettingDescriptor, ...] = (
     SettingDescriptor(
         "status_line.segments",
         "Status Line Segments",
-        "Ordered segments: directory, pid, model, context, git-branch, spend-today, "
-        "spend-week, spend-month. Directory and context are required; no duplicates. "
+        "Ordered segments: directory, pid, model, context, cache, git-branch, "
+        "spend-today, spend-week, spend-month, background-jobs. Directory and "
+        "context are required; no duplicates. The cache segment shows the last "
+        "LLM call's cache-hit percentage and stays hidden when the provider does "
+        "not report cache fields. "
         "Spend segments show recorded USD spend across all projects for the local "
         "calendar day, Monday-start week, or month (Today/Week/Month). The Usage "
         "browser's Current project filter never changes this scope. "

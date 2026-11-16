@@ -141,6 +141,7 @@ def test_stats_projection_includes_cached_token_counts() -> None:
     agent_loop = build_test_agent_loop()
     agent_loop.stats.session_cached_tokens = 42
     agent_loop.stats.last_turn_cached_tokens = 7
+    agent_loop.stats.last_turn_cached_tokens_reported = True
     agent_loop.stats.input_price_per_million = 1.0
     agent_loop.stats.cached_input_price_per_million = 0.1
 
@@ -149,9 +150,22 @@ def test_stats_projection_includes_cached_token_counts() -> None:
 
     assert stats.session_cached_tokens == 42
     assert stats.last_turn_cached_tokens == 7
+    assert stats.last_turn_cached_tokens_reported is True
     assert stats.cached_input_price_per_million == 0.1
     assert serialized["sessionCachedTokens"] == 42
     assert serialized["lastTurnCachedTokens"] == 7
+    assert serialized["lastTurnCachedTokensReported"] is True
+
+
+def test_stats_projection_defaults_cache_reporting_to_unreported() -> None:
+    agent_loop = build_test_agent_loop()
+
+    stats = project_stats(agent_loop)
+    serialized = stats.model_dump(mode="json", by_alias=True)
+
+    assert stats.last_turn_cached_tokens == 0
+    assert stats.last_turn_cached_tokens_reported is False
+    assert serialized["lastTurnCachedTokensReported"] is False
 
 
 def test_stats_projection_preserves_cost_ledger_fields() -> None:

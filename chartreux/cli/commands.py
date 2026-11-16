@@ -229,8 +229,8 @@ class CommandRegistry:
                 aliases=frozenset(["/safety"]),
                 description=(
                     "Show or change the session safety level (safe|smart|dangerous). "
-                    "/safety dangerous enters DANGEROUS only through the interactive "
-                    "warning ceremony; /safety safe revokes it atomically."
+                    "/safety dangerous enters DANGEROUS directly in the interactive "
+                    "TUI (idle-only); /safety safe revokes it atomically."
                 ),
                 handler="_safety_command",
                 side_channel=True,

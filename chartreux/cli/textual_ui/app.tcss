@@ -278,32 +278,6 @@ OptionList, OptionList:focus {
     text-overflow: ellipsis;
 }
 
-#dangerous-warning,
-#dangerous-confirm {
-    width: 80;
-    height: auto;
-    max-height: 80%;
-    padding: 1 2;
-    background: $surface;
-    border: solid $error;
-}
-
-#dangerous-warning-text,
-#dangerous-confirm-text {
-    height: auto;
-    color: $foreground;
-}
-
-#dangerous-warning-error {
-    height: 1;
-    color: $error;
-}
-
-#dangerous-confirm-buttons {
-    height: auto;
-    align-horizontal: left;
-}
-
 #queue-mode-footer {
     height: 1;
     color: $text-muted;
@@ -623,6 +597,18 @@ Markdown {
     width: auto;
     height: 100%;
     padding: 0 1 0 2;
+}
+
+/* v0.8.2 W7: SMART-adjudication transcript markers (green allowed / red
+   denied by smart approve). */
+.user-command-message.smart-approve-allowed .user-command-content,
+.user-command-message.smart-approve-allowed .user-command-border {
+    color: $success;
+}
+
+.user-command-message.smart-approve-denied .user-command-content,
+.user-command-message.smart-approve-denied .user-command-border {
+    color: $error;
 }
 
 .interrupt-content {

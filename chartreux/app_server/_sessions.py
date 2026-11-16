@@ -2606,6 +2606,9 @@ class SessionRuntimeRegistry(SubagentRunnerPort):  # noqa: PLR0904
                 effective_thinking=record.effective_thinking,
                 context_tokens=record.context_tokens,
                 context_window=record.context_window,
+                last_turn_prompt_tokens=record.last_turn_prompt_tokens,
+                last_turn_cached_tokens=record.last_turn_cached_tokens,
+                last_turn_cached_tokens_reported=record.last_turn_cached_tokens_reported,
                 # H4a: the in-process row's own compaction trigger, read from
                 # the child loop's active model -- the same denominator the
                 # main status bar uses, never the window beside it.
@@ -2800,6 +2803,9 @@ class SessionRuntimeRegistry(SubagentRunnerPort):  # noqa: PLR0904
                 effective_thinking=summary.effective_thinking,
                 context_tokens=summary.context_tokens,
                 context_window=summary.context_window,
+                last_turn_prompt_tokens=summary.last_turn_prompt_tokens,
+                last_turn_cached_tokens=summary.last_turn_cached_tokens,
+                last_turn_cached_tokens_reported=summary.last_turn_cached_tokens_reported,
                 context_threshold=summary.context_threshold,
                 compacting=summary.compacting,
                 stop_reason=(

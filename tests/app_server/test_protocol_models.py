@@ -1227,6 +1227,10 @@ def test_agents_update_carries_retention_metadata() -> None:
         "stopReason": None,
         "contextTokens": None,
         "contextWindow": None,
+        # W6: the per-call cache fields ride the row; unreported means unknown.
+        "lastTurnPromptTokens": None,
+        "lastTurnCachedTokens": None,
+        "lastTurnCachedTokensReported": False,
         "contextThreshold": None,
         "compacting": False,
         "initialTaskSummary": "Initial task",

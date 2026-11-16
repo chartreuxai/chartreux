@@ -629,6 +629,11 @@ class AgentSummary:
     """Terminal outcome of the most recently finalized run, if any."""
     context_tokens: int | None = None
     context_window: int | None = None
+    # Per-call (last LLM call) cache measurements, projected from the child's
+    # stats events. None / reported False means unknown, never a reported zero.
+    last_turn_prompt_tokens: int | None = None
+    last_turn_cached_tokens: int | None = None
+    last_turn_cached_tokens_reported: bool = False
     context_threshold: int | None = None
     """The agent's own automatic-compaction trigger (H4a).
 

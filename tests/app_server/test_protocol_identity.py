@@ -532,12 +532,15 @@ def test_frozen_pre_change_model_mirrors_the_current_field_set() -> None:
     This guards the freeze against drift: a later field added to the live
     model without updating the mirror fails here instead of silently
     weakening the old-client rejection test. The subtracted fields are the
-    ones this freeze predates: the always-emitted uncollected-run list (U2)
-    and the row's compaction trigger (H3).
+    ones this freeze predates: the always-emitted uncollected-run list (U2),
+    the row's compaction trigger (H3), and the per-call cache fields (W6).
     """
     current = set(AgentSummaryModel.model_fields) - {
         "uncollected_run_ids",
         "context_threshold",
+        "last_turn_prompt_tokens",
+        "last_turn_cached_tokens",
+        "last_turn_cached_tokens_reported",
     }
 
     assert set(_PreChangeAgentSummaryModel.model_fields) == current

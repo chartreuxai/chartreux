@@ -101,6 +101,7 @@ def test_all_segments_selectable_and_recorded_global_spend_described() -> None:
         "directory",
         "pid",
         "model",
+        "cache",
         "git-branch",
         "spend-today",
         "spend-week",

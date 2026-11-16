@@ -69,13 +69,13 @@ Every session runs at exactly one safety level — `safe`, `smart`, or `dangerou
 
 - `safe` (default): every tool call goes through the harness guard pipeline; denied calls stay denied.
 - `smart`: returned denials (shell-grammar refusals never reach it) are adjudicated once by a classifier model, which may override a denial it judges inside the user's request or launch intent. Verdicts are fail-closed — unparseable, refused, errored, or cap-exhausted responses uphold — and a decided call is never re-decided.
-- `dangerous`: all guards are suspended, with a non-dismissible banner. Ceremony-only: it is entered solely through the interactive TUI warning screen (idle-only, typed phrase `ENABLE DANGEROUS MODE`, separate confirmation) via `/safety dangerous` or Shift+Tab — never via a CLI flag, env var, config key, or programmatic mode — and `/safety safe` (or Shift+Tab out of it) revokes it atomically. Child agents inherit the parent's level as a launch snapshot and never run the ceremony.
+- `dangerous`: all guards are suspended, with a non-dismissible banner. Interactive-TUI-only: it is entered directly (idle-only) via `/safety dangerous` or Shift+Tab — never via a CLI flag, env var, config key, or programmatic mode — and `/safety safe` (or Shift+Tab out of it) revokes it atomically. Child agents inherit the parent's level as a launch snapshot and never transition to it themselves.
 
 The `[safety]` section configures the level and the classifier:
 
 ```toml
 [safety]
-default_level = "safe"              # "safe" or "smart"; "dangerous" is rejected (ceremony-only)
+default_level = "safe"              # "safe" or "smart"; "dangerous" is rejected (interactive TUI only)
 smart_approve_model = ""            # "" -> active model, resolved at use time
 smart_approve_prompt_id = "smart-approve-classifier"
 smart_approve_max_calls = 200       # per-session classifier call cap

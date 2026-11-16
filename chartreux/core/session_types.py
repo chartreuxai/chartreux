@@ -185,6 +185,10 @@ class AgentStats(BaseModel):
     last_turn_prompt_tokens: int = 0
     last_turn_completion_tokens: int = 0
     last_turn_cached_tokens: int = 0
+    # Reporting presence for the per-call cache count: False means the provider
+    # did not report cache fields, so last_turn_cached_tokens is unknown, not
+    # a reported zero.
+    last_turn_cached_tokens_reported: bool = False
     last_turn_duration: float = 0.0
     tokens_per_second: float = 0.0
 
@@ -295,6 +299,7 @@ class AgentStats(BaseModel):
         self.last_turn_prompt_tokens = 0
         self.last_turn_completion_tokens = 0
         self.last_turn_cached_tokens = 0
+        self.last_turn_cached_tokens_reported = False
         self.last_turn_duration = 0.0
         self.tokens_per_second = 0.0
 

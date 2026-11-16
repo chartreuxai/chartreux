@@ -122,7 +122,7 @@ can add commands.
 | `/loop <interval> <prompt>` | Schedule a recurring prompt; `/loop list` and `/loop cancel <id\|all>` manage it. |
 | `/theme` | Select `auto`, `light`, or `dark`. |
 | `/web-search` | Configure the web-search provider, credential, and search settings. |
-| `/safety [status\|safe\|smart\|dangerous]` | Show the safety posture report (level, classifier model, override/uphold counts, calls/spend vs cap, last classifier error) or request a level transition. Entering `dangerous` requires the interactive warning ceremony in the TUI; `/safety safe` revokes it atomically. See [Approval postures](../guides/tools-safety.md#approval-postures-safety-levels). |
+| `/safety [status\|safe\|smart\|dangerous]` | Show the safety posture report (level, classifier model, override/uphold counts, calls/spend vs cap, last classifier error) or request a level transition. Entering `dangerous` is an idle-only direct transition in the TUI; `/safety safe` revokes it atomically. See [Approval postures](../guides/tools-safety.md#approval-postures-safety-levels). |
 
 ## Key shortcuts
 
@@ -131,8 +131,8 @@ can add commands.
 | `Enter` | Submit input. |
 | `Ctrl+J` or `Shift+Enter` | Insert a newline. |
 | `Escape` | Interrupt an agent or close a dialog; `Esc Esc` opens rewind when input is empty. |
-| `Ctrl+C` | Interrupt active work or quit while idle; clears non-empty input before quitting. Idle quit confirmation follows `ask_confirmation_on_exit`. |
-| `Ctrl+D` | Delete right, or quit while idle according to `ask_confirmation_on_exit`. |
+| `Ctrl+C` | Clears non-empty input first; then interrupts an active turn (ahead of any queued input); otherwise quits while idle. Idle quit confirmation follows `ask_confirmation_on_exit`. |
+| `Ctrl+D` | Delete right, or quit while idle according to `ask_confirmation_on_exit`; during an active turn, opens the exit-consequences confirmation to quit. |
 | `Ctrl+Z` | Suspend with a message. |
 | `Ctrl+G` | Open the current plan/input in an external editor. |
 | `Ctrl+O` | Toggle tool output. |

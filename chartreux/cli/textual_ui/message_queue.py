@@ -370,7 +370,9 @@ class QueueController:  # noqa: PLR0904
                 sent = await self._deliver_prepared_locked(delivery) or sent
             return sent
 
-    async def _deliver_prepared_locked(self, delivery: _SteeringDelivery) -> bool:
+    async def _deliver_prepared_locked(
+        self, delivery: _SteeringDelivery, *, _retried: bool = False
+    ) -> bool:
         block = delivery.block
         try:
             await self._ports.steer_turn(
@@ -407,13 +409,18 @@ class QueueController:  # noqa: PLR0904
                     await self._turn_started_locked(block.item_id)
                 self._push_loading_queue_count()
                 raise
+            # Ambiguous outcome (transport lost mid-flight, or a steer aimed at
+            # a turn that is unwinding after an interrupt): the delivery stays
+            # parked with its receipt so a replay can still confirm it — it is
+            # never converted to a second delivery. One immediate replay of the
+            # same idempotency key settles the committed-but-response-lost
+            # case; if the outcome is still ambiguous the delivery remains
+            # queued and retryable instead of surfacing a hard error.
             delivery.ambiguous = True
             self._push_loading_queue_count()
-            raise RuntimeError(
-                "Steering delivery could not be confirmed; your prompt was kept "
-                "unresolved. Retry uses the same delivery receipt; queue remove "
-                "discards the entire unresolved delivery without undoing accepted context."
-            ) from error
+            if not _retried:
+                return await self._deliver_prepared_locked(delivery, _retried=True)
+            return False
         self._unresolved_steering.remove(delivery)
         for entry in block.entries:
             self._track_message(entry.widget)

@@ -8,7 +8,7 @@ from chartreux.core.agent_loop.llm_gateway import apply_usage
 from chartreux.core.config import ModelConfig
 from chartreux.core.llm_models import LLMUsage
 from chartreux.core.session_types import AgentStats
-from chartreux.core.usage import UsagePrices, capture_prices, price_usage
+from chartreux.core.usage import UsagePrices, UsagePurpose, capture_prices, price_usage
 
 
 def test_component_pricing_subtracts_cached_input() -> None:
@@ -188,3 +188,47 @@ def test_gateway_unknown_cost_flag_is_sticky() -> None:
         model=ModelConfig(name="wire", provider="provider", alias="base"),
     )
     assert stats.has_unknown_cost
+
+
+def test_apply_usage_records_per_call_cache_reporting_presence() -> None:
+    model = ModelConfig(
+        name="wire", provider="provider", alias="base", cached_input_price=0.1
+    )
+    reported = AgentStats()
+    apply_usage(
+        reported,
+        LLMUsage.from_reported(
+            prompt_tokens=1_000, completion_tokens=10, cached_tokens=400
+        ),
+        time_seconds=1,
+        model=model,
+    )
+    assert reported.last_turn_prompt_tokens == 1_000
+    assert reported.last_turn_cached_tokens == 400
+    assert reported.last_turn_cached_tokens_reported is True
+
+    unreported = AgentStats()
+    apply_usage(
+        unreported,
+        LLMUsage(prompt_tokens=1_000, completion_tokens=10),
+        time_seconds=1,
+        model=model,
+    )
+    # An omitted cache field is unknown, not a reported zero.
+    assert unreported.last_turn_cached_tokens == 0
+    assert unreported.last_turn_cached_tokens_reported is False
+
+    # A keepalive ping never replaces the per-call conversation measurement.
+    pinged = AgentStats(
+        last_turn_cached_tokens_reported=True, last_turn_cached_tokens=5
+    )
+    apply_usage(
+        pinged,
+        LLMUsage(prompt_tokens=10, completion_tokens=1),
+        time_seconds=0,
+        model=model,
+        purpose=UsagePurpose.KEEPALIVE,
+    )
+    assert pinged.last_turn_cached_tokens_reported is True
+    assert pinged.last_turn_cached_tokens == 5
+    assert pinged.keepalive_prompt_tokens == 10

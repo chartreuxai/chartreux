@@ -287,7 +287,10 @@ async def test_turn_pushes_fresh_context_while_tool_runs() -> None:
         isinstance(event, StatsUpdated) and event.params.stats.context_tokens == 0
         for event in events
     )
-    assert zero_updates == 1
+    # W3: StatsUpdated dedupes on the full projected stats snapshot, so the
+    # mid-turn tool-stat transition emits a second zero-context update while
+    # the context counter is still cold (turn-start emit plus that one).
+    assert zero_updates == 2
 
 
 @pytest.mark.asyncio

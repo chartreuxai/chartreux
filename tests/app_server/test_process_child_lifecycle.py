@@ -194,6 +194,9 @@ class _TelemetryClient:
         raises: BaseException | None = None,
         thinking: str | None = None,
         thinking_known: bool = True,
+        last_turn_prompt_tokens: int | None = None,
+        last_turn_cached_tokens: int | None = None,
+        last_turn_cached_tokens_reported: bool = False,
     ) -> None:
         self._model_alias = model_alias
         self._committed = committed
@@ -202,6 +205,9 @@ class _TelemetryClient:
         self._context_threshold = context_threshold
         self._raises = raises
         self._thinking = thinking
+        self._last_turn_prompt_tokens = last_turn_prompt_tokens
+        self._last_turn_cached_tokens = last_turn_cached_tokens
+        self._last_turn_cached_tokens_reported = last_turn_cached_tokens_reported
         self._thinking_known = thinking_known
         self.reads = 0
         # G5: a process child is published only when its ready frame announced
@@ -237,7 +243,12 @@ class _TelemetryClient:
             committed_model=self._committed,
             state=SimpleNamespace(session=SimpleNamespace(model=self._model_alias)),
             runtime=SimpleNamespace(
-                stats=SimpleNamespace(context_tokens=self._context_tokens),
+                stats=SimpleNamespace(
+                    context_tokens=self._context_tokens,
+                    last_turn_prompt_tokens=self._last_turn_prompt_tokens,
+                    last_turn_cached_tokens=self._last_turn_cached_tokens,
+                    last_turn_cached_tokens_reported=self._last_turn_cached_tokens_reported,
+                ),
                 context_window=self._context_window,
                 config=config,
             ),
@@ -1423,6 +1434,9 @@ async def test_the_child_snapshot_supplies_the_model_and_context(
         context_window=100_000,
         context_threshold=250_000,
         thinking="high",
+        last_turn_prompt_tokens=200_000,
+        last_turn_cached_tokens=84_000,
+        last_turn_cached_tokens_reported=True,
     )
     uncommitted = _TelemetryClient(model_alias="alias-model", context_tokens=5)
     failing = _TelemetryClient(raises=RuntimeError("child transport died"))
@@ -1454,18 +1468,25 @@ async def test_the_child_snapshot_supplies_the_model_and_context(
     # different number from the window beside it.
     assert reported_row.context_threshold == 250_000
     assert reported_row.effective_thinking == "high"
+    # W6: the per-call cache fields ride the same snapshot projection.
+    assert reported_row.last_turn_prompt_tokens == 200_000
+    assert reported_row.last_turn_cached_tokens == 84_000
+    assert reported_row.last_turn_cached_tokens_reported is True
     # No committed identity: the child's own active-model alias is the answer.
     assert alias_row.effective_model == "alias-model"
     assert alias_row.base_model is None
     assert alias_row.context_tokens == 5
     assert alias_row.context_window is None
     assert alias_row.context_threshold is None
+    assert alias_row.last_turn_cached_tokens is None
+    assert alias_row.last_turn_cached_tokens_reported is False
     # The read failed: unknown stays unknown.
     assert failed_row.effective_model is None
     assert failed_row.base_model is None
     assert failed_row.context_tokens is None
     assert failed_row.context_window is None
     assert failed_row.context_threshold is None
+    assert failed_row.last_turn_cached_tokens_reported is False
     assert failed_row.effective_thinking is None
 
 

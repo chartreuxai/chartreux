@@ -18,6 +18,7 @@ from chartreux.cli.textual_ui.app import (
 from chartreux.cli.textual_ui.quit_manager import (
     QUIT_CONFIRM_DELAY,
     ExitConsequencesScreen,
+    QuitConfirmKey,
     QuitManager,
 )
 from chartreux.cli.textual_ui.widgets.session_status_line import SessionStatusLine
@@ -192,6 +193,111 @@ class TestActionInterruptOrQuit(_SessionReadyApp):
             app.action_interrupt_or_quit()
         assert mock_confirm.call_args.args[0] == "Ctrl+C"
         assert "Main work:" in mock_confirm.call_args.args[1]
+
+    def test_interrupts_active_job_without_arming_quit(self, app: ChartreuxApp) -> None:
+        with (
+            patch.object(app, "_get_chat_input", return_value=None),
+            patch.object(app, "_agent_job_active", return_value=True),
+            patch.object(
+                app, "_try_interrupt_running_job", return_value=True
+            ) as mock_interrupt,
+            patch.object(app._quit_manager, "request_confirmation") as mock_confirm,
+            patch.object(app, "_force_quit") as mock_quit,
+        ):
+            app.action_interrupt_or_quit()
+        mock_interrupt.assert_called_once()
+        mock_confirm.assert_not_called()
+        mock_quit.assert_not_called()
+
+    def test_active_job_interrupt_precedes_armed_quit_confirmation(
+        self, app: ChartreuxApp
+    ) -> None:
+        app._quit_manager._confirm_time = time.monotonic()
+        app._quit_manager._confirm_key = "Ctrl+C"
+        with (
+            patch.object(app, "_get_chat_input", return_value=None),
+            patch.object(app, "_agent_job_active", return_value=True),
+            patch.object(
+                app, "_try_interrupt_running_job", return_value=True
+            ) as mock_interrupt,
+            patch.object(app, "_force_quit") as mock_quit,
+        ):
+            app.action_interrupt_or_quit()
+        mock_interrupt.assert_called_once()
+        mock_quit.assert_not_called()
+        assert app._quit_manager.is_confirmed("Ctrl+C")
+
+    def test_interrupts_active_job_before_queue_pop(self, app: ChartreuxApp) -> None:
+        mock_queue = MagicMock()
+        mock_queue.has_removable = True
+        with (
+            patch.object(app, "_get_chat_input", return_value=None),
+            patch.object(app, "_agent_job_active", return_value=True),
+            patch.object(
+                app, "_try_interrupt_running_job", return_value=True
+            ) as mock_interrupt,
+            patch.object(app, "_queue", mock_queue),
+            patch.object(app, "run_worker") as mock_run_worker,
+        ):
+            app.action_interrupt_or_quit()
+        mock_interrupt.assert_called_once()
+        mock_queue.pop_last.assert_not_called()
+        mock_run_worker.assert_not_called()
+
+    def test_idle_double_press_arms_then_quits(self, app: ChartreuxApp) -> None:
+        def fake_request(key: QuitConfirmKey, extra: str = "") -> None:
+            app._quit_manager._confirm_time = time.monotonic()
+            app._quit_manager._confirm_key = key
+
+        with (
+            patch.object(app, "_get_chat_input", return_value=None),
+            patch.object(app, "_agent_job_active", return_value=False),
+            patch.object(app, "_try_interrupt_no_job_steps", return_value=False),
+            patch.object(app, "_try_interrupt_running_job", return_value=False),
+            patch.object(
+                app._quit_manager, "request_confirmation", side_effect=fake_request
+            ),
+            patch.object(app._quit_manager, "cancel_confirmation"),
+            patch.object(app, "_force_quit") as mock_quit,
+        ):
+            app.action_interrupt_or_quit()
+            assert app._quit_manager.is_confirmed("Ctrl+C")
+            mock_quit.assert_not_called()
+            app.action_interrupt_or_quit()
+            mock_quit.assert_called_once()
+
+    def test_clears_input_before_interrupting_active_job(
+        self, app: ChartreuxApp
+    ) -> None:
+        mock_container = MagicMock()
+        mock_container.value = "some text"
+        with (
+            patch.object(app, "_get_chat_input", return_value=mock_container),
+            patch.object(app, "_agent_job_active", return_value=True),
+            patch.object(app, "_try_interrupt_running_job") as mock_interrupt,
+        ):
+            app.action_interrupt_or_quit()
+        assert mock_container.value == ""
+        mock_interrupt.assert_not_called()
+
+    def test_bash_only_task_uses_late_interrupt_rung(self, app: ChartreuxApp) -> None:
+        bash_task = MagicMock()
+        bash_task.done.return_value = False
+        with (
+            patch.object(app, "_get_chat_input", return_value=None),
+            patch.object(app, "_agent_job_active", return_value=False),
+            patch.object(app, "_try_interrupt_no_job_steps", return_value=False),
+            patch.object(app, "_handle_agent_running_escape") as mock_escape,
+            patch.object(app._quit_manager, "request_confirmation") as mock_confirm,
+        ):
+            app._bash_task = bash_task
+            try:
+                app.action_interrupt_or_quit()
+            finally:
+                app._bash_task = None
+        bash_task.cancel.assert_called_once()
+        mock_escape.assert_not_called()
+        mock_confirm.assert_not_called()
 
 
 class TestActionDeleteRightOrQuit(_SessionReadyApp):
@@ -431,6 +537,7 @@ async def test_intentional_exits_require_consequence_confirmation(
         patch.object(app, "_force_quit") as force,
         patch.object(app._quit_manager, "request_confirmation") as confirm,
         patch.object(app, "_get_chat_input", return_value=None),
+        patch.object(app, "_agent_job_active", return_value=False),
         patch.object(app, "_try_interrupt_no_job_steps", return_value=False),
         patch.object(app, "_try_interrupt_running_job", return_value=False),
     ):

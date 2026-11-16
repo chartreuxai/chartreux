@@ -1304,9 +1304,13 @@ class ReasoningMessage(ClickWithoutDragMixin, SpinnerMixin, StreamingMessageBase
 
 
 class UserCommandMessage(Static):
-    def __init__(self, content: str) -> None:
+    def __init__(self, content: str, *, variant: str | None = None) -> None:
         super().__init__()
         self.add_class("user-command-message")
+        # v0.8.2 W7: variant classes color smart-approve adjudication
+        # markers (smart-approve-allowed / smart-approve-denied).
+        if variant:
+            self.add_class(variant)
         self._content = content
 
     def compose(self) -> ComposeResult:

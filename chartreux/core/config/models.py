@@ -629,6 +629,7 @@ type StatusLineSegment = Literal[
     "pid",
     "model",
     "context",
+    "cache",
     "git-branch",
     "spend-today",
     "spend-week",

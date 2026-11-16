@@ -498,7 +498,7 @@ def _reject_unusable_transport_selector() -> None:
         sys.exit(1)
 
 
-#: Startup flags that would name a safety level. DANGEROUS is ceremony-only
+#: Startup flags that would name a safety level. DANGEROUS is interactive-TUI-only
 #: (unguarded-mode-design.md :61-65): no CLI flag, env var, config key,
 #: project file, or restored session may enable it, so these tokens are
 #: rejected outright instead of being wired to a level.
@@ -521,16 +521,17 @@ _DANGEROUS_STARTUP_ENV_VARS = frozenset({
 def _reject_dangerous_startup_enablement(cli_args: list[str]) -> None:
     """Reject any startup flag or env var that would enable DANGEROUS mode.
 
-    v0.8.0 A-P1: activation is interactive-TUI-ceremony-only. Programmatic
-    mode (``-p``/positional prompt/piped stdin) auto-approves tools but never
-    runs the ceremony, so a dangerous request there is refused here.
+    v0.8.0 A-P1: activation is interactive-TUI-only (v0.8.2 W2 removed the
+    ceremony). Programmatic mode (``-p``/positional prompt/piped stdin)
+    auto-approves tools but is never the interactive TUI, so a dangerous
+    request there is refused here.
     """
     for arg in cli_args:
         token = arg.split("=", 1)[0]
         if token in _DANGEROUS_STARTUP_FLAG_TOKENS:
             print(
                 f"Error: {token} is not accepted: DANGEROUS mode is enabled only "
-                "through the interactive ceremony (`/safety dangerous` in the TUI).",
+                "interactively (`/safety dangerous` in the TUI).",
                 file=sys.stderr,
             )
             sys.exit(1)
@@ -538,7 +539,7 @@ def _reject_dangerous_startup_enablement(cli_args: list[str]) -> None:
         if os.environ.get(var, "").strip().lower() == "dangerous":
             print(
                 f"Error: {var}=dangerous is not accepted: DANGEROUS mode is enabled "
-                "only through the interactive ceremony (`/safety dangerous` in the TUI).",
+                "only interactively (`/safety dangerous` in the TUI).",
                 file=sys.stderr,
             )
             sys.exit(1)

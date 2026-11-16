@@ -127,6 +127,12 @@ class AgentSummaryModel(ProtocolModel):
     stop_reason: RunStopReason | None = None
     context_tokens: int | None = None
     context_window: int | None = None
+    # Per-call (last LLM call) cache measurements. A producer that observed no
+    # cache reporting leaves reported False and the counts None, so a row
+    # renders the cache display as unknown/hidden, never a claimed 0%.
+    last_turn_prompt_tokens: int | None = None
+    last_turn_cached_tokens: int | None = None
+    last_turn_cached_tokens_reported: bool = False
     # The agent's own automatic-compaction trigger (H3): the denominator this
     # row's usage is rendered against, so a child row never measures itself
     # against a hard window no compaction protects. None when the producer

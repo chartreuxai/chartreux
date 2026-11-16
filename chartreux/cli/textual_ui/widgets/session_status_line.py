@@ -12,6 +12,7 @@ from textual.widget import Widget
 
 from chartreux.app_server.config import StatusLineConfigView
 from chartreux.app_server.models import UsageWindowSummary
+from chartreux.ui.cache_display import format_cache_hit
 from chartreux.ui.context_display import format_context
 from chartreux.ui.usage_display import format_usage_cost
 
@@ -36,6 +37,12 @@ class SessionStatusState:
     auto_compact_threshold: int | None = None
     compacting: bool = False
     last_recorded: bool = False
+    # Per-call (last LLM call) token measurements for the cache segment.
+    # last_turn_cached_tokens_reported False means the provider did not report
+    # cache fields, so the cache segment stays hidden.
+    last_turn_prompt_tokens: int = 0
+    last_turn_cached_tokens: int = 0
+    last_turn_cached_tokens_reported: bool = False
     branch: str | None = None
     branch_status: Literal["branch", "detached", "not_repository", "unknown"] = (
         "unknown"
@@ -64,7 +71,7 @@ def format_segment(
     return text.replace("—", "-") if state.ascii_chrome else text
 
 
-def _format_segment(  # noqa: PLR0911 -- one renderer per configured segment
+def _format_segment(  # noqa: PLR0911, PLR0912 -- one renderer per configured segment
     segment: str, state: SessionStatusState, config: StatusLineConfigView
 ) -> str:
     """Format one configured segment without reading resources."""
@@ -98,6 +105,15 @@ def _format_segment(  # noqa: PLR0911 -- one renderer per configured segment
             if state.branch_status == "branch" and state.branch:
                 return _single_line(state.branch)
             return "Git —"
+        case "cache":
+            # Hidden entirely when the provider did not report cache fields:
+            # an empty value is dropped from the row by format_status_line.
+            if not state.last_turn_cached_tokens_reported:
+                return ""
+            return (
+                f"cache {format_cache_hit(state.last_turn_cached_tokens, state.last_turn_prompt_tokens, reported=True)}"
+                " (last call)"
+            )
         case "background-jobs":
             return f"Jobs {state.active_background_job_count}"
         case "spend-today":
@@ -139,7 +155,13 @@ def format_status_line(
             width,
             ascii_chrome=state.ascii_chrome,
         )
-    parts = [(name, format_segment(name, state, config)) for name in config.segments]
+    parts = [
+        (name, value)
+        for name in config.segments
+        # Segments that render empty (cache while unreported) are hidden
+        # whole, leaving no stray separator behind.
+        if (value := format_segment(name, state, config)) != ""
+    ]
     separator = " | " if config.separator == "pipe" else " "
 
     def joined() -> str:

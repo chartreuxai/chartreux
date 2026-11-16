@@ -77,6 +77,7 @@ from chartreux.app_server.models import (
     PublicQueuedTurn,
     PublicReasoningEntry,
     PublicTurnStatus,
+    SkippedEffectState,
     TokenUsage,
     UsageWindow,
     UsageWindowSummaries,
@@ -639,6 +640,28 @@ def _split_app_server_source(
 _REJECT_HINT_BUSY = "wait for the current job to finish."
 _REJECT_HINT_PAUSED = "clear the queue first or remove this input."
 
+# Turn-boundary conflicts (raised at turn start, _turns.py) mean the submission
+# is queued behind the running turn — not rejected. Surface them as a benign
+# "queued" notice, never an error banner.
+_TURN_BOUNDARY_CONFLICT_MESSAGES = (
+    "A turn is already running",
+    "Resume queued turns before starting a new turn",
+)
+
+
+def _is_turn_boundary_conflict(error: AppServerResponseError) -> bool:
+    return (
+        error.error.code is ProtocolErrorCode.CONFLICT
+        and error.error.message in _TURN_BOUNDARY_CONFLICT_MESSAGES
+    )
+
+
+def _queued_behind_turn_notice() -> str:
+    return (
+        "Queued behind the running turn — it will start when the current turn finishes."
+    )
+
+
 _UNTRUSTED_CONFIG_WARNING_SECTION = "untrusted_config_warning"
 
 
@@ -658,6 +681,13 @@ def _interrupt_wait_timeout() -> float:
     reading the module global at call time keeps that patch effective.
     """
     return _INTERRUPT_WAIT_TIMEOUT
+
+
+# v0.8.2 W7: feedback markers the SMART adjudication hook writes into
+# tool-decision feedback and this scan reads back out of the effect entry.
+# Kept local: chartreux.core.agent_loop must stay un-imported at startup.
+_SMART_OVERRIDE_MARKER = "SMART classifier override:"
+_SMART_UPHOLD_MARKER = "SMART classifier uphold:"
 
 
 def _interrupt_settle_timeout() -> float:
@@ -903,9 +933,10 @@ class ChartreuxApp(App):  # noqa: PLR0904
         self._queue_selected_widget: Widget | None = None
         self._fatal_init_error = False
         self._force_quit_task: asyncio.Task[None] | None = None
-        # v0.8.0 A-P3: effect entry ids already rendered as SMART-override
-        # transcript markers (dedup across repeated HistoryEntryUpdated).
-        self._smart_override_marked: set[str] = set()
+        # v0.8.0 A-P3 / v0.8.2 W7: effect entry ids already rendered as
+        # SMART-adjudication transcript markers (dedup across repeated
+        # HistoryEntryUpdated events).
+        self._smart_adjudication_marked: set[str] = set()
 
     def _mark_session_ready(self) -> None:
         self._session_ready.set()
@@ -2170,6 +2201,12 @@ class ChartreuxApp(App):  # noqa: PLR0904
                     # window; the denominator stays the configured compaction
                     # trigger, never the window the event reports.
                     auto_compact_threshold=self._compaction_threshold(),
+                    # Per-call cache fields drive the optional `cache` segment;
+                    # the reported flag keeps it hidden when the provider did
+                    # not report cache fields.
+                    last_turn_prompt_tokens=event.params.stats.last_turn_prompt_tokens,
+                    last_turn_cached_tokens=event.params.stats.last_turn_cached_tokens,
+                    last_turn_cached_tokens_reported=event.params.stats.last_turn_cached_tokens_reported,
                 )
             )
             self._refresh_main_agent_details()
@@ -2460,7 +2497,9 @@ class ChartreuxApp(App):  # noqa: PLR0904
             await self._enqueue_edited_copy(event.value)
             return
         if self._queue.is_unresolved_prompt(current_index):
-            await self._report_unresolved_queue_edit()
+            # The unresolved delivery's receipt owns its payload, so the edit
+            # cannot land in place: append it as a new prompt instead.
+            await self._enqueue_edited_copy(event.value)
             return
         widget = self._queue_selected_widget
         prepared = await self._prepare_prompt_or_abort(event.value)
@@ -2479,19 +2518,10 @@ class ChartreuxApp(App):  # noqa: PLR0904
             current_index, event.value, prepared_prompt=prepared
         )
         if not updated:
-            if self._queue.is_unresolved_prompt(current_index):
-                await self._report_unresolved_queue_edit()
-            else:
-                await self._enqueue_edited_copy(event.value)
-
-    async def _report_unresolved_queue_edit(self) -> None:
-        await self._mount_and_scroll(
-            ErrorMessage(
-                "Steering delivery is unresolved; the original prompt was retained. "
-                "Retry the delivery or remove it from the queue instead of editing it.",
-                collapsed=self._tools_collapsed,
-            )
-        )
+            # In-place edit refused (the receipt payload of an unresolved
+            # delivery is immutable, or the item promoted mid-edit): queue the
+            # edited text as a new prompt.
+            await self._enqueue_edited_copy(event.value)
 
     async def _enqueue_edited_copy(self, value: str) -> None:
         """Queue an edited prompt again if the original started meanwhile."""
@@ -2719,6 +2749,17 @@ class ChartreuxApp(App):  # noqa: PLR0904
                     optimistic_start=optimistic_start,
                 )
             except AppServerResponseError as error:
+                if _is_turn_boundary_conflict(error):
+                    # The server refused to start a turn because one is already
+                    # running or queued work must resume first: from the user's
+                    # perspective the submission is queued — benign notice, not
+                    # an error banner.
+                    self.notify(
+                        _queued_behind_turn_notice(),
+                        severity="information",
+                        markup=False,
+                    )
+                    return True
                 await self._mount_and_scroll(
                     ErrorMessage(str(error), collapsed=self._tools_collapsed)
                 )
@@ -2821,7 +2862,7 @@ class ChartreuxApp(App):  # noqa: PLR0904
             )
             return
         if target == "dangerous":
-            await self._enter_dangerous_ceremony()
+            await self._enter_dangerous()
             return
         server = self._app_server
         if server is None:
@@ -2935,6 +2976,23 @@ class ChartreuxApp(App):  # noqa: PLR0904
                     skill_name=skill_name,
                     expected_turn_id=expected_turn_id,
                 )
+            except AppServerResponseError as error:
+                if _is_turn_boundary_conflict(error):
+                    # Turn-boundary conflict at steer time: the prompt is queued
+                    # behind the running turn — benign notice, not an error.
+                    self.notify(
+                        _queued_behind_turn_notice(),
+                        severity="information",
+                        markup=False,
+                    )
+                    return False
+                await self._mount_and_scroll(
+                    ErrorMessage(
+                        f"Steering admission failed; your prompt was kept. {error}",
+                        collapsed=self._tools_collapsed,
+                    )
+                )
+                return False
             except Exception as error:
                 await self._mount_and_scroll(
                     ErrorMessage(
@@ -2984,10 +3042,16 @@ class ChartreuxApp(App):  # noqa: PLR0904
         except AppServerResponseError as error:
             # The turn ended between remove and steer: steer_pending already
             # put the block back on the queue so it can promote as the next
-            # turn. Do not flash that recovery as an error.
-            if error.error.code is ProtocolErrorCode.STALE_TURN or (
-                error.error.code is ProtocolErrorCode.CONFLICT
-                and error.error.message == "No active turn"
+            # turn. Do not flash that recovery as an error. Turn-boundary
+            # conflicts likewise just mean the prompt stays queued behind the
+            # running turn.
+            if (
+                error.error.code is ProtocolErrorCode.STALE_TURN
+                or _is_turn_boundary_conflict(error)
+                or (
+                    error.error.code is ProtocolErrorCode.CONFLICT
+                    and error.error.message == "No active turn"
+                )
             ):
                 return False
             await self._mount_and_scroll(
@@ -3762,21 +3826,25 @@ class ChartreuxApp(App):  # noqa: PLR0904
             await self._remove_loading_widget()
         elif self._loading_widget is None and is_progress_event(event):
             await self._ensure_loading_widget()
-        await self._maybe_render_smart_override_marker(event, entry)
+        await self._maybe_render_smart_adjudication_marker(event, entry)
         if self.event_handler:
             await self.event_handler.handle_event(
                 event, loading_widget=self._loading_widget
             )
             self._sync_retry_command_availability()
 
-    async def _maybe_render_smart_override_marker(
+    async def _maybe_render_smart_adjudication_marker(
         self, event: AppServerEvent, entry: Any
     ) -> None:
-        """v0.8.0 A-P3 (amendment Q6): per-call classifier-override transcript line.
+        """v0.8.0 A-P3 (Q6) + v0.8.2 W7: per-call classifier-adjudication line.
 
-        When a tool-call effect completes carrying the SMART classifier
-        override marker (the loop's adjudication feedback), render one
-        UserCommandMessage with the verdict, rationale, and call identity.
+        When a tool-call effect completes or is skipped carrying the SMART
+        classifier marker (the loop's adjudication feedback), render one
+        UserCommandMessage with the verdict, rationale, and call identity —
+        green "allowed by smart approve" on override, red "denied by smart
+        approve" on uphold/cap/classifier-error. Decided-call replays never
+        carry the marker, and entry-id dedup keeps repeated
+        HistoryEntryUpdated events from re-rendering.
         """
         if not isinstance(event, HistoryEntryUpdated):
             return
@@ -3784,22 +3852,32 @@ class ChartreuxApp(App):  # noqa: PLR0904
             return
         if entry.generation_status is not PublicEntryGenerationStatus.COMPLETED:
             return
-        if not isinstance(entry.state, CompletedEffectState):
+        state = entry.state
+        if isinstance(state, CompletedEffectState):
+            text = f"{state.display.message}\n{state.output_text}"
+        elif isinstance(state, SkippedEffectState):
+            text = state.display.message
+        else:
             return
-        if entry.id in self._smart_override_marked:
+        if entry.id in self._smart_adjudication_marked:
             return
-        text = f"{entry.state.display.message}\n{entry.state.output_text}"
-        marker = "SMART classifier override:"
-        if marker not in text:
+        if _SMART_OVERRIDE_MARKER in text:
+            marker = _SMART_OVERRIDE_MARKER
+            label = "allowed by smart approve"
+            variant = "smart-approve-allowed"
+        elif _SMART_UPHOLD_MARKER in text:
+            marker = _SMART_UPHOLD_MARKER
+            label = "denied by smart approve"
+            variant = "smart-approve-denied"
+        else:
             return
-        self._smart_override_marked.add(entry.id)
-        rationale = (
-            text.split(marker, 1)[1].strip().splitlines()[0] if marker in text else ""
-        )
+        self._smart_adjudication_marked.add(entry.id)
+        rationale = text.split(marker, 1)[1].strip().splitlines()[0]
         await self._mount_and_scroll(
             UserCommandMessage(
-                f"**SMART classifier override** `{entry.detail.tool_name}` "
-                f"(call `{entry.id[:8]}`): {rationale}"
+                f"**{label}** `{entry.detail.tool_name}` "
+                f"(call `{entry.id[:8]}`): {rationale}",
+                variant=variant,
             )
         )
 
@@ -4164,6 +4242,10 @@ class ChartreuxApp(App):  # noqa: PLR0904
             if stats.last_turn_cached_tokens > 0
             else ""
         )
+        # W6 decision: /stats keeps the absolute cached counts above and adds
+        # no session-cumulative cache ratio — the absolute counts are
+        # sufficient, and the per-call ratio lives on the status line's
+        # optional `cache` segment and the subagent rows instead.
         status_text = f"""## Agent Statistics
 
 - **Steps**: {stats.steps:,}
@@ -4919,11 +5001,10 @@ class ChartreuxApp(App):  # noqa: PLR0904
 
         Bare ``/safety``/``status`` prints the current level. ``safe`` /
         ``smart`` / ``dangerous`` request a transition; entering DANGEROUS
-        always runs the interactive ceremony (idle-only, non-dismissible
-        warning screen, typed phrase, separate confirmation) and is only
-        reachable from this interactive TUI — ``-p``/ACP/app-server never
-        parse slash commands, and startup flags naming a level are rejected
-        in the entrypoint.
+        is an idle-only direct transition (v0.8.2 W2 removed the typed-
+        phrase/confirmation ceremony) and is only reachable from this
+        interactive TUI — ``-p``/ACP/app-server never parse slash commands,
+        and startup flags naming a level are rejected in the entrypoint.
         """
         arg = cmd_args.strip().lower()
         if arg in {"", "status"}:
@@ -4947,7 +5028,7 @@ class ChartreuxApp(App):  # noqa: PLR0904
             )
             return
         if arg == "dangerous":
-            await self._enter_dangerous_ceremony()
+            await self._enter_dangerous()
             return
         response = await self.app_server.request_safety_transition(arg)
         if not response.transitioned:
@@ -4962,37 +5043,18 @@ class ChartreuxApp(App):  # noqa: PLR0904
             UserCommandMessage(f"Safety level is now **{response.level}**.")
         )
 
-    async def _enter_dangerous_ceremony(self) -> None:
-        """The ceremony-only entry into DANGEROUS (unguarded doc :49-65)."""
-        from chartreux.cli.textual_ui.screens.safety_dangerous import (
-            DangerousConfirmScreen,
-            DangerousWarningScreen,
-        )
+    async def _enter_dangerous(self) -> None:
+        """The direct entry into DANGEROUS (unguarded doc :49-65).
 
+        v0.8.2 W2: the typed-phrase/confirmation ceremony is removed; the
+        idle-only check in the callers still applies and the server-side
+        gates are unchanged. The non-dismissible banner is the only
+        confirmation surface.
+        """
         current = await self.app_server.safety_level()
         if current == "dangerous":
             await self._mount_and_scroll(
                 UserCommandMessage("Safety level is already **dangerous**.")
-            )
-            return
-        # push_screen_wait needs a worker context; the slash-command handler
-        # does not always run inside one, so the screen wait rides a worker.
-        warning_worker = self.run_worker(
-            self.push_screen_wait(DangerousWarningScreen())
-        )
-        phrase = await warning_worker.wait()
-        if phrase != "phrase_ok":
-            await self._mount_and_scroll(
-                UserCommandMessage("DANGEROUS MODE not enabled (ceremony cancelled).")
-            )
-            return
-        confirm_worker = self.run_worker(
-            self.push_screen_wait(DangerousConfirmScreen())
-        )
-        confirmed = await confirm_worker.wait()
-        if not confirmed:
-            await self._mount_and_scroll(
-                UserCommandMessage("DANGEROUS MODE not enabled (not confirmed).")
             )
             return
         response = await self.app_server.request_safety_transition("dangerous")
@@ -5029,16 +5091,21 @@ class ChartreuxApp(App):  # noqa: PLR0904
         caller then revokes atomically). Revocation removes the banner and
         the tint class.
         """
-        container = self.query_one("#input-container")
-        container.remove_class("safety-safe", "safety-smart", "safety-dangerous")
-        if level in {"safe", "smart", "dangerous"}:
-            container.add_class(f"safety-{level}")
-            # v0.8.0 A-P3 (amendment Q6): the border-title label carries the
-            # level as the compact always-on affordance (plan-mode pattern).
-            if self._chat_input_container is not None:
-                self._chat_input_container.set_custom_border(f"safety: {level}")
-        elif self._chat_input_container is not None:
-            self._chat_input_container.set_custom_border(None)
+        # v0.8.2 W1: resolve the container once via a guarded query. The
+        # initial apply runs in _mount_after_session_ready before
+        # _complete_mount assigns _chat_input_container, so the field cannot
+        # be the source here; skip quietly when the container is not mounted.
+        containers = self.query(ChatInputContainer)
+        container = containers.first() if containers else None
+        if container is not None:
+            container.remove_class("safety-safe", "safety-smart", "safety-dangerous")
+            if level in {"safe", "smart", "dangerous"}:
+                container.add_class(f"safety-{level}")
+                # v0.8.0 A-P3 (amendment Q6): the border-title label carries the
+                # level as the compact always-on affordance (plan-mode pattern).
+                container.set_custom_border(f"safety: {level}")
+            else:
+                container.set_custom_border(None)
         banner_query = self.query("#dangerous-banner")
         if level == "dangerous":
             from chartreux.cli.textual_ui.screens.safety_dangerous import (
@@ -5047,10 +5114,15 @@ class ChartreuxApp(App):  # noqa: PLR0904
 
             if banner_query:
                 return True
-            try:
-                await self.query_one("#bottom-app-container").mount(
-                    DangerousBanner(), before=0
+            bottom_query = self.query("#bottom-app-container")
+            bottom_container = bottom_query.first() if bottom_query else None
+            if bottom_container is None:
+                logger.warning(
+                    "DANGEROUS banner mount skipped: no bottom-app container"
                 )
+                return False
+            try:
+                await bottom_container.mount(DangerousBanner(), before=0)
             except Exception as exc:
                 logger.warning("DANGEROUS banner mount failed: %s", exc)
                 return False
@@ -5616,6 +5688,9 @@ class ChartreuxApp(App):  # noqa: PLR0904
                 ),
                 auto_compact_threshold=self._compaction_threshold(),
                 compacting=self._root_compacting,
+                last_turn_prompt_tokens=runtime.stats.last_turn_prompt_tokens,
+                last_turn_cached_tokens=runtime.stats.last_turn_cached_tokens,
+                last_turn_cached_tokens_reported=runtime.stats.last_turn_cached_tokens_reported,
                 ascii_chrome=self.config.ascii_chrome,
                 active_background_job_count=self.app_server.state.active_background_job_count,
                 usage_day=self._usage_summaries.day if self._usage_summaries else None,
@@ -5796,13 +5871,17 @@ class ChartreuxApp(App):  # noqa: PLR0904
             self.screen, _get_exit_consequences_screen_class()
         ):
             return
-        # Ctrl+C priority ladder: clear input → second-press quit → bottom-app/etc
-        # no-op steps → pop last queued item (LIFO) → cancel running job → request quit.
+        # Ctrl+C priority ladder: clear input → interrupt active agent job →
+        # second-press quit → bottom-app/etc no-op steps → pop last queued item
+        # (LIFO) → cancel running job → request quit.
         if self._app_server is None:
             self._request_intentional_exit("Ctrl+C")
             return
         if (container := self._get_chat_input()) and container.value:
             container.value = ""
+            return
+        if self._agent_job_active():
+            self._try_interrupt_running_job()
             return
         if self._quit_manager.is_confirmed("Ctrl+C"):
             self._request_intentional_exit("Ctrl+C")

@@ -25,6 +25,7 @@ from chartreux.app_server.protocol import (
 )
 from chartreux.model_display import format_model_display_name
 from chartreux.observability.logging import logger
+from chartreux.ui.cache_display import format_cache_hit
 from chartreux.ui.chrome_glyphs import ascii_chrome_enabled, chrome_glyph
 from chartreux.ui.context_display import format_context
 from chartreux.ui.duration_display import format_duration
@@ -168,6 +169,17 @@ def _context_text(
         tokens, threshold, compacting=compacting, last_recorded=last_recorded
     )
     return text.replace("—", "-") if ascii_chrome_enabled() else text
+
+
+def _cache_text(agent: AgentSummaryModel) -> str | None:
+    """The per-call (last call) cache-hit text, or None while unreported."""
+    if not agent.last_turn_cached_tokens_reported:
+        return None
+    text = format_cache_hit(
+        agent.last_turn_cached_tokens, agent.last_turn_prompt_tokens, reported=True
+    )
+    text = text.replace("—", "-") if ascii_chrome_enabled() else text
+    return f"cache {text} (last call)"
 
 
 def _state_label(state: str, outcome: str | None = None) -> str:
@@ -1416,6 +1428,9 @@ class AgentBar(Vertical):  # noqa: PLR0904 -- Textual actions and event handlers
             # Retained results lead the metadata line: they are load-bearing,
             # so context, model and turn count yield to them at narrow widths.
             second.append(uncollected)
+        cache = _cache_text(agent)
+        if cache is not None:
+            second.append(cache)
         second.extend([context, model, f"turns {turns}"])
         if agent.resumed_from_run_id is not None:
             second.append(f"resumed from {agent.resumed_from_run_id}")
@@ -1459,6 +1474,7 @@ class AgentBar(Vertical):  # noqa: PLR0904 -- Textual actions and event handlers
                 "Context tokens",
                 str(agent.context_tokens) if agent.context_tokens is not None else None,
             ),
+            ("Last-call cache hit", _cache_text(agent)),
             (
                 "Auto-compact threshold",
                 str(agent.context_threshold)

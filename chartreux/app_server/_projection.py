@@ -374,6 +374,7 @@ def project_stats(agent_loop: AgentLoop) -> AgentStatsSnapshot:
         last_turn_prompt_tokens=stats.last_turn_prompt_tokens,
         last_turn_completion_tokens=stats.last_turn_completion_tokens,
         last_turn_cached_tokens=stats.last_turn_cached_tokens,
+        last_turn_cached_tokens_reported=stats.last_turn_cached_tokens_reported,
         last_turn_duration=stats.last_turn_duration,
         tokens_per_second=stats.tokens_per_second,
     )

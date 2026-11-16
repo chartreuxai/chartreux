@@ -71,6 +71,7 @@ class _StubClassifier:
         system_prompt: str,
         user_content: str,
         accounting_sink: Any,
+        usage_attribution: Any = None,
     ) -> str | None:
         self.calls.append({
             "system_prompt": system_prompt,

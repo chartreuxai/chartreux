@@ -217,7 +217,7 @@ The `[status_line]` table controls the bottom session status row. Unknown fields
 
 | Key | Default | Accepted value |
 | --- | --- | --- |
-| `segments` | `["directory", "pid", "context"]` | Ordered, unique list of `directory`, `pid`, `model`, `context`, `git-branch`, `spend-today`, `spend-week`, `spend-month`, or `background-jobs`. Both `directory` and `context` are required. |
+| `segments` | `["directory", "pid", "context"]` | Ordered, unique list of `directory`, `pid`, `model`, `context`, `cache`, `git-branch`, `spend-today`, `spend-week`, `spend-month`, or `background-jobs`. Both `directory` and `context` are required. |
 | `directory_style` | `"name"` | `name` or `path`. |
 | `context_style` | `"tokens-percent"` | `tokens` or `tokens-percent`. |
 | `separator` | `"pipe"` | `space` or `pipe`. |
@@ -233,6 +233,14 @@ branch lookup is asynchronous and cached. Configure this row in Settings > Statu
 line; see the
 [configuration guide](../guides/configuration.md#status-line-and-message-timing)
 for editor controls.
+
+`cache` is opt-in and renders `cache 42% (last call)`: the most recent LLM
+call's cached-token share of its prompt tokens, labeled as a per-call (last
+call) value, never a session-cumulative ratio. It stays hidden entirely when
+the provider does not report cache fields, so an unreported provider shows no
+cache segment rather than a misleading `0%`. The same per-call fields ride the
+subagent rows in the agent browser. Like the other optional segments, it drops
+first from the end under width pressure.
 
 `background-jobs` is opt-in and renders `Jobs N`, including `Jobs 0` when no
 managed jobs are active. It counts committed jobs whose owned cleanup has not

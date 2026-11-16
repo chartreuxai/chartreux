@@ -179,14 +179,17 @@ async def test_wait_submission_reaches_real_parent_before_children_complete(
             assert requests[0][1]["require_waiting_only"] is True
             assert requests[0][1]["expected_turn_id"] == turn_id
             if lost_response:
-                assert app._queue.has_unresolved_steering
+                # W5: a response lost after commit is replayed once
+                # automatically under the same receipt; the replay succeeds,
+                # so the delivery resolves and nothing stays parked.
+                assert not app._queue.has_unresolved_steering
+                assert len(requests) == 2
+                assert requests[0] == requests[1]
                 assert not app.app_server.turn_queue.items
                 assert await _wait_until(
                     pilot, lambda: not app.app_server.turn_active, timeout=5
                 )
-                assert await app._steer_queued_now()
-                assert requests[0] == requests[1]
-                assert not app._queue.has_unresolved_steering
+                assert not await app._steer_queued_now()
                 assert (
                     len([m for m in parent.messages if m.content == "new instructions"])
                     == 1

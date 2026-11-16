@@ -401,6 +401,11 @@ async def test_check_agents_returns_agent_summaries() -> None:
         "last_run_status": None,
         "context_tokens": 12_500,
         "context_window": 200_000,
+        # W6: per-call cache-hit fields ride the summary; the counts stay
+        # None and unreported when the agent never reported cache usage.
+        "last_turn_prompt_tokens": None,
+        "last_turn_cached_tokens": None,
+        "last_turn_cached_tokens_reported": False,
         # H4a: the agent's own compaction trigger is unknown when unobserved.
         "context_threshold": None,
         "compacting": False,

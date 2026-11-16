@@ -71,7 +71,12 @@ from chartreux.core.agent_loop._session_transitions import (
     SessionTransitions,
     _PrepareScratchpad,
 )
-from chartreux.core.agent_loop._smart_approve import SmartApproveSession
+from chartreux.core.agent_loop._smart_approve import (
+    OVERRIDE_FEEDBACK_MARKER,
+    UPHOLD_FEEDBACK_MARKER,
+    UPHOLD_MARKER_GATES,
+    SmartApproveSession,
+)
 from chartreux.core.agent_loop._title_cadence import TitleCadence
 from chartreux.core.agent_loop._tool_batch_runner import (
     ToolBatchRunner,
@@ -718,6 +723,8 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
         self._smart_approve = SmartApproveSession(
             config_getter=lambda: self._config_orchestrator.config,
             authority_state=self._authority_state,
+            ledger_sink_getter=self._smart_approve_ledger_sink,
+            attribution_getter=self._smart_approve_attribution,
         )
         if not is_subagent:
             # Startup reaper at top-level session start: collect managed
@@ -1849,6 +1856,46 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
         if owner is not None:
             return owner.writer
         return getattr(self, "_accounting_sink", None)
+
+    def _smart_approve_ledger_sink(self) -> Any:
+        """W7: the durable ledger sink for classifier usage records.
+
+        SmartApproveSession tees it with its in-memory spend sink, so every
+        classifier transport attempt lands in the usage ledger.
+        """
+        owner = self.accounting_owner
+        if owner is not None:
+            return owner.writer
+        return getattr(self, "_accounting_sink", None)
+
+    def _smart_approve_attribution(self) -> UsageAttribution | None:
+        """W7: session-identity attribution for classifier usage records.
+
+        Mirrors _keepalive_attribution / the coordinator's binding: only
+        session identity is frozen here — the gateway finalizer overwrites
+        model/provider/wire_name/purpose with the classifier's resolved
+        deployment at settlement.
+        """
+        owner = self.accounting_owner
+        if owner is None:
+            return getattr(self, "_usage_attribution", None)
+        try:
+            model = self.config.get_smart_approve_model()
+        except ValueError:
+            model = self.config.get_active_model()
+        return UsageAttribution(
+            root_session_id=owner.root_session_id,
+            session_id=self.session_id,
+            parent_session_id=self.parent_session_id,
+            agent_role="subagent" if self._is_subagent else "root",
+            agent_profile=self.launch_identity,
+            content_class=self.launch_purpose,
+            run_id=self.run_identity,
+            project_key=owner.project_key,
+            model=model.alias,
+            provider=model.provider,
+            wire_name=model.name,
+        )
 
     def _build_keepalive_scheduler(self) -> KeepaliveScheduler | None:
         """Build the root-only scheduler; None when the pilot is off, this is
@@ -3294,6 +3341,11 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
         ``_should_execute_tool``; grant branches never reach it. An override
         verdict executes the call; anything else (including every fail-closed
         path) returns the original denial untouched.
+
+        W7 R3/R4: classifier-consulted upholds (and cap/classifier-error
+        outcomes) carry the uphold feedback marker so the app renders a red
+        transcript marker; decided-call replays and the level/syntax gates
+        return the original denial untouched so replays never re-render.
         """
         _ = tool, tool_call_id
         session = self._smart_approve
@@ -3311,11 +3363,18 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
             launch_intent=launch_intent,
         )
         if verdict.verdict != "override":
+            if verdict.gate in UPHOLD_MARKER_GATES:
+                base = denial.feedback or f"Tool '{tool_name}' is denied by policy"
+                return ToolDecision(
+                    verdict=ToolExecutionResponse.SKIP,
+                    approval_type=ToolPermission.NEVER,
+                    feedback=f"{base}\n{UPHOLD_FEEDBACK_MARKER} {verdict.rationale}",
+                )
             return denial
         return ToolDecision(
             verdict=ToolExecutionResponse.EXECUTE,
             approval_type=ToolPermission.ALWAYS,
-            feedback=f"SMART classifier override: {verdict.rationale}",
+            feedback=f"{OVERRIDE_FEEDBACK_MARKER} {verdict.rationale}",
         )
 
     async def _persist_project_root_grant(self, root: Path) -> str:

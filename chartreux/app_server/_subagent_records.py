@@ -361,6 +361,12 @@ class AgentRecord:
     effective_thinking: str | None = None
     context_tokens: int | None = None
     context_window: int | None = None
+    # Per-call (last LLM call) cache measurements captured from the child's
+    # stats events; reported False means the provider did not report cache
+    # fields, so the counts are unknown and the cache display stays hidden.
+    last_turn_prompt_tokens: int | None = None
+    last_turn_cached_tokens: int | None = None
+    last_turn_cached_tokens_reported: bool = False
     compacting: bool = False
     compaction_entry_id: str | None = None
     stop_reason: RunStopReason | None = None

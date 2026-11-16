@@ -23,6 +23,16 @@ each, under the hard per-adjudication budget
 ``smart_approve_prompt`` (bundled ``smart_approve_classifier.md`` by
 default); any resolution/backend failure upholds. Per-session call and
 spend caps fail closed the same way.
+
+v0.8.2 W7 telemetry: every classifier transport attempt settles a
+``purpose="smart-approve"`` usage record through a durable tee sink (the
+session ledger writer plus the in-memory spend sink), and every
+adjudication gate outcome is emitted as one structured session log line.
+Pre-transport failures (model selection, empty content, skip_if_no_key in
+``run_utility_completion``) never produce a usage record — they are
+covered by the gate-outcome log instead. Classifier rationale is model
+content and never enters the usage ledger (core/usage.py) or the log
+lines.
 """
 
 from __future__ import annotations
@@ -30,6 +40,7 @@ from __future__ import annotations
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
 import json
+import logging
 from typing import TYPE_CHECKING, Any, Protocol
 
 from pydantic import BaseModel
@@ -52,10 +63,17 @@ from chartreux.core.llm.utility_completion import (
 )
 from chartreux.core.llm_models import LLMMessage, Role
 from chartreux.core.tools.models import PermissionContext
-from chartreux.core.usage import AccountingSink, UsagePurpose, UsageRecord
+from chartreux.core.usage import (
+    AccountingSink,
+    UsageAttribution,
+    UsagePurpose,
+    UsageRecord,
+)
 
 if TYPE_CHECKING:
     from chartreux.core.config.chartreux_schema import ChartreuxConfigSchema
+
+logger = logging.getLogger(__name__)
 
 __all__ = [
     "ClassifierRequest",
@@ -68,6 +86,30 @@ __all__ = [
 
 VERDICT_OVERRIDE = "override"
 VERDICT_UPHOLD = "uphold"
+
+#: v0.8.2 W7: adjudication gate outcomes, each emitted as one structured
+#: session log line. A classifier-consulted verdict logs its own verdict
+#: ("override"/"uphold") as the gate.
+GATE_LEVEL_NOT_SMART = "level-not-smart"
+GATE_SYNTAX = "syntax"
+GATE_DECIDED_REPLAY = "decided-call-replay"
+GATE_CAP = "cap"
+GATE_CLASSIFIER_ERROR = "classifier-error"
+GATE_UNPARSEABLE = "unparseable"
+
+#: Feedback markers the UI scans for in tool-decision feedback (W7 R3).
+OVERRIDE_FEEDBACK_MARKER = "SMART classifier override:"
+UPHOLD_FEEDBACK_MARKER = "SMART classifier uphold:"
+
+#: Gates that render a red "denied by smart approve" transcript marker;
+#: the override verdict renders the green one. Level/syntax/replay gates
+#: never render (replays must not re-render, W7 R4).
+UPHOLD_MARKER_GATES = frozenset({
+    VERDICT_UPHOLD,
+    GATE_CAP,
+    GATE_CLASSIFIER_ERROR,
+    GATE_UNPARSEABLE,
+})
 
 #: Current user instruction clamp (first chars kept).
 INSTRUCTION_CLAMP_CHARS = 2000
@@ -85,10 +127,15 @@ _ELISION = "…[truncated]"
 
 @dataclass(frozen=True, slots=True)
 class ClassifierVerdict:
-    """The parsed classifier verdict; ``verdict`` is exactly override/uphold."""
+    """The parsed classifier verdict; ``verdict`` is exactly override/uphold.
+
+    ``gate`` names the adjudication gate that produced the verdict (W7);
+    a classifier-consulted verdict carries its own verdict as the gate.
+    """
 
     verdict: str
     rationale: str
+    gate: str = "classifier"
 
 
 class ClassifierRequest(Protocol):
@@ -101,6 +148,7 @@ class ClassifierRequest(Protocol):
         system_prompt: str,
         user_content: str,
         accounting_sink: AccountingSink | None,
+        usage_attribution: UsageAttribution | None,
     ) -> Awaitable[str | None]: ...
 
 
@@ -239,8 +287,16 @@ async def _model_classifier(
     system_prompt: str,
     user_content: str,
     accounting_sink: AccountingSink | None,
+    usage_attribution: UsageAttribution | None,
 ) -> str | None:
     """The real classifier call: utility seam, SMART model, thinking OFF.
+
+    W7 R1: ``usage_attribution`` is passed through so every transport
+    attempt settles a ``purpose="smart-approve"`` usage record (outcome
+    completed/failed/refused) into the sink. W7 R2: pre-transport
+    failures (model selection, empty content) raise before any backend
+    exists and settle NO record; the adjudication site fail-closes to
+    uphold and the gate-outcome log covers the attempt.
 
     Any resolution or backend error propagates to the adjudication site,
     which fail-closes to uphold and records it as ``last_classifier_error``.
@@ -253,6 +309,7 @@ async def _model_classifier(
         request_timeout_seconds=config.api_timeout,
         retry_budget_seconds=config.api_retry_max_elapsed_time,
         accounting_sink=accounting_sink,
+        usage_attribution=usage_attribution,
         purpose=UsagePurpose.SMART_APPROVE,
         model_selector=select_smart_approve_model,
     )
@@ -271,10 +328,16 @@ class SmartApproveSession:
         config_getter: Callable[[], ChartreuxConfigSchema],
         authority_state: SessionAuthorityState | None,
         classifier: ClassifierRequest | None = None,
+        ledger_sink_getter: Callable[[], AccountingSink | None] | None = None,
+        attribution_getter: Callable[[], UsageAttribution | None] | None = None,
     ) -> None:
         self._config_getter = config_getter
         self._authority_state = authority_state
         self._classifier: ClassifierRequest = classifier or _model_classifier
+        # W7 R1: the durable ledger sink (tee'd with _spend_sink) and the
+        # session-identity attribution for the classifier's usage records.
+        self._ledger_sink_getter = ledger_sink_getter
+        self._attribution_getter = attribution_getter
         self.calls = 0
         self.spend_usd = 0.0
         self.override_count = 0
@@ -298,6 +361,38 @@ class SmartApproveSession:
     async def _spend_sink(self, record: UsageRecord, /) -> None:
         if record.purpose == UsagePurpose.SMART_APPROVE:
             self.spend_usd += float(record.known_cost_usd)
+
+    async def _tee_sink(self, record: UsageRecord, /) -> None:
+        """W7 R1: the durable tee — accrue in-memory spend, then settle to
+        the ledger sink. Spend accrues first so a ledger failure never
+        masks cap accounting; the finalizer's ``_write`` contains sink
+        errors, so neither leg raises into inference control flow.
+        """
+        await self._spend_sink(record)
+        if self._ledger_sink_getter is not None:
+            ledger = self._ledger_sink_getter()
+            if ledger is not None:
+                await ledger(record)
+
+    def _log_gate(
+        self, *, gate: str, verdict: str, tool_name: str, identity: dict[str, str]
+    ) -> None:
+        """W7 R5: one structured session log line per adjudication gate.
+
+        The classifier rationale is model-generated content and stays out
+        of this line (and out of the usage ledger entirely, per
+        core/usage.py), so only content-free fields are logged.
+        """
+        logger.info(
+            "smart_approve_adjudication gate=%s verdict=%s tool=%s "
+            "decided_call=%s calls=%d spend_usd=%.6f",
+            gate,
+            verdict,
+            tool_name,
+            identity,
+            self.calls,
+            self.spend_usd,
+        )
 
     def stats_view(self, config: ChartreuxConfigSchema) -> dict[str, Any]:
         """v0.8.0 A-P3: the posture-report counters and caps for /status, /safety."""
@@ -339,34 +434,65 @@ class SmartApproveSession:
         classifier; decided-call memory replays a recorded verdict; caps fail
         closed; otherwise the classifier is consulted and its strict verdict
         (or fail-closed uphold) is recorded in the decided-call memory.
+
+        W7: every gate outcome is emitted as one structured session log
+        line, and the classifier call settles its usage record through the
+        durable tee sink with session-identity attribution.
         """
         state = self._authority_state
+        identity = DecidedCallIdentity.of(tool_name, args)
         if state is None or state.level is not SafetyLevel.SMART:
-            return ClassifierVerdict(
-                verdict=VERDICT_UPHOLD, rationale="safety level is not smart"
+            verdict = ClassifierVerdict(
+                verdict=VERDICT_UPHOLD,
+                rationale="safety level is not smart",
+                gate=GATE_LEVEL_NOT_SMART,
             )
+            self._log_gate(
+                gate=GATE_LEVEL_NOT_SMART,
+                verdict=verdict.verdict,
+                tool_name=tool_name,
+                identity=identity.encode(),
+            )
+            return verdict
         if ctx is not None and ctx.denial_kind == "syntax":
-            return ClassifierVerdict(
+            verdict = ClassifierVerdict(
                 verdict=VERDICT_UPHOLD,
                 rationale="shell-grammar refusals never reach the classifier",
+                gate=GATE_SYNTAX,
             )
-        identity = DecidedCallIdentity.of(tool_name, args)
+            self._log_gate(
+                gate=GATE_SYNTAX,
+                verdict=verdict.verdict,
+                tool_name=tool_name,
+                identity=identity.encode(),
+            )
+            return verdict
         record = state.decided_calls.lookup(identity)
         if record is not None:
-            verdict = (
-                VERDICT_OVERRIDE
-                if record.decision == VERDICT_OVERRIDE
-                else VERDICT_UPHOLD
+            verdict = ClassifierVerdict(
+                verdict=(
+                    VERDICT_OVERRIDE
+                    if record.decision == VERDICT_OVERRIDE
+                    else VERDICT_UPHOLD
+                ),
+                rationale="decided-call memory: never re-decided",
+                gate=GATE_DECIDED_REPLAY,
             )
-            return ClassifierVerdict(
-                verdict=verdict, rationale="decided-call memory: never re-decided"
+            self._log_gate(
+                gate=GATE_DECIDED_REPLAY,
+                verdict=verdict.verdict,
+                tool_name=tool_name,
+                identity=identity.encode(),
             )
+            return verdict
         max_calls, max_spend, context_chars = self._caps()
         if self.calls >= max_calls or self.spend_usd >= max_spend:
             self.last_classifier_error = (
                 "smart_approve call/spend cap reached; upholding"
             )
-            verdict = ClassifierVerdict(verdict=VERDICT_UPHOLD, rationale="cap reached")
+            verdict = ClassifierVerdict(
+                verdict=VERDICT_UPHOLD, rationale="cap reached", gate=GATE_CAP
+            )
         else:
             self.calls += 1
             config = self._config_getter()
@@ -392,12 +518,19 @@ class SmartApproveSession:
                     config=config,
                     system_prompt=system_prompt,
                     user_content=user_content,
-                    accounting_sink=self._spend_sink,
+                    accounting_sink=self._tee_sink,
+                    usage_attribution=(
+                        self._attribution_getter()
+                        if self._attribution_getter is not None
+                        else None
+                    ),
                 )
             except Exception as error:
                 self.last_classifier_error = f"{type(error).__name__}: {error}"
                 verdict = ClassifierVerdict(
-                    verdict=VERDICT_UPHOLD, rationale="classifier call failed"
+                    verdict=VERDICT_UPHOLD,
+                    rationale="classifier call failed",
+                    gate=GATE_CLASSIFIER_ERROR,
                 )
             else:
                 parsed = parse_classifier_verdict(response)
@@ -406,10 +539,22 @@ class SmartApproveSession:
                         "unparseable or refused classifier response; upholding"
                     )
                     verdict = ClassifierVerdict(
-                        verdict=VERDICT_UPHOLD, rationale="unparseable response"
+                        verdict=VERDICT_UPHOLD,
+                        rationale="unparseable response",
+                        gate=GATE_UNPARSEABLE,
                     )
                 else:
-                    verdict = parsed
+                    verdict = ClassifierVerdict(
+                        verdict=parsed.verdict,
+                        rationale=parsed.rationale,
+                        gate=parsed.verdict,
+                    )
+        self._log_gate(
+            gate=verdict.gate,
+            verdict=verdict.verdict,
+            tool_name=tool_name,
+            identity=identity.encode(),
+        )
         state.record_decided_call(
             identity, decision=verdict.verdict, actor=AuthorityActor.CLASSIFIER.value
         )

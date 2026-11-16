@@ -1,14 +1,14 @@
 """v0.8.0 A-P1 chunk 2: the ``/safety`` command surface, the startup-flag
-rejection, and the DANGEROUS ceremony screens/banner.
+rejection, and the DANGEROUS direct transition/banner (v0.8.2 W2 removed the
+typed-phrase/confirmation ceremony screens).
 """
 
 from __future__ import annotations
 
-import asyncio
+from pathlib import Path
 
 import pytest
-from textual.app import App
-from textual.widgets import Button, Input, Static
+from textual.screen import ModalScreen
 
 from chartreux.app_server._model import validate_wire
 from chartreux.app_server.protocol import (
@@ -19,12 +19,10 @@ from chartreux.app_server.protocol import (
 )
 from chartreux.cli.commands import CommandRegistry
 import chartreux.cli.entrypoint as entrypoint
-from chartreux.cli.textual_ui.screens.safety_dangerous import (
-    DANGEROUS_PHRASE,
-    DangerousBanner,
-    DangerousConfirmScreen,
-    DangerousWarningScreen,
-)
+from chartreux.cli.textual_ui.screens import safety_dangerous
+from chartreux.cli.textual_ui.screens.safety_dangerous import DangerousBanner
+from chartreux.core.config.models import SessionLoggingConfig
+from tests.conftest import build_test_chartreux_app, build_test_vibe_config
 
 
 class TestSafetyCommandRegistration:
@@ -74,7 +72,7 @@ class TestDangerousStartupRejection:
         with pytest.raises(SystemExit) as exc_info:
             entrypoint._reject_dangerous_startup_enablement(argv)
         assert exc_info.value.code == 1
-        assert "interactive ceremony" in capsys.readouterr().err
+        assert "`/safety dangerous`" in capsys.readouterr().err
 
     @pytest.mark.parametrize("var", sorted(entrypoint._DANGEROUS_STARTUP_ENV_VARS))
     def test_dangerous_env_var_exits_1(
@@ -131,107 +129,87 @@ class TestSafetyWireModels:
         )
 
 
-class _ScreenApp(App[None]):
-    """Minimal host so a modal screen can be pushed under run_test."""
+class TestCeremonyRemoval:
+    """v0.8.2 W2: the typed-phrase/confirmation modal screens are gone."""
+
+    def test_modal_screens_and_phrase_are_gone(self) -> None:
+        assert not hasattr(safety_dangerous, "DangerousWarningScreen")
+        assert not hasattr(safety_dangerous, "DangerousConfirmScreen")
+        assert not hasattr(safety_dangerous, "DANGEROUS_PHRASE")
+        assert not hasattr(safety_dangerous, "WARNING_TEXT")
+
+    def test_modal_screens_are_not_importable(self) -> None:
+        with pytest.raises(ImportError):
+            from chartreux.cli.textual_ui.screens.safety_dangerous import (
+                DangerousConfirmScreen,  # type: ignore[reportAttributeAccessIssue] # noqa: F401
+            )
+        with pytest.raises(ImportError):
+            from chartreux.cli.textual_ui.screens.safety_dangerous import (
+                DangerousWarningScreen,  # type: ignore[reportAttributeAccessIssue] # noqa: F401
+            )
 
 
-def _push(app: _ScreenApp, screen) -> tuple[asyncio.Event, dict[str, object]]:
-    """Push a modal screen and return (done-event, result-holder)."""
-    done = asyncio.Event()
-    holder: dict[str, object] = {}
-
-    def _cb(result: object) -> None:
-        holder["result"] = result
-        done.set()
-
-    app.push_screen(screen, _cb)
-    return done, holder
-
-
-@pytest.mark.asyncio
-async def test_warning_screen_rejects_wrong_phrase_and_escape_then_accepts_phrase() -> (
-    None
-):
-    app = _ScreenApp()
-    async with app.run_test(size=(80, 24)) as pilot:
-        done, holder = _push(app, DangerousWarningScreen())
-        await pilot.pause()
-        screen = app.screen
-        assert isinstance(screen, DangerousWarningScreen)
-        phrase_input = screen.query_one("#dangerous-phrase", Input)
-        error = screen.query_one("#dangerous-warning-error", Static)
-
-        phrase_input.value = "not the phrase"
-        phrase_input.focus()
-        await pilot.pause()
-        await pilot.press("enter")
-        await pilot.pause()
-        assert not done.is_set()
-        assert "does not match" in str(error.render())
-
-        # Escape is a priority no-op: the screen stays open.
-        await pilot.press("escape")
-        await pilot.pause()
-        assert not done.is_set()
-        assert app.screen is screen
-
-        phrase_input.value = DANGEROUS_PHRASE
-        await pilot.press("enter")
-        await asyncio.wait_for(done.wait(), 5)
-        assert holder["result"] == "phrase_ok"
+def _dangerous_capable_config(tmp_path: Path):
+    """Test config with a writable session audit sink (server-side gate for
+    entering DANGEROUS fails closed without one).
+    """
+    return build_test_vibe_config(
+        session_logging=SessionLoggingConfig(enabled=True, save_dir=str(tmp_path))
+    )
 
 
 @pytest.mark.asyncio
-async def test_warning_screen_phrase_match_is_exact() -> None:
-    app = _ScreenApp()
-    async with app.run_test(size=(80, 24)) as pilot:
-        done, holder = _push(app, DangerousWarningScreen())
+async def test_safety_command_dangerous_transitions_directly(tmp_path: Path) -> None:
+    """``/safety dangerous`` reaches DANGEROUS with no modal on the stack."""
+    app = build_test_chartreux_app(config=_dangerous_capable_config(tmp_path))
+    async with app.run_test(size=(100, 30)) as pilot:
+        await app._session_ready.wait()
+        await app.app_server.resources.runtime.wait_until_ready()
         await pilot.pause()
-        screen = app.screen
-        assert isinstance(screen, DangerousWarningScreen)
-        phrase_input = screen.query_one("#dangerous-phrase", Input)
-        phrase_input.focus()
+        assert await app.app_server.safety_level() == "safe"
+        await app._safety_command("dangerous")
         await pilot.pause()
-        phrase_input.value = DANGEROUS_PHRASE.lower()
-        await pilot.press("enter")
-        await pilot.pause()
-        assert not done.is_set()
-        # Cancel the ceremony so the screen settles.
-        screen.dismiss(None)
-        await asyncio.wait_for(done.wait(), 5)
-        assert holder["result"] is None
+        assert await app.app_server.safety_level() == "dangerous"
+        # Direct transition: no ceremony modal was pushed.
+        assert not isinstance(app.screen, ModalScreen)
+        assert len(app.screen_stack) == 1
+        # Banner and tint mounted.
+        assert app.query("#dangerous-banner")
+        assert app.query_one("#input-container").has_class("safety-dangerous")
 
 
 @pytest.mark.asyncio
-async def test_confirm_screen_buttons_and_escape() -> None:
-    app = _ScreenApp()
-    async with app.run_test(size=(80, 24)) as pilot:
-        done, holder = _push(app, DangerousConfirmScreen())
+async def test_idle_shift_tab_cycle_reaches_dangerous_directly(tmp_path: Path) -> None:
+    """Pin: idle Shift+Tab cycling into dangerous opens no modal."""
+    app = build_test_chartreux_app(config=_dangerous_capable_config(tmp_path))
+    async with app.run_test(size=(100, 30)) as pilot:
+        await app._session_ready.wait()
+        await app.app_server.resources.runtime.wait_until_ready()
         await pilot.pause()
-        screen = app.screen
-        assert isinstance(screen, DangerousConfirmScreen)
-        await pilot.click("#dangerous-confirm-yes")
-        await asyncio.wait_for(done.wait(), 5)
-        assert holder["result"] is True
+        await app._cycle_safety_target("dangerous")
+        await pilot.pause()
+        assert await app.app_server.safety_level() == "dangerous"
+        assert not isinstance(app.screen, ModalScreen)
+        assert len(app.screen_stack) == 1
+        assert app.query("#dangerous-banner")
 
-    app = _ScreenApp()
-    async with app.run_test(size=(80, 24)) as pilot:
-        done, holder = _push(app, DangerousConfirmScreen())
-        await pilot.pause()
-        await pilot.click("#dangerous-confirm-no")
-        await asyncio.wait_for(done.wait(), 5)
-        assert holder["result"] is False
 
-    app = _ScreenApp()
-    async with app.run_test(size=(80, 24)) as pilot:
-        done, holder = _push(app, DangerousConfirmScreen())
+@pytest.mark.asyncio
+async def test_dangerous_transition_remains_idle_only(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The idle-only gate survives the ceremony removal on both entry paths."""
+    app = build_test_chartreux_app(config=_dangerous_capable_config(tmp_path))
+    async with app.run_test(size=(100, 30)) as pilot:
+        await app._session_ready.wait()
+        await app.app_server.resources.runtime.wait_until_ready()
         await pilot.pause()
-        screen = app.screen
-        assert isinstance(screen, DangerousConfirmScreen)
-        assert screen.query_one("#dangerous-confirm-yes", Button)
-        await pilot.press("escape")
-        await asyncio.wait_for(done.wait(), 5)
-        assert holder["result"] is False
+        monkeypatch.setattr(app, "_agent_job_active", lambda: True)
+        await app._safety_command("dangerous")
+        await app._cycle_safety_target("dangerous")
+        await pilot.pause()
+        assert await app.app_server.safety_level() == "safe"
+        assert not app.query("#dangerous-banner")
 
 
 def test_dangerous_banner_is_non_dismissible_marker() -> None:

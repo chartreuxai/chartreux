@@ -335,6 +335,56 @@ def test_spend_settings_help_describes_live_global_cost(segment):
     assert "Requires" not in description and "currently" not in description
 
 
+def _reported_cache_state(state, *, prompt=200_000, cached=84_000):
+    return replace(
+        state,
+        last_turn_prompt_tokens=prompt,
+        last_turn_cached_tokens=cached,
+        last_turn_cached_tokens_reported=True,
+    )
+
+
+def test_cache_segment_renders_per_call_ratio_next_to_context(state):
+    snapshot = _reported_cache_state(state)
+    config = StatusLineConfigView(segments=["directory", "context", "cache"])
+    assert format_segment("cache", snapshot, config) == "cache 42% (last call)"
+    assert (
+        format_status_line(snapshot, config, 200)
+        == "workspace | 135k/400k (34%) | cache 42% (last call)"
+    )
+
+
+@pytest.mark.parametrize("ascii_chrome", [False, True])
+def test_cache_segment_hidden_when_provider_unreported(state, ascii_chrome):
+    snapshot = replace(state, ascii_chrome=ascii_chrome)
+    config = StatusLineConfigView(segments=["directory", "context", "cache"])
+    # The segment renders empty and is dropped whole from the joined row.
+    assert format_segment("cache", snapshot, config) == ""
+    assert format_status_line(snapshot, config, 200) == "workspace | 135k/400k (34%)"
+    # A reported zero cached count is a real 0%, not hidden.
+    zero = _reported_cache_state(state, cached=0)
+    assert format_segment(
+        "cache", replace(zero, ascii_chrome=ascii_chrome), config
+    ) == ("cache 0% (last call)")
+
+
+def test_cache_segment_drops_first_under_width_pressure(state):
+    snapshot = _reported_cache_state(state)
+    config = StatusLineConfigView(segments=["directory", "context", "model", "cache"])
+    full = "workspace | 135k/400k (34%) | Provider/model | cache 42% (last call)"
+    assert format_status_line(snapshot, config, cell_len(full)) == full
+    # Optional segments drop from the end under width pressure: cache, as the
+    # last optional segment, drops before model.
+    without_cache = "workspace | 135k/400k (34%) | Provider/model"
+    assert (
+        format_status_line(snapshot, config, cell_len(without_cache)) == without_cache
+    )
+    required_only = "workspace | 135k/400k (34%)"
+    assert (
+        format_status_line(snapshot, config, cell_len(required_only)) == required_only
+    )
+
+
 @pytest.mark.parametrize("count", [0, 2])
 @pytest.mark.parametrize("ascii_chrome", [False, True])
 def test_jobs_opt_in(state, count, ascii_chrome):

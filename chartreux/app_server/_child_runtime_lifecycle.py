@@ -327,6 +327,9 @@ class ChildRuntimeAssembler:
             before = (
                 record.context_tokens,
                 record.context_window,
+                record.last_turn_prompt_tokens,
+                record.last_turn_cached_tokens,
+                record.last_turn_cached_tokens_reported,
                 record.compacting,
                 record.stop_reason,
             )
@@ -337,6 +340,11 @@ class ChildRuntimeAssembler:
                     else None
                 )
                 record.context_window = params.context_window
+                record.last_turn_prompt_tokens = params.stats.last_turn_prompt_tokens
+                record.last_turn_cached_tokens = params.stats.last_turn_cached_tokens
+                record.last_turn_cached_tokens_reported = (
+                    params.stats.last_turn_cached_tokens_reported
+                )
             elif isinstance(params, HistoryEntryAddedParams):
                 entry = params.entry
                 if (
@@ -383,6 +391,9 @@ class ChildRuntimeAssembler:
             after = (
                 record.context_tokens,
                 record.context_window,
+                record.last_turn_prompt_tokens,
+                record.last_turn_cached_tokens,
+                record.last_turn_cached_tokens_reported,
                 record.compacting,
                 record.stop_reason,
             )

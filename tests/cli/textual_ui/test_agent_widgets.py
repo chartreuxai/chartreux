@@ -20,6 +20,7 @@ from chartreux.app_server.protocol import (
 )
 from chartreux.cli.textual_ui.widgets.agent_bar import (
     AgentBar,
+    _cache_text,
     agent_group,
     agent_is_active,
     agent_state,
@@ -1965,3 +1966,40 @@ async def test_row_without_a_usable_threshold_renders_an_unknown_denominator() -
             assert (
                 _agent("garbage", context_threshold=malformed).context_threshold is None
             )
+
+
+@pytest.mark.asyncio
+async def test_subagent_rows_render_per_call_cache_hit_only_when_reported() -> None:
+    """W6: subagent surfaces carry the same per-call cache fields as the root.
+
+    A reported provider renders ``cache 42% (last call)`` in the row details
+    and the full metadata; an unreported one renders nothing at all, never a
+    claimed 0%.
+    """
+    app = _BrowserApp()
+    async with app.run_test():
+        reported = _agent(
+            "cached-1",
+            context_tokens=210_000,
+            context_threshold=400_000,
+            last_turn_prompt_tokens=200_000,
+            last_turn_cached_tokens=84_000,
+            last_turn_cached_tokens_reported=True,
+        )
+        assert _cache_text(reported) == "cache 42% (last call)"
+        detail = app.bar._agent_details(reported)
+        assert "cache 42% (last call)" in detail
+        metadata = app.bar.full_metadata(reported)
+        assert "Last-call cache hit: cache 42% (last call)" in metadata
+
+        unreported = _agent(
+            "plain-1",
+            context_tokens=210_000,
+            context_threshold=400_000,
+            last_turn_prompt_tokens=200_000,
+            last_turn_cached_tokens=0,
+            last_turn_cached_tokens_reported=False,
+        )
+        assert _cache_text(unreported) is None
+        assert "cache" not in app.bar._agent_details(unreported)
+        assert "Last-call cache hit" not in app.bar.full_metadata(unreported)

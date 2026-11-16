@@ -177,7 +177,12 @@ class _SnapshottingClient:
             committed_model=self._committed,
             state=SimpleNamespace(session=SimpleNamespace(model=None)),
             runtime=SimpleNamespace(
-                stats=SimpleNamespace(context_tokens=self._context_tokens),
+                stats=SimpleNamespace(
+                    context_tokens=self._context_tokens,
+                    last_turn_prompt_tokens=None,
+                    last_turn_cached_tokens=None,
+                    last_turn_cached_tokens_reported=False,
+                ),
                 context_window=32_000,
                 config=config,
             ),

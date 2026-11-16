@@ -46,6 +46,7 @@ from chartreux.app_server._utils import (
     public_error,
 )
 from chartreux.app_server.models import (
+    AgentStatsSnapshot,
     BlockedEffectState,
     CallbackOutput,
     EffectDetail,
@@ -1653,7 +1654,7 @@ class TurnController:  # noqa: PLR0904
         error: PublicError | None = None
         stop_reason: PublicTurnStopReason | None = None
         try:
-            last_context_tokens = await self._announce_turn_started(turn)
+            last_stats_snapshot = await self._announce_turn_started(turn)
             await self._inject_queued_contexts(queued_contexts)
             if manual_shell is not None and not manual_shell_committed:
                 # Item 5 B.2: a manual `!` command's record IS the user message.
@@ -1727,9 +1728,13 @@ class TurnController:  # noqa: PLR0904
                             else PublicTurnStopReason.LIMIT
                         )
                     await self._project_events([event])
-                    context_tokens = self._agent_loop.stats.context_tokens
-                    if context_tokens != last_context_tokens:
-                        last_context_tokens = context_tokens
+                    # W3: dedupe on the full projected stats snapshot, not just
+                    # context_tokens — cached-token and tool-call fields then
+                    # surface mid-turn too, and the emit count stays bounded by
+                    # the number of actual snapshot changes (never per chunk).
+                    stats_snapshot = project_stats(self._agent_loop)
+                    if stats_snapshot != last_stats_snapshot:
+                        last_stats_snapshot = stats_snapshot
                         await self._emit_stats()
                     if isinstance(event, UserMessageEvent) and (
                         loop_id := self._scheduled_loop_id
@@ -1778,7 +1783,7 @@ class TurnController:  # noqa: PLR0904
                 ),
             )
 
-    async def _announce_turn_started(self, turn: PublicTurn) -> int:
+    async def _announce_turn_started(self, turn: PublicTurn) -> AgentStatsSnapshot:
         await self._notify(
             "turn/started",
             TurnStartedParams(
@@ -1787,7 +1792,7 @@ class TurnController:  # noqa: PLR0904
         )
         await self._emit_status("running")
         await self._emit_stats()
-        return self._agent_loop.stats.context_tokens
+        return project_stats(self._agent_loop)
 
     async def _emit_scheduled_loop_notice(self, loop_id: str) -> None:
         projector = self._projector
