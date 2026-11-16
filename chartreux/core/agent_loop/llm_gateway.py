@@ -10,7 +10,7 @@ from http import HTTPStatus
 from itertools import count
 import threading
 import time
-from typing import ClassVar, Literal, Protocol
+from typing import Any, ClassVar, Literal, Protocol
 from uuid import uuid4
 
 from chartreux.core.agent_loop._transcript_integrity import (
@@ -1434,3 +1434,67 @@ def _is_non_retryable_error(error: BaseException) -> bool:
         seen.add(id(current))
         current = current.__cause__
     return False
+
+
+class GatewayPingTransport:
+    """The production ``PingTransport``: the gateway's non-streaming
+    ``complete()`` with ``purpose=KEEPALIVE`` and ``account_conversation=False``
+    (v0.8.0 C2 wiring, design item 3).
+
+    The request re-sends the snapshot's frozen prefix plus one minimal ping
+    message on the loop's CURRENT deployment/provider, offering NO tools. The
+    non-streaming path has no transcript sink, so the ping response can never
+    be appended; the scheduler drops it after ``observe_ping_usage`` and its
+    tool calls are never executed. The strict keepalive sink requirement
+    (``KeepaliveSinkRequiredError``) is enforced by the gateway's finalizer,
+    independent of this adapter.
+    """
+
+    def __init__(
+        self,
+        *,
+        gateway: LLMGateway,
+        backend_getter: Callable[[], BackendLike],
+        stats_getter: Callable[[], AgentStats],
+        sink_getter: Callable[[], AccountingSink | None],
+        attribution_getter: Callable[[], UsageAttribution | None],
+        model_getter: Callable[[], ModelConfig],
+        provider_getter: Callable[[], Any],
+        retry_budget_getter: Callable[[], RequestRetryBudget | None],
+    ) -> None:
+        self._gateway = gateway
+        self._backend_getter = backend_getter
+        self._stats_getter = stats_getter
+        self._sink_getter = sink_getter
+        self._attribution_getter = attribution_getter
+        self._model_getter = model_getter
+        self._provider_getter = provider_getter
+        self._retry_budget_getter = retry_budget_getter
+
+    async def __call__(self, ping: Any, /) -> LLMChunk:
+        from chartreux.core.agent_loop._keepalive import ping_messages
+
+        model = self._model_getter()
+        provider = self._provider_getter()
+        inputs = CompletionInputs(
+            model=model,
+            provider_name=provider.name,
+            emits_finish_reason=provider.emits_finish_reason,
+            messages=ping_messages(ping.snapshot),
+            tools=None,
+            tool_choice=None,
+            extra_headers={},
+            metadata={},
+            max_tokens=ping.snapshot.ping_settings.max_tokens,
+            account_conversation=False,
+            purpose=UsagePurpose.KEEPALIVE,
+        )
+        resources = CallResources(
+            backend=self._backend_getter(),
+            stats=self._stats_getter(),
+            process_message=lambda message: message,
+            accounting_sink=self._sink_getter(),
+            usage_attribution=self._attribution_getter(),
+            retry_budget=self._retry_budget_getter(),
+        )
+        return await self._gateway.complete(inputs, resources)

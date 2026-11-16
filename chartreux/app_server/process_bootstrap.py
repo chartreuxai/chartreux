@@ -54,16 +54,6 @@ ids and the closed per-direction dispatch tables. A pair that does not share a
 version rejects at the ready frame instead of misreading frames.
 """
 
-AGENT_WIRE_CAPABILITY_PLAN_HANDOFF_ROTATION = "plan-handoff-rotation"
-"""Additive agent-wire capability announced in the ready frame.
-
-A child that announces it runs the reconfigure plan-handoff long operation
-that rotates the session, so the coordinator may adopt the rotated identity
-and fence the superseded one (the ``session/fenced`` contract). A peer that
-does not announce it is a version skew, answered typed with a restart
-instruction instead of a silent fallback.
-"""
-
 AGENT_WIRE_CAPABILITY_RECOVERY_EVIDENCE = "recovery-evidence"
 """Additive agent-wire capability announced in the ready frame.
 
@@ -118,7 +108,6 @@ rather than silently downgraded to the static inherited policy (F11).
 """
 
 ADVERTISED_CAPABILITIES = frozenset({
-    AGENT_WIRE_CAPABILITY_PLAN_HANDOFF_ROTATION,
     AGENT_WIRE_CAPABILITY_RECOVERY_EVIDENCE,
     AGENT_WIRE_CAPABILITY_LIVE_AGENT_INVENTORY,
     AGENT_WIRE_CAPABILITY_ROOT_AGENTS_UPDATE,

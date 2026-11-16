@@ -63,11 +63,6 @@ from chartreux.app_server.protocol import (
     SessionListResponse,
     SessionLogReadParams,
     SessionLogReadResponse,
-    SessionPlanHandoffParams,
-    SessionPlanHandoffResponse,
-    SessionPlanRecord,
-    SessionPlanRecordWriteParams,
-    SessionPlanRecordWriteResponse,
     SessionReadParams,
     SessionReadResponse,
     SessionRelocateParams,
@@ -77,6 +72,10 @@ from chartreux.app_server.protocol import (
     SessionRewindReadParams,
     SessionRewindReadResponse,
     SessionRewindResponse,
+    SessionSafetyReadParams,
+    SessionSafetyReadResponse,
+    SessionSafetyTransitionParams,
+    SessionSafetyTransitionResponse,
     SessionSettingsUpdateParams,
     SessionShellCommandParams,
     SessionShellCommandResponse,
@@ -170,7 +169,7 @@ class ShellResource:
         return True
 
 
-class SessionResource:  # noqa: PLR0904 - resource facade over the session RPC surface
+class SessionResource:  # noqa: PLR0904 - one accessor per wire surface
     def __init__(
         self, connection: AppServerResourceConnection, state: ClientSessionState
     ) -> None:
@@ -184,6 +183,21 @@ class SessionResource:  # noqa: PLR0904 - resource facade over the session RPC s
     @property
     def state(self) -> PublicSessionState:
         return self._state.state
+
+    @property
+    def plan_mode_present(self) -> bool:
+        """Whether the resumed session's raw metadata carried a ``plan_mode`` key."""
+        return self._state.plan_mode_present
+
+    async def legacy_plan_mode_path(self) -> str | None:
+        """The plan document path a legacy ``plan_mode`` metadata key records.
+
+        The server reads it from the RAW metadata dict at the loader choke
+        point and carries it on the session-log summary; ``None`` when the
+        session was never planned or the log is not persisted.
+        """
+        log = await self.read_log()
+        return log.legacy_plan_path
 
     @property
     def history(self) -> list[PublicHistoryEntry]:
@@ -260,34 +274,6 @@ class SessionResource:  # noqa: PLR0904 - resource facade over the session RPC s
         self._state.session_log = response.log
         return response.log
 
-    @property
-    def resumed_plan_record(self) -> SessionPlanRecord | None:
-        """The plan mode the adopted session was resumed with, if any."""
-        return self._state.plan_record
-
-    async def write_plan_record(
-        self, record: SessionPlanRecord | None
-    ) -> SessionPlanRecord | None:
-        """Persist the plan mode; a null record removes it.
-
-        Returns the record as READ BACK by the server, which is None when
-        nothing was stored (session logging disabled).
-        """
-        client = await self._connection.connect()
-        response = validate_wire(
-            SessionPlanRecordWriteResponse,
-            await client.request(
-                "session/plan/record/write",
-                SessionPlanRecordWriteParams(
-                    session_id=self._state.session_id, record=record
-                ),
-            ),
-        )
-        return response.record
-
-    async def clear_plan_record(self) -> SessionPlanRecord | None:
-        return await self.write_plan_record(None)
-
     async def resume(
         self, session_id: str, *, on_adopt: Callable[[], None] | None = None
     ) -> None:
@@ -298,7 +284,7 @@ class SessionResource:  # noqa: PLR0904 - resource facade over the session RPC s
             nonlocal adopted
             response = validate_wire(SessionResumeResponse, raw_response)
             self._state.projection = ClientProjection(response.state)
-            self._state.plan_record = response.plan_record
+            self._state.plan_mode_present = response.plan_mode_present
             self._state.reset_usage_baseline()
             self._connection.mark_session_attached()
             if on_adopt is not None:
@@ -444,21 +430,6 @@ class SessionResource:  # noqa: PLR0904 - resource facade over the session RPC s
         self._state.session_log = response.session_log
         self._connection.mark_session_attached()
 
-    async def plan_handoff(
-        self, params: SessionPlanHandoffParams
-    ) -> SessionPlanHandoffResponse:
-        """Start the consented executor session; publishes the replaced state."""
-        client = await self._connection.connect()
-        response = validate_wire(
-            SessionPlanHandoffResponse,
-            await client.request("session/plan/handoff", params),
-        )
-        self._state.projection.replace_state(response.state)
-        self._state.reset_usage_baseline()
-        self._state.session_log = response.session_log
-        self._connection.mark_session_attached()
-        return response
-
     async def compact(self, extra_instructions: str = "") -> str:
         client = await self._connection.connect()
         try:
@@ -478,6 +449,29 @@ class SessionResource:  # noqa: PLR0904 - resource facade over the session RPC s
         self._state.session_log = response.session_log
         self._connection.mark_session_attached()
         return response.summary
+
+    async def safety_read(self) -> str:
+        """The session's current SafetyLevel value (v0.8.0 A-P1)."""
+        client = await self._connection.connect()
+        response = validate_wire(
+            SessionSafetyReadResponse,
+            await client.request(
+                "session/safety/read",
+                SessionSafetyReadParams(session_id=self._state.session_id),
+            ),
+        )
+        return response.level
+
+    async def safety_transition(self, to: str) -> SessionSafetyTransitionResponse:
+        """Request one authority-level transition (v0.8.0 A-P1 ceremony floor)."""
+        client = await self._connection.connect()
+        return validate_wire(
+            SessionSafetyTransitionResponse,
+            await client.request(
+                "session/safety/transition",
+                SessionSafetyTransitionParams(session_id=self._state.session_id, to=to),
+            ),
+        )
 
     def _adopt_compaction_failure_state(self, exc: AppServerResponseError) -> None:
         """Adopt the state a failed compaction still published.

@@ -37,7 +37,6 @@ from chartreux.app_server.models import (
 )
 from chartreux.app_server.process_bootstrap import (
     AGENT_WIRE_CAPABILITY_LIVE_AGENT_INVENTORY,
-    AGENT_WIRE_CAPABILITY_PLAN_HANDOFF_ROTATION,
     AGENT_WIRE_CAPABILITY_RECOVERY_EVIDENCE,
     AGENT_WIRE_CAPABILITY_ROOT_RUN_COMPLETIONS,
 )
@@ -48,7 +47,6 @@ from chartreux.app_server.protocol import (
     ContextInjectParams,
     ProtocolErrorCode,
     RuntimeSnapshot,
-    SessionPlanHandoffParams,
     TurnSteerParams,
 )
 from chartreux.app_server.transport import TRANSPORT_ENV_VAR
@@ -189,24 +187,27 @@ AGENT_DEFERRED_SESSION_METHODS = frozenset({
 # Op 10 mode group: one reconfigure request carries ONE invocation mode. The
 # short modes -- a settings apply-and-ack and the /clear history reset -- answer
 # once their steps land and are refused typed while a long operation holds the
-# agent's fence. The plan handoff and the config write run as long operations:
-# the handoff's receipt carries the fence outcome and what it adopted, and the
-# config write's receipt carries the SHIPPED transaction result verbatim.
+# agent's fence. The config write runs as a long operation: its receipt carries
+# the SHIPPED transaction result verbatim.
 AGENT_SESSION_RECONFIGURE_METHOD = "agent/session/reconfigure"
 
 # The session resources the agent's own config and loop answer: the stored
-# session list, one config reload transaction, the durable plan record, and the
-# policy read. Each is computed where the state lives, so the coordinator never
-# reconstructs a session view from a copy it does not own.
+# session list, one config reload transaction, the legacy plan-mode presence
+# flag, and the policy read. Each is computed where the state lives, so the
+# coordinator never reconstructs a session view from a copy it does not own.
 AGENT_SESSION_LIST_METHOD = "agent/session/list"
 AGENT_SESSION_CONFIG_RELOAD_METHOD = "agent/session/config/reload"
-AGENT_SESSION_PLAN_RECORD_READ_METHOD = "agent/session/plan/record/read"
-AGENT_SESSION_PLAN_RECORD_WRITE_METHOD = "agent/session/plan/record/write"
+AGENT_SESSION_PLAN_MODE_PRESENT_METHOD = "agent/session/plan_mode/present"
 AGENT_SESSION_POLICY_READ_METHOD = "agent/session/policy/read"
 # The authorized-roots view and its grant save: both are composed from the
 # agent's own orchestrator and layers, so the process that holds them answers.
 AGENT_SESSION_ROOTS_READ_METHOD = "agent/session/roots/read"
 AGENT_SESSION_ROOTS_SAVE_METHOD = "agent/session/roots/save"
+# v0.8.0 A-P1: the session safety level. The read reports the loop's current
+# SafetyLevel; the transition is gated agent-side (idle-only, audit sink, no
+# active background jobs on revoke) because the loop lives in this process.
+AGENT_SESSION_SAFETY_READ_METHOD = "agent/session/safety/read"
+AGENT_SESSION_SAFETY_TRANSITION_METHOD = "agent/session/safety/transition"
 
 # Prompt preparation. It reads the live model, the session's working directory
 # and its session directory, and it writes attachment snapshots, so the fs
@@ -587,8 +588,7 @@ AGENT_MCP_CATALOG_PUBLIC_METHODS: Mapping[str, str] = {
 
 # The typed owner-key lifecycle. The coordinator mints one owner key per
 # session generation and sends it with every catalog request; release is
-# explicit on session end (replacing the GC weak-drop), and a plan-handoff
-# rotation re-keys atomically so the auth bindings survive the rotation.
+# explicit on session end (replacing the GC weak-drop).
 AGENT_MCP_OWNER_RELEASE_METHOD = "agent/mcp/owner/release"
 AGENT_MCP_OWNER_REKEY_METHOD = "agent/mcp/owner/rekey"
 
@@ -678,22 +678,17 @@ class MCPOwnerKeyReceipt(BaseModel):
 
 RECONFIGURE_MODE_SETTINGS = "settings-update"
 RECONFIGURE_MODE_HISTORY_CLEAR = "history-clear"
-RECONFIGURE_MODE_PLAN_HANDOFF = "plan-handoff"
 RECONFIGURE_MODE_CONFIG_WRITE = "config-write"
 RECONFIGURE_MODES = frozenset({
     RECONFIGURE_MODE_SETTINGS,
     RECONFIGURE_MODE_HISTORY_CLEAR,
-    RECONFIGURE_MODE_PLAN_HANDOFF,
     RECONFIGURE_MODE_CONFIG_WRITE,
 })
 RECONFIGURE_SHORT_MODES = frozenset({
     RECONFIGURE_MODE_SETTINGS,
     RECONFIGURE_MODE_HISTORY_CLEAR,
 })
-RECONFIGURE_LONG_MODES = frozenset({
-    RECONFIGURE_MODE_PLAN_HANDOFF,
-    RECONFIGURE_MODE_CONFIG_WRITE,
-})
+RECONFIGURE_LONG_MODES = frozenset({RECONFIGURE_MODE_CONFIG_WRITE})
 
 # The reply classes the agent mints. A clear that completed its steps and then
 # could not finish a follow-up stage is its own class: the history IS cleared,
@@ -702,12 +697,10 @@ RECONFIGURE_LONG_MODES = frozenset({
 RECONFIGURE_OUTCOME_APPLIED = "applied"
 RECONFIGURE_OUTCOME_CLEARED = "cleared"
 RECONFIGURE_OUTCOME_CLEARED_WITH_FOLLOWUP_FAILURE = "cleared-with-followup-failure"
-RECONFIGURE_OUTCOME_ACCEPTED = "accepted"
 RECONFIGURE_OUTCOMES = frozenset({
     RECONFIGURE_OUTCOME_APPLIED,
     RECONFIGURE_OUTCOME_CLEARED,
     RECONFIGURE_OUTCOME_CLEARED_WITH_FOLLOWUP_FAILURE,
-    RECONFIGURE_OUTCOME_ACCEPTED,
 })
 
 # The steps a history clear names in its receipt, in the order they run.
@@ -830,20 +823,21 @@ AGENT_RECEIVING_REQUESTS = (
         AGENT_SESSION_RENAME_METHOD,
         AGENT_SESSION_FORK_METHOD,
         AGENT_SESSION_RELOCATE_METHOD,
-        # Op 10 mode group: settings, history clear and the plan handoff answer
+        # Op 10 mode group: settings and history clear answer
         # on their own request ids, so a refused or aborted mode is still a
         # typed answer rather than an unknown method.
         AGENT_SESSION_RECONFIGURE_METHOD,
         # The session resources answered from the agent's own config and loop:
-        # the stored session list, one config reload, the durable plan record
-        # and the policy read.
+        # the stored session list, one config reload, the legacy plan-mode
+        # presence flag and the policy read.
         AGENT_SESSION_LIST_METHOD,
         AGENT_SESSION_CONFIG_RELOAD_METHOD,
-        AGENT_SESSION_PLAN_RECORD_READ_METHOD,
-        AGENT_SESSION_PLAN_RECORD_WRITE_METHOD,
+        AGENT_SESSION_PLAN_MODE_PRESENT_METHOD,
         AGENT_SESSION_POLICY_READ_METHOD,
         AGENT_SESSION_ROOTS_READ_METHOD,
         AGENT_SESSION_ROOTS_SAVE_METHOD,
+        AGENT_SESSION_SAFETY_READ_METHOD,
+        AGENT_SESSION_SAFETY_TRANSITION_METHOD,
         # Prompt preparation: answered from the agent's own loop, model,
         # cwd and session directory, because its fs reads and attachment
         # writes cross the process boundary.
@@ -1037,11 +1031,6 @@ def required_agent_capabilities(
     instead of sending a frame an older peer would misread, fall back to
     stale state, or replay.
     """
-    if (
-        method == AGENT_SESSION_RECONFIGURE_METHOD
-        and params.get("mode") == RECONFIGURE_MODE_PLAN_HANDOFF
-    ):
-        return frozenset({AGENT_WIRE_CAPABILITY_PLAN_HANDOFF_ROTATION})
     if method == AGENT_RECOVERY_EVIDENCE_METHOD:
         return frozenset({AGENT_WIRE_CAPABILITY_RECOVERY_EVIDENCE})
     if method == AGENT_AGENTS_INVENTORY_READ_METHOD:
@@ -2920,8 +2909,7 @@ class ReconfigureRequest:
 
     ``mode`` decides which members are meaningful: a settings-update carries the
     bounds to apply, a history clear carries nothing but the session it clears,
-    a plan handoff carries the consent snapshot exactly as the in-process
-    request does, and a config write carries the config-write candidate. Its
+    and a config write carries the config-write candidate. Its
     ``reload_runtime`` flag is dropped on this path: the mode IS the reload leg,
     triggered by its own request rather than by reading a flag. ``deadline``
     rides the long modes only -- a short mode has no absolute deadline to honour.
@@ -2932,7 +2920,6 @@ class ReconfigureRequest:
     deadline: float | None = None
     max_turns: int | None = None
     max_tokens: int | None = None
-    handoff: SessionPlanHandoffParams | None = None
     config_write: ConfigWriteParams | None = None
 
 
@@ -2963,8 +2950,6 @@ class ReconfigureReply:
     max_tokens: int | None = None
     snapshot: AgentSessionSnapshot | None = None
     accounting: RootOpenAccounting | None = None
-    episode_id: str | None = None
-    attempt_generation: int | None = None
     config_write: ConfigWriteResponse | None = None
 
 
@@ -2975,14 +2960,12 @@ def encode_reconfigure_request(
     deadline: float | None = None,
     max_turns: int | None = None,
     max_tokens: int | None = None,
-    handoff: SessionPlanHandoffParams | None = None,
     config_write: ConfigWriteParams | None = None,
 ) -> dict[str, Any]:
     """Encode the params of one reconfigure request.
 
-    A plan handoff carries its own session identity inside the consent snapshot,
-    so the request carries no second copy of it. A config-write candidate
-    crosses without its ``reload_runtime`` flag: this mode is the reload leg.
+    A config-write candidate crosses without its ``reload_runtime`` flag:
+    this mode is the reload leg.
     """
     params: dict[str, Any] = {"mode": mode}
     if session_id is not None:
@@ -2993,8 +2976,6 @@ def encode_reconfigure_request(
         params["max_turns"] = max_turns
     if max_tokens is not None:
         params["max_tokens"] = max_tokens
-    if handoff is not None:
-        params["handoff"] = handoff.model_dump(mode="json")
     if config_write is not None:
         candidate = config_write.model_dump(mode="json", by_alias=True)
         candidate.pop("reload_runtime", None)
@@ -3015,31 +2996,6 @@ def decode_reconfigure_request(params: Mapping[str, Any]) -> ReconfigureRequest:
     ):
         raise UnsupportedAgentRequestError(
             "the reconfigure request carries no absolute deadline"
-        )
-    if mode == RECONFIGURE_MODE_PLAN_HANDOFF:
-        # The consent snapshot is the request: its session id, the executor
-        # selection, and the verifiable document body travel together.
-        raw = params.get("handoff")
-        if not isinstance(raw, Mapping):
-            raise UnsupportedAgentRequestError(
-                "the plan-handoff reconfigure carries no consent snapshot"
-            )
-        try:
-            handoff = SessionPlanHandoffParams.model_validate(raw)
-        except ValidationError as exc:
-            raise UnsupportedAgentRequestError(
-                "the plan-handoff reconfigure carries an unusable consent "
-                f"snapshot: {exc}"
-            ) from exc
-        if deadline is None:
-            raise UnsupportedAgentRequestError(
-                "a plan handoff must carry the coordinator's absolute deadline"
-            )
-        return ReconfigureRequest(
-            mode=mode,
-            session_id=handoff.session_id,
-            deadline=float(deadline),
-            handoff=handoff,
         )
     if mode == RECONFIGURE_MODE_CONFIG_WRITE:
         # The candidate IS the request: the ops, their target and the revision
@@ -3110,8 +3066,6 @@ def encode_reconfigure_reply(reply: ReconfigureReply) -> dict[str, Any]:
             if reply.accounting is not None
             else None
         ),
-        "episode_id": reply.episode_id,
-        "attempt_generation": reply.attempt_generation,
         "config_write": (
             reply.config_write.model_dump(mode="json", by_alias=True)
             if reply.config_write is not None
@@ -3167,10 +3121,6 @@ def decode_reconfigure_reply(payload: Mapping[str, Any]) -> ReconfigureReply:
             decode_open_accounting(accounting)
             if isinstance(accounting, Mapping)
             else None
-        ),
-        episode_id=_optional_str(payload.get("episode_id")),
-        attempt_generation=_optional_int(
-            payload.get("attempt_generation"), "attempt generation"
         ),
         config_write=config_write,
     )

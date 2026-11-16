@@ -81,6 +81,7 @@ from chartreux.core.llm_models import (
 )
 from chartreux.core.log_reader import PaginatedLogs
 from chartreux.core.model_catalog.resolver import ModelResolutionError
+from chartreux.core.session.session_loader import SessionLoader, legacy_plan_mode_path
 from chartreux.core.session.transcript_archive import (
     ArchiveIntegrityError,
     verify_archived_prefix_on_disk,
@@ -480,6 +481,13 @@ def _project_mcp_servers(
 def project_session_log(agent_loop: AgentLoop) -> SessionLogSummary:
     session_logger = agent_loop.session_logger
     session_dir = session_logger.session_dir if session_logger.persisted else None
+    plan_path: str | None = None
+    if session_dir is not None:
+        try:
+            raw_metadata = SessionLoader.load_raw_metadata(session_dir)
+            plan_path = legacy_plan_mode_path(raw_metadata)
+        except Exception:
+            plan_path = None
     return SessionLogSummary(
         enabled=session_logger.enabled,
         session_id=session_logger.session_id,
@@ -487,6 +495,7 @@ def project_session_log(agent_loop: AgentLoop) -> SessionLogSummary:
         path=str(session_dir) if session_dir is not None else None,
         title=session_logger.title,
         needs_initial_auto_title=session_logger.needs_initial_auto_title(),
+        legacy_plan_path=plan_path,
     )
 
 

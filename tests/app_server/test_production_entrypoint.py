@@ -1353,61 +1353,6 @@ async def test_a_roots_replacement_is_refused_typed_and_names_the_escape(
     assert "in_process" in caught.value.error.message
 
 
-@pytest.mark.asyncio
-@pytest.mark.timeout(120)
-async def test_a_plan_record_is_written_and_read_in_the_root_agent_process(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    from chartreux.app_server import process_session_backend
-    from chartreux.app_server.protocol import SessionPlanRecord
-
-    record = SessionPlanRecord(
-        plan_path=str(tmp_path / "plan.md"),
-        planner_model="planner-model",
-        planner_thinking="high",
-        state="drafting",
-    )
-    with egress.bootstrap_directory() as guard_dir:
-        _install_stdio_environment(monkeypatch, guard_dir)
-        monkeypatch.setattr(
-            process_session_backend,
-            "root_agent_command",
-            lambda: _child_command(tmp_path),
-        )
-        backends = _record_backends(monkeypatch)
-        harness = LocalHarness(_options(tmp_path))
-        try:
-            session = await harness.start()
-            # A saved turn is what carries the session metadata file; the
-            # record write itself stays an in-memory carry until one exists.
-            await _collect_turn(session, "hello")
-            written = await session.resources.sessions.write_plan_record(record)
-            # The resume response carries this read, so it is asked of the
-            # process directly here: same wire op, without a second spawn.
-            read_back = await backends[0].process.read_plan_record()
-            await session.close()
-        finally:
-            await harness.close()
-
-        # The record is on disk where the agent wrote it, not in a coordinator
-        # copy of the session's metadata.
-        metadata_files = list((tmp_path / "sessions").rglob("meta.json"))
-        persisted = [
-            json.loads(path.read_text(encoding="utf-8")).get("plan_mode")
-            for path in metadata_files
-        ]
-
-    assert written is not None
-    assert written.plan_path == record.plan_path
-    assert read_back is not None
-    assert read_back.plan_path == record.plan_path
-    assert read_back.state == "drafting"
-    recorded = [entry for entry in persisted if entry is not None]
-    assert len(recorded) == 1
-    assert recorded[0]["plan_path"] == record.plan_path
-    assert recorded[0]["state"] == "drafting"
-
-
 def test_an_explicit_stdio_selector_outranks_the_config_escape() -> None:
     from chartreux.app_server.transport import resolve_transport_selection
 

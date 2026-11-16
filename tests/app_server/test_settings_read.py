@@ -68,8 +68,8 @@ def test_tools_inventory_intersects_filters_without_changing_other_categories(
 
 
 def test_curated_registry_is_complete_and_validated() -> None:
-    assert len(EDITABLE_SETTINGS) == len(EDITABLE_BY_PATH) == 48
-    assert len(VISIBLE_SETTINGS) == 45
+    assert len(EDITABLE_SETTINGS) == len(EDITABLE_BY_PATH) == 49
+    assert len(VISIBLE_SETTINGS) == 46
     visible = {item.path: item for item in VISIBLE_SETTINGS}
     assert visible["status_line"].control == "status_line"
     assert "status_line" not in EDITABLE_BY_PATH

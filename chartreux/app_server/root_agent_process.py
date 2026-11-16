@@ -103,14 +103,15 @@ from chartreux.app_server.agent_wire import (
     AGENT_SESSION_HISTORY_LIST_METHOD,
     AGENT_SESSION_LIST_METHOD,
     AGENT_SESSION_NOT_FOUND_ERROR,
-    AGENT_SESSION_PLAN_RECORD_READ_METHOD,
-    AGENT_SESSION_PLAN_RECORD_WRITE_METHOD,
+    AGENT_SESSION_PLAN_MODE_PRESENT_METHOD,
     AGENT_SESSION_POLICY_READ_METHOD,
     AGENT_SESSION_RECONFIGURE_METHOD,
     AGENT_SESSION_RENAME_METHOD,
     AGENT_SESSION_REPLACE_METHOD,
     AGENT_SESSION_ROOTS_READ_METHOD,
     AGENT_SESSION_ROOTS_SAVE_METHOD,
+    AGENT_SESSION_SAFETY_READ_METHOD,
+    AGENT_SESSION_SAFETY_TRANSITION_METHOD,
     AGENT_SESSION_SNAPSHOT_METHOD,
     AGENT_SHELL_INTERRUPT_METHOD,
     AGENT_SHELL_RUN_METHOD,
@@ -143,9 +144,7 @@ from chartreux.app_server.agent_wire import (
     RECONFIGURE_CONFLICT_ERROR,
     RECONFIGURE_MODE_CONFIG_WRITE,
     RECONFIGURE_MODE_HISTORY_CLEAR,
-    RECONFIGURE_MODE_PLAN_HANDOFF,
     RECONFIGURE_MODE_SETTINGS,
-    RECONFIGURE_OUTCOME_ACCEPTED,
     TURN_OUTCOME_COMPLETED,
     TURN_OUTCOME_FAILED,
     TURN_OUTCOME_INTERRUPTED,
@@ -280,10 +279,8 @@ from chartreux.app_server.protocol import (
     SessionHistoryListResponse,
     SessionListParams,
     SessionListResponse,
-    SessionPlanHandoffParams,
-    SessionPlanRecord,
-    SessionPlanRecordWriteParams,
-    SessionPlanRecordWriteResponse,
+    SessionSafetyReadResponse,
+    SessionSafetyTransitionResponse,
     SettingsReadParams,
     SettingsReadResponse,
     SkillsInstalledResponse,
@@ -418,22 +415,6 @@ _CATALOG_RESPONSES: Mapping[str, type[ProtocolModel]] = {
     "identity/read": IdentityReadResponse,
 }
 """The response type each carried catalog read is validated as on this end."""
-
-PLAN_HANDOFF_DEADLINE = 300.0
-"""The agent-side absolute deadline of one plan handoff.
-
-It is sized to the full consent transaction the agent runs -- the episode
-fence, the durable retirement and marker, the transcript reset, the selection
-install and the injection -- and the agent aborts the operation at this same
-absolute deadline, so a wedged-but-alive handoff cannot outlive it.
-"""
-
-PLAN_HANDOFF_REPLY_GRACE = 30.0
-"""How long past the handoff deadline the coordinator waits for its reply.
-
-Only a lost reply reaches the one-shot marker re-check; this grace is what lets
-an honest abort answer land first.
-"""
 
 CONFIG_WRITE_DEADLINE = 60.0
 """The agent-side absolute deadline of one config-write reconfigure (mode d).
@@ -599,8 +580,8 @@ class RootAgentReconfigureConflict(RootAgentProcessError):
     """A reconfigure mode is refused before a frame is sent, typed.
 
     Raised for the coordinator's own unresolved state (a settlement or a long
-    operation still in flight) and for a handoff whose lost reply proved
-    nothing: a reconfigure is never resent on an ambiguous outcome.
+    operation still in flight): a reconfigure is never resent on an ambiguous
+    outcome.
     """
 
 
@@ -717,8 +698,6 @@ class RootAgentProcess:  # noqa: PLR0904 - the coordinator-side port surface
         compact_reply_grace: float = COMPACT_REPLY_GRACE,
         replace_deadline: float = REPLACE_DEADLINE,
         replace_reply_grace: float = REPLACE_REPLY_GRACE,
-        handoff_deadline: float = PLAN_HANDOFF_DEADLINE,
-        handoff_reply_grace: float = PLAN_HANDOFF_REPLY_GRACE,
         config_write_deadline: float = CONFIG_WRITE_DEADLINE,
         config_write_reply_grace: float = CONFIG_WRITE_REPLY_GRACE,
     ) -> None:
@@ -730,8 +709,6 @@ class RootAgentProcess:  # noqa: PLR0904 - the coordinator-side port surface
             raise ValueError("compact_deadline must be positive")
         if replace_deadline <= 0:
             raise ValueError("replace_deadline must be positive")
-        if handoff_deadline <= 0:
-            raise ValueError("handoff_deadline must be positive")
         if config_write_deadline <= 0:
             raise ValueError("config_write_deadline must be positive")
         self._spawned = spawned
@@ -747,8 +724,6 @@ class RootAgentProcess:  # noqa: PLR0904 - the coordinator-side port surface
         self._compact_reply_grace = max(compact_reply_grace, 0.0)
         self._replace_deadline = replace_deadline
         self._replace_reply_grace = max(replace_reply_grace, 0.0)
-        self._handoff_deadline = handoff_deadline
-        self._handoff_reply_grace = max(handoff_reply_grace, 0.0)
         self._config_write_deadline = config_write_deadline
         self._config_write_reply_grace = max(config_write_reply_grace, 0.0)
         self._replace_request: str | None = None
@@ -1499,8 +1474,8 @@ class RootAgentProcess:  # noqa: PLR0904 - the coordinator-side port surface
     ) -> ReconfigureReply:
         """Apply the session bounds where the loop lives: apply and acknowledge.
 
-        The mode is short: it sets the bounds and answers, with no history reset
-        and no plan readback. It is refused typed while a long operation is in
+        The mode is short: it sets the bounds and answers, with no history reset.
+        It is refused typed while a long operation is in
         flight, because the agent's one-long-op fence would refuse it there.
         """
         self._require_short_mode_admissible("update the session settings")
@@ -1516,9 +1491,7 @@ class RootAgentProcess:  # noqa: PLR0904 - the coordinator-side port surface
         """Clear the history in the agent process.
 
         Everything the coordinator owns stays coordinator-side and runs BEFORE
-        this call: the /clear plan-episode settlement and the pin removal are
-        the TUI leg's own steps, and a refused settlement means this frame is
-        never sent.
+        this call: a refused settlement means this frame is never sent.
         """
         self._require_short_mode_admissible("clear the history")
         params = encode_reconfigure_request(
@@ -1570,48 +1543,6 @@ class RootAgentProcess:  # noqa: PLR0904 - the coordinator-side port surface
         self._adopt_reconfigure(reply)
         return reply
 
-    async def plan_handoff(self, params: SessionPlanHandoffParams) -> ReconfigureReply:
-        """Run the full consent fence in the agent process as a long operation.
-
-        The consent snapshot crosses verbatim; the agent applies exactly those
-        values or fails without starting execution. A lost reply is settled by
-        ONE marker re-check -- the operation's own TERMINAL record -- and is
-        never resent.
-        """
-        if self._closed:
-            raise RootAgentProcessError("the root agent process is closed")
-        if self._death is not None:
-            raise RootAgentExitedError(
-                self._death.reason, exit_code=self._death.exit_code
-            )
-        deadline = time.monotonic() + self._handoff_deadline
-        request = encode_reconfigure_request(
-            mode=RECONFIGURE_MODE_PLAN_HANDOFF, deadline=deadline, handoff=params
-        )
-        request_id = self._begin_request(
-            AGENT_SESSION_RECONFIGURE_METHOD,
-            request,
-            long_method=RECONFIGURE_MODE_PLAN_HANDOFF,
-        )
-        try:
-            payload = await self._await_request(
-                request_id,
-                AGENT_SESSION_RECONFIGURE_METHOD,
-                request,
-                timeout=self._handoff_deadline + self._handoff_reply_grace,
-            )
-        except TimeoutError:
-            reply = await self._settle_handoff_timeout(request_id)
-        except RootAgentRequestError as exc:
-            self._raise_reconfigure_code(exc)
-        else:
-            reply = decode_reconfigure_reply(payload)
-        # The handoff rotates the session, so the reply's payload is the state
-        # to address from now on -- including the one the re-check read, whose
-        # identity the resent-free settlement must honour just the same.
-        self._adopt_reconfigure(reply)
-        return reply
-
     async def list_sessions(self, params: SessionListParams) -> SessionListResponse:
         """List stored sessions from the config the agent's own loop holds."""
         payload = await self._request(
@@ -1630,23 +1561,13 @@ class RootAgentProcess:  # noqa: PLR0904 - the coordinator-side port surface
         )
         return ConfigMutationResponse.model_validate(payload)
 
-    async def read_plan_record(self) -> SessionPlanRecord | None:
-        """Read the durable plan mode the agent's session metadata carries."""
+    async def plan_mode_present(self) -> bool:
+        """True when the resumed session's raw metadata carried a plan_mode key."""
         payload = await self._request(
-            AGENT_SESSION_PLAN_RECORD_READ_METHOD,
+            AGENT_SESSION_PLAN_MODE_PRESENT_METHOD,
             {"session_id": self._require_session_id()},
         )
-        record = payload.get("record")
-        return None if record is None else SessionPlanRecord.model_validate(record)
-
-    async def write_plan_record(
-        self, params: SessionPlanRecordWriteParams
-    ) -> SessionPlanRecordWriteResponse:
-        """Persist (or remove) the plan mode where the transcript is written."""
-        payload = await self._request(
-            AGENT_SESSION_PLAN_RECORD_WRITE_METHOD, params.model_dump(mode="json")
-        )
-        return SessionPlanRecordWriteResponse.model_validate(payload)
+        return bool(payload.get("plan_mode_present"))
 
     async def read_policy(self, params: PolicyReadParams) -> PolicyReadResponse:
         """Read the policy revision and sources the agent's loop enforces."""
@@ -1668,6 +1589,21 @@ class RootAgentProcess:  # noqa: PLR0904 - the coordinator-side port surface
             AGENT_SESSION_ROOTS_SAVE_METHOD, params.model_dump(mode="json")
         )
         return RootsSaveResponse.model_validate(payload)
+
+    async def safety_read(self) -> SessionSafetyReadResponse:
+        """Read the session's current SafetyLevel from the agent's loop (A-P1)."""
+        payload = await self._request(
+            AGENT_SESSION_SAFETY_READ_METHOD, {"session_id": self._require_session_id()}
+        )
+        return SessionSafetyReadResponse.model_validate(payload)
+
+    async def safety_transition(self, to: str) -> SessionSafetyTransitionResponse:
+        """Request one authority-level transition in the agent process (A-P1)."""
+        payload = await self._request(
+            AGENT_SESSION_SAFETY_TRANSITION_METHOD,
+            {"session_id": self._require_session_id(), "to": to},
+        )
+        return SessionSafetyTransitionResponse.model_validate(payload)
 
     async def read_dangerous_command_authority(
         self, params: DangerousCommandAuthorityReadParams
@@ -2092,7 +2028,7 @@ class RootAgentProcess:  # noqa: PLR0904 - the coordinator-side port surface
     async def rekey_mcp_owner_key(
         self, session_id: str, old_owner_key: str, new_owner_key: str
     ) -> MCPOwnerKeyReceipt:
-        """Atomically re-key across a plan-handoff rotation.
+        """Atomically re-key across a session rotation.
 
         The handle is unchanged, so the auth bindings survive the rotation;
         a naive session-id-derived key would silently drop them mid-session.
@@ -2247,39 +2183,6 @@ class RootAgentProcess:  # noqa: PLR0904 - the coordinator-side port surface
                 "session state and retry once it settles."
             )
 
-    async def _settle_handoff_timeout(self, request_id: str) -> ReconfigureReply:
-        """Settle one timed-out handoff with the ONE marker re-check.
-
-        The operation's own record survives the handoff, so a payload
-        constructed after the deadline carries it: a completed record proves the
-        fence reached its terminal flip, and that payload is the state the
-        reply would have carried. Anything else claims nothing, and a handoff
-        is never resent.
-        """
-        try:
-            snapshot = await self.snapshot(include_history=False)
-        except BaseException as exc:
-            if isinstance(exc, asyncio.CancelledError):
-                raise
-            raise RootAgentReconfigureConflict(
-                "the plan handoff's one-shot marker re-check failed "
-                f"({type(exc).__name__}: {exc}), so nothing is claimed and "
-                "nothing is resent; read the session state before retrying"
-            ) from exc
-        verdict = self.marker_verdict(snapshot, request_id)
-        if verdict.state == MARKER_TERMINAL and verdict.outcome == OP_OUTCOME_COMPLETED:
-            return ReconfigureReply(
-                mode=RECONFIGURE_MODE_PLAN_HANDOFF,
-                outcome=RECONFIGURE_OUTCOME_ACCEPTED,
-                snapshot=snapshot,
-            )
-        outcome = f" ({verdict.outcome})" if verdict.outcome else ""
-        raise RootAgentReconfigureConflict(
-            "the plan handoff's reply was lost and its marker re-check answered "
-            f"{verdict.state}{outcome}: nothing is claimed and nothing is "
-            "resent; read the session state before retrying"
-        )
-
     async def _settle_config_write_timeout(self, request_id: str) -> ReconfigureReply:
         """Settle one timed-out config write with the ONE marker re-check.
 
@@ -2316,7 +2219,7 @@ class RootAgentProcess:  # noqa: PLR0904 - the coordinator-side port surface
     def _adopt_reconfigure(self, reply: ReconfigureReply) -> None:
         """Adopt the identity a reconfigure reply left behind.
 
-        A clear rotates the session (and a handoff rotates it too), so the
+        A clear rotates the session, so the
         agent's own reply is the authority: the snapshot carries the id and the
         directories this end must address from now on. The marker table is NOT
         cleared -- the incarnation does not change -- so any open settlement

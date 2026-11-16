@@ -47,6 +47,7 @@ from chartreux.core.agent_loop._dangerous_command_grants import (
 from chartreux.core.dangerous_commands import RepositoryScope
 from chartreux.core.tools.base import BaseTool, ToolPermission
 from chartreux.core.tools.manager import ToolManager
+from chartreux.core.tools.permissions import dangerous_mode_active
 from chartreux.observability.logging import logger
 
 
@@ -85,7 +86,14 @@ def revalidate_execution_admission(
     a revoked one fails closed. A revalidation that itself fails fails closed
     as a denial, so a denied admission is always accounted as a rejected
     call, never an unhandled error.
+
+    v0.8.0 A-P1: at SafetyLevel DANGEROUS the gate yields (None) — the
+    pre-check's bypass already admitted the call, and re-denying here would
+    resurrect the guards the level suspends. UNREACHABLE-BY-STATE before the
+    A-P1 ceremony can produce the level.
     """
+    if dangerous_mode_active():
+        return None
     tool_name = tool.get_name()
     if admission is not None and (
         grant_store is None
@@ -173,7 +181,13 @@ async def live_authority_admission_denial(
     the call on policy that no longer exists. Every failure of the question —
     no live client, a dead pipe, a timeout, an unreadable or foreign answer —
     is a denial: only the owner's own allow lets the call through.
+
+    v0.8.0 A-P1: at SafetyLevel DANGEROUS (inherited by a child as an
+    explicit launch snapshot) the owner ask is skipped — the session's
+    runtime authority already admits the call.
     """
+    if dangerous_mode_active():
+        return None
     ask = getattr(tool_manager, "live_authority_denial", None)
     if ask is None:
         return None

@@ -2,6 +2,61 @@
 
 All notable changes to Chartreux are documented in this file.
 
+## 0.8.0 (2026-11-15)
+
+### Added
+
+- **The keep-alive pilot is wired into the agent loop.** A root-only timer
+  issues keep-alive turns at `max(30, min_idle_gap_seconds/2)` seconds while
+  the conversation is idle, quiesces while owned dependency runs are active,
+  and `/stats` gains a keep-alive block reporting the pilot's state.
+- **Three-level safety postures.** Every session runs at one safety level —
+  `safe`, `smart`, or `dangerous` — surfaced as `/safety` (bare or `status`
+  prints a posture report: level, classifier model, override/uphold counts,
+  calls/spend vs cap, last classifier error) and `Shift+Tab` (cycles
+  safe -> smart -> dangerous -> safe; app-level reverse focus via Shift+Tab is
+  displaced, `Tab` still cycles forward, modal screens keep their own
+  Shift+Tab). The input box tints per level with a border-title label,
+  `/status` gains a "Safety posture" section, and transitions plus classifier
+  overrides render transcript markers. At `smart`, returned denials (never
+  shell-grammar refusals) are adjudicated once by a fail-closed classifier
+  configured via the new `[safety]` section (`default_level`,
+  `smart_approve_model`, `smart_approve_prompt_id` — exposed in Settings beside
+  `compaction_prompt_id`, `smart_approve_max_calls`, `smart_approve_max_spend_usd`,
+  `smart_approve_context_chars`). `dangerous` stays ceremony-only (interactive
+  TUI warning screen, typed phrase, atomic revoke via `/safety safe`).
+
+### Removed
+
+- **Plan mode is removed entirely.** The `/plan` command (with its `status`,
+  `accept`, `cancel`, `rebind`, and `mark-accepted` actions), the
+  `-P`/`--plan` flag, the `[plan]` config section and its
+  `CHARTREUX_PLAN__*` environment bridge, the plan workspace, the episode
+  state machine, and the two-phase accept/handoff transaction are gone;
+  typing `/plan` is now an unknown command and a stored `[plan]` block is a
+  config-load error that names the removal. Sessions that were planning
+  under the removed feature resume as ordinary sessions, with one notice
+  naming the plan document's path. On-disk plan workspaces under
+  `~/.chartreux/workspaces/*/tasks/plan-*` (markers, claim locks, episode
+  sidecars, accepted snapshots, `plan.md` documents) are user data and are
+  left exactly as written: no remaining code path reads them, and plan
+  documents remain ordinary readable files.
+- **The keep-alive spend cap is retired.** The `[keepalive]` section loses
+  `max_spend_usd`; the pilot is attempt-capped only, with `max_attempts`
+  remaining the session tick budget and `min_idle_gap_seconds` the idle
+  floor. A stored `max_spend_usd` key or `CHARTREUX_KEEPALIVE__MAX_SPEND_USD`
+  value is now a config-load error with a pointed retired-key diagnostic on
+  both the TOML and environment paths, and `enabled=true` no longer requires
+  a positive spend cap. The historical 0.7.6 entry below keeps its
+  `max_spend_usd` mention as history.
+
+### Fixed
+
+- **Subagent transcript view fixes.** The subagent transcript timeline renders
+  minute-group headers, marks entries injected by the host with an `injected`
+  flag, and folds `<file_state>` blocks under a collapsed header that persists
+  across entry rebuilds.
+
 ## 0.7.9 (2026-11-15)
 
 This release stabilizes the app-server subagent lifecycle: a running process

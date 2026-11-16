@@ -177,26 +177,6 @@ def parse_arguments() -> argparse.Namespace:
         "persisted to trusted_folders.toml). Skips the trust prompt. "
         "Use this for non-interactive automation.",
     )
-    parser.add_argument(
-        "-P",
-        "--plan",
-        nargs="?",
-        const=True,
-        default=None,
-        metavar="THEME",
-        help="Start in plan mode when the interactive UI opens. With THEME, the "
-        "plan's heading carries it (the heading-only semantics of /plan THEME). "
-        "With -c/--resume the mode is ensured after the session lands: a restored "
-        "plan-mode record keeps its own theme (THEME is ignored), and a session "
-        "that was not planning enters plan mode on the resumed conversation — "
-        "use a bare `chartreux -P` to start clean. "
-        "Planner model and thinking come from [plan.planner]; override them with "
-        "the config env bridge, e.g. CHARTREUX_PLAN__PLANNER__MODEL=<model> — "
-        "there is no --plan-model flag. Interactive only: rejected with "
-        "-p/--prompt, a positional prompt, piped stdin, and --setup. A theme "
-        "beginning with '-' is read as an unknown option, so keep themes plain "
-        "text.",
-    )
 
     continuation_group = parser.add_mutually_exclusive_group()
     continuation_group.add_argument(
@@ -218,36 +198,7 @@ def parse_arguments() -> argparse.Namespace:
     if cli_args[:1] == ["update"]:
         parser.error("the 'update' command is not available")
     args = parser.parse_args(cli_args)
-    _reject_plan_conflicts(args, parser)
     return args
-
-
-def _reject_plan_conflicts(
-    args: argparse.Namespace, parser: argparse.ArgumentParser
-) -> None:
-    """Reject -P/--plan launches that have no interactive session to land in.
-
-    Plan mode is a TUI surface, so the launches that never open one — a prompt
-    flag, a positional prompt, or --setup — are refused here instead of being
-    accepted and silently ignored. The piped-stdin half of the matrix is
-    rejected in ``run_cli``, where stdin content is resolved before mode
-    selection.
-    """
-    if args.plan is None:
-        return
-    if args.prompt is not None:
-        parser.error(
-            "-P/--plan cannot be combined with -p/--prompt: plan mode needs an "
-            "interactive session"
-        )
-    if args.initial_prompt is not None:
-        parser.error(
-            f"-P/--plan takes a theme, not a prompt: got the positional prompt "
-            f"{args.initial_prompt!r}. Put the theme after -P "
-            "(`chartreux -P THEME`) or drop -P."
-        )
-    if args.setup:
-        parser.error("-P/--plan cannot be combined with --setup")
 
 
 def _enter_worktree(
@@ -547,6 +498,52 @@ def _reject_unusable_transport_selector() -> None:
         sys.exit(1)
 
 
+#: Startup flags that would name a safety level. DANGEROUS is ceremony-only
+#: (unguarded-mode-design.md :61-65): no CLI flag, env var, config key,
+#: project file, or restored session may enable it, so these tokens are
+#: rejected outright instead of being wired to a level.
+_DANGEROUS_STARTUP_FLAG_TOKENS = frozenset({
+    "--dangerous",
+    "--unguarded",
+    "--bypass-tool-permissions",
+    "--safety",
+    "--safety-level",
+    "--safety-mode",
+})
+
+_DANGEROUS_STARTUP_ENV_VARS = frozenset({
+    "CHARTREUX_SAFETY_LEVEL",
+    "CHARTREUX_SAFETY__DEFAULT_LEVEL",
+    "CHARTREUX_SAFETY__LEVEL",
+})
+
+
+def _reject_dangerous_startup_enablement(cli_args: list[str]) -> None:
+    """Reject any startup flag or env var that would enable DANGEROUS mode.
+
+    v0.8.0 A-P1: activation is interactive-TUI-ceremony-only. Programmatic
+    mode (``-p``/positional prompt/piped stdin) auto-approves tools but never
+    runs the ceremony, so a dangerous request there is refused here.
+    """
+    for arg in cli_args:
+        token = arg.split("=", 1)[0]
+        if token in _DANGEROUS_STARTUP_FLAG_TOKENS:
+            print(
+                f"Error: {token} is not accepted: DANGEROUS mode is enabled only "
+                "through the interactive ceremony (`/safety dangerous` in the TUI).",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+    for var in _DANGEROUS_STARTUP_ENV_VARS:
+        if os.environ.get(var, "").strip().lower() == "dangerous":
+            print(
+                f"Error: {var}=dangerous is not accepted: DANGEROUS mode is enabled "
+                "only through the interactive ceremony (`/safety dangerous` in the TUI).",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
+
 def main() -> None:
     _set_process_title()
 
@@ -555,6 +552,7 @@ def main() -> None:
 
     args = parse_arguments()
     _reject_unusable_transport_selector()
+    _reject_dangerous_startup_enablement(sys.argv[1:])
     worktree_session: PreparedWorktree | None = None
     cli_token: OwnershipToken | None = None
 

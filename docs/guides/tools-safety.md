@@ -63,6 +63,28 @@ The current per-tool permission values are `always` and `never`:
 
 These are tool permissions, not application-wide operating modes. The former `plan`, `ask`, `accept-edits`, and `auto-approve` mode set is not part of the current configuration. Routine tool calls do not request interactive approval: execution remains governed by permission policy, denylists, sensitive-file and workspace checks, and other runtime safeguards. Child agents cannot receive authority beyond their parent. MCP tools use the same filtering and permission mechanisms; see [MCP](mcp.md).
 
+## Approval postures (safety levels)
+
+Every session runs at exactly one safety level — `safe`, `smart`, or `dangerous` — and the level is the session's single authority surface. Use `/safety` (or `/safety status`) to print the posture report (level, classifier model, override/uphold counts, calls/spend vs cap, last classifier error); `/status` also carries a "Safety posture" section. `Shift+Tab` cycles safe -> smart -> dangerous -> safe. The input box tints green/blue/red and its border title shows the active level; every transition and every classifier override renders a transcript marker.
+
+- `safe` (default): every tool call goes through the harness guard pipeline; denied calls stay denied.
+- `smart`: returned denials (shell-grammar refusals never reach it) are adjudicated once by a classifier model, which may override a denial it judges inside the user's request or launch intent. Verdicts are fail-closed — unparseable, refused, errored, or cap-exhausted responses uphold — and a decided call is never re-decided.
+- `dangerous`: all guards are suspended, with a non-dismissible banner. Ceremony-only: it is entered solely through the interactive TUI warning screen (idle-only, typed phrase `ENABLE DANGEROUS MODE`, separate confirmation) via `/safety dangerous` or Shift+Tab — never via a CLI flag, env var, config key, or programmatic mode — and `/safety safe` (or Shift+Tab out of it) revokes it atomically. Child agents inherit the parent's level as a launch snapshot and never run the ceremony.
+
+The `[safety]` section configures the level and the classifier:
+
+```toml
+[safety]
+default_level = "safe"              # "safe" or "smart"; "dangerous" is rejected (ceremony-only)
+smart_approve_model = ""            # "" -> active model, resolved at use time
+smart_approve_prompt_id = "smart-approve-classifier"
+smart_approve_max_calls = 200       # per-session classifier call cap
+smart_approve_max_spend_usd = 0.25  # per-session classifier spend cap
+smart_approve_context_chars = 3000  # conversation-context budget (0 = packet only)
+```
+
+`smart_approve_prompt_id` also appears in Settings under Prompts & Compaction (`safety.smart_approve_prompt_id`), with the bundled `smart-approve-classifier` prompt plus any custom prompts from the user prompts directories.
+
 ## Trusted folders
 
 Chartreux asks before trusting a new workspace when it detects material that can influence agent behavior. The prompt identifies `AGENTS.md`, `.chartreux/` and `.agents/` configuration directories, and relevant repository-context files, including instruction files between the repository root and the current directory.

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from typing import cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -45,6 +46,7 @@ def _app_with_fake_runtime(runtime: MagicMock) -> ChartreuxApp:
     app_server.resources.runtime = runtime
     app_server.resources.usage.current = None
     app_server.resources.usage.read = AsyncMock()
+    app_server.resources.sessions.plan_mode_present = False
     app._app_server = app_server
     return app
 
@@ -65,6 +67,31 @@ async def test_finish_resume_notices_shows_notices_after_ready() -> None:
     runtime.wait_until_ready.assert_awaited_once()
     notices.assert_awaited_once()
     mount.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_finish_resume_notices_posts_the_legacy_plan_mode_notice() -> None:
+    runtime = MagicMock()
+    runtime.wait_until_ready = AsyncMock()
+    app = _app_with_fake_runtime(runtime)
+    sessions = cast(MagicMock, app.app_server.resources.sessions)
+    sessions.plan_mode_present = True
+    sessions.legacy_plan_mode_path = AsyncMock(
+        return_value="/tmp/workspaces/tasks/plan-x/plan.md"
+    )
+
+    with (
+        patch.object(app, "_show_post_init_notices_once", AsyncMock()),
+        patch.object(app, "_mount_and_scroll", AsyncMock()) as mount,
+        patch.object(app, "_refresh_banner", MagicMock()),
+    ):
+        await app._finish_resume_notices()
+
+    mount.assert_awaited_once()
+    (message,), _ = mount.call_args
+    assert isinstance(message, UserCommandMessage)
+    assert "plan mode" in message._content
+    assert "/tmp/workspaces/tasks/plan-x/plan.md" in message._content
 
 
 @pytest.mark.asyncio

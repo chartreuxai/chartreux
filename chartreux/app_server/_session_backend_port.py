@@ -48,9 +48,6 @@ from chartreux.app_server.protocol import (
     SessionListParams,
     SessionListResponse,
     SessionMemorialItem,
-    SessionPlanRecord,
-    SessionPlanRecordWriteParams,
-    SessionPlanRecordWriteResponse,
     SessionReadParams,
     SessionReadResponse,
     SessionResumeParams,
@@ -389,11 +386,9 @@ class SessionBackend(Protocol):  # noqa: PLR0904 - unified backend contract
         self, params: SessionCompactParams
     ) -> SessionBackendResult[SessionCompactResponse]: ...
 
-    async def read_plan_record(self) -> SessionPlanRecord | None: ...
-
-    async def write_plan_record(
-        self, params: SessionPlanRecordWriteParams
-    ) -> SessionBackendResult[SessionPlanRecordWriteResponse]: ...
+    async def plan_mode_present(self) -> bool:
+        """True when the resumed session's raw metadata carried a ``plan_mode`` key."""
+        ...
 
     async def dispatch_extension(
         self, method: str, raw_params: dict[str, Any]

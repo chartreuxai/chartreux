@@ -19,7 +19,6 @@ from pydantic import (
     ConfigDict,
     Field,
     HttpUrl,
-    ValidationError,
     field_validator,
     model_validator,
 )
@@ -539,73 +538,7 @@ class CompletionSectionConfig(BaseModel):
     mode: Literal["stamp", "enforce"] = "enforce"
 
 
-DEFAULT_PLAN_PLANNER_MODEL = "glm-5-3"
-DEFAULT_PLAN_PLANNER_THINKING: ThinkingLevel = "high"
-DEFAULT_PLAN_EXECUTOR_MODEL = "mistral-large-4"
-DEFAULT_PLAN_EXECUTOR_THINKING: ThinkingLevel = "medium"
-DEFAULT_PLAN_EXECUTOR_IDENTITY = "orchestrator"
-
-
-class PlanPlannerConfig(BaseModel):
-    """The ``[plan.planner]`` selection: the model and thinking level of ``/plan``.
-
-    The shipped default is GLM high (requirement R3). Planning keeps the
-    ordinary agent permissions so exploration and research are not restricted
-    (requirement R4); nothing here narrows them.
-    """
-
-    model_config = ConfigDict(extra="forbid")
-
-    model: str = Field(default=DEFAULT_PLAN_PLANNER_MODEL, min_length=1)
-    thinking: ThinkingLevel = DEFAULT_PLAN_PLANNER_THINKING
-
-
-class PlanExecutorConfig(BaseModel):
-    """The ``[plan.executor]`` selection for the handed-off execution session.
-
-    The shipped default is ML4 medium with the orchestrator identity
-    (requirement R3). The selected values are snapshotted when the consent
-    modal opens and applied exactly as displayed, or not at all.
-    """
-
-    model_config = ConfigDict(extra="forbid")
-
-    model: str = Field(default=DEFAULT_PLAN_EXECUTOR_MODEL, min_length=1)
-    thinking: ThinkingLevel = DEFAULT_PLAN_EXECUTOR_THINKING
-    identity: str = DEFAULT_PLAN_EXECUTOR_IDENTITY
-
-    @field_validator("identity")
-    @classmethod
-    def _validate_identity(cls, value: str) -> str:
-        # ONE definition of identity ids: reuse the [agent].identity rule so a
-        # typo fails at config load instead of at handoff.
-        try:
-            AgentSelectionConfig(identity=value)
-        except ValidationError as error:
-            raise ValueError(f"invalid plan executor identity: {value!r}") from error
-        return value
-
-
-class PlanSectionConfig(BaseModel):
-    """The ``[plan]`` config section: the ``/plan``-mode model selections.
-
-    One subsection per role, deep-mergeable across layers like every other
-    container section, so a layer that names only ``[plan.executor] identity``
-    preserves the typed defaults of everything else.
-    """
-
-    model_config = ConfigDict(extra="forbid")
-
-    planner: Annotated[PlanPlannerConfig, WithDeepMerge()] = Field(
-        default_factory=PlanPlannerConfig
-    )
-    executor: Annotated[PlanExecutorConfig, WithDeepMerge()] = Field(
-        default_factory=PlanExecutorConfig
-    )
-
-
 DEFAULT_KEEPALIVE_MAX_ATTEMPTS = 100
-DEFAULT_KEEPALIVE_MAX_SPEND_USD = 1.0
 DEFAULT_KEEPALIVE_MIN_IDLE_GAP_SECONDS = 240.0
 
 
@@ -614,36 +547,81 @@ class KeepaliveSectionConfig(BaseModel):
 
     The pilot SHIPS OFF: ``enabled`` defaults to FALSE, and while disabled
     the pilot has zero behavior — no snapshot, no timer, no ledger row; the
-    wiring reads this flag first and does nothing when it is off. The caps
-    are the ABSOLUTE per-session bounds the strict accountant enforces:
+    wiring reads this flag first and does nothing when it is off. The cap
+    is the ABSOLUTE per-session bound the accountant enforces:
     ``max_attempts`` is the count cap (ATTEMPTS, superseded ones included,
-    not completions) and ``max_spend_usd`` the spend cap in USD;
-    ``min_idle_gap_seconds`` is the idle-gap floor the scheduler requires
-    before any ping may be considered. Validated like every other section:
-    unknown keys are rejected and the caps carry strict bounds.
+    not completions); ``min_idle_gap_seconds`` is the idle-gap floor the
+    scheduler requires before any ping may be considered. Validated like
+    every other section: unknown keys are rejected and the caps carry
+    strict bounds. ``max_spend_usd`` is a RETIRED key — the pilot is
+    attempt-capped only — rejected with a pointed diagnostic on both the
+    source and the environment path.
     """
 
     model_config = ConfigDict(extra="forbid")
 
     enabled: bool = Field(default=False, strict=True)
     max_attempts: int = Field(default=DEFAULT_KEEPALIVE_MAX_ATTEMPTS, ge=1, strict=True)
-    max_spend_usd: Annotated[float, BeforeValidator(_reject_bool_duration)] = Field(
-        default=DEFAULT_KEEPALIVE_MAX_SPEND_USD, ge=0.0, allow_inf_nan=False
-    )
     min_idle_gap_seconds: Annotated[float, BeforeValidator(_reject_bool_duration)] = (
         Field(
             default=DEFAULT_KEEPALIVE_MIN_IDLE_GAP_SECONDS, ge=0.0, allow_inf_nan=False
         )
     )
 
-    @model_validator(mode="after")
-    def _validate_enabled_needs_spend_room(self) -> KeepaliveSectionConfig:
-        if self.enabled and self.max_spend_usd <= 0.0:
+    @model_validator(mode="before")
+    @classmethod
+    def _reject_retired_max_spend_usd(cls, value: Any) -> Any:
+        if isinstance(value, Mapping) and "max_spend_usd" in value:
             raise ValueError(
-                "keepalive.enabled requires max_spend_usd > 0: an enabled pilot "
-                "with a zero spend cap could never reserve a ping"
+                "keepalive max_spend_usd is retired; the keep-alive pilot is "
+                "attempt-capped only — remove the key. It has no effect."
             )
-        return self
+        return value
+
+
+DEFAULT_SMART_APPROVE_MAX_CALLS = 200
+DEFAULT_SMART_APPROVE_MAX_SPEND_USD = 0.25
+DEFAULT_SMART_APPROVE_CONTEXT_CHARS = 3000
+DEFAULT_SMART_APPROVE_PROMPT_ID = "smart-approve-classifier"
+
+
+class SafetySectionConfig(BaseModel):
+    """The ``[safety]`` config section (v0.8.0 A-P2; amendment Q3/Q5).
+
+    ``default_level`` accepts only ``safe``/``smart`` — DANGEROUS is
+    ceremony-only and is rejected with a pointed diagnostic, never set by
+    config, env, or startup flag. ``smart_approve_model`` empty means the
+    active model, resolved at use time. The caps are the strict per-session
+    bounds the classifier enforces fail-closed: ``smart_approve_max_calls``
+    (count) and ``smart_approve_max_spend_usd`` (USD), and
+    ``smart_approve_context_chars`` is the hard code-enforced ceiling on the
+    conversation context sent per adjudication (0 = packet-only).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    default_level: Literal["safe", "smart"] = "safe"
+    smart_approve_model: str = ""
+    smart_approve_prompt_id: str = DEFAULT_SMART_APPROVE_PROMPT_ID
+    smart_approve_max_calls: int = Field(
+        default=DEFAULT_SMART_APPROVE_MAX_CALLS, ge=1, strict=True
+    )
+    smart_approve_max_spend_usd: Annotated[
+        float, BeforeValidator(_reject_bool_duration)
+    ] = Field(default=DEFAULT_SMART_APPROVE_MAX_SPEND_USD, ge=0.0, allow_inf_nan=False)
+    smart_approve_context_chars: int = Field(
+        default=DEFAULT_SMART_APPROVE_CONTEXT_CHARS, ge=0, strict=True
+    )
+
+    @model_validator(mode="before")
+    @classmethod
+    def _reject_dangerous_default_level(cls, value: Any) -> Any:
+        if isinstance(value, Mapping) and value.get("default_level") == "dangerous":
+            raise ValueError(
+                "safety.default_level cannot be 'dangerous': DANGEROUS is "
+                "ceremony-only and never set by config; use 'safe' or 'smart'"
+            )
+        return value
 
 
 type StatusLineSegment = Literal[

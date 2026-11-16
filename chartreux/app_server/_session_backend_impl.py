@@ -16,7 +16,6 @@ from chartreux.app_server._handler import CoreRequestHandler
 from chartreux.app_server._host import HostRequestHandler, project_session_list
 from chartreux.app_server._mcp_authorization_bridge import RegistryAuthorizationProvider
 from chartreux.app_server._model import ProtocolModel
-from chartreux.app_server._plan_record import plan_mode_record, session_plan_record
 from chartreux.app_server._resources import ResourceRequestHandler
 from chartreux.app_server._root_session import RootSessionCoordinator
 from chartreux.app_server._session_backend_port import (
@@ -86,9 +85,6 @@ from chartreux.app_server.protocol import (
     SessionHistoryClearResponse,
     SessionListParams,
     SessionListResponse,
-    SessionPlanRecord,
-    SessionPlanRecordWriteParams,
-    SessionPlanRecordWriteResponse,
     SessionReadParams,
     SessionReadResponse,
     SessionRelocateResponse,
@@ -129,6 +125,7 @@ from chartreux.core.dangerous_commands import (
 from chartreux.core.git.worktree import ManagedWorktree, PreparedWorktree
 from chartreux.core.git.worktree.record import OwnershipToken, release_holder
 from chartreux.core.session.session_lease import SessionBusyError
+from chartreux.core.session.session_loader import SessionLoader
 from chartreux.core.tools.mcp.authorization import (
     MCPAuthorizationRef as MCPAuthorizationRefImpl,
     MCPAuthorizationRequired as MCPAuthorizationRequiredImpl,
@@ -905,57 +902,21 @@ class SessionBackendImpl:
         active_model = loop.config.get_active_model().alias
         return await logger.persist_active_model(active_model)
 
-    async def read_plan_record(self) -> SessionPlanRecord | None:
-        """The persisted plan mode, or None when this session is not planning.
+    async def plan_mode_present(self) -> bool:
+        """True when the resumed session's raw metadata carried a ``plan_mode`` key.
 
-        Internal to the app server: a resume response carries this value, so
-        no client-facing read exists to ask for it separately.
+        Detection reads the RAW metadata dict through the loader choke point,
+        never the typed record — the typed ``SessionMetadata`` drops the
+        retired key (``extra="ignore"``), so only the raw dict still has it.
         """
-        metadata = self.session.agent_loop.session_logger.session_metadata
-        if metadata is None or metadata.plan_mode is None:
-            return None
-        return session_plan_record(metadata.plan_mode)
-
-    async def write_plan_record(
-        self, params: SessionPlanRecordWriteParams, *, force_durable: bool = False
-    ) -> SessionBackendResult[SessionPlanRecordWriteResponse]:
-        """Persist (or, with a null record, remove) the plan mode.
-
-        ``force_durable`` selects the FORCED durable write the plan handoff
-        needs — C2's retirement of the source record as accepted, and C3's
-        executor marker. It creates the metadata file when it does not exist yet
-        and raises unless the write is durable, which the ordinary entry/cancel
-        writes cannot afford to require: those land on a session that may have no
-        saved turn, where the first full save carries the in-memory record. The
-        root-session guard applies to both paths.
-
-        The response carries the record as READ BACK, so a session whose
-        logging is disabled answers None instead of echoing a mode no resume
-        could restore.
-        """
-        self._require_plan_record_session(params.session_id)
         logger = self.session.agent_loop.session_logger
-        record = None if params.record is None else plan_mode_record(params.record)
-        if force_durable:
-            await logger.persist_plan_mode_durable(record)
-        elif record is None:
-            await logger.clear_plan_mode()
-        else:
-            await logger.persist_plan_mode(record)
-        metadata = logger.session_metadata
-        persisted = (
-            None
-            if metadata is None or metadata.plan_mode is None
-            else session_plan_record(metadata.plan_mode)
+        session_dir = logger.session_dir
+        if not logger.enabled or session_dir is None:
+            return False
+        raw_metadata = await asyncio.to_thread(
+            SessionLoader.load_raw_metadata, session_dir
         )
-        return SessionBackendResult(SessionPlanRecordWriteResponse(record=persisted))
-
-    def _require_plan_record_session(self, session_id: str) -> None:
-        if session_id != self.session_id:
-            raise SessionBackendError(
-                ProtocolErrorCode.INVALID_PARAMS,
-                "The plan record belongs to the root session",
-            )
+        return "plan_mode" in raw_metadata
 
     async def read_turn_queue(
         self, params: TurnQueueReadParams

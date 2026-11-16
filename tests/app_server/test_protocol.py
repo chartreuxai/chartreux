@@ -34,8 +34,6 @@ from chartreux.app_server.protocol import (
     RootRecoveryScheduleResponse,
     ServerRequest,
     SessionOptions,
-    SessionPlanHandoffParams,
-    SessionPlanHandoffResponse,
     SessionStopParams,
     SessionStopResponse,
     SessionUpdatedParams,
@@ -46,11 +44,6 @@ from chartreux.app_server.session import AppServerTurnError, SessionStopUnknownO
 from chartreux.app_server.transport import memory_transport_pair
 from chartreux.core.agent_loop import AgentLoop
 from chartreux.core.config import SessionLoggingConfig
-from chartreux.core.config.chartreux_schema import ChartreuxConfigSchema
-from chartreux.core.config.layers.overrides import OverridesLayer
-from chartreux.core.config.layers.user import UserConfigLayer
-from chartreux.core.config.models import ModelConfig
-from chartreux.core.config.orchestrator import ConfigOrchestrator
 from chartreux.core.llm.exceptions import BackendError, PayloadSummary
 from chartreux.core.model_catalog.availability import AvailabilityRegistry
 from chartreux.core.paths import LOG_FILE
@@ -1326,109 +1319,6 @@ async def test_agent_transcript_is_rejected_without_an_attached_session() -> Non
 
 
 # ---------------------------------------------------------------------------
-# Package A5: the session/fenced typed variant and superseded-id fencing.
-# ---------------------------------------------------------------------------
-
-_A5_PLANNER = "alpha"
-_A5_EXECUTOR = "beta"
-
-
-async def _a5_layered_loop(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> AgentLoop:
-    """A loop on a real orchestrator with alpha/beta models, session id 'initial'."""
-    models = [
-        ModelConfig(name="alpha", provider="mistral", alias="alpha"),
-        ModelConfig(name="beta", provider="mistral", alias="beta"),
-    ]
-    config = build_test_vibe_config(
-        active_model=_A5_PLANNER,
-        models=models,
-        session_logging=SessionLoggingConfig(enabled=False),
-    )
-
-    async def load(
-        cfg: ChartreuxConfigSchema,
-    ) -> ConfigOrchestrator[ChartreuxConfigSchema]:
-        user_path = tmp_path / "user-config.toml"
-        user_path.write_text('theme = "dark"\n')
-        user = UserConfigLayer(path=user_path)
-        launch = OverridesLayer(
-            name="launch",
-            data={
-                "active_model": _A5_PLANNER,
-                "session_logging": cfg.session_logging.model_dump(mode="json"),
-            },
-        )
-        return await ConfigOrchestrator.create(
-            schema=ChartreuxConfigSchema,
-            layers=[user, launch, OverridesLayer(data={})],
-            default_layer_resolver=lambda: user,
-            catalog_snapshot=cfg.catalog_snapshot,
-        )
-
-    monkeypatch.setattr("tests.conftest._load_orchestrator", load)
-    return build_test_agent_loop(config=config, session_id="initial")
-
-
-def _a5_handoff_params(session_id: str) -> dict[str, Any]:
-    return SessionPlanHandoffParams(
-        session_id=session_id,
-        executor_model=_A5_EXECUTOR,
-        executor_thinking="medium",
-        executor_identity="orchestrator",
-        plan_path="/tmp/plan-workspace/plan.md",
-    ).model_dump(mode="json", by_alias=True)
-
-
-@pytest.mark.asyncio
-async def test_plan_handoff_rotates_and_the_old_id_is_fenced_in_process(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    loop = await _a5_layered_loop(monkeypatch, tmp_path)
-    client_transport, server_transport = memory_transport_pair()
-    server = build_test_app_server(loop, server_transport)
-    client = AppServerClient(client_transport, run_peer=server.serve)
-    try:
-        await client.initialize(ClientInfo(name="test", version="1"))
-        await client.notify("initialized")
-        await client.request("session/start", {"agentConfig": {"cwd": str(loop.cwd)}})
-        old_id = loop.session_id
-
-        raw = await client.request("session/plan/handoff", _a5_handoff_params(old_id))
-        response = SessionPlanHandoffResponse.model_validate(raw)
-        new_id = response.state.session.id
-        assert new_id != old_id
-        # The in-process handoff arm leaves the dispatch flags unset (the
-        # design's round-2 note); the fence comes from the handler's own
-        # handoff map, asserted below.
-
-        # A request addressed to the superseded id answers the typed
-        # session/fenced variant, never a bare NOT_FOUND.
-        with pytest.raises(AppServerResponseError) as exc_info:
-            await client.request("session/ready/read", {"sessionId": old_id})
-        error = exc_info.value.error
-        assert error.code is ProtocolErrorCode.CONFLICT
-        data = cast(dict[str, Any], error.data)
-        assert data["code"] == "session/fenced"
-        assert data["reason"] == "session_rotated"
-        assert data["sessionId"] == new_id
-        assert data["supersededSessionId"] == old_id
-        assert "not replayed" in data["instruction"]
-
-        # The rotated id still answers, and a genuinely unknown id keeps the
-        # plain not-found contract.
-        ready = await client.request("session/ready/read", {"sessionId": new_id})
-        assert ready is not None
-        with pytest.raises(AppServerResponseError) as unknown_info:
-            await client.request("session/ready/read", {"sessionId": "unknown-id"})
-        assert unknown_info.value.error.code is ProtocolErrorCode.NOT_FOUND
-    finally:
-        await client.close()
-        await server.close()
-        await loop.aclose()
-
-
 @pytest.mark.asyncio
 async def test_superseded_session_fence_translates_only_not_found_for_superseded_ids() -> (
     None
@@ -1463,60 +1353,6 @@ async def test_superseded_session_fence_translates_only_not_found_for_superseded
         # Params without a session id are untouched.
         assert await server._superseded_session_fence(not_found, {}) is None
     finally:
-        await server.close()
-        await client_transport.close()
-        await agent_loop.aclose()
-
-
-@pytest.mark.asyncio
-async def test_superseded_session_fence_resolves_a_pending_handoff_through_the_backend() -> (
-    None
-):
-    client_transport, server_transport = memory_transport_pair()
-    agent_loop = build_test_agent_loop()
-    server = build_test_app_server(agent_loop, server_transport)
-
-    class _BackendWithResolver:
-        session_id = "old"
-
-        def guard_request(self) -> None:
-            return None
-
-        async def rotated_session_id_for(self, session_id: str) -> str | None:
-            return "rotated" if session_id == "old" else None
-
-    class _OlderPeerWithoutTheVariant:
-        session_id = "old"
-
-        def guard_request(self) -> None:
-            return None
-
-    try:
-        server._root = cast(Any, _BackendWithResolver())
-        server._pending_handoffs.add("old")
-        not_found = SessionBackendError(
-            ProtocolErrorCode.NOT_FOUND, "Session not found: old"
-        )
-
-        fenced = await server._superseded_session_fence(not_found, {"sessionId": "old"})
-        assert fenced is not None
-        assert fenced.code is ProtocolErrorCode.CONFLICT
-        data = cast(dict[str, Any], fenced.data)
-        assert data["code"] == "session/fenced"
-        assert data["sessionId"] == "rotated"
-
-        # An older peer that cannot report the rotated identity gets the
-        # version-skew error -- never a bare NOT_FOUND, never a silent retry.
-        server._root = cast(Any, _OlderPeerWithoutTheVariant())
-        skew = await server._superseded_session_fence(not_found, {"sessionId": "old"})
-        assert skew is not None
-        assert skew.code is ProtocolErrorCode.NOT_IMPLEMENTED
-        data = cast(dict[str, Any], skew.data)
-        assert data["code"] == "version_skew"
-        assert data["variant"] == "session/fenced"
-        assert "not retried" in str(skew)
-    finally:
-        server._root = None
         await server.close()
         await client_transport.close()
         await agent_loop.aclose()

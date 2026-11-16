@@ -6,33 +6,27 @@ later chunks extend it in place under named sections (SNAPSHOT in 5b, SCHEDULER
 + OBSERVE in 5c). This file carries the ACCOUNTANT (5a), SNAPSHOT (5b), and
 SCHEDULER + OBSERVE (5c) sections.
 
-The accountant is the synchronous, conservative, PRE-SEND RESERVATION enforcer
-for the absolute per-session count and spend caps of the keep-alive pilot
-(design P5, "SPEND CAP"). Before each ping is sent, the prospective MAXIMUM cost
-is reserved against the caps, priced in BILLABLE TOKENS, not bytes:
+The accountant is the synchronous, conservative, PRE-SEND RESERVATION seam
+for the absolute per-session ATTEMPT cap of the keep-alive pilot (design P5
+as amended: the USD spend cap is retired — the cap is attempts-only). Before
+each ping is sent, one attempt is reserved against the count cap; the
+reservation is the identity token for pre-send supersession, and every
+attempt is settled exactly once. The count cap counts ATTEMPTS (reserved
+pings, superseded ones included), not completions. EVERY attempt writes a
+ledger row (purpose=keepalive, with a typed keepalive entry carrying
+outcome=completed | unknown-usage | cancelled | superseded) so the ledger
+reconstructs the attempt burn.
 
-- input cost: a proven-conservative billable-input-token bound for the COMPLETE
-  ping request (the snapshot prefix plus any request envelope) via a
-  provider-specific conversion that provably never undercounts
-  provider-billed input tokens, including framing additions, priced at the
-  UNCACHED input rate;
-- output cost: the ping's declared max completion tokens x the completion price.
+FAIL-CLOSED: when the attribution or the ledger sink are unavailable, the
+accountant halts for that deployment and no ping is sent. (The former
+fail-closed inputs — the provider-specific billable-input conversion, the
+prices, and the declared output limit — served USD estimation only and are
+retired with the spend cap.)
 
-FAIL-CLOSED: when the provider-specific conversion, the applicable prices, the
-declared output limit, the attribution, or the ledger sink are unavailable, the
-accountant halts for that deployment and no ping is sent. A ping is sent only
-when the reservation fits the remaining caps. Reconciliation on the ping's
-recorded usage releases reservation-minus-actual; pre-send supersession (a real
-call starting mid-reserve) releases the reservation unspent. The count cap
-counts ATTEMPTS (reserved pings, superseded ones included), not completions.
-EVERY attempt writes a ledger row (purpose=keepalive, with a typed keepalive
-entry carrying outcome=completed | unknown-usage | cancelled | superseded) so
-the ledger reconstructs cap burn; unknown-usage and cancelled attempts RETAIN
-their full reservation in the accumulator.
-
-Pricing source: the ledger-recorded prices, frozen at accountant start with the
-same ``capture_prices`` the gateway records on every row — the async ledger
-write is the record, not the counter.
+Row pricing: each ledger row still carries the ledger-recorded prices, frozen
+at accountant start with the same ``capture_prices`` the gateway records on
+every row, plus the recorded actual cost when the usage is complete — the
+ledger is the record; there is no cap accumulator anymore.
 
 The SNAPSHOT section (chunk 5b) holds the IMMUTABLE serialized cache-relevant
 prefix: ``KeepaliveSnapshotStore`` freezes the prefix together with the
@@ -61,19 +55,19 @@ behavior of ordinary calls.
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Awaitable, Callable, Iterable
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from enum import StrEnum
 import hashlib
-from math import ceil
+import json
 from threading import Lock
 from typing import Any, Protocol
 from uuid import uuid4
 
 from chartreux.core.config import ModelConfig
 from chartreux.core.config.models import KeepaliveSectionConfig
-from chartreux.core.llm_models import LLMChunk, LLMUsage
+from chartreux.core.llm_models import LLMChunk, LLMMessage, LLMUsage, Role
 from chartreux.core.usage import (
     KeepaliveLedgerEntry,
     KeepaliveOutcome,
@@ -105,51 +99,6 @@ class KeepaliveReservationStateError(KeepaliveAccountantError):
     """A reservation was settled twice or was never reserved."""
 
 
-type BillableInputBound = Callable[[int], int]
-"""Complete serialized request bytes -> billable input tokens, never undercounting."""
-
-
-@dataclass(frozen=True)
-class BillableInputRule:
-    """A provider's conservative conversion constants.
-
-    ``bound(bytes) = ceil(bytes / chars_per_token) + framing_tokens`` provably
-    dominates the provider's actual billing
-    ``ceil(bytes / actual_chars_per_token) + actual_framing_tokens`` whenever
-    ``chars_per_token <= actual_chars_per_token`` and
-    ``framing_tokens >= actual_framing_tokens``. The registered constants must
-    satisfy that domination — that is what makes the bound proven-conservative
-    rather than a heuristic estimate.
-    """
-
-    chars_per_token: float
-    framing_tokens: int
-
-    def bound(self, request_bytes: int) -> int:
-        """The conservative billable-input-token bound for one request."""
-        if request_bytes < 0:
-            raise ValueError("request_bytes must be non-negative")
-        return ceil(request_bytes / self.chars_per_token) + self.framing_tokens
-
-
-_BILLABLE_INPUT_RULES: dict[str, BillableInputRule] = {}
-
-
-def register_billable_input_rule(provider: str, rule: BillableInputRule) -> None:
-    """Register the proven-conservative conversion for one provider."""
-    if rule.chars_per_token <= 0:
-        raise ValueError("chars_per_token must be positive")
-    if rule.framing_tokens < 0:
-        raise ValueError("framing_tokens must be non-negative")
-    _BILLABLE_INPUT_RULES[provider] = rule
-
-
-def billable_input_bound(provider: str) -> BillableInputBound | None:
-    """The registered conversion for ``provider``; None when unavailable."""
-    rule = _BILLABLE_INPUT_RULES.get(provider)
-    return None if rule is None else rule.bound
-
-
 class KeepaliveLedgerSink(Protocol):
     """Synchronous ledger settlement for keepalive attempt rows.
 
@@ -164,51 +113,21 @@ class KeepaliveLedgerSink(Protocol):
 
 @dataclass(frozen=True)
 class KeepaliveCaps:
-    """Absolute per-session caps; the count cap counts ATTEMPTS, not completions."""
+    """The absolute per-session cap; the count cap counts ATTEMPTS, not completions."""
 
     max_attempts: int
-    max_spend_usd: float
 
     def __post_init__(self) -> None:
         if self.max_attempts < 1:
             raise ValueError("max_attempts must be positive")
-        if self.max_spend_usd < 0:
-            raise ValueError("max_spend_usd must be non-negative")
 
 
 @dataclass(frozen=True)
 class KeepaliveReservation:
-    """One reserved ping attempt; settle it exactly once."""
+    """One reserved ping attempt — the supersession identity token; settle it exactly once."""
 
     attempt_id: str
     attempt_ordinal: int
-    reserved_input_tokens: int
-    reserved_output_tokens: int
-    reserved_cost_usd: float
-
-
-@dataclass(frozen=True)
-class KeepaliveBurn:
-    """Cap burn: reserved attempts and retained spend."""
-
-    attempts: int
-    retained_spend_usd: float
-
-
-def reconstruct_keepalive_burn(records: Iterable[UsageRecord]) -> KeepaliveBurn:
-    """Rebuild the cap burn from keepalive-purpose ledger rows alone.
-
-    Counting the rows reconstructs the attempts-counted count-cap burn; summing
-    each entry's retained_cost_usd reconstructs the spend-cap burn.
-    """
-    attempts = 0
-    spend = 0.0
-    for record in records:
-        entry = record.keepalive
-        if record.purpose is UsagePurpose.KEEPALIVE and entry is not None:
-            attempts += 1
-            spend += entry.retained_cost_usd
-    return KeepaliveBurn(attempts=attempts, retained_spend_usd=spend)
 
 
 #: The ordinary outcome axis a keepalive attempt row maps onto; the precise
@@ -225,12 +144,12 @@ class KeepaliveAccountant:
     """Synchronous pre-send reservation accountant for keepalive pings (P5 5a).
 
     One instance per deployment (session). ``reserve`` must be called before
-    each ping is sent and returns the reservation the caps were charged; the
-    reservation is then settled exactly once — ``reconcile`` on recorded usage
-    (releases reservation-minus-actual), ``mark_unknown_usage`` or ``cancel``
-    (both retain the full reservation), or ``supersede`` (pre-send supersession
-    by a real call: released unspent, still counted as an attempt). Every
-    settlement writes one ledger row through the sink.
+    each ping is sent and returns the reservation token; the attempt is counted
+    immediately against the absolute count cap. The reservation is then settled
+    exactly once — ``reconcile`` on recorded usage, ``mark_unknown_usage`` or
+    ``cancel``, or ``supersede`` (pre-send supersession by a real call: still
+    counted as an attempt). Every settlement writes one ledger row through the
+    sink.
     """
 
     def __init__(
@@ -246,15 +165,14 @@ class KeepaliveAccountant:
         self._caps = caps
         self._model = model
         self._provider = provider
-        # Prices are frozen at accountant start — the same capture the gateway
-        # records on each ledger row (the ledger is the record, not the counter).
+        # Row prices are frozen at accountant start — the same capture the
+        # gateway records on each ledger row (the ledger is the record).
         self._prices: UsagePrices = capture_prices(model)
         self._attribution = attribution
         self._ledger = ledger
         self._clock = clock if clock is not None else lambda: datetime.now(UTC)
         self._lock = Lock()
         self._attempts = 0
-        self._charged_spend_usd = 0.0
         self._halted = False
         self._open: dict[str, KeepaliveReservation] = {}
 
@@ -271,73 +189,34 @@ class KeepaliveAccountant:
             return self._attempts
 
     @property
-    def charged_spend_usd(self) -> float:
-        """Spend charged against the spend cap: open reservations plus retained."""
-        with self._lock:
-            return self._charged_spend_usd
-
-    @property
     def open_attempts(self) -> int:
         """Reservations not yet settled."""
         with self._lock:
             return len(self._open)
 
-    def burn(self) -> KeepaliveBurn:
-        """The accountant-side cap burn (attempts and charged spend)."""
-        with self._lock:
-            return KeepaliveBurn(
-                attempts=self._attempts, retained_spend_usd=self._charged_spend_usd
-            )
-
-    def reserve(
-        self, request_bytes: int, declared_max_tokens: int | None
-    ) -> KeepaliveReservation:
-        """Reserve the prospective maximum cost of one ping BEFORE it is sent.
+    def reserve(self) -> KeepaliveReservation:
+        """Reserve one ping attempt BEFORE it is sent.
 
         Raises ``KeepaliveFailClosedError`` (and halts the deployment) when the
-        conversion, prices, declared output limit, attribution, or sink are
-        unavailable, and ``KeepaliveCapExceededError`` when the reservation does
-        not fit the remaining caps. Otherwise the attempt is counted and
-        charged immediately.
+        attribution or the ledger sink are unavailable, and
+        ``KeepaliveCapExceededError`` when the count cap is already reached.
+        Otherwise the attempt is counted immediately.
         """
         with self._lock:
-            reason = self._unavailable_reason(declared_max_tokens)
+            reason = self._unavailable_reason()
             if self._halted or reason is not None:
                 self._halted = True
                 raise KeepaliveFailClosedError(
                     reason or "the keepalive deployment is halted"
                 )
-            bound = billable_input_bound(self._provider)
-            input_price = self._prices.input
-            output_price = self._prices.output
-            assert (
-                bound is not None
-                and input_price is not None
-                and output_price is not None
-                and declared_max_tokens is not None
-            )
-            reserved_input = bound(request_bytes)
-            reserved_cost = (
-                reserved_input * input_price + declared_max_tokens * output_price
-            ) / 1_000_000
             if self._attempts + 1 > self._caps.max_attempts:
                 raise KeepaliveCapExceededError(
                     f"count cap {self._caps.max_attempts} already reached by "
                     f"{self._attempts} reserved attempts"
                 )
-            if self._charged_spend_usd + reserved_cost > self._caps.max_spend_usd:
-                raise KeepaliveCapExceededError(
-                    f"spend cap {self._caps.max_spend_usd} USD would be exceeded: "
-                    f"{self._charged_spend_usd} charged + {reserved_cost} reserved"
-                )
             self._attempts += 1
-            self._charged_spend_usd += reserved_cost
             reservation = KeepaliveReservation(
-                attempt_id=str(uuid4()),
-                attempt_ordinal=self._attempts,
-                reserved_input_tokens=reserved_input,
-                reserved_output_tokens=declared_max_tokens,
-                reserved_cost_usd=reserved_cost,
+                attempt_id=str(uuid4()), attempt_ordinal=self._attempts
             )
             self._open[reservation.attempt_id] = reservation
             return reservation
@@ -352,9 +231,9 @@ class KeepaliveAccountant:
     ) -> None:
         """Settle a sent ping on its recorded usage: outcome=completed.
 
-        Releases reservation-minus-actual: the accumulator is charged only the
-        recorded actual cost. Incomplete recorded usage cannot be reconciled
-        and falls back to ``mark_unknown_usage`` (full reservation retained).
+        The ledger row carries the recorded actual tokens and cost. Incomplete
+        recorded usage cannot be reconciled and falls back to
+        ``mark_unknown_usage``.
         """
         tokens = UsageTokens(
             input_tokens=input_tokens,
@@ -364,58 +243,35 @@ class KeepaliveAccountant:
         if tokens.presence_state is not UsageState.COMPLETE:
             self.mark_unknown_usage(reservation)
             return
-        pricing = price_usage(**tokens.model_dump(), prices=self._prices)
-        retained = (
-            pricing.known_cost_usd
-            if not pricing.has_unknown_cost
-            else reservation.reserved_cost_usd
-        )
-        self._settle(reservation, KeepaliveOutcome.COMPLETED, tokens, retained)
+        self._settle(reservation, KeepaliveOutcome.COMPLETED, tokens)
 
     def mark_unknown_usage(self, reservation: KeepaliveReservation) -> None:
-        """Settle a ping whose usage was not recorded: outcome=unknown-usage.
-
-        The full reservation is retained in the accumulator.
-        """
-        self._settle(
-            reservation,
-            KeepaliveOutcome.UNKNOWN_USAGE,
-            None,
-            reservation.reserved_cost_usd,
-        )
+        """Settle a ping whose usage was not recorded: outcome=unknown-usage."""
+        self._settle(reservation, KeepaliveOutcome.UNKNOWN_USAGE, None)
 
     def cancel(self, reservation: KeepaliveReservation) -> None:
-        """Settle a cancelled ping: outcome=cancelled, full reservation retained."""
-        self._settle(
-            reservation, KeepaliveOutcome.CANCELLED, None, reservation.reserved_cost_usd
-        )
+        """Settle a cancelled ping: outcome=cancelled."""
+        self._settle(reservation, KeepaliveOutcome.CANCELLED, None)
 
     def supersede(self, reservation: KeepaliveReservation) -> None:
         """Settle a pre-send supersession (a real call started mid-reserve).
 
-        The reservation is released unspent; the attempt still counts against
-        the count cap. Outcome=superseded.
+        The attempt still counts against the count cap. Outcome=superseded.
         """
-        self._settle(reservation, KeepaliveOutcome.SUPERSEDED, None, 0.0)
+        self._settle(reservation, KeepaliveOutcome.SUPERSEDED, None)
 
-    def _unavailable_reason(self, declared_max_tokens: int | None) -> str | None:
-        """Why this deployment cannot reserve right now, or None when it can."""
+    def _unavailable_reason(self) -> str | None:
+        """Why this deployment cannot reserve right now, or None when it can.
+
+        Only the ledger sink and the attribution fail closed: the price and
+        conversion checks served USD estimation and are retired with the
+        spend cap.
+        """
         checks: list[tuple[bool, str]] = [
             (self._ledger is None, "no ledger sink: the ping accountant requires one"),
             (
                 self._attribution is None,
                 "no usage attribution: the ping accountant requires one",
-            ),
-            (
-                billable_input_bound(self._provider) is None,
-                "no registered conservative billable-input conversion for "
-                f"provider {self._provider!r}",
-            ),
-            (self._prices.input is None, "the uncached input price is unknown"),
-            (self._prices.output is None, "the completion price is unknown"),
-            (
-                declared_max_tokens is None,
-                "no declared max completion tokens: the output cost is unbounded",
             ),
         ]
         for failed, reason in checks:
@@ -428,7 +284,6 @@ class KeepaliveAccountant:
         reservation: KeepaliveReservation,
         outcome: KeepaliveOutcome,
         tokens: UsageTokens | None,
-        retained_cost_usd: float,
     ) -> None:
         with self._lock:
             if reservation.attempt_id not in self._open:
@@ -436,12 +291,8 @@ class KeepaliveAccountant:
                     f"attempt {reservation.attempt_ordinal} is not an open reservation"
                 )
             del self._open[reservation.attempt_id]
-            self._charged_spend_usd += retained_cost_usd - reservation.reserved_cost_usd
-            record = self._attempt_record(
-                reservation, outcome, tokens, retained_cost_usd
-            )
-        # The ledger write sits outside the accumulator lock: the ledger is the
-        # record, the accumulator is the counter.
+            record = self._attempt_record(reservation, outcome, tokens)
+        # The ledger write sits outside the lock: the ledger is the record.
         assert self._ledger is not None
         self._ledger(record)
 
@@ -450,7 +301,6 @@ class KeepaliveAccountant:
         reservation: KeepaliveReservation,
         outcome: KeepaliveOutcome,
         tokens: UsageTokens | None,
-        retained_cost_usd: float,
     ) -> UsageRecord:
         assert self._attribution is not None
         attribution = self._attribution.model_copy(
@@ -466,6 +316,15 @@ class KeepaliveAccountant:
         usage_state = (
             tokens.presence_state if tokens is not None else UsageState.MISSING
         )
+        has_unknown_cost = (
+            outcome is not KeepaliveOutcome.COMPLETED
+            or usage_state is not UsageState.COMPLETE
+        )
+        known_cost_usd = 0.0
+        if not has_unknown_cost and tokens is not None:
+            pricing = price_usage(**tokens.model_dump(), prices=self._prices)
+            known_cost_usd = pricing.known_cost_usd
+            has_unknown_cost = pricing.has_unknown_cost
         return UsageRecord(
             **attribution.model_dump(),
             **(
@@ -479,18 +338,9 @@ class KeepaliveAccountant:
             record_id=str(uuid4()),
             occurred_at=self._clock(),
             prices_usd_per_million=self._prices,
-            known_cost_usd=retained_cost_usd,
-            has_unknown_cost=(
-                outcome is not KeepaliveOutcome.COMPLETED
-                or usage_state is not UsageState.COMPLETE
-            ),
-            keepalive=KeepaliveLedgerEntry(
-                outcome=outcome,
-                reserved_input_tokens=reservation.reserved_input_tokens,
-                reserved_output_tokens=reservation.reserved_output_tokens,
-                reserved_cost_usd=reservation.reserved_cost_usd,
-                retained_cost_usd=retained_cost_usd,
-            ),
+            known_cost_usd=known_cost_usd,
+            has_unknown_cost=has_unknown_cost,
+            keepalive=KeepaliveLedgerEntry(outcome=outcome),
         )
 
 
@@ -499,8 +349,9 @@ class KeepaliveAccountant:
 # ---------------------------------------------------------------------------
 
 #: The pilot's declared ping output bound: the ping-only generation settings
-#: default to this max completion tokens, which is what the accountant's
-#: pre-send reservation prices as the ping's output cost.
+#: default to this max completion tokens (the reservation pricing that
+#: consumed it is retired with the spend cap; the bound stays as the ping's
+#: declared limit).
 DEFAULT_PING_MAX_TOKENS = 64
 
 #: The ping-only temperature ceiling (the ping's own sampling bound, separate
@@ -841,9 +692,9 @@ class KeepaliveScheduler:
     - a live snapshot exists for this deployment/provider.
 
     Supersession — a real call starting while a ping is open — applies in BOTH
-    phases: a RESERVED ping (pre-send) is settled ``superseded`` (released
-    unspent); an IN-FLIGHT ping is cancelled and settled ``cancelled`` (the
-    wire request may have been billed, so its full reservation is retained).
+    phases: a RESERVED ping (pre-send) is settled ``superseded``; an IN-FLIGHT
+    ping is cancelled and settled ``cancelled``. In both phases the attempt
+    still counts against the count cap.
     """
 
     def __init__(
@@ -930,6 +781,44 @@ class KeepaliveScheduler:
         with self._lock:
             return tuple(self._records)
 
+    def invalidate(
+        self, trigger: KeepaliveInvalidation, *, detail: str | None = None
+    ) -> KeepaliveSnapshot | None:
+        """Wiring hook: drop the live snapshot on one of the six triggers."""
+        return self._snapshot_store.invalidate(trigger, detail=detail)
+
+    def stats_view(self, *, max_attempts: int) -> KeepaliveStatsView:
+        """Wiring hook: the pinned /stats view of the scheduler's state."""
+        with self._lock:
+            records = tuple(self._records)
+            stop = self._cycle_stopped
+        settled = sum(1 for r in records if not r.superseded and r.stop is None)
+        superseded = sum(1 for r in records if r.superseded)
+        error = sum(
+            1
+            for r in records
+            if not r.superseded and r.stop is KeepaliveStopReason.ERROR
+        )
+        last_observation = next(
+            (r.observation for r in reversed(records) if r.observation is not None),
+            None,
+        )
+        return KeepaliveStatsView(
+            enabled=self._enabled,
+            attempts_used=self._accountant.attempts,
+            max_attempts=max_attempts,
+            pings_sent=len(records),
+            settled=settled,
+            superseded=superseded,
+            error=error,
+            cached_coverage=(
+                last_observation.cached_coverage
+                if last_observation is not None
+                else None
+            ),
+            stop=stop,
+        )
+
     def _root(self) -> bool:
         is_root = self._gates.is_root
         return is_root() if callable(is_root) else is_root
@@ -968,8 +857,8 @@ class KeepaliveScheduler:
         A real call is conversation activity: it invalidates the live snapshot
         (the 5b trigger) and restarts the idle gap. It also SUPERSEDES any
         open ping — in both phases: a RESERVED ping is settled ``superseded``
-        here (released unspent); an IN-FLIGHT ping task is cancelled, and the
-        task itself settles it ``cancelled`` (full reservation retained).
+        here; an IN-FLIGHT ping task is cancelled, and the task itself settles
+        it ``cancelled``.
         """
         self._snapshot_store.note_conversation_activity()
         with self._lock:
@@ -987,7 +876,7 @@ class KeepaliveScheduler:
             else:
                 supersede = None
         if supersede is not None:
-            # Pre-send supersession: released unspent, still a counted attempt.
+            # Pre-send supersession: still a counted attempt.
             self._accountant.supersede(supersede)
         elif phase is KeepalivePhase.IN_FLIGHT and task is not None and not task.done():
             task.cancel()
@@ -1031,9 +920,7 @@ class KeepaliveScheduler:
         if snapshot is None or self._transport is None:
             return None
         try:
-            reservation = self._accountant.reserve(
-                snapshot.byte_length, snapshot.ping_settings.max_tokens
-            )
+            reservation = self._accountant.reserve()
         except KeepaliveFailClosedError:
             return None
         except KeepaliveCapExceededError:
@@ -1106,8 +993,7 @@ class KeepaliveScheduler:
             else:
                 self._accountant.mark_unknown_usage(reservation)
         except asyncio.CancelledError:
-            # In-flight supersession by a real call: the wire request may have
-            # been billed, so the FULL reservation is retained.
+            # In-flight supersession by a real call: settled cancelled.
             superseded = True
             self._accountant.cancel(reservation)
         except Exception:
@@ -1222,3 +1108,52 @@ def observe_ping_usage(
             stop=KeepaliveStopReason.INSUFFICIENT_CACHED_COVERAGE,
         )
     return PingObservation(usage=tokens, cached_coverage=coverage, stop=None)
+
+
+# ---------------------------------------------------------------------------
+# WIRING section (v0.8.0 C2): the loop-side hooks the root AgentLoop drives
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class KeepaliveStatsView:
+    """The pinned /stats view of the keep-alive pilot (design item 7).
+
+    Content-free: counts, a coverage fraction, and the last stop reason —
+    never any prefix bytes or response content.
+    """
+
+    enabled: bool
+    attempts_used: int
+    max_attempts: int
+    pings_sent: int
+    settled: int
+    superseded: int
+    error: int
+    cached_coverage: float | None
+    stop: KeepaliveStopReason | None
+
+
+def serialize_prefix(messages: Sequence[LLMMessage]) -> bytes:
+    """Serialize the frozen cache-relevant prefix for the snapshot store."""
+    return json.dumps([message.model_dump(mode="json") for message in messages]).encode(
+        "utf-8"
+    )
+
+
+def deserialize_prefix(serialized: bytes) -> tuple[LLMMessage, ...]:
+    """Rebuild the snapshotted prefix; the ping re-sends exactly these."""
+    return tuple(
+        LLMMessage.model_validate(item)
+        for item in json.loads(serialized.decode("utf-8"))
+    )
+
+
+def ping_messages(snapshot: KeepaliveSnapshot) -> tuple[LLMMessage, ...]:
+    """The ping request's messages: the frozen prefix plus one minimal,
+    content-free ping message (``content_class: None`` rides on the ledger).
+    """
+    return (
+        *deserialize_prefix(snapshot.serialized),
+        LLMMessage(role=Role.user, content="ping"),
+    )

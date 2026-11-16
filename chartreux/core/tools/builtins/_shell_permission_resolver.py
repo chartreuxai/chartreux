@@ -110,7 +110,7 @@ from chartreux.core.tools.builtins._shell_permission_analysis import (
     analyze_shell_command,
     argv_permission_diagnostics,
 )
-from chartreux.core.tools.permissions import PermissionContext
+from chartreux.core.tools.permissions import PermissionContext, dangerous_mode_active
 from chartreux.core.tools.utils import (
     PathAccess,
     PathAuthority,
@@ -147,8 +147,16 @@ class DangerousCommandAuthorityProvider(Protocol):
 
 
 def _denied(diagnostic: Diagnostic) -> PermissionContext:
+    # v0.8.0 A-P2: carry the typed SYNTAX discriminator. At v0.7.9 the SYNTAX
+    # vs POLICY class was only a reason-text prefix, so shell-grammar
+    # refusals reached the loop seam with denial_kind=None; the typed marker
+    # lets the seam keep them away from the SMART classifier.
     return PermissionContext(
-        permission=ToolPermission.NEVER, reason=render_diagnostic(diagnostic)
+        permission=ToolPermission.NEVER,
+        reason=render_diagnostic(diagnostic),
+        denial_kind=(
+            "syntax" if diagnostic.denial_class is DenialClass.SYNTAX else None
+        ),
     )
 
 
@@ -3899,6 +3907,13 @@ class ShellPermissionResolver:
         return entry
 
     def resolve_permission(self, args: ShellCommandArgs) -> PermissionContext | None:  # noqa: PLR0911, PLR0912, PLR0914
+        # v0.8.0 A-P1: at SafetyLevel DANGEROUS the shell policy admits —
+        # hard guards, dangerous Git operations, denylisted commands, shell
+        # syntax restrictions, path checks, and modeled network egress all
+        # yield; the tool selects its unguarded execution path instead.
+        # UNREACHABLE-BY-STATE before the A-P1 ceremony.
+        if dangerous_mode_active():
+            return None
         precondition = self._resolve_preconditions()
         if precondition is not None:
             return precondition

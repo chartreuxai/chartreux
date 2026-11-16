@@ -4,6 +4,7 @@ import asyncio
 from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
 from contextlib import suppress
 from dataclasses import dataclass, field, replace
+import os
 from pathlib import Path
 import threading
 from typing import TYPE_CHECKING, Any, Literal
@@ -58,6 +59,7 @@ from chartreux.core._usage_startup import (
 from chartreux.core.agent_loop import AgentLoop, AgentRuntimePolicy
 from chartreux.core.agent_loop._file_state_context import RevisionRegistryPort
 from chartreux.core.agent_loop._loop import RootAccountingOwner
+from chartreux.core.agent_loop._safety_authority import AuthorityLaunchSnapshot
 from chartreux.core.agent_loop._transcript_integrity import (
     TranscriptIntegrityError,
     pop_report_from_metadata,
@@ -89,7 +91,6 @@ from chartreux.core.hooks.config import load_hooks_from_fs
 from chartreux.core.hooks.models import HookConfigResult
 from chartreux.core.llm_models import LLMMessage, Role
 from chartreux.core.paths import WORKTREES_DIR
-from chartreux.core.plan_episode import restored_plan_record
 from chartreux.core.recovery_models import PackageTier
 from chartreux.core.rewind import archived_history_for, complete_history
 from chartreux.core.scratchpad import cleanup_scratchpad
@@ -308,6 +309,11 @@ class RootOpenRequest:
     inherited_restrictions: tuple[SourceRestrictions, ...] | None = None
     inherited_mode_restrictions: tuple[SourceRestrictions, ...] | None = None
     inherited_root_grants: tuple[Path, ...] | None = None
+    # v0.8.0 A-P0: the parent's safety-authority launch snapshot (JSON-safe
+    # encoded AuthorityLaunchSnapshot) a child loop is constructed with.
+    # None for roots and resumes; a legacy spawn payload without the key
+    # decodes to None and falls back to the hard-coded SAFE initial level.
+    inherited_authority: dict[str, Any] | None = None
 
     def __post_init__(self) -> None:
         if self.startup_accounting is not None and (
@@ -389,6 +395,7 @@ class _AgentLoopBlueprint:
             inherited_restrictions=self.policy.inherited_restrictions,
             inherited_mode_restrictions=self.policy.inherited_mode_restrictions,
             inherited_root_grants=self.policy.inherited_root_grants,
+            inherited_authority=self.policy.authority_snapshot,
             parent_authority_getter=self.policy.parent_authority_getter,
             parent_authority_revision_getter=self.policy.parent_authority_revision_getter,
             user_input_capability=self.policy.user_input_capability,
@@ -460,6 +467,9 @@ class _RootRuntimeBlueprint:
         inherited_restrictions: tuple[SourceRestrictions, ...] = (),
         inherited_mode_restrictions: tuple[SourceRestrictions, ...] = (),
         inherited_root_grants: tuple[Path, ...] = (),
+        # v0.8.0 A-P0: JSON-safe encoded AuthorityLaunchSnapshot from the
+        # process-spawn payload; None for roots/resumes/legacy payloads.
+        inherited_authority: dict[str, Any] | None = None,
     ) -> AgentLoop:
         # B2c, process-spawn counterpart: a subagent's run-budget default arms
         # every process-child loop the same way ``_create_like`` arms an
@@ -512,6 +522,7 @@ class _RootRuntimeBlueprint:
             inherited_restrictions=inherited_restrictions,
             inherited_mode_restrictions=inherited_mode_restrictions,
             inherited_root_grants=inherited_root_grants,
+            authority_snapshot=AuthorityLaunchSnapshot.decode(inherited_authority),
         )
         return _AgentLoopBlueprint(
             config_orchestrator=self.config_orchestrator.copy(),
@@ -1258,7 +1269,6 @@ class AgentRuntimeFactory:
             )
             await forked.wait_until_ready()
             forked.messages.extend(_messages_for_fork(source, message_id))
-            _inherit_plan_mode(source, forked)
             await forked.session_logger.save_interaction(
                 forked.messages, forked.stats, forked.config, forked.tool_manager
             )
@@ -1978,6 +1988,7 @@ class HarnessProcess:
                         request.inherited_mode_restrictions or ()
                     ),
                     inherited_root_grants=request.inherited_root_grants or (),
+                    inherited_authority=request.inherited_authority,
                 )
                 if context is not None:
                     # Replay content-free outcomes, not just bytes: a cold scan
@@ -2231,6 +2242,39 @@ def _require_session_logging(config: ChartreuxConfigSchema) -> None:
     raise RuntimeSessionNotFoundError(
         "Session logging is disabled. Enable it in config to use --continue or --resume"
     )
+
+
+class SessionAuditSinkUnavailableError(RuntimeError):
+    """No writable session audit sink: authority escalation fails closed."""
+
+
+def require_writable_session_audit_sink(config: ChartreuxConfigSchema) -> None:
+    """Fail closed unless the session has a writable audit sink.
+
+    v0.8.0 A-P0 (unguarded doc, Audit): session logging can be disabled when
+    the root opens (the ``request.session_logging`` override in
+    ``HarnessProcess.open_root``), so any safety-level activation must first
+    require a writable session audit sink — the sink the
+    ``authority_transition`` events and authorizer tags land in.
+    """
+    if not config.session_logging.enabled:
+        raise SessionAuditSinkUnavailableError(
+            "session logging is disabled: no writable session audit sink"
+        )
+    save_dir = Path(config.session_logging.save_dir).expanduser()
+    if not save_dir.is_dir() or not os.access(save_dir, os.W_OK):
+        raise SessionAuditSinkUnavailableError(
+            f"session audit sink {save_dir} is not a writable directory"
+        )
+
+
+def session_audit_sink_available(config: ChartreuxConfigSchema) -> bool:
+    """Fail-closed boolean read of :func:`require_writable_session_audit_sink`."""
+    try:
+        require_writable_session_audit_sink(config)
+    except SessionAuditSinkUnavailableError:
+        return False
+    return True
 
 
 def _find_session_to_continue(config: ChartreuxConfigSchema, *, cwd: Path) -> str:
@@ -2524,34 +2568,6 @@ def _messages_for_fork(source: AgentLoop, message_id: str | None) -> list[LLMMes
         len(messages),
     )
     return [message.model_copy(deep=True) for message in messages[:end]]
-
-
-def _inherit_plan_mode(source: AgentLoop, forked: AgentLoop) -> None:
-    """Carry the plan-mode record into a fork, REBOUND to the same sidecar.
-
-    ``/branch`` shares the plan document with its source, so resuming the fork
-    is resuming a planning session. Only the record travels, and it travels
-    rebuilt from the episode sidecar (design §4.5): the sidecar is the single
-    shared-disk arbiter, so no fork-local identity copy exists, an accepted or
-    cancelled source episode inherits its terminal state and never re-arms, and
-    a second fork's accept consults the same sidecar, sees accepting/accepted,
-    and refuses. ``source``'s own meta carries the P1 mirror of the episode, so
-    it is the session the bounded executor scan excludes.
-
-    An untrusted arbiter read leaves the copied record in place: the restore
-    surfaces observe the sidecar themselves and display the failure, and every
-    transition (accept above all) re-validates the sidecar before it acts.
-    """
-    source_metadata = source.session_logger.session_metadata
-    forked_metadata = forked.session_logger.session_metadata
-    if source_metadata is None or forked_metadata is None:
-        return
-    record = source_metadata.plan_mode
-    if record is None:
-        return
-    forked_metadata.plan_mode = restored_plan_record(
-        record, session_id=source.session_id
-    )
 
 
 _USAGE_SETTLEMENT_TIMEOUT = 5.0

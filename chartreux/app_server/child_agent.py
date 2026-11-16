@@ -32,6 +32,7 @@ from chartreux.app_server._agent_transcript import read_live_agent_transcript
 from chartreux.app_server._subagent_transcript import (
     AGENT_CONFIG_PAYLOAD_KEY,
     AGENT_NAME_PAYLOAD_KEY,
+    AUTHORITY_SNAPSHOT_PAYLOAD_KEY,
     INHERITED_MODE_RESTRICTIONS_PAYLOAD_KEY,
     INHERITED_RESTRICTIONS_PAYLOAD_KEY,
     INHERITED_ROOT_GRANTS_PAYLOAD_KEY,
@@ -882,6 +883,10 @@ class HarnessChildLoopFactory:
             inherited_root_grants = decode_inherited_root_grants(
                 payload[INHERITED_ROOT_GRANTS_PAYLOAD_KEY]
             )
+            # v0.8.0 A-P0: the parent's safety-authority launch snapshot rides
+            # the spawn payload the same way. A legacy payload without the key
+            # decodes to None, and the child falls back to the hard-coded SAFE
+            # initial level (initial_level(config)) — never a silent elevation.
             loop = await self._process.open_root(
                 RootOpenRequest(
                     options=options,
@@ -898,6 +903,7 @@ class HarnessChildLoopFactory:
                     inherited_restrictions=inherited_restrictions,
                     inherited_mode_restrictions=inherited_mode_restrictions,
                     inherited_root_grants=inherited_root_grants,
+                    inherited_authority=payload.get(AUTHORITY_SNAPSHOT_PAYLOAD_KEY),
                 )
             )
         except asyncio.CancelledError:

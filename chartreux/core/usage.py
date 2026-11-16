@@ -57,6 +57,7 @@ class UsagePurpose(StrEnum):
     TITLE = "title"
     WORKTREE_NAMING = "worktree-naming"
     KEEPALIVE = "keepalive"
+    SMART_APPROVE = "smart-approve"
 
 
 class UsageOutcome(StrEnum):
@@ -201,21 +202,13 @@ class CallAccountingOutcome(UsageTokens):
 class KeepaliveLedgerEntry(_ImmutableModel):
     """Content-free P5 accounting for one keep-alive attempt.
 
-    The reserved_* fields carry the pre-send reservation the attempt was
-    charged against the absolute caps (billable input bound + declared max
-    completion tokens, priced at the ledger-recorded rates). retained_cost_usd
-    is what the attempt ultimately kept against the caps: the recorded actual
-    for completed, the full reservation for unknown-usage and cancelled, and
-    zero for superseded (released unspent pre-send). Summing retained_cost_usd
-    over purpose=keepalive rows reconstructs the spend-cap burn; counting
-    those rows reconstructs the attempts-counted count-cap burn.
+    The entry carries the attempt's precise outcome; counting
+    purpose=keepalive rows reconstructs the attempts-counted count-cap burn.
+    The spend-cap money fields (reserved_*/retained_cost_usd) are retired
+    with the USD cap: the pilot is attempt-capped only.
     """
 
     outcome: KeepaliveOutcome
-    reserved_input_tokens: TokenCount
-    reserved_output_tokens: TokenCount
-    reserved_cost_usd: UsdAmount
-    retained_cost_usd: UsdAmount
 
 
 class UsageRecord(UsageAttribution, CallAccountingOutcome):

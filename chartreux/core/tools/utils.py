@@ -13,7 +13,7 @@ import posixpath
 
 from chartreux.core.config.harness_files import HarnessFilesManager
 from chartreux.core.tools.base import ToolPermission
-from chartreux.core.tools.permissions import PermissionContext
+from chartreux.core.tools.permissions import PermissionContext, dangerous_mode_active
 from chartreux.core.workspace import Workspace
 from chartreux.utils.paths import is_foreign_windows_path
 
@@ -287,6 +287,13 @@ class PathAuthority:
     parents: tuple[PathAuthority, ...] = ()
 
     def resolve(self, path: str, access: PathAccess) -> PermissionContext | None:
+        # v0.8.0 A-P1: at SafetyLevel DANGEROUS the file authority is
+        # bypassed — configured tool denial, path denylist, sensitive
+        # patterns, Plan/scratchpad ceilings and authorized-root checks all
+        # yield (OS permissions/mounts/process credentials still apply).
+        # UNREACHABLE-BY-STATE before the A-P1 ceremony.
+        if dangerous_mode_active():
+            return PermissionContext(permission=ToolPermission.ALWAYS)
         decision = resolve_file_tool_permission(
             path,
             tool_name=self.tool_name,
@@ -336,7 +343,12 @@ def resolve_file_tool_permission(  # noqa: PLR0911, PLR0913 - independent runtim
     explicitly modeled shell reads, never writes or opaque mutators.
     Other reads and writes require workspace authority; allowlists never expand
     it. Decisions never manufacture per-call approval requirements.
+
+    v0.8.0 A-P1: at SafetyLevel DANGEROUS every configured ceiling yields —
+    tool denial, denylist, sensitive patterns, ceilings, authorized roots.
     """
+    if dangerous_mode_active():
+        return PermissionContext(permission=ToolPermission.ALWAYS)
     if config_permission == ToolPermission.NEVER:
         return PermissionContext(
             permission=ToolPermission.NEVER,

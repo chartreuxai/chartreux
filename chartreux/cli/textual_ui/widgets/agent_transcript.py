@@ -47,12 +47,16 @@ from chartreux.app_server.protocol import (
     AgentTranscriptToolStatus,
 )
 from chartreux.cli.textual_ui.widgets.agent_bar import short_agent_display_id
+from chartreux.cli.textual_ui.widgets.collapsible import HeaderCollapsibleSection
+from chartreux.cli.textual_ui.widgets.entry_expansion import EntryExpansionState
 from chartreux.cli.textual_ui.widgets.inline_notice import InlineNotice
+from chartreux.cli.textual_ui.widgets.message_header import MinuteKey
 from chartreux.cli.textual_ui.widgets.messages import (
     AssistantMessage,
     StreamingMessageBase,
     UserMessage,
 )
+from chartreux.cli.textual_ui.widgets.minute_group_header import MinuteGroupHeader
 from chartreux.cli.textual_ui.widgets.tool_grouping import (
     ToolGroupExpansionState,
     effect_state_is_terminal,
@@ -62,7 +66,10 @@ from chartreux.cli.textual_ui.widgets.tools import (
     ToolGroup,
     ToolResultMessage,
 )
-from chartreux.cli.textual_ui.windowing.history import build_history_widgets
+from chartreux.cli.textual_ui.windowing.history import (
+    advance_rendered_minute,
+    build_history_widgets,
+)
 from chartreux.observability.logging import get_effective_log_level, logger
 from chartreux.ui.chrome_glyphs import chrome_glyph
 from chartreux.ui.widgets.no_markup_static import NoMarkupStatic
@@ -315,6 +322,7 @@ class AgentTranscriptViewer(Vertical):
         self._last_heartbeat = 0.0
         self._max_heartbeat_drift = 0.0
         self._expansion_state = ToolGroupExpansionState()
+        self._entry_expansion_state = EntryExpansionState()
 
     @property
     def agent_id(self) -> str:
@@ -684,6 +692,93 @@ class AgentTranscriptViewer(Vertical):
                 | ToolResultMessage,
             ):
                 widget.set_show_message_timestamps(show)
+        # The viewer owns its minute headers: the gate-off walk removes them all,
+        # the gate-on walk re-stamps the ones the entries still open.
+        if self.is_mounted and not self._viewer_closed:
+            self.run_worker(self._sync_minute_headers())
+
+    async def _sync_minute_headers(self) -> None:
+        """Mount, relabel or drop the group header each mounted unit opens.
+
+        Mirrors the main presenter's reconcile: the walk reuses the pure helpers
+        in ``windowing/history.py`` (never the window-private methods, and never
+        ``created_at`` — viewer-built entries have no ``turn_id``). A stamped
+        header lives in the unit's widget list ahead of the first root, so
+        mount-cap eviction and ``_replace_unit`` remove it with the roots.
+        """
+        content = self._content
+        if content is None:
+            return
+        show = self.show_message_timestamps
+        rendered: MinuteKey | None = None
+        for unit in self._units:
+            entries = sorted(unit.entries.values(), key=lambda entry: entry.created_at)
+            for position, entry in enumerate(entries):
+                rendered, marker = advance_rendered_minute(rendered, entry)
+                if position == 0:
+                    await self._stamp_unit_header(unit, marker if show else None)
+                elif marker is not None and unit.group is not None and show:
+                    await self._stamp_fold_marker(unit, entry, marker)
+        if not show:
+            # Fold-interior stamps built by the shared builder follow the gate too.
+            for header in list(self.query(MinuteGroupHeader)):
+                if any(
+                    unit.widgets and unit.widgets[0] is header for unit in self._units
+                ):
+                    continue
+                await header.remove()
+
+    async def _stamp_unit_header(
+        self, unit: _MountedUnit, minute: MinuteKey | None
+    ) -> None:
+        """Mount, relabel or drop the header a unit's leading record opens."""
+        content = self._content
+        if content is None or not unit.widgets:
+            return
+        current = (
+            unit.widgets[0] if isinstance(unit.widgets[0], MinuteGroupHeader) else None
+        )
+        if minute is None:
+            if current is not None:
+                unit.widgets.pop(0)
+                await current.remove()
+            return
+        if current is None:
+            header = MinuteGroupHeader(minute)
+            await content.mount(header, before=unit.widgets[0])
+            unit.widgets.insert(0, header)
+        elif current.minute != minute:
+            current.set_minute(minute)
+        else:
+            current.refresh_label()
+
+    async def _stamp_fold_marker(
+        self, unit: _MountedUnit, entry: PublicHistoryEntry, minute: MinuteKey
+    ) -> None:
+        """Keep the fold-interior stamp a grouped record opens in step."""
+        group = unit.group
+        if group is None:
+            return
+        anchor_widgets = unit.entry_widgets.get(entry.id)
+        if not anchor_widgets:
+            return
+        container = group.content_container
+        children = list(container.children)
+        try:
+            anchor_index = children.index(anchor_widgets[0])
+        except ValueError:
+            return
+        existing: MinuteGroupHeader | None = None
+        if anchor_index > 0:
+            previous = children[anchor_index - 1]
+            if isinstance(previous, MinuteGroupHeader):
+                existing = previous
+        if existing is None:
+            await container.mount(MinuteGroupHeader(minute), before=anchor_widgets[0])
+        elif existing.minute != minute:
+            existing.set_minute(minute)
+        else:
+            existing.refresh_label()
 
     def _reconcile_timing_only(
         self, previous: AgentTranscriptEntry, entry: AgentTranscriptEntry
@@ -813,6 +908,7 @@ class AgentTranscriptViewer(Vertical):
         )
         if not self._is_current(epoch):
             return
+        await self._sync_minute_headers()
         self._known_entries = staged
         self._cursor = response.oldest_cursor
         self._has_more = response.has_more or False
@@ -961,7 +1057,11 @@ class AgentTranscriptViewer(Vertical):
                     **common,
                 )
             case AgentTranscriptEntryKind.REASONING:
-                return PublicReasoningEntry(text=_entry_display_text(entry), **common)
+                return PublicReasoningEntry(
+                    text=_entry_display_text(entry),
+                    event_at=_entry_event_at(entry),
+                    **common,
+                )
             case (
                 AgentTranscriptEntryKind.TOOL_CALL
                 | AgentTranscriptEntryKind.TOOL_RESULT
@@ -1027,6 +1127,7 @@ class AgentTranscriptViewer(Vertical):
                     detail=detail,
                     state=state,
                     related_entry_id=entry.tool_call_id,
+                    event_at=_entry_event_at(entry),
                     **common,
                 )
 
@@ -1114,10 +1215,17 @@ class AgentTranscriptViewer(Vertical):
                 continue
 
             index = widget_indices.get(widget)
-            indexed_entry = history_by_index.get(index) if index is not None else None
+            if index is None:
+                continue
+            indexed_entry = history_by_index.get(index)
             if indexed_entry is None:
                 continue
             projected, history_entry = indexed_entry
+            if isinstance(widget, UserMessage) and _is_file_state_block(projected):
+                # The wrapper is the widget registered against the entry's
+                # index, so _build_units cannot skip it.
+                widget = self._file_state_section(projected, widget)
+                widget_indices[widget] = index
             if (
                 units
                 and units[-1].group is None
@@ -1136,6 +1244,33 @@ class AgentTranscriptViewer(Vertical):
                     )
                 )
         return units
+
+    def _file_state_section(
+        self, entry: AgentTranscriptEntry, body: UserMessage
+    ) -> HeaderCollapsibleSection:
+        """Wrap an injected file_state block in a disclosure that starts folded.
+
+        The collapsed flag is keyed by entry id in the viewer's
+        ``EntryExpansionState`` store: consulted on every build and written on
+        toggle, so a user-expanded block survives the ``_replace_unit`` rebuilds
+        that per-edit content changes trigger.
+        """
+        section = HeaderCollapsibleSection(
+            body, header_text=_file_state_label(entry.display_text), header_muted=True
+        )
+        collapsed = self._entry_expansion_state.register(entry.entry_id)
+        if not collapsed:
+            # The section is not mounted yet, so set the expanded state
+            # directly; set_collapsed would route through the unmounted app.
+            section._is_collapsed = False
+            body.display = True
+            section._triangle.update(chrome_glyph("disclosure_open"))
+            section._on_toggled(False)
+        entry_id = entry.entry_id
+        section.on_collapse_changed = lambda collapsed, _entry_id=entry_id: (
+            self._entry_expansion_state.set_collapsed(_entry_id, collapsed)
+        )
+        return section
 
     async def _mount_entries(  # noqa: PLR0911, PLR0912, PLR0915
         self,
@@ -1591,6 +1726,38 @@ class AgentTranscriptViewer(Vertical):
 def _entry_display_text(entry: AgentTranscriptEntry, text: str | None = None) -> str:
     display_text = entry.display_text if text is None else text
     return f"{display_text} [truncated]" if entry.truncated else display_text
+
+
+def _entry_event_at(entry: AgentTranscriptEntry) -> int | None:
+    """The wire entry's canonical posting time as an epoch-ms event clock.
+
+    Only ``posted_at`` feeds this — ``created_at`` is a synthetic transcript
+    ordinal in the subagent view and never becomes a wall-clock minute.
+    """
+    if entry.posted_at is None:
+        return None
+    return int(entry.posted_at.timestamp() * 1000)
+
+
+def _is_file_state_block(entry: AgentTranscriptEntry) -> bool:
+    """The compound fold discriminator: injected AND a file_state tag.
+
+    ``injected`` alone is not enough (compaction boundaries, resume
+    continuations and other injections exist); a user-typed ``<file_state``
+    string has ``injected=False`` and never folds.
+    """
+    return (
+        entry.kind is AgentTranscriptEntryKind.USER_TEXT
+        and entry.injected
+        and entry.display_text.startswith("<file_state")
+    )
+
+
+def _file_state_label(display_text: str) -> str:
+    """The disclosure label naming the block kind."""
+    if display_text.startswith("<file_state_handoff>"):
+        return "File state handoff"
+    return "File state"
 
 
 __all__ = ["AgentTranscriptViewer"]

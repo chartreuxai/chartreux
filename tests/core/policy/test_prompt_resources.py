@@ -439,7 +439,8 @@ def test_utility_prompts_remain_a_separate_untouched_mechanism() -> None:
     # Utility prompts (compact, session_title, ...) are not part of the
     # identity/workflow/strategy corpus; they load through the strict
     # loader branch and survive the enum retirement untouched.
-    assert len(list(UtilityPrompt)) == 8
+    # v0.8.0 A-P2 adds SMART_APPROVE_CLASSIFIER (the bundled classifier prompt).
+    assert len(list(UtilityPrompt)) == 9
     for prompt in UtilityPrompt:
         assert prompt.read()
 

@@ -30,7 +30,6 @@ from chartreux.core.llm_models import (
     archived_replacement,
 )
 from chartreux.core.message_list import MessageList
-from chartreux.core.plan_episode import PlanEpisodeWriteError, durable_replace_plan
 from chartreux.core.session.session_loader import (
     MESSAGES_FILENAME,
     METADATA_FILENAME,
@@ -61,7 +60,6 @@ from chartreux.core.session.transcript_archive import (
 from chartreux.core.session_types import (
     AgentStats,
     LaunchMetadata,
-    PlanModeRecord,
     SessionMetadata,
     WorktreeContext,
 )
@@ -69,7 +67,6 @@ from chartreux.core.tools.secret_redaction import scrub_child_env
 from chartreux.core.utils import utc_now
 from chartreux.utils.durable_io import (
     durable_append,
-    durable_mkdir,
     durable_replace,
     durable_replace_stream,
     read_chunks,
@@ -932,16 +929,10 @@ class SessionLogger:  # noqa: PLR0904
         return end_time if isinstance(end_time, str) else None
 
     @staticmethod
-    def _persist_metadata_sync(
-        metadata: Any, session_dir: Path, *, plan_scope: bool = False
-    ) -> None:
+    def _persist_metadata_sync(metadata: Any, session_dir: Path) -> None:
         metadata_filepath = session_dir / METADATA_FILENAME
-        # A plan-scope write is published through the plan-mode wrapper, so its
-        # temporary sibling carries the recognizable plan temp prefix instead of
-        # an opaque random name.
-        publish = durable_replace_plan if plan_scope else durable_replace
         try:
-            publish(
+            durable_replace(
                 metadata_filepath,
                 json.dumps(metadata, indent=2, ensure_ascii=False).encode("utf-8"),
             )
@@ -955,23 +946,14 @@ class SessionLogger:  # noqa: PLR0904
             ) from e
 
     @staticmethod
-    async def persist_metadata(
-        metadata: Any, session_dir: Path, *, plan_scope: bool = False
-    ) -> None:
+    async def persist_metadata(metadata: Any, session_dir: Path) -> None:
         await asyncio.to_thread(
-            SessionLogger._persist_metadata_sync,
-            metadata,
-            session_dir,
-            plan_scope=plan_scope,
+            SessionLogger._persist_metadata_sync, metadata, session_dir
         )
 
-    async def _persist_metadata_locked(
-        self, metadata: Any, session_dir: Path, *, plan_scope: bool = False
-    ) -> None:
+    async def _persist_metadata_locked(self, metadata: Any, session_dir: Path) -> None:
         """Finish a metadata write before cancellation can release the save lock."""
-        persistence = asyncio.create_task(
-            self.persist_metadata(metadata, session_dir, plan_scope=plan_scope)
-        )
+        persistence = asyncio.create_task(self.persist_metadata(metadata, session_dir))
         try:
             await asyncio.shield(persistence)
         except asyncio.CancelledError as cancellation:
@@ -3474,90 +3456,6 @@ class SessionLogger:  # noqa: PLR0904
                 await self._persist_metadata_locked(metadata, session_dir)
             session_metadata.config = config
             return True
-
-    async def persist_plan_mode(self, record: PlanModeRecord) -> None:
-        """Record the active plan mode (design §7); written once at entry.
-
-        The in-memory field is set as well as the file patched, for the same
-        reason ``created_worktree`` does both: entry can precede the session's
-        first message, so on a fresh session there is no metadata file to patch
-        yet and only the in-memory record can reach the first full save.
-        """
-        session_info = self._get_session_info()
-        if session_info is None:
-            return
-        _, session_metadata = session_info
-        session_metadata.plan_mode = record
-        await self._persist_metadata_field("plan_mode", record.model_dump(mode="json"))
-
-    async def clear_plan_mode(self) -> None:
-        """Remove the plan-mode record; the session is no longer planning."""
-        session_info = self._get_session_info()
-        if session_info is None:
-            return
-        _, session_metadata = session_info
-        session_metadata.plan_mode = None
-        await self._persist_metadata_field("plan_mode", None)
-
-    async def persist_plan_mode_durable(self, record: PlanModeRecord | None) -> None:
-        """Record (or, with ``None``, remove) the plan mode as a FORCED write.
-
-        This is the variant the handoff's two integrity writes use: C2's
-        retirement of the source record as accepted, and C3's executor marker
-        (episode identity, consent digest, snapshot reference) as the replacement
-        session's first durable act. ``_persist_metadata_field_locked`` returns
-        SILENTLY when the metadata file does not exist yet, and both writes land
-        exactly there — a fresh planning session with no saved turn, and a
-        session just rotated by the reset. A caller cannot tell that skip from a
-        durable write, so nothing here is silent: the metadata file is created
-        when absent, the bytes are published through the plan-scoped durable
-        wrapper (temporary sibling, content fsync, atomic replace, parent fsync),
-        and every failure raises.
-
-        The in-memory record is set before the write, as in
-        :meth:`persist_plan_mode`; a failed write therefore leaves memory ahead
-        of disk, and what recovery reads is the durable marker — the absence of
-        which is the recognized row-3 state, never a reported success. A disk-full
-        failure keeps its own type (``SessionDiskFullError``); every other
-        failure raises ``PlanEpisodeWriteError``.
-        """
-        async with self._save_lock:
-            session_info = self._get_session_info()
-            if session_info is None:
-                raise PlanEpisodeWriteError(
-                    "session logging is disabled; the plan-mode record cannot be "
-                    "written durably"
-                )
-            session_dir, session_metadata = session_info
-            session_metadata.plan_mode = record
-            try:
-                durable_mkdir(session_dir)
-            except OSError as e:
-                raise PlanEpisodeWriteError(
-                    f"Failed to create the session directory at {session_dir}: {e}"
-                ) from e
-            metadata_path = session_dir / METADATA_FILENAME
-            if metadata_path.exists():
-                try:
-                    raw = (await read_safe_async(metadata_path)).text
-                    metadata = json.loads(raw)
-                except (OSError, json.JSONDecodeError) as e:
-                    raise PlanEpisodeWriteError(
-                        f"Failed to read session metadata at {metadata_path}: {e}"
-                    ) from e
-            else:
-                metadata = session_metadata.model_dump(mode="json")
-            metadata["plan_mode"] = (
-                None if record is None else record.model_dump(mode="json")
-            )
-            try:
-                await self._persist_metadata_locked(
-                    metadata, session_dir, plan_scope=True
-                )
-            except SessionDiskFullError:
-                raise
-            except RuntimeError as error:
-                raise PlanEpisodeWriteError(str(error)) from error
 
     async def persist_loops(self) -> None:
         session_info = self._get_session_info()

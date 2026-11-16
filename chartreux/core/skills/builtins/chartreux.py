@@ -37,7 +37,6 @@ prompts, workflows, orchestration strategies, logs, and session data live here.
   logs/
     chartreux.log           # Main log file
     session/           # Session log files
-  plans/               # Session plans
 
 ~/.agents/
   skills/              # Additional user-level skills directory
@@ -367,7 +366,7 @@ shell safety policy.
 File-based tools (`read_file`, `read_image`, `grep`, `write_file`, `edit`) enforce runtime authority in this order:
 
 1. **Tool denial, denylist, or sensitive-pattern match** → always denied
-2. **Runtime-owned Plan/scratchpad scope** → allowed only for the exact designated Plan file or session scratchpad, including inherited scopes
+2. **Runtime-owned scratchpad scope** → allowed only for the session scratchpad, including inherited scopes
 3. **Authorized workspace roots** → allowed
 4. **Otherwise** → denied; configured tool permissions do not grant filesystem authority
 
@@ -751,6 +750,36 @@ The harness runs the mandated checks itself at finalization. Templates map to fi
 
 The evidence is per-run and bounded: the chronology caps at 128 entries, and evidence that outlived the caps, a truncated snapshot, or a shell write surface that could not be established classify as unavailable — an availability fact, never a contradiction. The stamp rides on the completed result and stays retrievable until result expiry; no chronology content reaches the parent-facing result, and mixed-version consumption of a persisted result with a populated audit is unsupported. No TUI rendering of the stamp is provided.
 
+## Approval Postures (safety levels)
+
+Every session runs at exactly one safety level — `safe`, `smart`, or
+`dangerous` — and the level is the session's single authority surface:
+
+- `safe` (default): every tool call goes through the harness guard pipeline;
+  denied calls stay denied.
+- `smart`: denied tool calls (except shell-grammar refusals, which never reach
+  it) are adjudicated once by a classifier model, which may override a denial
+  it judges inside the user's request or launch intent. Verdicts are
+  fail-closed (unparseable, refused, errored, or cap-exhausted responses
+  uphold), decided calls are never re-decided, and per-session call/spend caps
+  apply. The classifier model and prompt are configurable via `[safety]`
+  (`smart_approve_model`, `smart_approve_prompt_id`, `smart_approve_max_calls`,
+  `smart_approve_max_spend_usd`, `smart_approve_context_chars`); the default
+  level is `[safety] default_level` (`safe` or `smart` only).
+- `dangerous`: all guards are suspended. Interactive-only: it can be entered
+  solely through the TUI warning screen (idle-only, typed phrase
+  `ENABLE DANGEROUS MODE`, separate confirmation) via `/safety dangerous` or
+  Shift+Tab — never via a CLI flag, env var, config key, or programmatic mode —
+  and `/safety safe` (or Shift+Tab out of it) revokes it atomically.
+
+`/safety` (or `/safety status`) prints the posture report (level, classifier
+model, override/uphold counts, calls/spend vs cap, last classifier error);
+`/status` carries a "Safety posture" section; `Shift+Tab` cycles the level.
+The input box tints green/blue/red (`safe`/`smart`/`dangerous`) and its border
+title shows the level; every transition and every classifier override renders a
+transcript marker. Child agents inherit the parent's level as a launch
+snapshot and never go through the DANGEROUS warning screen themselves.
+
 ## Built-in Slash Commands
 
 - `/help` - Show help message
@@ -766,36 +795,6 @@ The evidence is per-run and bounded: the chronology caps at 128 entries, and evi
   commented template when absent and reloads configuration after editing if the
   file changed
 - `/clear`, `/new` - Start a new conversation. Optionally pass a prompt to seed it
-- `/plan`, `/plan status`, `/plan accept`, `/plan cancel`, `/plan rebind` - Plan
-  first, then execute the accepted plan in a fresh session. `/plan` switches this
-  conversation to the configured planner model (default: GLM high) with unchanged
-  permissions and allocates a `plan.md` in this project's task workspace; the
-  planner writes it with a `## Summary` section. Plan mode refuses to start, and a
-  stored episode refuses to resume, when session logging is disabled: the episode
-  lease that enforces one owner per session depends on the logging domain.
-  `/plan status` reports the episode identity and its observed state — draft,
-  accepting, accepted, cancelled, possibly-executed, executed, legacy-unverified,
-  or unresolvable — as the episode sidecar reports it, along with the plan
-  document and the recovery actions that state allows; a terminal or
-  unidentifiable episode is still displayed. `/plan accept` previews the episode's
-  bound draft and, for an unfinished accept transaction, re-offers it to the
-  owning session (release the claim and restart, or verify the surviving bytes and
-  re-consent); accept is disabled on a legacy-unverified record. A
-  possibly-executed episode is adjudicated with `/plan mark-accepted` after
-  inspecting the recorded executor session, and terminal episodes offer a fresh
-  start or a cancel that restores the pre-entry selections. The consent modal
-  shows the episode, its lifecycle state, the plan document, the theme, the
-  document content, summary, size, SHA-256 digest, and the snapshotted executor
-  selection (default: ML4 medium with the orchestrator identity); Start execution
-  replaces this conversation with an executor session seeded with exactly the
-  confirmed bytes, while Cancel or Escape (the default) stays in plan mode.
-  `/plan cancel` exits plan mode and restores the model and thinking selections
-  that were active before `/plan`. `/plan rebind <path>` binds the episode, or
-  allocates a fresh one, to a canonicalized document inside the authorized roots
-  (the session cwd or chartreux plan storage) and refuses an outside path; the
-  rebound document requires a fresh consent. `/clear` while planning ends plan
-  mode as well. Configure the selections in `[plan.planner]` and
-  `[plan.executor]`.
 - `/log` - Show path to current interaction log file
 - `/log-level` - Show the effective log-level chain (session, environment,
   configuration, effective).
@@ -887,6 +886,7 @@ The evidence is per-run and bounded: the chronology caps at 128 entries, and evi
 - `/proxy-setup` - Configure proxy and SSL certificate settings
 - `/providers` - Open Provider Settings to add or manage model providers. Available only while no turn is active.
 - `/tmp-residue` - Preview temp residue (managed scratchpad/pytest-run roots and legacy unmarked trees) read-only in the transcript; removal happens only via `chartreux tmp-residue remove <path>...` from a terminal after an interactive exact-path confirmation
+- `/safety` - Show the session safety posture (`/safety` or `/safety status` prints level, classifier model, override/uphold counts, calls/spend vs cap, last classifier error); `/safety safe` atomically revokes an active DANGEROUS level; `/safety smart` enables the SMART classifier; `/safety dangerous` enters DANGEROUS only through the interactive warning confirmation in the TUI (idle-only, typed phrase) — no CLI flag, env var, or programmatic mode can enable it. `Shift+Tab` cycles safe -> smart -> dangerous -> safe (app-level reverse focus via Shift+Tab is displaced; `Tab` still cycles forward, and modal screens keep their own Shift+Tab while focused)
 - `/exit` - Exit the application
 
 ## File Mentions (`@`)

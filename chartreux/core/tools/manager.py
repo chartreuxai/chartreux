@@ -48,6 +48,7 @@ from chartreux.core.tools.classification import (
     classify_tool,
     shipped_builtin_name,
 )
+from chartreux.core.tools.permissions import dangerous_mode_active
 from chartreux.core.tools.remote import MCPTool
 from chartreux.core.tools.utils import PathAuthority
 from chartreux.core.utils import name_matches, run_sync
@@ -135,7 +136,13 @@ def posture_allows_name(posture: ToolPosture, tool_name: str) -> bool:
     MUTATING. The authoritative check is the manager's registry-provenance
     classification (``get_authority_classification``); this guard exists so
     launch admission rejects loosening attempts before construction.
+
+    v0.8.0 A-P1: at SafetyLevel DANGEROUS the posture axis yields — a
+    "reviewer" is no longer harness-enforced read-only. UNREACHABLE-BY-STATE
+    before the A-P1 ceremony.
     """
+    if dangerous_mode_active():
+        return True
     return posture_allows_class(posture, classify_tool(tool_name, builtin=True))
 
 
@@ -149,6 +156,9 @@ def identity_allows_name(identity: AgentIdentity, tool_name: str) -> bool:
     variant of a carved-out name still fails closed at the shipped-builtin
     check inside the manager.
     """
+    if dangerous_mode_active():
+        # v0.8.0 A-P1: the personal axis yields at DANGEROUS.
+        return True
     if tool_name in identity.execution_carve_out:
         return True
     return posture_allows_name(identity.personal_tools, tool_name)
@@ -194,8 +204,14 @@ def child_withheld_tools(identity: AgentIdentity | None) -> frozenset[str]:
 
     ``identity`` is None for a custom identity, which carries no harness-known
     posture (unrestricted on both axes): only the loop-level set applies.
+
+    v0.8.0 A-P1: at SafetyLevel DANGEROUS the posture leg yields; only the
+    loop-level structural set (owner-only run inventory, no child prompts or
+    spawns) stays withheld — it is not a posture guard.
     """
     withheld = set(CHILD_CONTEXT_UNAVAILABLE_TOOLS)
+    if dangerous_mode_active():
+        return frozenset(withheld)
     if identity is not None:
         withheld.update(
             name
@@ -905,6 +921,12 @@ class ToolManager:  # noqa: PLR0904 - reviewed authority lookup joins the full m
         """
         if chain_class is None:
             chain_class = selected
+        # v0.8.0 A-P1: at SafetyLevel DANGEROUS the granted-axis filters,
+        # both posture axes, and the parent-delegation ceiling all yield —
+        # tool availability is overridden. UNREACHABLE-BY-STATE before the
+        # A-P1 ceremony.
+        if dangerous_mode_active():
+            return selected
         config = self._config
         disabled, per_source = self._build_source_disable_index(config)
         if (
@@ -1527,9 +1549,15 @@ class ToolManager:  # noqa: PLR0904 - reviewed authority lookup joins the full m
         personal posture AND the launching parent's delegation ceiling, live),
         or the live owner withholds it from this process child's catalog.
         Roots withhold nothing. Recomputed on every call.
+
+        v0.8.0 A-P1: at DANGEROUS only the loop-level structural set stays
+        withheld (it is not a posture guard); posture and parent-ceiling
+        withholdings yield.
         """
         if not self._is_bounded_child:
             return frozenset()
+        if dangerous_mode_active():
+            return CHILD_CONTEXT_UNAVAILABLE_TOOLS
         with self._lock:
             registered = frozenset(self._all_tools)
         available = self.available_tools

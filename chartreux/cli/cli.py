@@ -368,7 +368,6 @@ def _run_interactive_mode(args: argparse.Namespace, stdin_prompt: str | None) ->
                     args.resume if isinstance(args.resume, str) else None
                 ),
                 continue_latest=bool(args.continue_session),
-                plan=getattr(args, "plan", None),
             ),
         )
     except AppServerResponseError as exc:
@@ -401,14 +400,6 @@ def run_cli(args: argparse.Namespace) -> None:
     # command line takes precedence over piped input.
     stdin_isatty = sys.stdin.isatty()
     stdin_prompt = get_prompt_from_stdin()
-    # Plan mode is a TUI surface: piped input that carries a prompt selects
-    # programmatic mode, which has no interactive session to land in.
-    if getattr(args, "plan", None) is not None and stdin_prompt is not None:
-        print(
-            "Error: -P/--plan cannot be combined with a prompt piped on stdin.",
-            file=sys.stderr,
-        )
-        sys.exit(2)
     is_programmatic = (
         args.prompt is not None
         or args.initial_prompt is not None

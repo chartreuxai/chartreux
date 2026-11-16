@@ -232,18 +232,76 @@ OptionList, OptionList:focus {
     }
 }
 
-/* Plan mode standing indicator: an amber prompt with a "plan" label. The class
-   rides the input container (app.py `_set_plan_tint`); the label is the
-   input box's border title, set beside it. */
-#input-container.plan-mode #input-box {
-    border-top: solid $warning;
-    border-bottom: solid $warning;
-    border-title-color: $warning;
+/* v0.8.0 A-P1: safety-level tints on the input container (amendment Q6
+   pattern; the dangerous class marks the DANGEROUS level). */
+#input-container.safety-dangerous #input-box {
+    border-top: solid $error;
+    border-bottom: solid $error;
+    border-title-color: $error;
 
     &:focus-within {
-        border-top: solid $warning;
-        border-bottom: solid $warning;
+        border-top: solid $error;
+        border-bottom: solid $error;
     }
+}
+
+#input-container.safety-smart #input-box {
+    border-top: solid $primary;
+    border-bottom: solid $primary;
+    border-title-color: $primary;
+
+    &:focus-within {
+        border-top: solid $primary;
+        border-bottom: solid $primary;
+    }
+}
+
+#input-container.safety-safe #input-box {
+    border-top: solid $success;
+    border-bottom: solid $success;
+    border-title-color: $success;
+
+    &:focus-within {
+        border-top: solid $success;
+        border-bottom: solid $success;
+    }
+}
+
+/* Non-dismissible DANGEROUS banner, outside the scrolling transcript
+   (unguarded-mode-design.md :69-72). */
+#dangerous-banner {
+    height: 1;
+    width: 100%;
+    color: $error;
+    background: $surface;
+    text-style: bold;
+    text-overflow: ellipsis;
+}
+
+#dangerous-warning,
+#dangerous-confirm {
+    width: 80;
+    height: auto;
+    max-height: 80%;
+    padding: 1 2;
+    background: $surface;
+    border: solid $error;
+}
+
+#dangerous-warning-text,
+#dangerous-confirm-text {
+    height: auto;
+    color: $foreground;
+}
+
+#dangerous-warning-error {
+    height: 1;
+    color: $error;
+}
+
+#dangerous-confirm-buttons {
+    height: auto;
+    align-horizontal: left;
 }
 
 #queue-mode-footer {

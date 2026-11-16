@@ -18,7 +18,7 @@ from chartreux.app_server._dispatch import (
     unsupported_title_alias,
 )
 from chartreux.app_server._execution import cancel_tasks
-from chartreux.app_server._handler import session_fenced_failure, version_skew_failure
+from chartreux.app_server._handler import session_fenced_failure
 from chartreux.app_server._host import HostRequestHandler
 from chartreux.app_server._model import ProtocolModel, validate_wire
 from chartreux.app_server._session_backend_port import (
@@ -77,7 +77,6 @@ from chartreux.app_server.protocol import (
     SessionForkParams,
     SessionHandoffParams,
     SessionListParams,
-    SessionPlanRecordWriteParams,
     SessionReadParams,
     SessionReadResponse,
     SessionResumeParams,
@@ -140,7 +139,6 @@ _SESSION_ATTACHMENT_CANDIDATES = frozenset({
     "session/continue",
     "session/rewind",
     "session/history/clear",
-    "session/plan/handoff",
 })
 
 _SESSION_BACKEND_HOST_LIFECYCLE_METHODS = frozenset({
@@ -168,7 +166,6 @@ _SESSION_BACKEND_METHODS = frozenset({
     "config/write",
     "session/compact",
     "session/context/inject",
-    "session/plan/record/write",
     "session/settings/update",
     "app_server/session/turn/enqueue",
     "app_server/session/turn/queue/read",
@@ -244,11 +241,9 @@ class AppServer:
         self._next_request_id = 1
         self._event_watermarks: dict[str, int] = {}
         # Session rotations this connection adopted (superseded id -> rotated
-        # id) and the handoff source ids still in flight, so a request
-        # addressed to a superseded id is fenced instead of answered with a
-        # bare not-found or silently retried.
+        # id), so a request addressed to a superseded id is fenced instead of
+        # answered with a bare not-found or silently retried.
         self._session_rotations: dict[str, str] = {}
-        self._pending_handoffs: set[str] = set()
         self._callback_requests: dict[int, CallbackDelivery] = {}
         self._client_requests: dict[int, PendingClientRequest] = {}
         self._abandoned_client_request_ids: set[int] = set()
@@ -853,11 +848,10 @@ class AppServer:
     ) -> RequestFailure | None:
         """Translate a bare not-found for a superseded id into the typed fence.
 
-        A request addressed to a session id a plan handoff rotated must never
-        answer bare NOT_FOUND or be silently retried: a settled rotation maps
-        the old id to the rotated one, and one still in flight between
-        handoff-send and settlement is resolved through the backend. A peer
-        that cannot report the rotation is a version skew, not a not-found.
+        A request addressed to a rotated session id must never answer bare
+        NOT_FOUND or be silently retried: a settled rotation maps the old id
+        to the rotated one. A peer that cannot report the rotation is a
+        version skew, not a not-found.
         """
         if exc.code is not ProtocolErrorCode.NOT_FOUND:
             return None
@@ -865,16 +859,8 @@ class AppServer:
         if not isinstance(session_id, str):
             return None
         rotated = self._session_rotations.get(session_id)
-        if rotated is None and session_id in self._pending_handoffs:
-            resolver = getattr(self._root, "rotated_session_id_for", None)
-            if resolver is not None:
-                rotated = await resolver(session_id)
         if rotated is not None and rotated != session_id:
             return session_fenced_failure(session_id, rotated)
-        if session_id in self._pending_handoffs:
-            return version_skew_failure(
-                session_id, "the in-flight handoff's rotated identity is unavailable"
-            )
         return None
 
     def _events_read(self, raw_params: dict[str, Any]) -> DispatchResult:
@@ -1004,7 +990,7 @@ class AppServer:
             return await self._host_handler.dispatch(method, raw_params)
         return await self._open_initial_session(method, raw_params)
 
-    async def _dispatch_to_root(  # noqa: PLR0912 - the rotation fence adds a branch
+    async def _dispatch_to_root(
         self, method: str, raw_params: dict[str, Any]
     ) -> DispatchResult:
         root = self._root
@@ -1032,71 +1018,59 @@ class AppServer:
         if method in _SESSION_BACKEND_METHODS:
             raise RuntimeError(f"Session backend method was not routed: {method}")
         previous_session_id = root.session_id
-        handoff_source = (
-            raw_params.get("sessionId") if method == "session/plan/handoff" else None
-        )
-        if isinstance(handoff_source, str):
-            # Between handoff-send and settlement the source id is pending:
-            # a submit addressed to it is fenced, never forwarded against the
-            # pre-rotation session.
-            self._pending_handoffs.add(handoff_source)
         try:
-            try:
-                result = await root.dispatch_extension(method, raw_params)
-            except SessionBackendError as exc:
-                if exc.code is ProtocolErrorCode.NOT_FOUND and method in {
-                    "session/read",
-                    "session/history/list",
-                    "session/turns/list",
-                }:
-                    if (
-                        method == "session/history/list"
-                        and raw_params.get("sessionId") == root.session_id
-                    ):
-                        # The attached session's live history is agent-owned:
-                        # a not-found from its carrier is a typed mismatch,
-                        # never the persisted host projection served for an
-                        # attached id.
-                        raise SessionBackendError(
-                            ProtocolErrorCode.CONFLICT,
-                            f"Session {root.session_id} is attached; its live "
-                            "history is served by the root agent, not the "
-                            "persisted host projection",
-                        ) from exc
-                    return await self._host_handler.dispatch(method, raw_params)
-                raise
-            try:
-                if result.session_attached and root.session_id != previous_session_id:
-                    # The dispatch rotated the session: remember old -> new so a
-                    # late request addressed to the old id is fenced, then
-                    # resubscribe the event stream to the rotated session.
-                    self._session_rotations[previous_session_id] = root.session_id
-                    # Release the old event consumer before subscribing: the
-                    # backend admits exactly one subscriber, and the rotation
-                    # replaces it.
-                    previous_task = self._backend_event_task
-                    if previous_task is not None:
-                        previous_task.cancel()
-                        with suppress(asyncio.CancelledError):
-                            await previous_task
-                    subscription = await root.subscribe(
-                        SessionReadParams(
-                            session_id=root.session_id, history=PageRequest(limit=200)
-                        )
+            result = await root.dispatch_extension(method, raw_params)
+        except SessionBackendError as exc:
+            if exc.code is ProtocolErrorCode.NOT_FOUND and method in {
+                "session/read",
+                "session/history/list",
+                "session/turns/list",
+            }:
+                if (
+                    method == "session/history/list"
+                    and raw_params.get("sessionId") == root.session_id
+                ):
+                    # The attached session's live history is agent-owned:
+                    # a not-found from its carrier is a typed mismatch,
+                    # never the persisted host projection served for an
+                    # attached id.
+                    raise SessionBackendError(
+                        ProtocolErrorCode.CONFLICT,
+                        f"Session {root.session_id} is attached; its live "
+                        "history is served by the root agent, not the "
+                        "persisted host projection",
+                    ) from exc
+                return await self._host_handler.dispatch(method, raw_params)
+            raise
+        try:
+            if result.session_attached and root.session_id != previous_session_id:
+                # The dispatch rotated the session: remember old -> new so a
+                # late request addressed to the old id is fenced, then
+                # resubscribe the event stream to the rotated session.
+                self._session_rotations[previous_session_id] = root.session_id
+                # Release the old event consumer before subscribing: the
+                # backend admits exactly one subscriber, and the rotation
+                # replaces it.
+                previous_task = self._backend_event_task
+                if previous_task is not None:
+                    previous_task.cancel()
+                    with suppress(asyncio.CancelledError):
+                        await previous_task
+                subscription = await root.subscribe(
+                    SessionReadParams(
+                        session_id=root.session_id, history=PageRequest(limit=200)
                     )
-                    await self._replace_backend_event_task(root, subscription)
-                    await self._replay_pending_backend_events(
-                        root, subscription.snapshot.last_event_id
-                    )
-                await self._flush_backend_events(root)
-            except BaseException:
-                if result.on_response_abandoned is not None:
-                    result.on_response_abandoned()
-                raise
-            return result
-        finally:
-            if isinstance(handoff_source, str):
-                self._pending_handoffs.discard(handoff_source)
+                )
+                await self._replace_backend_event_task(root, subscription)
+                await self._replay_pending_backend_events(
+                    root, subscription.snapshot.last_event_id
+                )
+            await self._flush_backend_events(root)
+        except BaseException:
+            if result.on_response_abandoned is not None:
+                result.on_response_abandoned()
+            raise
+        return result
 
     async def _dispatch_backend_host_operation(
         self, method: str, raw_params: dict[str, Any]
@@ -1195,7 +1169,7 @@ class AppServer:
                 SessionResumeResponse(
                     state=response.state,
                     last_event_id=response.last_event_id,
-                    plan_record=await lifecycle.backend.read_plan_record(),
+                    plan_mode_present=await lifecycle.backend.plan_mode_present(),
                     # A resume that respawned a confirmed-dead root surfaces the
                     # retired generation's memorial queue/shell state and its
                     # typed death receipt; the memorial is never re-admitted
@@ -1264,11 +1238,6 @@ class AppServer:
                 after_response=result.after_response,
                 on_response_abandoned=result.on_response_abandoned,
             )
-        if method == "session/plan/record/write":
-            result = await root.write_plan_record(
-                validate_wire(SessionPlanRecordWriteParams, raw_params)
-            )
-            return DispatchResult(result.response, after_response=result.after_response)
         return None
 
     @staticmethod

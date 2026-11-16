@@ -14,6 +14,7 @@ from chartreux.cli.programmatic import (
     ProgrammaticLimitError,
     ProgrammaticOutput,
     ProgrammaticPersistenceError,
+    _warn_if_legacy_plan_mode,
     run_programmatic,
 )
 from chartreux.core.config import ChartreuxConfigSchema, SessionLoggingConfig
@@ -170,6 +171,27 @@ def test_untrusted_workspace_warning_comes_from_app_server(
     assert str(project) in warning
     assert "AGENTS.md" in warning
     assert "--trust" in warning
+
+
+@pytest.mark.asyncio
+async def test_legacy_plan_mode_warning_prints_one_stderr_line(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from types import SimpleNamespace
+
+    flagged = SimpleNamespace(
+        resources=SimpleNamespace(sessions=SimpleNamespace(plan_mode_present=True))
+    )
+    await _warn_if_legacy_plan_mode(flagged)  # type: ignore[arg-type]
+    warning = capsys.readouterr().err
+    assert "plan mode" in warning
+    assert "v0.8.0" in warning
+
+    quiet = SimpleNamespace(
+        resources=SimpleNamespace(sessions=SimpleNamespace(plan_mode_present=False))
+    )
+    await _warn_if_legacy_plan_mode(quiet)  # type: ignore[arg-type]
+    assert capsys.readouterr().err == ""
 
 
 def test_conversation_limits_cross_the_public_turn_boundary(

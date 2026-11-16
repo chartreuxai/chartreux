@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import base64
 from collections.abc import AsyncGenerator, Awaitable, Callable, Sequence
 from contextlib import suppress
 from dataclasses import dataclass
@@ -108,12 +107,11 @@ from chartreux.app_server.protocol import (
     SessionContinueResponse,
     SessionKind,
     SessionOptions,
-    SessionPlanHandoffParams,
-    SessionPlanHandoffResponse,
     SessionReadParams,
     SessionReadResponse,
     SessionResumeParams,
     SessionResumeResponse,
+    SessionSafetyTransitionResponse,
     SessionStartParams,
     SessionStartResponse,
     SessionStopParams,
@@ -1173,48 +1171,15 @@ class AppServerSession:  # noqa: PLR0904
         await self.resources.sessions.clear_history()
         await self.resources.refresh()
 
-    async def plan_handoff(
-        self,
-        *,
-        executor_model: str,
-        executor_thinking: str,
-        executor_identity: str,
-        plan_path: str,
-        planner_thinking_alias: str | None,
-        planner_thinking_value: str | None,
-        episode_id: str | None = None,
-        snapshot_path: str | None = None,
-        snapshot_sha256: str | None = None,
-        snapshot_bytes: bytes | None = None,
-    ) -> SessionPlanHandoffResponse:
-        """Start the consented executor session for an accepted plan.
+    async def safety_level(self) -> str:
+        """The session's current SafetyLevel value (v0.8.0 A-P1)."""
+        return await self.resources.sessions.safety_read()
 
-        The consent snapshot is sent verbatim; the server applies exactly these
-        values or fails without starting execution. An episode-bound handoff
-        also carries the previewed document bytes — the request's sole verified
-        artifact — base64-encoded for the newline-delimited JSON transport.
-        """
-        response = await self.resources.sessions.plan_handoff(
-            SessionPlanHandoffParams(
-                session_id=self.session_id,
-                executor_model=executor_model,
-                executor_thinking=executor_thinking,
-                executor_identity=executor_identity,
-                plan_path=plan_path,
-                planner_thinking_alias=planner_thinking_alias,
-                planner_thinking_value=planner_thinking_value,
-                episode_id=episode_id,
-                snapshot_path=snapshot_path,
-                snapshot_sha256=snapshot_sha256,
-                snapshot_bytes_b64=(
-                    None
-                    if snapshot_bytes is None
-                    else base64.b64encode(snapshot_bytes).decode("ascii")
-                ),
-            )
-        )
-        await self.resources.refresh()
-        return response
+    async def request_safety_transition(
+        self, to: str
+    ) -> SessionSafetyTransitionResponse:
+        """Request one authority-level transition (v0.8.0 A-P1 ceremony floor)."""
+        return await self.resources.sessions.safety_transition(to)
 
     def begin_close(self) -> None:
         """Signal an intentional shutdown before ``close()``.

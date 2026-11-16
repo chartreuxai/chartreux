@@ -36,7 +36,8 @@
 .terminal-r2 { fill: #d0b344 }
 .terminal-r3 { fill: #608ab1 }
 .terminal-r4 { fill: #292929 }
-.terminal-r5 { fill: #c5c8c6;font-weight: bold }
+.terminal-r5 { fill: #98a84b }
+.terminal-r6 { fill: #c5c8c6;font-weight: bold }
     </style>
 
     <defs>
@@ -168,9 +169,9 @@
 </text><text class="terminal-r1" x="0" y="581.2" textLength="97.6" clip-path="url(#terminal-line-23)">line_100</text><text class="terminal-r1" x="109.8" y="581.2" textLength="12.2" clip-path="url(#terminal-line-23)">=</text><text class="terminal-r2" x="134.2" y="581.2" textLength="36.6" clip-path="url(#terminal-line-23)">700</text><text class="terminal-r1" x="1220" y="581.2" textLength="12.2" clip-path="url(#terminal-line-23)">
 </text><text class="terminal-r1" x="1220" y="605.6" textLength="12.2" clip-path="url(#terminal-line-24)">
 </text><text class="terminal-r1" x="1220" y="630" textLength="12.2" clip-path="url(#terminal-line-25)">
-</text><text class="terminal-r3" x="0" y="654.4" textLength="1220" clip-path="url(#terminal-line-26)">────────────────────────────────────────────────────────────────────────────────────────────────────</text><text class="terminal-r1" x="1220" y="654.4" textLength="12.2" clip-path="url(#terminal-line-26)">
-</text><text class="terminal-r5" x="0" y="678.8" textLength="12.2" clip-path="url(#terminal-line-27)">&gt;</text><text class="terminal-r1" x="1220" y="678.8" textLength="12.2" clip-path="url(#terminal-line-27)">
-</text><text class="terminal-r3" x="0" y="703.2" textLength="1220" clip-path="url(#terminal-line-28)">────────────────────────────────────────────────────────────────────────────────────────────────────</text><text class="terminal-r1" x="1220" y="703.2" textLength="12.2" clip-path="url(#terminal-line-28)">
+</text><text class="terminal-r5" x="0" y="654.4" textLength="1220" clip-path="url(#terminal-line-26)">────────────────────────────────────────────────────────────────────────────────────────────────────</text><text class="terminal-r1" x="1220" y="654.4" textLength="12.2" clip-path="url(#terminal-line-26)">
+</text><text class="terminal-r6" x="0" y="678.8" textLength="12.2" clip-path="url(#terminal-line-27)">&gt;</text><text class="terminal-r1" x="1220" y="678.8" textLength="12.2" clip-path="url(#terminal-line-27)">
+</text><text class="terminal-r5" x="0" y="703.2" textLength="1220" clip-path="url(#terminal-line-28)">────────────────────────────────────────────────────────────────────────────────────────────────────</text><text class="terminal-r1" x="1220" y="703.2" textLength="12.2" clip-path="url(#terminal-line-28)">
 </text><text class="terminal-r1" x="0" y="727.6" textLength="353.8" clip-path="url(#terminal-line-29)">workdir&#160;|&#160;pid&#160;0&#160;|&#160;0/500k&#160;(0%)</text>
     </g>
     </g>

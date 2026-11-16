@@ -14,7 +14,7 @@ import signal
 import subprocess
 import sys
 import time
-from typing import TYPE_CHECKING, Any, ClassVar
+from typing import TYPE_CHECKING, Any, ClassVar, cast
 from weakref import WeakKeyDictionary
 import webbrowser
 
@@ -29,6 +29,7 @@ from textual.events import (
     AppBlur,
     AppFocus,
     DescendantFocus,
+    Key,
     MouseScrollDown,
     MouseScrollUp,
     MouseUp,
@@ -88,12 +89,10 @@ from chartreux.app_server.protocol import (
     AgentsInventoryReadResponse,
     AgentSummaryModel,
     AppServerResponseError,
-    ConfigFieldWire,
     ConfigReadResponse,
     ConfigWriteOpWire,
     ProtocolError,
     ProtocolErrorCode,
-    SessionPlanRecord,
     UsageReadResponse,
     UsageUpdatedParams,
 )
@@ -132,53 +131,6 @@ from chartreux.cli.textual_ui.message_queue import (
     SideChannelPorts,
 )
 from chartreux.cli.textual_ui.notifications import TextualNotificationAdapter
-from chartreux.cli.textual_ui.plan_mode import (
-    EPISODE_ROW_ACCEPTING_NO_SNAPSHOT,
-    EPISODE_STATE_ACCEPTED,
-    EPISODE_STATE_CANCELLED,
-    PLAN_MODE_LABEL,
-    PLAN_MODE_TINT_CLASS,
-    ConfirmedPlan,
-    EpisodeView,
-    ExecutorSelection,
-    LoggingDomainView,
-    PlanDocumentBrief,
-    PlanModeState,
-    abort_accept_claim,
-    adjudicate_possibly_executed,
-    allocate_workspace,
-    brief_from_bytes,
-    cancel_accepting_episode,
-    cancel_episode,
-    clear_ops,
-    default_workspaces_root,
-    entry_ops,
-    episode_directory,
-    episode_snapshot_path,
-    episode_status_lines,
-    episode_view_from_state,
-    handoff_failed_before_replacement,
-    logging_domain,
-    logging_entry_guard,
-    observe_episode_view,
-    plan_section,
-    plan_status,
-    planner_seed,
-    pre_entry_snapshot,
-    read_document,
-    read_document_bytes,
-    rebind_current_episode,
-    rebind_fresh_episode,
-    record_from_state,
-    release_crashed_claim,
-    release_workspace,
-    reopen_accepting_episode,
-    restore_ops,
-    resume_notice,
-    session_logging_enabled,
-    state_from_record,
-    surviving_snapshot_path,
-)
 from chartreux.cli.textual_ui.program_status import ProgramStatusEmitter
 from chartreux.cli.textual_ui.program_status_composition import (
     CallbackOwner,
@@ -309,7 +261,6 @@ _DIAGNOSTIC_HEARTBEAT_DRIFT_WARNING_SECONDS = 0.25
 if TYPE_CHECKING:
     from chartreux.app_server.session import AppServerSession, SessionExitSummary
     from chartreux.cli.textual_ui.quit_manager import ExitConsequencesScreen
-    from chartreux.cli.textual_ui.screens.plan_consent import PlanConsentScreen
     from chartreux.cli.textual_ui.screens.routes import RoutesSnapshot, RoutesUpdate
     from chartreux.cli.textual_ui.screens.settings import SettingsScreen
     from chartreux.cli.textual_ui.widgets.debug_console import DebugConsole
@@ -411,17 +362,44 @@ def _get_word_select_screen_class() -> type[WordSelectScreen]:
     return WordSelectScreen
 
 
-def _get_plan_consent_screen_class() -> type[PlanConsentScreen]:
-    from chartreux.cli.textual_ui.screens.plan_consent import PlanConsentScreen
-
-    return PlanConsentScreen
-
-
 def is_progress_event(event: AppServerEvent) -> bool:
     entry = _public_entry(event)
     return isinstance(
         entry, (PublicMessageEntry, PublicReasoningEntry, PublicEffectEntry)
     )
+
+
+def format_keepalive_stats_block(view: Any) -> str:
+    """The pinned ``/stats`` keep-alive block (v0.8.0 C2, design item 7).
+
+    ``view`` is the loop's ``KeepaliveStatsView`` (None when the pilot is not
+    wired — flag off, a child loop, or no reachable scheduler). The fields are
+    PINNED: attempts used / max_attempts, pings sent with their outcomes
+    (settled / superseded / error), the cache-coverage fraction from
+    ``observe_ping_usage``, and the last stop reason.
+    """
+    if view is None:
+        return (
+            "\n## Keepalive\n\n_not wired (pilot off or no scheduler this session)_\n"
+        )
+    if not view.enabled:
+        return "\n## Keepalive\n\n_disabled_\n"
+    coverage = (
+        f"{view.cached_coverage:.1%}" if view.cached_coverage is not None else "unknown"
+    )
+    stop = view.stop.value if view.stop is not None else "none"
+    lines = [
+        "",
+        "## Keepalive",
+        "",
+        f"- **Attempts**: {view.attempts_used} / {view.max_attempts}",
+        f"- **Pings sent**: {view.pings_sent} "
+        f"(settled {view.settled}, superseded {view.superseded}, error {view.error})",
+        f"- **Cache coverage**: {coverage}",
+        f"- **Last stop**: {stop}",
+        "",
+    ]
+    return "\n".join(lines)
 
 
 async def _session_selection_restrictions(
@@ -591,8 +569,6 @@ class StartupOptions:
     startup_prompt_for_workspace_trust: bool | None = None
     resume_session_id: str | None = None
     continue_latest: bool = False
-    # `-P`/`--plan`: True for a bare flag, the theme string when one was given.
-    plan: bool | str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -721,6 +697,16 @@ class ChartreuxApp(App):  # noqa: PLR0904
         # this binding is the keyboard path; both invoke the EXISTING retry
         # operation, gated exactly like the /retry command.
         Binding("ctrl+r", "retry_turn", "Retry turn", show=False),
+        # v0.8.0 A-P3 (amendment Q1): Shift+Tab cycles the safety level
+        # safe -> smart -> dangerous -> safe. Priority so it displaces the
+        # base screen's reverse-focus binding; while a modal screen is on the
+        # stack the action delegates to the modal chain, so modal screens
+        # that bind shift+tab keep reverse-focus while focused. The cost
+        # (app-level reverse focus via Shift+Tab is displaced; Tab still
+        # cycles forward) is documented in the /help keyboard list.
+        Binding(
+            "shift+tab", "cycle_safety", "Cycle safety level", show=False, priority=True
+        ),
     ]
 
     _main_ui_mounted: bool = False
@@ -742,7 +728,7 @@ class ChartreuxApp(App):  # noqa: PLR0904
         """
         super().open_url(normalize_url(url), new_tab=new_tab)
 
-    def __init__(  # noqa: PLR0915 - app-wide state and controller wiring
+    def __init__(
         self,
         history_file: Path,
         app_server: AppServerSource,
@@ -842,16 +828,6 @@ class ChartreuxApp(App):  # noqa: PLR0904
         self._pending_picker_reload: tuple[str, str] | None = None
         self._picker_update_pending = False
         self._proxy_save_pending = False
-        # Plan mode is in-memory session state: the workspace plus the
-        # pre-entry override snapshot cancel restores. A process restart loses
-        # it; the plan document on disk survives. The record and the observed
-        # episode surface are kept even when the mode is NOT armed: a terminal,
-        # legacy, unresolvable, or possibly-executed episode must still be
-        # displayable and actionable, and never restored as an active mode.
-        self._plan_mode: PlanModeState | None = None
-        self._plan_record: SessionPlanRecord | None = None
-        self._plan_view: EpisodeView | None = None
-        self._plan_accept_worker: Worker[None] | None = None
         self._current_version = current_version
         self._configure_startup_options(startup)
         self._quit_manager = QuitManager(self)
@@ -927,6 +903,9 @@ class ChartreuxApp(App):  # noqa: PLR0904
         self._queue_selected_widget: Widget | None = None
         self._fatal_init_error = False
         self._force_quit_task: asyncio.Task[None] | None = None
+        # v0.8.0 A-P3: effect entry ids already rendered as SMART-override
+        # transcript markers (dedup across repeated HistoryEntryUpdated).
+        self._smart_override_marked: set[str] = set()
 
     def _mark_session_ready(self) -> None:
         self._session_ready.set()
@@ -1290,8 +1269,6 @@ class ChartreuxApp(App):  # noqa: PLR0904
         self._is_resuming_session = opts.is_resuming_session
         self._resume_session_id = opts.resume_session_id
         self._continue_latest = opts.continue_latest
-        self._startup_plan = opts.plan
-        self._startup_plan_started = False
         self._startup_prompt_for_workspace_trust = (
             opts.startup_prompt_for_workspace_trust
             if opts.startup_prompt_for_workspace_trust is not None
@@ -2042,6 +2019,13 @@ class ChartreuxApp(App):  # noqa: PLR0904
             self._refresh_command_registry()
         self._refresh_banner()
         self._refresh_context_progress()
+        # v0.8.0 A-P3: apply the session's initial safety level (tint class +
+        # border-title label) so the always-on affordance is correct from
+        # startup, including a resumed session's inherited level.
+        try:
+            await self._apply_safety_level_ui(await self.app_server.safety_level())
+        except Exception as exc:
+            logger.warning("Initial safety-level UI apply failed: %s", exc)
         # Ready now unless a resume/continue/picker flow is pending — those mark
         # ready at their own return-to-input points to avoid dispatching against
         # a half-rebound session.
@@ -2207,23 +2191,7 @@ class ChartreuxApp(App):  # noqa: PLR0904
             return
         if self._resume_session_id is not None or self._continue_latest:
             return
-        await self._ensure_startup_plan_mode()
         self._process_startup_prompt()
-
-    async def _ensure_startup_plan_mode(self) -> None:
-        """Enter plan mode for a `-P`/`--plan` launch (design §6/§8).
-
-        Runs at every landing point — the post-ready startup and, on the resume
-        paths, after the resume restore — so the mode is ensured on the session
-        the launch actually landed in. A restored record makes the entry its
-        already-active guard, so a `-P` theme never overrides an existing mode;
-        without one the entry runs on the landed conversation.
-        """
-        if self._startup_plan is None or self._startup_plan_started:
-            return
-        self._startup_plan_started = True
-        theme = self._startup_plan if isinstance(self._startup_plan, str) else ""
-        await self._plan_enter(theme=theme.strip() or None)
 
     async def _process_startup_prompt_when_available(self) -> None:
         await self._startup_command_availability_ready.wait()
@@ -2808,6 +2776,106 @@ class ChartreuxApp(App):  # noqa: PLR0904
         if not self._command_context().retry_available:
             return
         await self._retry()
+
+    async def action_cycle_safety(self) -> None:
+        """v0.8.0 A-P3 (amendment Q1): Shift+Tab cycles safe -> smart -> dangerous.
+
+        The app-level binding is priority, so while the main chat input is
+        focused it displaces the base screen's reverse-focus default and cycles
+        the safety level. Anywhere else — a modal screen on the stack (the
+        design's modal no-op), or any focused widget outside the chat input —
+        the key is delegated to the below-app chain exactly as if this binding
+        were absent, so modal screens and widgets keep their own shift+tab
+        behavior (reverse focus / group cycling). Entering ``dangerous``
+        always runs the interactive warning screen; a bare key press never
+        changes authority state by itself beyond this explicit cycle.
+        """
+        if len(self.screen_stack) > 1 or not self._main_input_focused():
+            await self._dispatch_shift_tab_below_app()
+            return
+        server = self._app_server
+        if server is None:
+            return
+        level_getter = cast(
+            "Callable[[], Awaitable[str]] | None", getattr(server, "safety_level", None)
+        )
+        if level_getter is None:
+            return
+        try:
+            current = await level_getter()
+        except Exception as exc:
+            logger.warning("cycle_safety: safety level read failed: %s", exc)
+            return
+        order = ("safe", "smart", "dangerous")
+        if current not in order:
+            return
+        await self._cycle_safety_target(order[(order.index(current) + 1) % len(order)])
+
+    async def _cycle_safety_target(self, target: str) -> None:
+        """Drive one Shift+Tab cycle step to ``target`` (idle-only)."""
+        if self._agent_job_active():
+            await self._mount_and_scroll(
+                UserCommandMessage(
+                    "Safety-level changes are idle-only; wait for the current turn."
+                )
+            )
+            return
+        if target == "dangerous":
+            await self._enter_dangerous_ceremony()
+            return
+        server = self._app_server
+        if server is None:
+            return
+        transition = cast(
+            "Callable[[str], Awaitable[Any]] | None",
+            getattr(server, "request_safety_transition", None),
+        )
+        if transition is None:
+            return
+        response = await transition(target)
+        if not response.transitioned:
+            await self._mount_and_scroll(
+                UserCommandMessage(
+                    f"Safety level unchanged ({response.level}): {response.reason}"
+                )
+            )
+            return
+        await self._apply_safety_level_ui(response.level)
+        await self._mount_and_scroll(
+            UserCommandMessage(f"Safety level is now **{response.level}**.")
+        )
+
+    def _main_input_focused(self) -> bool:
+        """True when the focused widget is the chat input or inside its container."""
+        container = self._chat_input_container
+        focused = self.focused
+        if container is None or focused is None:
+            return False
+        return any(node is container for node in focused.ancestors_with_self)
+
+    async def _dispatch_shift_tab_below_app(self) -> None:
+        """Delegate ``shift+tab`` to the chain below the app, as if the
+        app-level priority binding did not exist.
+
+        Textual's priority pass runs app-first, so this handler preempts the
+        rest of that pass and the key forwarding. Reproduce both: first the
+        remaining below-app priority bindings (top-down, skipping the app
+        namespace so this handler does not recurse), then — when unhandled —
+        re-forward the key to the focused widget as a forwarded event, which
+        skips the app priority branch on bubbling and runs the widgets'
+        ``on_key`` handlers plus the non-priority binding pass exactly as
+        without this binding.
+        """
+        for namespace, bindings in reversed(self.screen._binding_chain):
+            if namespace is self:
+                continue
+            for binding in bindings.key_to_bindings.get("shift+tab", ()):
+                if binding.priority and await self.run_action(
+                    binding.action, namespace
+                ):
+                    return
+        forward_target = self.focused or self.screen
+        forward_target._forward_event(Key("shift+tab", None))
 
     async def _remove_loading_widget(self) -> None:
         if self._loading_widget and self._loading_widget.parent:
@@ -3694,11 +3762,46 @@ class ChartreuxApp(App):  # noqa: PLR0904
             await self._remove_loading_widget()
         elif self._loading_widget is None and is_progress_event(event):
             await self._ensure_loading_widget()
+        await self._maybe_render_smart_override_marker(event, entry)
         if self.event_handler:
             await self.event_handler.handle_event(
                 event, loading_widget=self._loading_widget
             )
             self._sync_retry_command_availability()
+
+    async def _maybe_render_smart_override_marker(
+        self, event: AppServerEvent, entry: Any
+    ) -> None:
+        """v0.8.0 A-P3 (amendment Q6): per-call classifier-override transcript line.
+
+        When a tool-call effect completes carrying the SMART classifier
+        override marker (the loop's adjudication feedback), render one
+        UserCommandMessage with the verdict, rationale, and call identity.
+        """
+        if not isinstance(event, HistoryEntryUpdated):
+            return
+        if not isinstance(entry, PublicEffectEntry):
+            return
+        if entry.generation_status is not PublicEntryGenerationStatus.COMPLETED:
+            return
+        if not isinstance(entry.state, CompletedEffectState):
+            return
+        if entry.id in self._smart_override_marked:
+            return
+        text = f"{entry.state.display.message}\n{entry.state.output_text}"
+        marker = "SMART classifier override:"
+        if marker not in text:
+            return
+        self._smart_override_marked.add(entry.id)
+        rationale = (
+            text.split(marker, 1)[1].strip().splitlines()[0] if marker in text else ""
+        )
+        await self._mount_and_scroll(
+            UserCommandMessage(
+                f"**SMART classifier override** `{entry.detail.tool_name}` "
+                f"(call `{entry.id[:8]}`): {rationale}"
+            )
+        )
 
     async def _shutdown(self) -> None:
         # The liveness poller stops before anything tears down: no snapshot
@@ -4090,7 +4193,91 @@ class ChartreuxApp(App):  # noqa: PLR0904
         except Exception:
             status_text += "\n## Authorized Roots\n\nProject roots unavailable.\n"
         status_text += self._format_background_agent_results()
+        # v0.8.0 C2: the pinned keepalive block (design item 7) — the view
+        # comes from the session's root loop when reachable; the wire stats
+        # snapshot does not carry scheduler state, so an unreachable loop
+        # renders the "not wired" line.
+        # v0.8.0 A-P3 (amendment Q6): the "Safety posture" section — level,
+        # classifier model (configured + resolved or error), override/uphold
+        # counts, calls/spend vs cap, last classifier error.
+        posture_view = self._safety_posture_view()
+        if posture_view is not None:
+            status_text += "\n" + self._format_safety_posture_block(posture_view) + "\n"
+        else:
+            status_text += "\n" + (await self._safety_posture_fallback_text()) + "\n"
+        status_text += format_keepalive_stats_block(self._keepalive_stats_view())
         await self._mount_and_scroll(UserCommandMessage(status_text))
+
+    def _keepalive_stats_view(self) -> Any:
+        """The root loop's keepalive stats view, when the loop is reachable."""
+        # Boundary rule: textual must not reference the loop identifier, so the
+        # duck-typed lookup goes through a string-keyed getattr.
+        loop = getattr(self.app_server, "agent_loop", None)
+        if loop is None:
+            return None
+        getter = getattr(loop, "keepalive_stats_view", None)
+        return getter() if callable(getter) else None
+
+    def _safety_posture_view(self) -> Any:
+        """v0.8.0 A-P3: the root loop's safety posture view, when reachable."""
+        # Same boundary rule as _keepalive_stats_view: string-keyed getattr.
+        loop = getattr(self.app_server, "agent_loop", None)
+        if loop is None:
+            return None
+        getter = getattr(loop, "safety_posture_view", None)
+        return getter() if callable(getter) else None
+
+    async def _safety_posture_text(self) -> str:
+        """The bare ``/safety`` posture report (amendment Q1/Q6)."""
+        view = self._safety_posture_view()
+        if view is None:
+            return await self._safety_posture_fallback_text()
+        return self._format_safety_posture_block(view)
+
+    async def _safety_posture_fallback_text(self) -> str:
+        """Posture block when the root loop is unreachable (level only)."""
+        level = "unknown"
+        server = self._app_server
+        level_getter = cast(
+            "Callable[[], Awaitable[str]] | None",
+            getattr(server, "safety_level", None) if server is not None else None,
+        )
+        if level_getter is not None:
+            try:
+                level = await level_getter()
+            except Exception as exc:
+                logger.debug("Safety level read failed: %s", exc)
+        return (
+            f"## Safety posture\n\n- **Level**: **{level}**\n"
+            "- Classifier stats unavailable (loop not reachable)."
+        )
+
+    def _format_safety_posture_block(self, view: Any) -> str:
+        """Render the "Safety posture" section shared by /status and /safety."""
+        level = str(view.get("level", "unknown"))
+        model_expression = str(view.get("model_expression", ""))
+        resolved = view.get("resolved_model")
+        model_error = view.get("model_error")
+        if resolved:
+            model_line = f"`{model_expression}` -> **{resolved}**"
+        elif model_error:
+            model_line = f"`{model_expression}` -> resolution error: {model_error}"
+        else:
+            model_line = f"`{model_expression}` (unresolved)"
+        last_error = view.get("last_classifier_error") or "none"
+        lines = [
+            "## Safety posture",
+            "",
+            f"- **Level**: **{level}**",
+            f"- **Classifier model**: {model_line}",
+            f"- **Classifier prompt**: `{view.get('prompt_id', '')}`",
+            f"- **Overrides / upholds**: {view.get('override_count', 0)} / {view.get('uphold_count', 0)}",
+            f"- **Classifier calls**: {view.get('calls', 0)}/{view.get('max_calls', 0)}",
+            f"- **Classifier spend**: ${float(view.get('spend_usd', 0.0)):.4f}"
+            f"/${float(view.get('max_spend_usd', 0.0)):.2f}",
+            f"- **Last classifier error**: {last_error}",
+        ]
+        return "\n".join(lines)
 
     def _format_background_agent_results(self) -> str:
         """Uncollected background results from the last `agents/update` payload.
@@ -4714,7 +4901,7 @@ class ChartreuxApp(App):  # noqa: PLR0904
     async def _reset_message_widgets(self) -> None:
         """Tear down the on-screen conversation widgets and UI state.
 
-        Shared by ``/clear`` and the ``/plan accept`` handoff. Does not touch the
+        Shared by ``/clear``. Does not touch the
         agent loop's message history — callers decide whether the core history
         also needs clearing.
         """
@@ -4727,6 +4914,151 @@ class ChartreuxApp(App):  # noqa: PLR0904
             await self.event_handler.finalize_streaming()
         await self._messages_area.remove_children()
 
+    async def _safety_command(self, cmd_args: str = "", **kwargs: Any) -> None:
+        """The ``/safety`` handler (v0.8.0 A-P1, amendment Q1/Q2).
+
+        Bare ``/safety``/``status`` prints the current level. ``safe`` /
+        ``smart`` / ``dangerous`` request a transition; entering DANGEROUS
+        always runs the interactive ceremony (idle-only, non-dismissible
+        warning screen, typed phrase, separate confirmation) and is only
+        reachable from this interactive TUI — ``-p``/ACP/app-server never
+        parse slash commands, and startup flags naming a level are rejected
+        in the entrypoint.
+        """
+        arg = cmd_args.strip().lower()
+        if arg in {"", "status"}:
+            # v0.8.0 A-P3 (amendment Q1/Q6): bare /safety prints the full
+            # posture report — level, classifier model, override/uphold
+            # counts, calls/spend vs cap, last classifier error.
+            await self._mount_and_scroll(
+                UserCommandMessage(await self._safety_posture_text())
+            )
+            return
+        if arg not in {"safe", "smart", "dangerous"}:
+            await self._mount_and_scroll(
+                UserCommandMessage("Usage: `/safety [status|safe|smart|dangerous]`")
+            )
+            return
+        if self._agent_job_active():
+            await self._mount_and_scroll(
+                UserCommandMessage(
+                    "Safety-level changes are idle-only; wait for the current turn."
+                )
+            )
+            return
+        if arg == "dangerous":
+            await self._enter_dangerous_ceremony()
+            return
+        response = await self.app_server.request_safety_transition(arg)
+        if not response.transitioned:
+            await self._mount_and_scroll(
+                UserCommandMessage(
+                    f"Safety level unchanged ({response.level}): {response.reason}"
+                )
+            )
+            return
+        await self._apply_safety_level_ui(response.level)
+        await self._mount_and_scroll(
+            UserCommandMessage(f"Safety level is now **{response.level}**.")
+        )
+
+    async def _enter_dangerous_ceremony(self) -> None:
+        """The ceremony-only entry into DANGEROUS (unguarded doc :49-65)."""
+        from chartreux.cli.textual_ui.screens.safety_dangerous import (
+            DangerousConfirmScreen,
+            DangerousWarningScreen,
+        )
+
+        current = await self.app_server.safety_level()
+        if current == "dangerous":
+            await self._mount_and_scroll(
+                UserCommandMessage("Safety level is already **dangerous**.")
+            )
+            return
+        # push_screen_wait needs a worker context; the slash-command handler
+        # does not always run inside one, so the screen wait rides a worker.
+        warning_worker = self.run_worker(
+            self.push_screen_wait(DangerousWarningScreen())
+        )
+        phrase = await warning_worker.wait()
+        if phrase != "phrase_ok":
+            await self._mount_and_scroll(
+                UserCommandMessage("DANGEROUS MODE not enabled (ceremony cancelled).")
+            )
+            return
+        confirm_worker = self.run_worker(
+            self.push_screen_wait(DangerousConfirmScreen())
+        )
+        confirmed = await confirm_worker.wait()
+        if not confirmed:
+            await self._mount_and_scroll(
+                UserCommandMessage("DANGEROUS MODE not enabled (not confirmed).")
+            )
+            return
+        response = await self.app_server.request_safety_transition("dangerous")
+        if not response.transitioned:
+            await self._mount_and_scroll(
+                UserCommandMessage(
+                    f"DANGEROUS MODE refused ({response.level}): {response.reason}"
+                )
+            )
+            return
+        applied = await self._apply_safety_level_ui(response.level)
+        if not applied:
+            # The warning banner could not be displayed: do not stay active —
+            # revoke atomically and report.
+            revoke = await self.app_server.request_safety_transition("safe")
+            await self._mount_and_scroll(
+                UserCommandMessage(
+                    "DANGEROUS MODE could not display its warning banner, so it was "
+                    f"not activated (now {revoke.level})."
+                )
+            )
+            return
+        await self._mount_and_scroll(
+            UserCommandMessage(
+                "Safety level is now **dangerous** — all guards are suspended. "
+                "Revoke with `/safety safe`."
+            )
+        )
+
+    async def _apply_safety_level_ui(self, level: str) -> bool:
+        """Tint + non-dismissible banner for the active level.
+
+        Returns False when the DANGEROUS banner cannot be mounted (the
+        caller then revokes atomically). Revocation removes the banner and
+        the tint class.
+        """
+        container = self.query_one("#input-container")
+        container.remove_class("safety-safe", "safety-smart", "safety-dangerous")
+        if level in {"safe", "smart", "dangerous"}:
+            container.add_class(f"safety-{level}")
+            # v0.8.0 A-P3 (amendment Q6): the border-title label carries the
+            # level as the compact always-on affordance (plan-mode pattern).
+            if self._chat_input_container is not None:
+                self._chat_input_container.set_custom_border(f"safety: {level}")
+        elif self._chat_input_container is not None:
+            self._chat_input_container.set_custom_border(None)
+        banner_query = self.query("#dangerous-banner")
+        if level == "dangerous":
+            from chartreux.cli.textual_ui.screens.safety_dangerous import (
+                DangerousBanner,
+            )
+
+            if banner_query:
+                return True
+            try:
+                await self.query_one("#bottom-app-container").mount(
+                    DangerousBanner(), before=0
+                )
+            except Exception as exc:
+                logger.warning("DANGEROUS banner mount failed: %s", exc)
+                return False
+            return True
+        for banner in banner_query:
+            await banner.remove()
+        return True
+
     async def _clear_history(self, cmd_args: str = "", **kwargs: Any) -> None:
         # R2/OD3: clearing starts a NEW session — invalidate any pending
         # automatic continuation synchronously (session change).
@@ -4736,31 +5068,6 @@ class ChartreuxApp(App):  # noqa: PLR0904
         session_log = self.app_server.resources.runtime.session_log
         resumable = session_log.enabled and session_log.persisted
         prompt = cmd_args.strip()
-        # /clear exits plan mode entirely: the pins /plan wrote are removed
-        # unconditionally (the saved restore snapshot is voided, not applied).
-        plan_state = self._plan_mode
-        plan_record = self._plan_record
-        if plan_record is None and plan_state is not None:
-            plan_record = record_from_state(plan_state)
-        plan_document = (
-            plan_state.plan_path
-            if plan_state is not None
-            else (None if plan_record is None else plan_record.plan_path)
-        )
-        plan_removal_failure: str | None = None
-        plan_record_failure: str | None = None
-        if plan_state is not None or plan_record is not None:
-            (
-                refusal,
-                plan_removal_failure,
-                plan_record_failure,
-            ) = await self._plan_exit_for_clear(plan_state, plan_record)
-            if refusal is not None:
-                await self._plan_error(
-                    f"Clear refused: {refusal} Nothing was cleared; the plan "
-                    "episode keeps its state."
-                )
-                return
         try:
             await self.app_server.clear_history()
             await self._queue.clear_server_queue()
@@ -4785,23 +5092,6 @@ class ChartreuxApp(App):  # noqa: PLR0904
                 await self._mount_and_scroll(
                     UserCommandMessage("New conversation started.")
                 )
-            if plan_state is not None or plan_record is not None:
-                await self._mount_and_scroll(
-                    UserCommandMessage(
-                        "Plan mode ended. The plan document was left in place: "
-                        f"`{plan_document}`"
-                    )
-                )
-                if plan_removal_failure is not None:
-                    await self._plan_error(
-                        "The planner model and thinking selections may remain "
-                        f"active for this session: {plan_removal_failure}"
-                    )
-                if plan_record_failure is not None:
-                    await self._plan_error(
-                        "The plan-mode record could not be removed, so a "
-                        f"resume may restore the mode: {plan_record_failure}"
-                    )
             self._chat_widget.scroll_home(animate=False)
             self._sync_terminal_title()
 
@@ -4826,1136 +5116,6 @@ class ChartreuxApp(App):  # noqa: PLR0904
 
         if prompt:
             await self._handle_user_message(prompt)
-
-    async def _plan_exit_for_clear(
-        self, plan_state: PlanModeState | None, plan_record: SessionPlanRecord | None
-    ) -> tuple[str | None, str | None, str | None]:
-        """Settle the plan episode before /clear; (refusal, removal, record).
-
-        design:242 — an observed exit during an accept claim orders the
-        abort-accept BEFORE the record clears, so no accepting zombie can
-        survive a /clear; that episode goes back to DRAFT and takes no terminal
-        write. design:477 — outside the accept flow /clear IS the same terminal
-        cancel as /plan cancel. A refusal names its reason and clears nothing.
-        """
-        view, view_failure = await self._plan_observe(plan_record)
-        if plan_record is not None and view is None:
-            return (
-                f"the plan episode status could not be read: {view_failure}",
-                None,
-                None,
-            )
-        abort_failure = await self._plan_abort_claim_first(plan_record)
-        if abort_failure is not None:
-            return abort_failure, None, None
-        if view is not None and view.draft and plan_record is not None:
-            cancel_failure = await self._plan_cancel_episode(plan_record)
-            if cancel_failure is not None:
-                return cancel_failure, None, None
-        self._plan_mode = None
-        self._plan_record = None
-        self._plan_view = None
-        self._set_plan_tint(False)
-        removal_failure = None
-        if plan_state is not None:
-            removal_failure = await self._plan_write(
-                clear_ops(plan_state), reason="plan mode cleared"
-            )
-        # /clear ends the mode, so the record ends with it: the resumed
-        # replacement session is not a planning session.
-        return None, removal_failure, await self._plan_clear_record()
-
-    # --- Plan mode (/plan, /plan status, /plan accept, /plan cancel) ---
-
-    async def _plan_command(self, cmd_args: str = "", **kwargs: Any) -> None:
-        action = cmd_args.strip()
-        lowered = action.lower()
-        # Only an EXACT subcommand token dispatches: `/plan <theme>` is the
-        # pre-existing entry form, so "accept later" stays a theme.
-        if lowered == "accept":
-            await self._plan_start_accept()
-        elif lowered == "cancel":
-            await self._plan_cancel()
-        elif lowered == "status":
-            await self._plan_status()
-        elif lowered in {"mark-accepted", "mark_accepted"}:
-            await self._plan_mark_accepted()
-        elif lowered == "rebind" or lowered.startswith("rebind "):
-            await self._plan_rebind(action[len("rebind") :].strip())
-        else:
-            await self._plan_enter(theme=action or None)
-
-    async def _plan_status(self) -> None:
-        """Report the episode's observed state, its document, and its actions.
-
-        The sidecar is consulted first for every display, and the observation
-        runs the completion rule for an accepted episode. A record whose mode
-        is not armed still reports its surface: terminal, legacy-unresolvable,
-        and possibly-executed episodes are displayable, never silently hidden.
-        """
-        state = self._plan_mode
-        record = self._plan_record
-        if state is None and record is None:
-            await self._plan_error(
-                "Not in plan mode. Use /plan to start planning first."
-            )
-            return
-        if record is None and state is not None:
-            record = record_from_state(state)
-        view, observation_failure = await self._plan_observe(record)
-        if view is None:
-            await self._plan_error(
-                f"Cannot read the plan episode status: {observation_failure}"
-            )
-            return
-        self._plan_view = view
-        path = None if state is None else state.plan_path
-        remedy = None
-        if view.possibly_executed and record is not None:
-            surviving = surviving_snapshot_path(record)
-            remedy = None if surviving is None else str(surviving)
-        lines = [episode_status_lines(view, plan_path=path, remedy_path=remedy)]
-        if state is not None:
-            lines.insert(0, plan_status(state.plan_path, state.theme))
-        await self._mount_and_scroll(UserCommandMessage("\n".join(lines)))
-
-    async def _plan_error(self, message: str) -> None:
-        await self._mount_and_scroll(
-            ErrorMessage(message, collapsed=self._tools_collapsed)
-        )
-
-    async def _plan_fields(self) -> list[ConfigFieldWire]:
-        response = await self.app_server.resources.config.read_fields()
-        return list(response.fields)
-
-    async def _plan_write(
-        self, ops: list[ConfigWriteOpWire], *, reason: str
-    ) -> str | None:
-        """Apply one per-key session-override write; the failure detail or None."""
-        try:
-            response = await self.app_server.resources.config.write(ops, reason=reason)
-        except Exception as exc:
-            return str(exc)
-        if response.rejected or response.failures:
-            return response.failures[0] if response.failures else "rejected"
-        if response.application != "applied":
-            return f"not applied ({response.application})"
-        return None
-
-    async def _plan_persist_record(self, state: PlanModeState) -> str | None:
-        """Persist the plan-mode record; the failure detail or None.
-
-        A response with no stored record means the session is not logged, so
-        there is nothing a resume could restore — the designed behavior, not a
-        failure to report.
-        """
-        try:
-            stored = await self.app_server.resources.sessions.write_plan_record(
-                record_from_state(state)
-            )
-        except Exception as exc:
-            return str(exc)
-        if stored is None:
-            logger.debug("Plan mode record not stored: session logging is disabled")
-        return None
-
-    async def _plan_clear_record(self) -> str | None:
-        """Remove the plan-mode record; the failure detail or None."""
-        try:
-            await self.app_server.resources.sessions.clear_plan_record()
-        except Exception as exc:
-            return str(exc)
-        return None
-
-    async def _plan_write_record(self, record: SessionPlanRecord | None) -> None:
-        """Persist one plan record verbatim (the recovery write callback)."""
-        await self.app_server.resources.sessions.write_plan_record(record)
-
-    async def _plan_context(self) -> tuple[LoggingDomainView | None, str | None]:
-        """The session's own logging domain and the failure reading it."""
-        try:
-            fields = await self._plan_fields()
-        except Exception as exc:
-            return None, str(exc)
-        return logging_domain(fields), None
-
-    async def _plan_observe(
-        self, record: SessionPlanRecord | None
-    ) -> tuple[EpisodeView | None, str | None]:
-        """Observe a record's episode sidecar-first; the view and any failure."""
-        if record is None:
-            return None, None
-        domain, context_failure = await self._plan_context()
-        if context_failure is not None:
-            return None, context_failure
-        return observe_episode_view(
-            record, session_id=self.app_server.session_id, domain=domain
-        )
-
-    def _plan_authorized_roots(self) -> tuple[Path, ...]:
-        """The re-bind authorities: the session cwd plus chartreux plan storage.
-
-        Plan-mode-owned episode storage is the one additional root: the
-        possibly-executed remedy re-binds a surviving proof path that lives
-        there, and design:244's outside-roots refusal still governs every
-        user-supplied path.
-        """
-        return (Path(self.app_server.cwd), default_workspaces_root())
-
-    async def _plan_remedy_path(
-        self, record: SessionPlanRecord, view: EpisodeView
-    ) -> str | None:
-        """The surviving proof path for a possibly-executed remedy, if any."""
-        if not view.possibly_executed:
-            return None
-        surviving = surviving_snapshot_path(record)
-        return None if surviving is None else str(surviving)
-
-    async def _plan_abort_claim_first(  # noqa: PLR0911
-        self, record: SessionPlanRecord | None
-    ) -> str | None:
-        """Abort a held accept claim; the refusal detail or None.
-
-        Consulted by /clear and /plan cancel before anything is cleared: a
-        claim held by another session and a post-commit attempt both refuse,
-        and the caller then clears nothing.
-        """
-        view, failure = await self._plan_observe(record)
-        if view is None:
-            return failure
-        if view.possibly_executed:
-            executor = view.executor_session_id or "(unrecorded)"
-            return (
-                f"an executor session records plan episode {view.episode_id} "
-                f"({executor}); inspect it or mark the episode accepted first"
-            )
-        if not view.recoverable:
-            return None
-        if record is None:
-            return "the plan episode record is unavailable"
-        directory = episode_directory(record)
-        if directory is None:
-            return "the plan episode directory cannot be resolved"
-        if not view.owner:
-            return (
-                f"the accept claim for plan episode {view.episode_id} is held by "
-                "another session; the owning session must act"
-            )
-        domain, context_failure = await self._plan_context()
-        if context_failure is not None:
-            return context_failure
-        if domain is None:
-            return "the session logging domain is unavailable"
-        return abort_accept_claim(
-            directory, session_id=self.app_server.session_id, domain=domain
-        )
-
-    async def _plan_restore_pins(self, record: SessionPlanRecord) -> str | None:
-        """Restore pre-entry selections on a never-re-armed surface (DR-61)."""
-        return await self._plan_write(
-            restore_ops(state_from_record(record)), reason="plan mode cancel restore"
-        )
-
-    def _set_plan_tint(self, active: bool) -> None:
-        """Apply or drop the standing indicator: the tint class and its label."""
-        container = self._chat_input_container
-        if container is None:
-            return
-        if active:
-            container.add_class(PLAN_MODE_TINT_CLASS)
-        else:
-            container.remove_class(PLAN_MODE_TINT_CLASS)
-        try:
-            input_box = container.get_widget_by_id(ChatInputContainer.ID_INPUT_BOX)
-        except Exception:
-            return
-        input_box.border_title = f" {PLAN_MODE_LABEL} " if active else ""
-
-    async def _restore_resumed_plan_mode(self) -> None:
-        """Restore a resumed plan record as a SURFACE, never a silent mode (§1).
-
-        Runs inside the resume, before the session is marked ready. A draft
-        episode continues as active planning; every other observed state is
-        displayed with its design-named actions and is NEVER armed. The logging
-        guard refuses loudly: plan mode requires the session lease.
-        """
-        try:
-            record = self.app_server.resources.sessions.resumed_plan_record
-        except Exception:
-            logger.exception("Failed to read the resumed session's plan record")
-            return
-        self._plan_mode = None
-        self._plan_record = record
-        self._plan_view = None
-        self._set_plan_tint(False)
-        if record is None:
-            return
-        fields: list[ConfigFieldWire] | None
-        try:
-            fields = await self._plan_fields()
-        except Exception:
-            logger.exception("Failed to read the plan configuration on resume")
-            fields = None
-        enabled = None if fields is None else session_logging_enabled(fields)
-        if enabled is None:
-            enabled = self.app_server.resources.runtime.session_log.enabled
-        refusal = logging_entry_guard(enabled)
-        if refusal is not None:
-            await self._plan_error(
-                f"Plan mode cannot resume: {refusal}. The plan record was left "
-                "in place."
-            )
-            return
-        view, observation_failure = await self._plan_observe(record)
-        if view is None:
-            await self._plan_error(
-                "Plan mode cannot resume: the episode status could not be read: "
-                f"{observation_failure}. Treat it as unresolvable — /plan rebind "
-                "<path> or /plan to start a new plan."
-            )
-            return
-        self._plan_view = view
-        remedy_path = await self._plan_remedy_path(record, view)
-        if view.draft:
-            try:
-                self._plan_mode = state_from_record(record)
-            except Exception as exc:
-                await self._plan_error(
-                    f"Plan mode cannot resume: the record is unusable ({exc}). "
-                    "Treat it as unresolvable — /plan rebind <path> or /plan to "
-                    "start a new plan."
-                )
-                return
-            self._set_plan_tint(True)
-            notice = resume_notice(record)
-            if view.episode_id:
-                notice = f"{notice} Episode: {view.episode_id}."
-        else:
-            # Never a silent restore: the pre-entry pins return automatically
-            # (DR-61) and the state is shown with its design-named actions.
-            restore_failure = await self._plan_restore_pins(record)
-            if restore_failure is not None:
-                await self._plan_error(
-                    "The previous model and thinking selections could not be "
-                    f"restored: {restore_failure}. Inspect them with /model or "
-                    "/thinking."
-                )
-            notice = episode_status_lines(
-                view, plan_path=record.plan_path, remedy_path=remedy_path
-            )
-        await self._mount_and_scroll(UserCommandMessage(notice))
-        # The resumed model cannot see a UI mount: the notice is part of the
-        # history the next turn is built from, as compaction's notice is part
-        # of the boundary it is built from. It races the startup prompt by
-        # design, so a refusal is logged and the restore stands.
-        try:
-            await self.app_server.inject_user_context(notice)
-        except Exception:
-            logger.exception("Failed to inject the plan-mode resume notice")
-
-    async def _plan_enter(self, theme: str | None = None) -> None:  # noqa: PLR0914
-        """Switch this conversation to the configured planner and allocate a plan."""
-        if self._plan_mode is not None:
-            await self._mount_and_scroll(
-                UserCommandMessage(
-                    "Plan mode is already active. Plan document: "
-                    f"`{self._plan_mode.plan_path}`"
-                )
-            )
-            return
-        try:
-            fields = await self._plan_fields()
-            selection = plan_section(fields)
-        except Exception as exc:
-            await self._plan_error(f"Failed to read the plan configuration: {exc}")
-            return
-        enabled = session_logging_enabled(fields)
-        if enabled is None:
-            enabled = self.app_server.resources.runtime.session_log.enabled
-        # design:215-218 — the per-session lease carries "one live process per
-        # session id" and is BYPASSED when logging is disabled, so entry refuses
-        # loudly rather than running the arbiter unguarded.
-        refusal = logging_entry_guard(enabled)
-        if refusal is not None:
-            await self._plan_error(refusal)
-            return
-        planner = selection.planner
-        if await self._is_active_model_enforced():
-            await self._plan_error(
-                "Plan mode cannot switch the model: 'active_model' is enforced "
-                "by your administrator. Contact your admin to change it."
-            )
-            return
-        workspace, workspace_error = allocate_workspace(
-            self.app_server.session_id, project_root=Path(self.app_server.cwd)
-        )
-        if workspace is None:
-            await self._plan_error(
-                f"Failed to create the plan workspace: {workspace_error}"
-            )
-            return
-        pre_entry_active_model, pre_entry_thinking = pre_entry_snapshot(
-            fields, planner.model, self.config.models
-        )
-        state = PlanModeState(
-            workspace=workspace,
-            planner=planner,
-            pre_entry_active_model=pre_entry_active_model,
-            pre_entry_planner_thinking=pre_entry_thinking,
-            theme=theme,
-        )
-        failure = await self._plan_write(entry_ops(planner), reason="plan mode entry")
-        if failure is None:
-            reload_error = await self._reload_config()
-            if reload_error is not None:
-                failure = f"runtime reload failed ({reload_error})"
-        if failure is not None:
-            revert = await self._plan_write(
-                restore_ops(state), reason="plan mode entry revert"
-            )
-            detail = (
-                "the previous selections were restored"
-                if revert is None
-                else "a planner selection may remain active; inspect it with "
-                f"/model or /thinking ({revert})"
-            )
-            await self._plan_error(f"Failed to enter plan mode: {failure} ({detail})")
-            return
-        self._plan_mode = state
-        self._plan_record = record_from_state(state)
-        self._plan_view = episode_view_from_state(state)
-        self._set_plan_tint(True)
-        record_failure = await self._plan_persist_record(state)
-        if record_failure is not None:
-            await self._mount_and_scroll(
-                WarningMessage(
-                    "Plan mode is active, but it will not be restored on "
-                    f"resume: {record_failure}."
-                )
-            )
-        seed = planner_seed(workspace, theme=theme)
-        if self._is_busy() or self._queue.paused:
-            await self._enqueue_prompt_with_resources(seed)
-        else:
-            await self._handle_user_message(seed)
-
-    async def _plan_start_accept(self) -> None:
-        if self._plan_mode is None and self._plan_record is None:
-            await self._plan_error(
-                "Not in plan mode. Use /plan to start planning first."
-            )
-            return
-        if (
-            self._plan_accept_worker is not None
-            and not self._plan_accept_worker.is_finished
-        ):
-            return
-        self._plan_accept_worker = self.run_worker(
-            self._plan_accept(), exclusive=False, name="plan-accept"
-        )
-
-    async def _plan_accept(self) -> None:
-        """Preview the BOUND draft and start the consented executor session.
-
-        The document comes from the episode binding, never from a record copy:
-        an absent or unreadable draft refuses with the re-bind/cancel recovery
-        (criterion 2), and accept never arms on a legacy record. The handoff
-        carries exactly the bytes the modal last showed.
-        """
-        state = self._plan_mode
-        record = self._plan_record
-        if record is None and state is not None:
-            record = record_from_state(state)
-        if state is None and record is None:
-            await self._plan_error(
-                "Not in plan mode. Use /plan to start planning first."
-            )
-            return
-        if state is None:
-            assert record is not None
-            await self._plan_recover_accept(record)
-            return
-        if (
-            record is None
-            or record.episode_id is None
-            or state.workspace.episode_id is None
-        ):
-            await self._plan_error(
-                "Cannot accept the plan: this plan record carries no episode "
-                "identity (legacy-unverified), so accept is disabled. Use "
-                "/plan rebind <path> to bind a fresh episode to an authorized "
-                "document, or /plan cancel."
-            )
-            return
-        document, document_error, content = await self._plan_bound_document(state)
-        if document is None or content is None:
-            await self._plan_error(
-                f"Cannot accept the plan: {document_error} Bind another document "
-                "with /plan rebind <path>, or /plan cancel."
-            )
-            return
-        try:
-            executor = plan_section(await self._plan_fields()).executor
-        except Exception as exc:
-            await self._plan_error(f"Failed to read the plan configuration: {exc}")
-            return
-        confirmation = await self._plan_request_consent(
-            document, content, executor, state, record
-        )
-        if confirmation is None:
-            await self._mount_and_scroll(
-                UserCommandMessage(
-                    "Plan execution cancelled. Plan mode is still active. "
-                    f"Plan document: `{state.plan_path}`"
-                )
-            )
-            return
-        await self._plan_handoff(
-            document, confirmation, executor, state, episode_id=record.episode_id
-        )
-
-    async def _plan_bound_document(
-        self, state: PlanModeState
-    ) -> tuple[PlanDocumentBrief | None, str | None, bytes | None]:
-        """Read and validate the episode's bound draft; (brief, error, bytes)."""
-        path = state.workspace.document_path
-        document, document_error = read_document(path)
-        if document is None:
-            return None, document_error, None
-        content, content_error = read_document_bytes(path)
-        if content is None:
-            return None, content_error, None
-        return document, None, content
-
-    async def _plan_recover_accept(  # noqa: PLR0911
-        self, record: SessionPlanRecord
-    ) -> None:
-        """Owner-only accept-recovery for an unfinished accept attempt.
-
-        Row 2 (no surviving snapshot) releases the claim and re-offers from
-        scratch. Row 3 verifies the surviving bytes by either name, restores
-        the record, and re-previews exactly those bytes; its confirm keeps the
-        claim held and re-enters the commit with them, so the draft is never
-        re-read on this leg (design sec.4.2/4.4).
-        """
-        view, observation_failure = await self._plan_observe(record)
-        if view is None:
-            await self._plan_error(
-                f"Cannot recover the plan episode: {observation_failure}"
-            )
-            return
-        remedy_path = await self._plan_remedy_path(record, view)
-        if not view.recoverable:
-            await self._plan_error(
-                episode_status_lines(
-                    view, plan_path=record.plan_path, remedy_path=remedy_path
-                )
-            )
-            return
-        if not view.owner:
-            await self._plan_error(
-                f"The accept claim for plan episode {view.episode_id} is held by "
-                "another session; only the owning session can recover it."
-            )
-            return
-        directory = episode_directory(record)
-        domain, context_failure = await self._plan_context()
-        if directory is None or domain is None:
-            await self._plan_error(
-                "Cannot recover the plan episode: "
-                f"{context_failure or 'the session logging domain is unavailable'}."
-            )
-            return
-        if view.row == EPISODE_ROW_ACCEPTING_NO_SNAPSHOT:
-            release_failure = release_crashed_claim(
-                directory,
-                episode_id=record.episode_id or "",
-                session_id=self.app_server.session_id,
-                domain=domain,
-            )
-            if release_failure is not None:
-                await self._plan_error(
-                    f"Cannot recover the plan episode: {release_failure}"
-                )
-                return
-            self._plan_mode = state_from_record(record)
-            self._plan_record = record
-            self._plan_view = episode_view_from_state(self._plan_mode)
-            self._set_plan_tint(True)
-            await self._plan_accept()
-            return
-        offer, offer_failure = await reopen_accepting_episode(
-            directory,
-            record=record,
-            session_id=self.app_server.session_id,
-            domain=domain,
-            write_record=self._plan_write_record,
-        )
-        if offer is None:
-            await self._plan_error(f"Cannot recover the plan episode: {offer_failure}")
-            return
-        state = state_from_record(record)
-        document = brief_from_bytes(state.workspace.document_path, offer.content)
-        try:
-            executor = plan_section(await self._plan_fields()).executor
-        except Exception as exc:
-            await self._plan_error(f"Failed to read the plan configuration: {exc}")
-            return
-        confirmation = await self._plan_request_consent(
-            document, offer.content, executor, state, record, snapshot_consent=True
-        )
-        if confirmation is None:
-            # An abort at every cycle releases the claim (DR-27).
-            abort_failure = await self._plan_abort_claim_first(record)
-            if abort_failure is not None:
-                await self._plan_error(
-                    f"The recovery was cancelled but the claim could not be "
-                    f"released: {abort_failure}"
-                )
-                return
-            await self._mount_and_scroll(
-                UserCommandMessage(
-                    "Plan execution cancelled. The accept claim was released and "
-                    "the episode is back in draft. Plan document: "
-                    f"`{state.plan_path}`"
-                )
-            )
-            return
-        # The claim STAYS held: the confirm re-enters COMMIT with the located
-        # snapshot's digest-verified bytes, and the draft is never consulted
-        # again (design sec.4.2/4.4, DR-39).
-        self._plan_mode = state
-        self._plan_record = record
-        self._plan_view = episode_view_from_state(state)
-        self._set_plan_tint(True)
-        await self._plan_handoff(
-            document,
-            confirmation,
-            executor,
-            state,
-            episode_id=record.episode_id or "",
-            snapshot_path=offer.snapshot_path,
-        )
-
-    async def _plan_request_consent(
-        self,
-        document: PlanDocumentBrief,
-        content: bytes,
-        executor: ExecutorSelection,
-        state: PlanModeState,
-        record: SessionPlanRecord,
-        *,
-        snapshot_consent: bool = False,
-    ) -> ConfirmedPlan | None:
-        """Show the consent modal; the bytes it last showed and confirmed.
-
-        ``snapshot_consent`` marks the recovery re-offer: its ``content`` is the
-        episode's verified surviving snapshot, so the modal must not consult the
-        draft when the user confirms.
-        """
-        screen_class = _get_plan_consent_screen_class()
-        screen = screen_class(
-            plan_path=str(document.path),
-            summary=document.summary,
-            executor_model=executor.model,
-            executor_thinking=executor.thinking,
-            executor_identity=executor.identity,
-            executor_display_name=self.config.model_display_name(executor.model),
-            theme=state.theme,
-            episode_id=record.episode_id,
-            lifecycle_state=record.display_state,
-            document_bytes=content,
-            snapshot_consent=snapshot_consent,
-        )
-        confirmed = await self.push_screen_wait(screen)
-        if confirmed is not True:
-            return None
-        consent = screen.confirmed
-        if consent is None:
-            return None
-        return ConfirmedPlan(
-            content=consent.document_bytes,
-            sha256=consent.sha256,
-            summary=consent.summary,
-        )
-
-    async def _plan_handoff(
-        self,
-        document: PlanDocumentBrief,
-        confirmation: ConfirmedPlan,
-        executor: ExecutorSelection,
-        state: PlanModeState,
-        *,
-        episode_id: str,
-        snapshot_path: Path | None = None,
-    ) -> None:
-        """Start the executor with exactly the reviewed and verified bytes.
-
-        The request carries the episode identity, the snapshot locator, its
-        digest, and the modal's confirmed bytes: the bytes are the one byte
-        authority, and the TUI seeds nothing afterwards — the server injects
-        the verified document into the executor's initial context.
-
-        A fresh accept locates the episode's LIVE snapshot name inside the
-        episode directory (the sidecar's directory, never the document's). The
-        recovery re-offer passes the name it actually located — by EITHER name,
-        since a post-commit claim may have renamed it — with the bytes it
-        verified and the user re-confirmed.
-        """
-        if snapshot_path is None:
-            snapshot_path = episode_snapshot_path(state.workspace.directory, episode_id)
-        try:
-            await self.app_server.plan_handoff(
-                executor_model=executor.model,
-                executor_thinking=executor.thinking,
-                executor_identity=executor.identity,
-                plan_path=str(document.path),
-                planner_thinking_alias=state.planner.model,
-                planner_thinking_value=state.pre_entry_planner_thinking,
-                episode_id=episode_id,
-                snapshot_path=str(snapshot_path),
-                snapshot_sha256=confirmation.sha256,
-                snapshot_bytes=confirmation.content,
-            )
-        except AppServerResponseError as exc:
-            if handoff_failed_before_replacement(exc.error):
-                await self._plan_error(
-                    "Failed to start plan execution: "
-                    f"{exc.error.message} Plan mode is still active; retry "
-                    "/plan accept or /plan cancel."
-                )
-                return
-            self._plan_mode = None
-            self._plan_record = None
-            self._plan_view = None
-            await self._plan_error(
-                "Failed to start plan execution: "
-                f"{exc.error.message}\n"
-                "The executor conversation may already be active; the plan "
-                f"document is at `{state.plan_path}`. Check the episode status "
-                "with /plan status."
-            )
-            return
-        except Exception as exc:
-            self._plan_mode = None
-            self._plan_record = None
-            self._plan_view = None
-            await self._plan_error(
-                f"Failed to start plan execution: {exc}\n"
-                "The executor conversation may already be active; the plan "
-                f"document is at `{state.plan_path}`. Check the episode status "
-                "with /plan status."
-            )
-            return
-        # The handoff replaced the session: mirror /clear's post-reset UI.
-        # The executor surface is retired here — the server owns the episode's
-        # accepted state and the injected bytes.
-        self._plan_mode = None
-        self._plan_record = None
-        self._plan_view = None
-        self._set_plan_tint(False)
-        self._root_recovery.cancel_local(reason="session_changed")
-        await self._queue.clear_server_queue()
-        self._refresh_context_progress()
-        self._refresh_banner()
-        await self._reset_message_widgets()
-        await self._messages_area.mount(SlashCommandMessage("plan accept"))
-        await self._mount_and_scroll(
-            UserCommandMessage(
-                f"Plan execution started. Plan document: `{state.plan_path}`"
-            )
-        )
-        self._chat_widget.scroll_home(animate=False)
-        self._sync_terminal_title()
-        self._advance_record_epoch(clear_retired=True)
-        # A plan-accept start is the same durable reset class as /clear: the
-        # new owner is the idle prompt, and old-session liveness reads are
-        # invalidated with it (design §3.3).
-        self._agent_liveness.invalidate()
-        self._settle_composed_status(
-            outcome=ReleaseOutcome("idle"),
-            turn_active=self._agent_job_active(),
-            durable=True,
-        )
-
-    async def _plan_cancel(self) -> None:
-        """Cancel: abort a held claim, or cancel the episode with pin restore."""
-        state = self._plan_mode
-        record = self._plan_record
-        if record is None and state is not None:
-            record = record_from_state(state)
-        if state is None and record is None:
-            await self._plan_error(
-                "Not in plan mode. Use /plan to start planning first."
-            )
-            return
-        assert record is not None
-        view, observation_failure = await self._plan_observe(record)
-        if view is None:
-            await self._plan_error(
-                f"Cannot cancel the plan episode: {observation_failure}"
-            )
-            return
-        remedy_path = await self._plan_remedy_path(record, view)
-        if view.possibly_executed:
-            # Only the design-named actions exist here: inspect, or adjudicate.
-            await self._plan_error(
-                episode_status_lines(
-                    view, plan_path=record.plan_path, remedy_path=remedy_path
-                )
-            )
-            return
-        if view.recoverable:
-            await self._plan_abort_accept(record, view)
-            return
-        await self._plan_cancel_surface(state, record, view)
-
-    async def _plan_abort_accept(
-        self, record: SessionPlanRecord, view: EpisodeView
-    ) -> None:
-        """Cancel during accepting IS abort-accept: pins untouched, no cleanup."""
-        directory = episode_directory(record)
-        domain, context_failure = await self._plan_context()
-        if directory is None or domain is None:
-            await self._plan_error(
-                "Cannot abort the accept transaction: "
-                f"{context_failure or 'the session logging domain is unavailable'}."
-            )
-            return
-        if not view.owner:
-            await self._plan_error(
-                f"The accept claim for plan episode {view.episode_id} is held by "
-                "another session; the owning session must act."
-            )
-            return
-        settle_failure = await cancel_accepting_episode(
-            directory,
-            record=record,
-            session_id=self.app_server.session_id,
-            domain=domain,
-            write_record=self._plan_write_record,
-        )
-        if settle_failure is not None:
-            await self._plan_error(
-                f"Cannot abort the accept transaction: {settle_failure}"
-            )
-            return
-        state = state_from_record(record)
-        self._plan_mode = state
-        self._plan_record = record
-        self._plan_view = episode_view_from_state(state)
-        self._set_plan_tint(True)
-        await self._mount_and_scroll(
-            UserCommandMessage(
-                "The accept transaction was aborted: the claim is released and "
-                "the episode is back in draft. Planning continues. Plan "
-                f"document: `{state.plan_path}`"
-            )
-        )
-
-    async def _plan_cancel_surface(
-        self, state: PlanModeState | None, record: SessionPlanRecord, view: EpisodeView
-    ) -> None:
-        """/plan cancel outside the accept flow: the EPISODE's terminal cancel.
-
-        Design sec.4.5 (:477): ``draft --/plan cancel--> cancelled (terminal)``.
-        The sidecar is the arbiter, so a draft episode is written ``cancelled``
-        through the fenced transition rather than merely forgotten, and the
-        record keeps that terminal state as display history (:494-495) — a
-        resume shows the cancelled banner with start-new and cancel-with-pin-
-        restore, and never re-arms. An episode with no sidecar left to
-        transition keeps whatever terminal display its record already carries
-        (accepted stays accepted; a lost sidecar's unresolvable record becomes
-        cancelled), and a legacy record, which names no episode, ends with the
-        mode. Every path restores the pre-entry selections (DR-61) and applies
-        the plan-owned cleanup whitelist.
-        """
-        if state is None:
-            state = state_from_record(record)
-        if view.draft:
-            # The terminal transition runs BEFORE the mode is dropped: a refusal
-            # leaves the episode exactly as it was and cancels nothing.
-            cancel_failure = await self._plan_cancel_episode(record)
-            if cancel_failure is not None:
-                await self._plan_error(
-                    f"Cannot cancel the plan episode: {cancel_failure}"
-                )
-                return
-        self._plan_mode = None
-        self._set_plan_tint(False)
-        self._plan_view = None
-        record_failure: str | None = None
-        terminal_now = view.draft or view.unresolvable
-        if record.episode_id is None:
-            # A legacy record names no episode, so there is nothing to keep as
-            # terminal history: the mode and its record end together.
-            self._plan_record = None
-            record_failure = await self._plan_clear_record()
-        elif terminal_now:
-            cancelled = record.model_copy(update={"state": EPISODE_STATE_CANCELLED})
-            self._plan_record = cancelled
-            try:
-                await self._plan_write_record(cancelled)
-            except Exception as exc:
-                record_failure = str(exc)
-        else:
-            # Already terminal or executor-recorded: the record IS the display
-            # authority and must not be rewritten to a weaker state.
-            self._plan_record = record
-        # The workspace is released immediately BEFORE the restore write: the
-        # mode is already off, and the pins' outcome must not leave an empty
-        # directory behind. Only a chartreux-allocated directory loses its
-        # plan-owned entries; provenance bytes and the retained fence keep it.
-        # A failed record write skips the release: the cleanup removes the
-        # sidecar, and the terminal arbiter state must survive as the display
-        # authority (design :494-495) when the record could not record it.
-        workspace_removed = record_failure is None and release_workspace(
-            state.workspace
-        )
-        failure = await self._plan_write(
-            restore_ops(state), reason="plan mode cancel restore"
-        )
-        if failure is not None:
-            await self._plan_error(
-                "Plan mode cancelled, but the previous model and thinking "
-                f"selections could not be fully restored: {failure}. Inspect them "
-                "with /model or /thinking."
-            )
-            return
-        if record_failure is not None:
-            await self._plan_error(
-                "Plan mode cancelled, but its stored record could not be "
-                f"updated, so a resume may not show the cancellation: "
-                f"{record_failure}"
-            )
-        if workspace_removed:
-            summary = (
-                "Plan mode cancelled. The previous model and thinking selections "
-                "were restored; the empty plan workspace was removed."
-            )
-        else:
-            summary = (
-                "Plan mode cancelled. The previous model and thinking selections "
-                "were restored; the plan document was left in place at "
-                f"`{state.plan_path}`."
-            )
-        await self._mount_and_scroll(UserCommandMessage(summary))
-
-    async def _plan_cancel_episode(self, record: SessionPlanRecord) -> str | None:
-        """Write the episode's terminal cancel; the failure detail or None."""
-        directory = episode_directory(record)
-        if directory is None or record.episode_id is None:
-            return None
-        domain, context_failure = await self._plan_context()
-        if domain is None:
-            return context_failure or "the session logging domain is unavailable"
-        return cancel_episode(
-            directory, session_id=self.app_server.session_id, domain=domain
-        )
-
-    async def _plan_rebind(self, path: str) -> None:  # noqa: PLR0911, PLR0914, PLR0915
-        """Bind the episode (or a fresh one) to an authorized document path."""
-        if not path:
-            await self._plan_error(
-                "Use /plan rebind <path> with the authorized plan document."
-            )
-            return
-        domain, context_failure = await self._plan_context()
-        if domain is None:
-            await self._plan_error(
-                "Cannot bind the plan document: "
-                f"{context_failure or 'the session logging domain is unavailable'}."
-            )
-            return
-        roots = self._plan_authorized_roots()
-        target = Path(path).expanduser()
-        state = self._plan_mode
-        record = self._plan_record
-        if record is None and state is not None:
-            record = record_from_state(state)
-        if state is not None and record is not None and record.episode_id is not None:
-            workspace, rebind_failure = rebind_current_episode(
-                state,
-                target,
-                authorized_roots=roots,
-                session_id=self.app_server.session_id,
-                domain=domain,
-            )
-            if workspace is None:
-                await self._plan_error(
-                    f"Cannot bind the plan document: {rebind_failure}"
-                )
-                return
-            new_state = replace(state, workspace=workspace)
-            self._plan_mode = new_state
-            self._plan_record = record_from_state(new_state)
-            self._plan_view = episode_view_from_state(new_state)
-            write_failure = await self._plan_persist_record(new_state)
-            if write_failure is not None:
-                await self._mount_and_scroll(
-                    WarningMessage(
-                        "The plan document was re-bound, but its record could not "
-                        f"be updated, so a resume may show the old binding: "
-                        f"{write_failure}."
-                    )
-                )
-            await self._mount_and_scroll(
-                UserCommandMessage(
-                    "Plan document re-bound: "
-                    f"`{new_state.plan_path}`. Accept previews its bytes and "
-                    "requires a fresh consent."
-                )
-            )
-            return
-        # Rebind-to-new-episode: legacy, unresolvable, or the proof-path remedy.
-        if record is not None:
-            base = state_from_record(record)
-            planner = base.planner
-            pre_entry_active_model = base.pre_entry_active_model
-            pre_entry_planner_thinking = base.pre_entry_planner_thinking
-            theme = base.theme
-        else:
-            try:
-                fields = await self._plan_fields()
-                selection = plan_section(fields)
-            except Exception as exc:
-                await self._plan_error(f"Failed to read the plan configuration: {exc}")
-                return
-            planner = selection.planner
-            pre_entry_active_model, pre_entry_planner_thinking = pre_entry_snapshot(
-                fields, planner.model, self.config.models
-            )
-            theme = None
-        workspace, rebind_failure = rebind_fresh_episode(
-            target,
-            authorized_roots=roots,
-            session_id=self.app_server.session_id,
-            domain=domain,
-            project_root=Path(self.app_server.cwd),
-        )
-        if workspace is None:
-            await self._plan_error(f"Cannot bind the plan document: {rebind_failure}")
-            return
-        new_state = PlanModeState(
-            workspace=workspace,
-            planner=planner,
-            pre_entry_active_model=pre_entry_active_model,
-            pre_entry_planner_thinking=pre_entry_planner_thinking,
-            theme=theme,
-        )
-        failure = await self._plan_write(entry_ops(planner), reason="plan mode entry")
-        if failure is not None:
-            await self._plan_error(f"Failed to enter plan mode: {failure}")
-            return
-        reload_error = await self._reload_config()
-        if reload_error is not None:
-            await self._plan_error(
-                f"Failed to enter plan mode: runtime reload failed ({reload_error})"
-            )
-            return
-        self._plan_mode = new_state
-        self._plan_record = record_from_state(new_state)
-        self._plan_view = episode_view_from_state(new_state)
-        self._set_plan_tint(True)
-        write_failure = await self._plan_persist_record(new_state)
-        if write_failure is not None:
-            await self._mount_and_scroll(
-                WarningMessage(
-                    "Plan mode is active, but it will not be restored on "
-                    f"resume: {write_failure}."
-                )
-            )
-        await self._mount_and_scroll(
-            UserCommandMessage(
-                f"Plan episode {workspace.episode_id} bound to "
-                f"`{new_state.plan_path}`. Accept previews its bytes and requires "
-                "a fresh consent."
-            )
-        )
-
-    async def _plan_mark_accepted(self) -> None:
-        """Owner adjudication of a possibly-executed episode: mark it accepted."""
-        record = self._plan_record
-        if record is None:
-            await self._plan_error("There is no plan episode to mark accepted.")
-            return
-        view, observation_failure = await self._plan_observe(record)
-        if view is None:
-            await self._plan_error(
-                f"Cannot mark the plan episode accepted: {observation_failure}"
-            )
-            return
-        remedy_path = await self._plan_remedy_path(record, view)
-        if not view.possibly_executed:
-            await self._plan_error(
-                episode_status_lines(
-                    view, plan_path=record.plan_path, remedy_path=remedy_path
-                )
-            )
-            return
-        if not view.owner:
-            await self._plan_error(
-                f"Plan episode {view.episode_id} is owned by another session; "
-                "only the owning session can adjudicate it."
-            )
-            return
-        directory = episode_directory(record)
-        domain, context_failure = await self._plan_context()
-        if directory is None or domain is None:
-            await self._plan_error(
-                "Cannot mark the plan episode accepted: "
-                f"{context_failure or 'the session logging domain is unavailable'}."
-            )
-            return
-        _, adjudication_failure = adjudicate_possibly_executed(
-            directory,
-            episode_id=record.episode_id or "",
-            session_id=self.app_server.session_id,
-            domain=domain,
-        )
-        if adjudication_failure is not None:
-            await self._plan_error(
-                f"Cannot mark the plan episode accepted: {adjudication_failure}"
-            )
-            return
-        surviving = surviving_snapshot_path(record)
-        updated = record.model_copy(
-            update={
-                "state": EPISODE_STATE_ACCEPTED,
-                "snapshot_path": None if surviving is None else surviving.name,
-            }
-        )
-        try:
-            await self._plan_write_record(updated)
-        except Exception as exc:
-            await self._plan_error(
-                "The episode is accepted, but its record could not be updated: "
-                f"{exc}. A resume will re-read the sidecar."
-            )
-        self._plan_mode = None
-        self._plan_record = updated
-        self._plan_view = None
-        self._set_plan_tint(False)
-        restore_failure = await self._plan_restore_pins(updated)
-        if restore_failure is not None:
-            await self._plan_error(
-                "The previous model and thinking selections could not be "
-                f"restored: {restore_failure}. Inspect them with /model or "
-                "/thinking."
-            )
-        observed, _ = await self._plan_observe(updated)
-        accepted = observed or EpisodeView(
-            row="accepted", state=EPISODE_STATE_ACCEPTED, episode_id=record.episode_id
-        )
-        await self._mount_and_scroll(
-            UserCommandMessage(
-                episode_status_lines(
-                    accepted,
-                    plan_path=updated.plan_path,
-                    remedy_path=None if surviving is None else str(surviving),
-                )
-            )
-        )
 
     async def _show_log_path(self, **kwargs: Any) -> None:
         session_log = await self.app_server.resources.sessions.read_log()

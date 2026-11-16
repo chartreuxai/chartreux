@@ -39,6 +39,10 @@ class PermissionContext(BaseModel):
             "parent_ceiling",
             "tool_policy",
             "dangerous_command",
+            # v0.8.0 A-P2: typed SYNTAX discriminator. Shell-grammar refusals
+            # carry this kind so the loop seam can keep them away from the
+            # SMART classifier (they were only a reason-text prefix before).
+            "syntax",
         ]
         | None
     ) = None

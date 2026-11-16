@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 from collections.abc import Callable
 from contextlib import suppress
 from pathlib import Path
@@ -19,7 +18,6 @@ from chartreux.app_server.client import AppServerClient
 from chartreux.app_server.models import (
     PublicMessageEntry,
     SessionTextContentBlock,
-    TextContentBlock,
     TurnUserInputEntry,
 )
 from chartreux.app_server.protocol import (
@@ -34,8 +32,6 @@ from chartreux.app_server.protocol import (
     SessionHistoryListParams,
     SessionHistoryListResponse,
     SessionOptions,
-    SessionPlanHandoffParams,
-    SessionPlanHandoffResponse,
     SessionReadParams,
     SessionReadResponse,
     SessionResumeParams,
@@ -43,7 +39,6 @@ from chartreux.app_server.protocol import (
     SessionStopParams,
     SessionStopResponse,
     TurnEnqueueParams,
-    TurnStartParams,
 )
 from chartreux.app_server.root_agent_process import (
     RootAgentSessionNotFound,
@@ -53,11 +48,7 @@ from chartreux.app_server.root_agent_process import (
 from chartreux.app_server.session import AppServerSession, SessionStopUnknownOutcome
 from chartreux.app_server.transport import memory_transport_pair
 from chartreux.core.agent_loop import AgentLoop
-from chartreux.core.config.chartreux_schema import ChartreuxConfigSchema
-from chartreux.core.config.layers.overrides import OverridesLayer
-from chartreux.core.config.layers.user import UserConfigLayer
-from chartreux.core.config.models import ModelConfig, SessionLoggingConfig
-from chartreux.core.config.orchestrator import ConfigOrchestrator
+from chartreux.core.config.models import SessionLoggingConfig
 from tests.app_server.backend_contract.conftest import (
     BackendContractConnection,
     connect_backend_contract_host,
@@ -311,239 +302,6 @@ async def test_resume_attaches_the_requested_persisted_session_and_keeps_it_usab
         ] == ["save this", "saved", "resume this", "resumed"]
     finally:
         await resumed.close()
-
-
-# ---------------------------------------------------------------------------
-# Plan-handoff carrier contract (package A5): rotation adoption and the
-# session/fenced variant, asserted identically on both transports.
-#
-# in_process runs the legacy backend in this process; stdio runs the
-# process-session backend whose root agent is served over a memory wire
-# (install_memory_root_agent) -- no spawned child, because the B1
-# spawned-provider gate has not passed. An in-process-only pass is not
-# spawned-stdio parity proof.
-# ---------------------------------------------------------------------------
-
-PLANNER = "alpha"
-EXECUTOR = "beta"
-
-
-async def _layered_loop(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> AgentLoop:
-    """A loop on a real orchestrator with alpha/beta models, session id 'initial'."""
-    models = [
-        ModelConfig(name="alpha", provider="mistral", alias="alpha"),
-        ModelConfig(name="beta", provider="mistral", alias="beta"),
-    ]
-    config = build_test_vibe_config(
-        active_model=PLANNER,
-        models=models,
-        session_logging=SessionLoggingConfig(enabled=False),
-    )
-
-    async def load(
-        cfg: ChartreuxConfigSchema,
-    ) -> ConfigOrchestrator[ChartreuxConfigSchema]:
-        user_path = tmp_path / "user-config.toml"
-        user_path.write_text('theme = "dark"\n')
-        user = UserConfigLayer(path=user_path)
-        launch = OverridesLayer(
-            name="launch",
-            data={
-                "active_model": PLANNER,
-                "session_logging": cfg.session_logging.model_dump(mode="json"),
-            },
-        )
-        return await ConfigOrchestrator.create(
-            schema=ChartreuxConfigSchema,
-            layers=[user, launch, OverridesLayer(data={})],
-            default_layer_resolver=lambda: user,
-            catalog_snapshot=cfg.catalog_snapshot,
-        )
-
-    monkeypatch.setattr("tests.conftest._load_orchestrator", load)
-    return build_test_agent_loop(config=config, session_id="initial")
-
-
-def _handoff_params(session_id: str) -> dict[str, Any]:
-    return SessionPlanHandoffParams(
-        session_id=session_id,
-        executor_model=EXECUTOR,
-        executor_thinking="medium",
-        executor_identity="orchestrator",
-        plan_path="/tmp/plan-workspace/plan.md",
-    ).model_dump(mode="json", by_alias=True)
-
-
-def _turn_start_params(session_id: str) -> dict[str, Any]:
-    return TurnStartParams(
-        session_id=session_id, message=[TextContentBlock(text="hello")]
-    ).model_dump(mode="json", by_alias=True)
-
-
-@pytest_asyncio.fixture(params=["in_process", "stdio"])
-async def handoff_contract(
-    request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> Any:
-    """One app-server per transport, both serving the same layered loop."""
-    loop = await _layered_loop(monkeypatch, tmp_path)
-    client_transport, server_transport = memory_transport_pair()
-    harness = None
-    if request.param == "stdio":
-        install_memory_root_agent(monkeypatch, loop)
-        harness = await create_harness_server(server_transport, transport_kind="stdio")
-        client = AppServerClient(client_transport, run_peer=harness.serve)
-        server = harness._server
-    else:
-        server = build_test_app_server(loop, server_transport)
-        client = AppServerClient(client_transport, run_peer=server.serve)
-    session = await attach_test_app_server_session(client)
-    try:
-        yield client, session, server, loop, request.param
-    finally:
-        await session.close()
-        await client.close()
-        if harness is not None:
-            await harness.close()
-        else:
-            await server.close()
-        await loop.aclose()
-
-
-@pytest.mark.asyncio
-async def test_plan_handoff_adopts_the_rotated_session_and_fences_the_old_id(
-    handoff_contract: Any,
-) -> None:
-    client, session, server, _loop, transport = handoff_contract
-    old_id = session.session_id
-
-    raw = await client.request("session/plan/handoff", _handoff_params(old_id))
-    response = SessionPlanHandoffResponse.model_validate(raw)
-    new_id = response.state.session.id
-    assert new_id != old_id
-    # On the stdio topology the server recorded the rotation on the
-    # resubscribe path; the in-process arm deliberately leaves the dispatch
-    # flags unset and fences through the handler's handoff map instead.
-    if transport == "stdio":
-        assert server._session_rotations.get(old_id) == new_id
-    else:
-        assert server._session_rotations.get(old_id) is None
-
-    # The rotated identity is adopted: reads addressed to it answer.
-    read = await client.request(
-        "session/read",
-        SessionReadParams(session_id=new_id).model_dump(mode="json", by_alias=True),
-    )
-    assert SessionReadResponse.model_validate(read).state.session.id == new_id
-
-    # A request still addressed to the superseded id answers the typed
-    # session/fenced variant -- non-NOT_FOUND, carrying the rotated identity,
-    # the fence reason and the adoption instruction.
-    with pytest.raises(AppServerResponseError) as exc_info:
-        await client.request("session/ready/read", {"sessionId": old_id})
-    error = exc_info.value.error
-    assert error.code is ProtocolErrorCode.CONFLICT
-    data = cast(dict[str, Any], error.data)
-    assert data["code"] == "session/fenced"
-    assert data["reason"] == "session_rotated"
-    assert data["sessionId"] == new_id
-    assert data["supersededSessionId"] == old_id
-    assert "not replayed" in data["instruction"]
-
-    # A genuinely unknown id keeps the plain not-found contract.
-    with pytest.raises(AppServerResponseError) as unknown_info:
-        await client.request("session/ready/read", {"sessionId": "no-such-session"})
-    assert unknown_info.value.error.code is ProtocolErrorCode.NOT_FOUND
-
-
-@pytest.mark.asyncio
-async def test_old_session_id_submit_after_handoff_is_fenced_without_replay(
-    handoff_contract: Any,
-) -> None:
-    client, session, server, _loop, _transport = handoff_contract
-    old_id = session.session_id
-
-    raw = await client.request("session/plan/handoff", _handoff_params(old_id))
-    new_id = SessionPlanHandoffResponse.model_validate(raw).state.session.id
-
-    with pytest.raises(AppServerResponseError) as exc_info:
-        await client.request("turn/start", _turn_start_params(old_id))
-    error = exc_info.value.error
-    assert error.code is ProtocolErrorCode.CONFLICT
-    data = cast(dict[str, Any], error.data)
-    assert data["code"] == "session/fenced"
-    assert data["sessionId"] == new_id
-
-    # No automatic replay: no turn was started on either backend.
-    root = server._root
-    active = getattr(root, "_active_turn", None)
-    if active is None and hasattr(root, "handler"):
-        active = root.handler._turns.active_turn
-    assert active is None
-
-
-@pytest.mark.asyncio
-async def test_mid_window_old_id_submit_is_fenced_on_the_stdio_backend(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    """Between handoff-send and settlement the old-id submit is fenced.
-
-    The agent's handoff body is paused after the rotation (reload step), so
-    the coordinator still holds the old id while the agent already rotated:
-    a turn/start addressed to the old id must answer session/fenced carrying
-    the rotated identity, never a bare NOT_FOUND and never a replay.
-    """
-    loop = await _layered_loop(monkeypatch, tmp_path)
-    install_memory_root_agent(monkeypatch, loop)
-    client_transport, server_transport = memory_transport_pair()
-    harness = await create_harness_server(server_transport, transport_kind="stdio")
-    server = harness._server
-    client = AppServerClient(client_transport, run_peer=harness.serve)
-    session = await attach_test_app_server_session(client)
-    release = asyncio.Event()
-    try:
-        old_id = session.session_id
-        rotated = asyncio.Event()
-        real_reload = loop.reload_with_initial_messages
-
-        async def gated_reload(*args: Any, **kwargs: Any) -> Any:
-            # Runs after the rotation (clear_history) and before the handoff
-            # reply: the mid-window.
-            rotated.set()
-            await release.wait()
-            return await real_reload(*args, **kwargs)
-
-        monkeypatch.setattr(loop, "reload_with_initial_messages", gated_reload)
-
-        handoff_task = asyncio.create_task(
-            client.request("session/plan/handoff", _handoff_params(old_id))
-        )
-        await asyncio.wait_for(rotated.wait(), timeout=10)
-        # The agent rotated; the coordinator has not settled the handoff yet.
-        assert loop.session_id != old_id
-        assert old_id in server._pending_handoffs
-
-        with pytest.raises(AppServerResponseError) as exc_info:
-            await client.request("turn/start", _turn_start_params(old_id))
-        error = exc_info.value.error
-        assert error.code is ProtocolErrorCode.CONFLICT
-        data = cast(dict[str, Any], error.data)
-        assert data["code"] == "session/fenced"
-        assert data["reason"] == "session_rotated"
-        assert data["sessionId"] == loop.session_id
-
-        release.set()
-        raw = await asyncio.wait_for(handoff_task, timeout=10)
-        new_id = SessionPlanHandoffResponse.model_validate(raw).state.session.id
-        assert new_id == loop.session_id
-        # No replay happened: the fenced turn never started.
-        assert server._root is not None
-        assert cast(Any, server._root)._active_turn is None
-    finally:
-        release.set()
-        await session.close()
-        await client.close()
-        await harness.close()
-        await loop.aclose()
 
 
 # ---------------------------------------------------------------------------

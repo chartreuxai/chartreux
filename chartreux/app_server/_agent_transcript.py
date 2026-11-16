@@ -732,6 +732,7 @@ def _project_user_entry(
         text,
         timestamp=timestamp,
         posted_at=_posted_at(message),
+        injected=bool(message.get("injected")),
         payload=_EntryPayload(
             title="User message", attachment_names=names, attachment_count=count
         ),
@@ -1219,6 +1220,7 @@ def _entry(
     payload: _EntryPayload,
     posted_at: datetime | None = None,
     turn_duration_ms: float | None = None,
+    injected: bool = False,
 ) -> AgentTranscriptEntry:
     bounded_text, truncated = _truncate_utf8(display_text, _DISPLAY_TEXT_LIMIT)
     entry = AgentTranscriptEntry(
@@ -1230,6 +1232,7 @@ def _entry(
         updated_at=timestamp,
         posted_at=posted_at,
         turn_duration_ms=turn_duration_ms,
+        injected=injected,
         generation_status=PublicEntryGenerationStatus.COMPLETED,
         title=_bounded_text(payload.title, MAX_AGENT_TRANSCRIPT_ID_LENGTH),
         tool_name=payload.tool_name,

@@ -8,7 +8,6 @@ from chartreux.app_server.protocol import (
     DiagnosticsListResponse,
     RuntimeReadResponse,
     RuntimeSnapshot,
-    SessionPlanRecord,
     StatsReadResponse,
 )
 
@@ -23,9 +22,10 @@ class ClientSessionState:
     def __init__(self, bootstrap: ClientBootstrap) -> None:
         self.projection = ClientProjection(bootstrap.state)
         self.apply_runtime_read(bootstrap.runtime)
-        # Set by an adopted resume; the plan-mode restore reads it before the
-        # session is marked ready, so it must not need a request of its own.
-        self.plan_record: SessionPlanRecord | None = None
+        # Set by an adopted resume; True when the resumed session's raw
+        # metadata carried a ``plan_mode`` key (the removed plan-mode
+        # feature), so the client can surface one notice line.
+        self.plan_mode_present: bool = False
         self._usage_baseline = self._current_usage()
 
     @property

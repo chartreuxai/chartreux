@@ -37,10 +37,6 @@ from pydantic import TypeAdapter, ValidationError
 
 from chartreux.app_server._dispatch import DispatchResult
 from chartreux.app_server._execution import cancel_tasks
-from chartreux.app_server._handler import (
-    session_fenced_backend_error,
-    version_skew_backend_error,
-)
 from chartreux.app_server._model import ProtocolModel, validate_wire
 from chartreux.app_server._policy_tree import (
     ManifestPolicyTreeJournal,
@@ -198,11 +194,6 @@ from chartreux.app_server.protocol import (
     SessionLogReadParams,
     SessionLogReadResponse,
     SessionMemorialItem,
-    SessionPlanHandoffParams,
-    SessionPlanHandoffResponse,
-    SessionPlanRecord,
-    SessionPlanRecordWriteParams,
-    SessionPlanRecordWriteResponse,
     SessionReadParams,
     SessionReadResponse,
     SessionReadyReadParams,
@@ -210,6 +201,8 @@ from chartreux.app_server.protocol import (
     SessionReadyWaitParams,
     SessionReadyWaitResponse,
     SessionResumeParams,
+    SessionSafetyReadParams,
+    SessionSafetyTransitionParams,
     SessionSettingsUpdateParams,
     SessionShellCommandParams,
     SessionShellCommandResponse,
@@ -847,12 +840,6 @@ class ProcessSessionBackend:  # noqa: PLR0904 - the session port surface
         # ran in between (R3-A2): the record text then becomes the retried
         # turn's own user input instead of running on the later transcript.
         self._turn_starts = 0
-        # Session rotations this end adopted or is awaiting: a settled plan
-        # handoff maps the superseded id to the rotated one, and an in-flight
-        # handoff names its source id, so a request addressed to either is
-        # fenced instead of forwarded against the pre-rotation session.
-        self._rotations: dict[str, str] = {}
-        self._pending_handoffs: set[str] = set()
         # R2/OD3: the root automatic-recovery gate stays coordinator-local on
         # this topology too. Its loop-owned predicate inputs (live config,
         # transcript-integrity verdict, availability) cross the agent wire as
@@ -946,7 +933,7 @@ class ProcessSessionBackend:  # noqa: PLR0904 - the session port surface
         # The typed owner key every session-scoped mcp_catalog carrier sends
         # with its request: the agent files the auth bindings under a handle
         # held for exactly as long as this key lives, released explicitly on
-        # shutdown and re-keyed atomically across a plan-handoff rotation.
+        # shutdown.
         self._mcp_owner_key = f"mcp-owner-{uuid4().hex}"
         self._adopt_state(state.state)
         self._events_idle.set()
@@ -1548,22 +1535,14 @@ class ProcessSessionBackend:  # noqa: PLR0904 - the session port surface
         """List stored sessions from the config the agent's own loop holds."""
         return await self._process.list_sessions(params)
 
-    async def read_plan_record(self) -> SessionPlanRecord | None:
-        """Read the durable plan mode the agent's session metadata carries.
+    async def plan_mode_present(self) -> bool:
+        """Whether the resumed session's raw metadata carried a ``plan_mode`` key.
 
-        A resume response carries this value, so it is answered before the
-        session is adopted; a coordinator-side copy of the mode would be a
-        second, unsynchronized record of the same fact.
+        A resume response carries this flag, so it is answered before the
+        session is adopted; the coordinator keeps no record of the removed
+        plan mode beyond this presence bit.
         """
-        return await self._process.read_plan_record()
-
-    async def write_plan_record(
-        self, params: SessionPlanRecordWriteParams
-    ) -> SessionBackendResult[SessionPlanRecordWriteResponse]:
-        """Persist (or remove) the plan mode where the transcript is written."""
-        self._require_session(params.session_id)
-        reply = await self._process.write_plan_record(params)
-        return SessionBackendResult(reply)
+        return await self._process.plan_mode_present()
 
     # -- turns -----------------------------------------------------------
 
@@ -1575,109 +1554,14 @@ class ProcessSessionBackend:  # noqa: PLR0904 - the session port surface
             raise fence
         if session_id == self.session_id:
             return
-        rotated_to = self._rotations.get(session_id)
-        if rotated_to is not None:
-            # The id was superseded by a rotation this end adopted: fence the
-            # request with the rotated identity instead of a bare not-found.
-            raise session_fenced_backend_error(session_id, rotated_to)
         raise SessionBackendError(
             ProtocolErrorCode.NOT_FOUND, f"Session not found: {session_id}"
         )
 
-    async def plan_handoff(self, params: SessionPlanHandoffParams) -> DispatchResult:
-        """Carry the consented plan handoff to the agent and adopt the rotation.
-
-        The wire leg runs the full consent fence in the agent process, which
-        rotates the session inside the operation; the reply's snapshot is the
-        rotated identity this end adopts, and the dispatch flags are set for
-        stdio explicitly (``session/fork``'s pattern) so the server resubscribes
-        to the rotated session once the response has been sent.
-        """
-        self._require_session(params.session_id)
-        source_id = params.session_id
-        self._pending_handoffs.add(source_id)
-        try:
-            try:
-                reply = await self._process.plan_handoff(params)
-            except RootAgentProcessError as exc:
-                raise _wire_failure(exc) from exc
-            state = self._adopt_snapshot(reply.snapshot)
-            if state is None:
-                raise SessionBackendError(
-                    ProtocolErrorCode.INTERNAL_ERROR,
-                    "The plan handoff settled without the state it left behind",
-                )
-        finally:
-            self._pending_handoffs.discard(source_id)
-        rotated_id = self.session_id
-        if rotated_id != source_id:
-            self._rotations[source_id] = rotated_id
-            # The rotation is a new session generation: the recovery gate's
-            # episodes and projections belong to the superseded one, so they
-            # are invalidated, never silently rearmed.
-            self._recovery_gate.invalidate_all()
-            # The typed MCP owner key atomically re-keys across the rotation:
-            # the agent-side handle is unchanged, so the auth bindings survive
-            # the rotation instead of being silently dropped mid-session.
-            old_owner_key = self._mcp_owner_key
-            new_owner_key = f"mcp-owner-{uuid4().hex}"
-            try:
-                await self._process.rekey_mcp_owner_key(
-                    rotated_id, old_owner_key, new_owner_key
-                )
-            except RootAgentProcessError as exc:
-                raise _wire_failure(exc) from exc
-            self._mcp_owner_key = new_owner_key
-        return DispatchResult(
-            SessionPlanHandoffResponse(state=state, session_log=self._log),
-            session_attached=rotated_id != source_id,
-        )
-
-    async def rotated_session_id_for(self, session_id: str) -> str | None:
-        """The rotated identity a superseded ``session_id`` maps to, if known.
-
-        A settled handoff records the mapping directly. One still in flight is
-        resolved from the agent's own snapshot, because the agent rotates inside
-        the operation before its reply lands; a peer that cannot report a
-        rotation (an older build without the fence) answers None, and the caller
-        answers the version-skew error instead of a bare not-found.
-        """
-        rotated = self._rotations.get(session_id)
-        if rotated is not None:
-            return rotated
-        if session_id in self._pending_handoffs:
-            try:
-                snapshot = await self._process.snapshot()
-            except RootAgentProcessError:
-                return None
-            rotated = snapshot.state.session.id
-            if rotated != session_id:
-                return rotated
-        return None
-
-    async def _require_forwardable_session(self, session_id: str) -> None:
-        """Fence a submit addressed to a session whose rotation is in flight.
-
-        Between handoff-send and settlement the source id is still this end's
-        current id, so the ordinary check passes; forwarding the submit would
-        run it against the pre-rotation session, so a pending rotation fences
-        it instead, with the rotated identity the agent's own snapshot reports.
-        A peer that cannot report one is a version skew, never a bare
-        not-found and never a silent retry.
-        """
-        if session_id in self._pending_handoffs:
-            rotated = await self.rotated_session_id_for(session_id)
-            if rotated is not None:
-                raise session_fenced_backend_error(session_id, rotated)
-            raise version_skew_backend_error(
-                session_id, "the agent cannot report the rotated identity"
-            )
-        self._require_session(session_id)
-
     async def start_turn(
         self, params: TurnStartParams
     ) -> SessionBackendResult[TurnStartResponse]:
-        await self._require_forwardable_session(params.session_id)
+        self._require_session(params.session_id)
         if self._active_turn is not None:
             raise SessionBackendError(
                 ProtocolErrorCode.CONFLICT,
@@ -1882,7 +1766,7 @@ class ProcessSessionBackend:  # noqa: PLR0904 - the session port surface
     async def inject_context(
         self, params: ContextInjectParams
     ) -> SessionBackendResult[ContextInjectResponse]:
-        await self._require_forwardable_session(params.session_id)
+        self._require_session(params.session_id)
         if self._active_turn is not None:
             raise SessionBackendError(
                 ProtocolErrorCode.CONFLICT, "Use turn/steer while a turn is active"
@@ -2160,7 +2044,7 @@ class ProcessSessionBackend:  # noqa: PLR0904 - the session port surface
     async def enqueue_turn(
         self, params: TurnEnqueueParams
     ) -> SessionBackendResult[TurnEnqueueResponse]:
-        await self._require_forwardable_session(params.session_id)
+        self._require_session(params.session_id)
         try:
             result = self._turn_queue.enqueue(
                 params, validate=self._validate_queued_input
@@ -2868,7 +2752,7 @@ class ProcessSessionBackend:  # noqa: PLR0904 - the session port surface
             stop_requested=(
                 self._turn_task is not None and self._turn_task.cancelling() > 0
             ),
-            handoff_pending=bool(self._pending_handoffs),
+            handoff_pending=False,
             # Session lifecycle reservations (start/resume/continue) are served
             # by the backend host, not this attached backend, so none is
             # reserved here; the closing flag below covers this end's own
@@ -3318,15 +3202,6 @@ class ProcessSessionBackend:  # noqa: PLR0904 - the session port surface
     async def dispatch_extension(  # noqa: PLR0911, PLR0912, PLR0915 - one arm per extension method
         self, method: str, raw_params: dict[str, Any]
     ) -> Any:
-        if method == "session/plan/handoff":
-            # The routing arm the stdio topology was missing: the consent
-            # fence runs in the agent process over the existing reconfigure
-            # carrier, and the reply's rotated identity is adopted here with
-            # the attachment flag set, so the server resubscribes to the
-            # rotated session once the response has been sent.
-            return await self.plan_handoff(
-                validate_wire(SessionPlanHandoffParams, raw_params)
-            )
         # The runtime view is the one extension the agent's own snapshot
         # answers: it is resolved against the agent process's config and tool
         # manager, so every read asks the agent for a FRESH snapshot and the
@@ -3419,6 +3294,26 @@ class ProcessSessionBackend:  # noqa: PLR0904 - the session port surface
             except RootAgentProcessError as exc:
                 raise _wire_failure(exc) from exc
             return DispatchResult(response)
+        if method == "session/safety/read":
+            # v0.8.0 A-P1: the SafetyLevel lives on the agent's loop, so the
+            # read crosses to the process that owns it (same floor as the
+            # in-process handler's read).
+            params = SessionSafetyReadParams.model_validate(raw_params)
+            self._require_session(params.session_id)
+            try:
+                return DispatchResult(await self._process.safety_read())
+            except RootAgentProcessError as exc:
+                raise _wire_failure(exc) from exc
+        if method == "session/safety/transition":
+            # v0.8.0 A-P1: the transition is gated where the loop lives
+            # (idle-only, audit sink, background jobs), so it crosses to the
+            # agent process rather than being decided from a coordinator copy.
+            params = validate_wire(SessionSafetyTransitionParams, raw_params)
+            self._require_session(params.session_id)
+            try:
+                return DispatchResult(await self._process.safety_transition(params.to))
+            except RootAgentProcessError as exc:
+                raise _wire_failure(exc) from exc
         if method == "loops/list":
             # The schedule lives in the agent's own loop manager -- the one its
             # scheduler reads -- so the list is answered there. A coordinator

@@ -109,6 +109,7 @@ class AppServerConnection:
                 )
                 current = response.state
                 self._state.projection.replace_state(current)
+                self._state.plan_mode_present = response.plan_mode_present
                 self._snapshot = ConnectionSnapshot(previous, current)
                 self._attached_session_id = self._state.session_id
             return client

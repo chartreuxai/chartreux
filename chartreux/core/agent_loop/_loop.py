@@ -40,6 +40,16 @@ from chartreux.core.agent_loop._file_state_context import (
     RevisionRegistryPort,
 )
 from chartreux.core.agent_loop._in_process_execution import InProcessTurnExecution
+from chartreux.core.agent_loop._keepalive import (
+    KeepaliveAccountant,
+    KeepaliveCaps,
+    KeepaliveGates,
+    KeepaliveInvalidation,
+    KeepaliveScheduler,
+    KeepaliveSnapshotStore,
+    KeepaliveStatsView,
+    serialize_prefix,
+)
 from chartreux.core.agent_loop._loop_types import (
     AgentRuntimePolicy,
     AgentTurnOptions,
@@ -50,11 +60,18 @@ from chartreux.core.agent_loop._loop_types import (
 from chartreux.core.agent_loop._outward_redaction import OutwardEventRedactor
 from chartreux.core.agent_loop._request_broker import InteractionRequestBroker
 from chartreux.core.agent_loop._root_grants import SessionRootGrants
+from chartreux.core.agent_loop._safety_authority import (
+    AuthorityLaunchSnapshot,
+    SafetyLevel,
+    SessionAuthorityState,
+    initial_level,
+)
 from chartreux.core.agent_loop._session_transitions import (
     _PREPARE_SCRATCHPAD,
     SessionTransitions,
     _PrepareScratchpad,
 )
+from chartreux.core.agent_loop._smart_approve import SmartApproveSession
 from chartreux.core.agent_loop._title_cadence import TitleCadence
 from chartreux.core.agent_loop._tool_batch_runner import (
     ToolBatchRunner,
@@ -82,6 +99,7 @@ from chartreux.core.agent_loop.errors import (
 from chartreux.core.agent_loop.llm_gateway import (
     CallResources,
     CompletionInputs,
+    GatewayPingTransport,
     LLMGateway,
     TranscriptAppend,
     select_backend,
@@ -185,12 +203,6 @@ from chartreux.core.middleware import (
     TurnLimitMiddleware,
 )
 from chartreux.core.model_catalog.availability import EligibleDeployment
-from chartreux.core.plan_episode import (
-    EpisodeObservation,
-    PlanEpisodeError,
-    restore_episode_record,
-)
-from chartreux.core.plan_mode import build_plan_mode_compaction_notice
 from chartreux.core.policy.bundle import (
     ActivatedPolicy,
     BundleStore,
@@ -246,8 +258,10 @@ from chartreux.core.tools.base import BaseTool, InvokeContext, ToolPermission
 from chartreux.core.tools.builtins.skill import build_skill_result
 from chartreux.core.tools.io_port import ToolIOPort
 from chartreux.core.tools.manager import ToolManager
+from chartreux.core.tools.models import PermissionContext
+from chartreux.core.tools.permissions import bind_dangerous_mode
 from chartreux.core.tools.utils import DEFAULT_SENSITIVE_PATTERNS
-from chartreux.core.usage import UsagePurpose
+from chartreux.core.usage import UsageAttribution, UsagePurpose, UsageRecord
 from chartreux.core.utils import (
     VIBE_STOP_EVENT_TAG,
     RetryObserver,
@@ -257,6 +271,7 @@ from chartreux.core.utils import (
 from chartreux.core.workspace import Workspace
 from chartreux.observability.logging import logger
 from chartreux.user_content import UserDisplayContent, UserResource
+from chartreux.utils.api_keys import resolve_api_key
 from chartreux.utils.cache_store import CacheStore, InMemoryCacheStore
 from chartreux.utils.paths import is_dangerous_directory
 
@@ -311,33 +326,57 @@ _NO_TURN = _ActiveTurn()
 _DISABLE_AUTO_TITLE_ENV_VAR = "CHARTREUX_TEST_DISABLE_AUTO_TITLE"
 
 
+def _authority_dangerous_getter(self: AgentLoop) -> Callable[[], bool]:
+    """Live DANGEROUS getter for the A-P1 enforcement seam (v0.8.0).
+
+    A probe or partial stand-in without an authority state (test fences)
+    reads as guarded: the seam fails closed.
+    """
+    state = getattr(self, "_authority_state", None)
+    if state is None:
+        return lambda: False
+    return state.is_dangerous
+
+
 def requires_init(fn: Callable[..., Any]) -> Callable[..., Any]:
     """Decorator that awaits deferred initialization before executing the method."""
     if inspect.isasyncgenfunction(fn):
 
         @wraps(fn)
         async def gen_wrapper(self: AgentLoop, *args: Any, **kwargs: Any) -> Any:
-            with secret_redaction.bind_policy(self.scrub_policy):
+            with (
+                secret_redaction.bind_policy(self.scrub_policy),
+                bind_dangerous_mode(_authority_dangerous_getter(self)),
+            ):
                 await self.wait_until_ready()
             agen = fn(self, *args, **kwargs)
             sent: Any = None
             try:
                 while True:
-                    with secret_redaction.bind_policy(self.scrub_policy):
+                    with (
+                        secret_redaction.bind_policy(self.scrub_policy),
+                        bind_dangerous_mode(_authority_dangerous_getter(self)),
+                    ):
                         try:
                             event = await agen.asend(sent)
                         except StopAsyncIteration:
                             return
                     sent = yield event
             finally:
-                with secret_redaction.bind_policy(self.scrub_policy):
+                with (
+                    secret_redaction.bind_policy(self.scrub_policy),
+                    bind_dangerous_mode(_authority_dangerous_getter(self)),
+                ):
                     await agen.aclose()
 
         return gen_wrapper
 
     @wraps(fn)
     async def wrapper(self: AgentLoop, *args: Any, **kwargs: Any) -> Any:
-        with secret_redaction.bind_policy(self.scrub_policy):
+        with (
+            secret_redaction.bind_policy(self.scrub_policy),
+            bind_dangerous_mode(_authority_dangerous_getter(self)),
+        ):
             await self.wait_until_ready()
             return await fn(self, *args, **kwargs)
 
@@ -495,6 +534,10 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
         inherited_restrictions: tuple[SourceRestrictions, ...] = (),
         inherited_mode_restrictions: tuple[SourceRestrictions, ...] = (),
         inherited_root_grants: tuple[Path, ...] = (),
+        # v0.8.0 A-P0: the parent's safety-authority launch snapshot a child
+        # loop is constructed with. None for roots and resumes: the initial
+        # level then comes from initial_level(config) (hard-coded SAFE).
+        inherited_authority: AuthorityLaunchSnapshot | None = None,
         parent_authority_getter: Callable[[], ToolManager] | None = None,
         parent_authority_revision_getter: Callable[[], int] | None = None,
         launch_identity: str | None = None,
@@ -526,6 +569,13 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
         self._job_lifetime_generation = 0
         self.accounting_owner = accounting_owner
         self._detached_accounting_producers: set[asyncio.Task[None]] = set()
+        # v0.8.0 C2: the root-only keep-alive pilot wiring. The scheduler is
+        # built only when the [keepalive] flag is on and this is the root; the
+        # timer task is created once at loop startup and cancelled in
+        # _aclose_owned. FLAG OFF => zero behavior: no scheduler, no timer.
+        self._keepalive_scheduler: KeepaliveScheduler | None = None
+        self._keepalive_timer_task: asyncio.Task[None] | None = None
+        self._keepalive_notice_sent = False
         self._inherited_restrictions = tuple(inherited_restrictions)
         self._inherited_mode_restrictions = tuple(inherited_mode_restrictions)
         self._parent_authority_getter = parent_authority_getter
@@ -647,6 +697,28 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
         self.session_id = session_id or generate_session_id()
         self._session_lease = session_lease
         self.parent_session_id = parent_session_id
+        # v0.8.0 A-P0: the session's safety-authority state. A child inherits
+        # the parent's level through the launch snapshot (explicit runtime
+        # authority, never a fabricated approval, and children never run the
+        # DANGEROUS ceremony); a root derives its initial level from the
+        # initial_level(config) seam, hard-coded SAFE in A-P0. Transitions
+        # emit authority_transition events onto the out-of-band queue.
+        authority_snapshot = inherited_authority or AuthorityLaunchSnapshot(
+            level=initial_level(config_orchestrator.config)
+        )
+        self._authority_snapshot: AuthorityLaunchSnapshot | None = authority_snapshot
+        self._authority_state = SessionAuthorityState(
+            session_id=self.session_id,
+            level=authority_snapshot.level,
+            sink=self._out_of_band_events.put_nowait,
+        )
+        # v0.8.0 A-P2: the SMART-classifier adjudication session. Inert unless
+        # the authority level is SMART; the _should_execute_tool hook consults
+        # it on returned denials only.
+        self._smart_approve = SmartApproveSession(
+            config_getter=lambda: self._config_orchestrator.config,
+            authority_state=self._authority_state,
+        )
         if not is_subagent:
             # Startup reaper at top-level session start: collect managed
             # allocations whose owners are conclusively dead (fail-closed).
@@ -844,6 +916,7 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
             request_broker=self._request_broker,
             user_input_capability_getter=lambda: self._user_input_capability,
             is_subagent_getter=lambda: self._is_subagent,
+            authority_state_getter=lambda: self._authority_state,
             grant_port_getter=lambda: self._dangerous_command_grant_port,
             tool_manager_getter=lambda: self.tool_manager,
             session_id_getter=lambda: self.session_id,
@@ -1330,6 +1403,7 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
         """Await deferred initialization and record its duration."""
         await self._await_deferred_init()
         self._ensure_init_duration_recorded()
+        self._ensure_keepalive_timer()
 
     async def _await_deferred_init(self) -> None:
         """Await the deferred init thread and plan-attribute task."""
@@ -1364,6 +1438,39 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
         return self.agent_manager.config
 
     @property
+    def authority_state(self) -> SessionAuthorityState:
+        """v0.8.0 A-P0: the session's safety-authority state."""
+        return self._authority_state
+
+    @property
+    def safety_level(self) -> SafetyLevel:
+        """The session's current SafetyLevel (single surface, amendment Q2)."""
+        return self._authority_state.level
+
+    def safety_posture_view(self) -> dict[str, Any]:
+        """v0.8.0 A-P3: posture-report data for /status and bare ``/safety``.
+
+        Level plus the SMART classifier's configured expression, resolved
+        model name (or the resolution error), and the session counters/caps.
+        Model resolution is use-time and fail-closed: a resolution failure is
+        reported as ``model_error``, never raised.
+        """
+        config = self._config_orchestrator.config
+        view = self._smart_approve.stats_view(config)
+        resolved_model: str | None = None
+        model_error: str | None = None
+        try:
+            resolved_model = config.get_smart_approve_model().name
+        except Exception as exc:
+            model_error = f"{type(exc).__name__}: {exc}"
+        return {
+            "level": self._authority_state.level.value,
+            "resolved_model": resolved_model,
+            "model_error": model_error,
+            **view,
+        }
+
+    @property
     def runtime_policy(self) -> AgentRuntimePolicy:
         return AgentRuntimePolicy(
             max_turns=self._max_turns,
@@ -1382,6 +1489,7 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
             inherited_restrictions=self._inherited_restrictions,
             inherited_mode_restrictions=self._inherited_mode_restrictions,
             inherited_workspace=self._inherited_workspace,
+            authority_snapshot=self._authority_snapshot,
             parent_authority_getter=self._parent_authority_getter,
             parent_authority_revision_getter=self._parent_authority_revision_getter,
         )
@@ -1413,6 +1521,10 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
                 )
             ),
             inherited_root_grants=self._dispatch_root_grants,
+            # v0.8.0 A-P0: the child launch snapshot captures the parent's
+            # CURRENT safety level at dispatch — children inherit it as
+            # explicit runtime authority and never run the DANGEROUS ceremony.
+            authority_snapshot=self._authority_state.launch_snapshot(),
         )
 
     def attach_live_authority(self, authority: Any | None) -> None:
@@ -1681,6 +1793,180 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
                 "Stop live background jobs before changing execution authority"
             )
 
+    # --- v0.8.0 C2: keep-alive wiring (design items 1-4, 7-8) ---
+
+    @property
+    def keepalive_scheduler(self) -> KeepaliveScheduler | None:
+        """The root-only keep-alive scheduler; None on children and when off."""
+        return self._keepalive_scheduler
+
+    def keepalive_stats_view(self) -> KeepaliveStatsView | None:
+        """The pinned /stats view of the pilot, or None when not wired."""
+        scheduler = self._keepalive_scheduler
+        if scheduler is None:
+            return None
+        return scheduler.stats_view(max_attempts=self.config.keepalive.max_attempts)
+
+    def _keepalive_ledger_sink(self) -> Callable[[UsageRecord], None] | None:
+        """The accountant's synchronous ledger sink, adapted from the async
+        writer facade at the scheduling layer; None when no owner is bound
+        (the accountant then fail-closes and halts the deployment).
+        """
+        owner = self.accounting_owner
+        if owner is None:
+            return None
+
+        def ledger(record: UsageRecord) -> None:
+            async def _append() -> None:
+                await owner.writer.append(record)
+
+            task = asyncio.get_running_loop().create_task(_append())
+            self._detached_accounting_producers.add(task)
+            task.add_done_callback(self._detached_accounting_producers.discard)
+
+        return ledger
+
+    def _keepalive_attribution(self, model: ModelConfig) -> UsageAttribution | None:
+        owner = self.accounting_owner
+        if owner is None:
+            return getattr(self, "_usage_attribution", None)
+        return UsageAttribution(
+            root_session_id=owner.root_session_id,
+            session_id=self.session_id,
+            parent_session_id=self.parent_session_id,
+            agent_role="subagent" if self._is_subagent else "root",
+            agent_profile=self.launch_identity,
+            content_class=self.launch_purpose,
+            run_id=self.run_identity,
+            project_key=owner.project_key,
+            model=model.alias,
+            provider=model.provider,
+            wire_name=model.name,
+        )
+
+    def _keepalive_gateway_sink(self) -> Any:
+        owner = self.accounting_owner
+        if owner is not None:
+            return owner.writer
+        return getattr(self, "_accounting_sink", None)
+
+    def _build_keepalive_scheduler(self) -> KeepaliveScheduler | None:
+        """Build the root-only scheduler; None when the pilot is off, this is
+        a child, or no model/key resolves (the skip_if_no_key pre-timer path:
+        a missing key is detected BEFORE the timer starts and skips fast).
+        """
+        section = self.config.keepalive
+        if not section.enabled or self._is_subagent:
+            return None
+        try:
+            model = self.config.get_active_model()
+        except ValueError:
+            return None
+        provider = self.config.get_provider_for_model(model)
+        if provider.api_key_env_var and not resolve_api_key(provider.api_key_env_var):
+            return None
+        accountant = KeepaliveAccountant(
+            caps=KeepaliveCaps(max_attempts=section.max_attempts),
+            model=model,
+            provider=model.provider,
+            attribution=self._keepalive_attribution(model),
+            ledger=self._keepalive_ledger_sink(),
+        )
+        gates = KeepaliveGates(
+            is_root=lambda: not self._is_subagent,
+            owned_dependency_runs_active=lambda: self.active_background_job_count > 0,
+            min_idle_gap_seconds=section.min_idle_gap_seconds,
+        )
+        transport = GatewayPingTransport(
+            gateway=self._llm_gateway,
+            backend_getter=lambda: self.backend,
+            stats_getter=lambda: self.stats,
+            sink_getter=self._keepalive_gateway_sink,
+            attribution_getter=lambda: self._keepalive_attribution(
+                self.config.get_active_model()
+            ),
+            model_getter=lambda: self.config.get_active_model(),
+            provider_getter=lambda: self.config.get_provider_for_model(
+                self.config.get_active_model()
+            ),
+            retry_budget_getter=lambda: RequestRetryBudget(
+                self.config.api_retry_max_elapsed_time
+            ),
+        )
+        tick = max(30.0, section.min_idle_gap_seconds / 2)
+        return KeepaliveScheduler.from_config(
+            section,
+            gates=gates,
+            snapshot_store=KeepaliveSnapshotStore(),
+            accountant=accountant,
+            deployment=model.alias,
+            provider=model.provider,
+            transport=transport,
+            tick_seconds=tick,
+        )
+
+    def _ensure_keepalive_timer(self) -> None:
+        """Create the root-only timer task once, at loop startup."""
+        if self._keepalive_scheduler is None:
+            self._keepalive_scheduler = self._build_keepalive_scheduler()
+        scheduler = self._keepalive_scheduler
+        if scheduler is None or not scheduler.enabled:
+            return
+        task = self._keepalive_timer_task
+        if task is None or task.done():
+            self._keepalive_timer_task = asyncio.create_task(
+                self._keepalive_timer_loop(), name=f"vibe-keepalive:{self.session_id}"
+            )
+            self._keepalive_timer_task.add_done_callback(self._keepalive_timer_finished)
+
+    def _keepalive_timer_finished(self, task: asyncio.Task[None]) -> None:
+        if task.cancelled():
+            return
+        if exc := task.exception():
+            logger.error(
+                "Keepalive timer task failed: %s", self.session_id, exc_info=exc
+            )
+
+    async def _keepalive_timer_loop(self) -> None:
+        """Drive the scheduler's idle-cycle timer; never raises (the
+        done-callback logs rather than crashes, like the title drain).
+        """
+        scheduler = self._keepalive_scheduler
+        if scheduler is None:
+            return
+
+        async def tick_sleep(seconds: float) -> None:
+            await asyncio.sleep(seconds)
+            # ONE first-stop notice per session (first-line diagnostic).
+            stop = scheduler.stopped
+            if stop is not None and not self._keepalive_notice_sent:
+                self._keepalive_notice_sent = True
+                logger.info(
+                    "Keep-alive idle cycle stopped (first stop this session): %s",
+                    stop.value,
+                )
+
+        try:
+            await scheduler.run(sleep=tick_sleep)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.error("Keepalive timer loop failed", exc_info=True)
+
+    def _keepalive_note_activity(self, *, partial_wake: bool = False) -> None:
+        scheduler = self._keepalive_scheduler
+        if scheduler is not None:
+            scheduler.note_conversation_activity(partial_wake=partial_wake)
+
+    def _keepalive_refresh_snapshot(self) -> None:
+        scheduler = self._keepalive_scheduler
+        if scheduler is None:
+            return
+        frozen, _version, _epoch = self.messages.freeze_for_request()
+        if not frozen:
+            return
+        scheduler.refresh_snapshot(serialized=serialize_prefix(frozen))
+
     async def _aclose_owned(self) -> None:
         with self._deferred_init_lock:
             self._closing = True
@@ -1696,7 +1982,7 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
         if self._mcp_pool is not None:
             self._mcp_pool.retire()
         await self._title_controller.aclose()
-        for task in (self._plan_attrs_task,):
+        for task in (self._plan_attrs_task, self._keepalive_timer_task):
             if task is not None and not task.done():
                 task.cancel()
                 with contextlib.suppress(BaseException):
@@ -2073,6 +2359,8 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
             self.tool_manager,
             allow_empty=allow_empty,
         )
+        # v0.8.0 C2: snapshot hygiene — refresh the live prefix after each save.
+        self._keepalive_refresh_snapshot()
 
     @requires_init
     async def inject_user_context(  # noqa: PLR0913
@@ -2145,6 +2433,8 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
         # W10: before this turn's tools bind to the scratchpad, spend one
         # bounded non-blocking retry of a boot-time busy-lock degrade.
         self._ensure_scratchpad()
+        # v0.8.0 C2: the root-only keep-alive timer starts once at loop startup.
+        self._ensure_keepalive_timer()
         self._backend_lifetime.drain(whole_turn_active=False)
         options = turn_options or AgentTurnOptions()
         if options.user_initiated_retry and self.committed_model is not None:
@@ -2481,6 +2771,9 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
         self.messages.append(user_message)
         self.stats.steps += 1
         self._current_user_message_id = user_message.message_id
+        # v0.8.0 C2: new user input is conversation activity — it invalidates
+        # the snapshot and restarts the idle gap.
+        self._keepalive_note_activity(partial_wake=True)
 
         if user_message.message_id is None:
             raise AgentLoopError("User message must have a message_id")
@@ -2735,41 +3028,52 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
             yield event
 
     async def _perform_llm_turn(self) -> AsyncGenerator[BaseEvent, None]:
-        await self._settle_steering_injections()
-        # Append point for working-set state blocks. This is the ONLY flush
-        # point: the conversation loop continues while the last message is a
-        # tool result, so a block must never be appended after a batch (it
-        # would end the turn early). Flushing here appends the block as the
-        # last message at append time — after the previous batch's tool
-        # results, before this turn's assistant message — which keeps provider
-        # tool_use/tool_result adjacency intact and the cached request prefix
-        # stable. It also catches steering-injected reads (e.g. @mentioned
-        # files) observed outside a tool batch.
-        self._flush_file_state_blocks()
-        self._execution_message = None
+        # v0.8.0 C2: every real conversation turn is wrapped with
+        # notify_real_call_* — a real call starting mid-ping supersedes it.
+        # The wrap stays INSIDE this generator (not a delegating wrapper) so
+        # aclose() still propagates into the tool-batch cleanup below.
+        keepalive = self._keepalive_scheduler
+        if keepalive is not None:
+            keepalive.notify_real_call_started()
         try:
-            if self.enable_streaming:
-                async for event in self._stream_assistant_events():
-                    yield event
-            else:
-                assistant_event = await self._get_assistant_event()
-                if assistant_event.content:
-                    yield assistant_event
-
-            last_message = self._execution_message or self.messages[-1]
-            parsed = self.format_handler.parse_message(last_message)
-        finally:
+            await self._settle_steering_injections()
+            # Append point for working-set state blocks. This is the ONLY flush
+            # point: the conversation loop continues while the last message is a
+            # tool result, so a block must never be appended after a batch (it
+            # would end the turn early). Flushing here appends the block as the
+            # last message at append time — after the previous batch's tool
+            # results, before this turn's assistant message — which keeps provider
+            # tool_use/tool_result adjacency intact and the cached request prefix
+            # stable. It also catches steering-injected reads (e.g. @mentioned
+            # files) observed outside a tool batch.
+            self._flush_file_state_blocks()
             self._execution_message = None
-        resolved = self.format_handler.resolve_tool_calls(parsed, self.tool_manager)
+            try:
+                if self.enable_streaming:
+                    async for event in self._stream_assistant_events():
+                        yield event
+                else:
+                    assistant_event = await self._get_assistant_event()
+                    if assistant_event.content:
+                        yield assistant_event
 
-        if not resolved.tool_calls and not resolved.failed_calls:
-            return
+                last_message = self._execution_message or self.messages[-1]
+                parsed = self.format_handler.parse_message(last_message)
+            finally:
+                self._execution_message = None
+            resolved = self.format_handler.resolve_tool_calls(parsed, self.tool_manager)
 
-        async with contextlib.aclosing(
-            self._tool_batch_runner.handle_tool_calls(resolved)
-        ) as calls:
-            async for event in calls:
-                yield event
+            if not resolved.tool_calls and not resolved.failed_calls:
+                return
+
+            async with contextlib.aclosing(
+                self._tool_batch_runner.handle_tool_calls(resolved)
+            ) as calls:
+                async for event in calls:
+                    yield event
+        finally:
+            if keepalive is not None:
+                keepalive.notify_real_call_finished()
 
     async def _stream_assistant_events(
         self,
@@ -2904,6 +3208,17 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
         self, tool: BaseTool, args: BaseModel, tool_call_id: str | None = None
     ) -> ToolDecision:
         tool_name = tool.get_name()
+        # v0.8.0 A-P1: at SafetyLevel DANGEROUS the whole admission is
+        # bypassed — the live-authority ask, configured tool denial,
+        # resolver denials, and the out-of-root/dangerous-command grant
+        # prompts all yield, and no grant is created or persisted. The
+        # bypass keys on the authority state and is UNREACHABLE-BY-STATE
+        # before the A-P1 ceremony (chunk 2) can produce the level.
+        if self._authority_state.is_dangerous():
+            return ToolDecision(
+                verdict=ToolExecutionResponse.EXECUTE,
+                approval_type=ToolPermission.ALWAYS,
+            )
         # G5b: a process child asks its owner BEFORE it resolves anything
         # locally, so a call the owner already refuses never reaches a grant
         # prompt or a path-authority walk. This answer is advisory for the
@@ -2945,17 +3260,62 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
                 )
                 if decision is not None:
                     return decision
-            return ToolDecision(
+            denial = ToolDecision(
                 verdict=ToolExecutionResponse.SKIP,
                 approval_type=ToolPermission.NEVER,
                 feedback=(ctx.reason if ctx is not None else None)
                 or f"Tool '{tool_name}' is disabled by policy",
+            )
+            # v0.8.0 A-P2: at SafetyLevel SMART a returned denial is offered
+            # to the classifier; shell-grammar (SYNTAX) refusals never reach
+            # it (typed denial_kind marker), and the verdict is fail-closed.
+            return await self._smart_adjudicate_denial(
+                tool, args, ctx, tool_name, tool_call_id, denial
             )
         # Tools execute automatically unless denied. Positive accident guards
         # must return NEVER at their resolver; opaque extensions are
         # trusted code, not proven filesystem-contained implementations.
         return ToolDecision(
             verdict=ToolExecutionResponse.EXECUTE, approval_type=ToolPermission.ALWAYS
+        )
+
+    async def _smart_adjudicate_denial(
+        self,
+        tool: BaseTool,
+        args: BaseModel,
+        ctx: PermissionContext | None,
+        tool_name: str,
+        tool_call_id: str | None,
+        denial: ToolDecision,
+    ) -> ToolDecision:
+        """v0.8.0 A-P2 SMART hook: adjudicate a returned denial, or pass it on.
+
+        Consulted only where a denial is returned from
+        ``_should_execute_tool``; grant branches never reach it. An override
+        verdict executes the call; anything else (including every fail-closed
+        path) returns the original denial untouched.
+        """
+        _ = tool, tool_call_id
+        session = self._smart_approve
+        launch_intent: str | None = None
+        if self._is_subagent and isinstance(self.launch_context, dict):
+            raw_intent = self.launch_context.get("task_summary")
+            if isinstance(raw_intent, str) and raw_intent.strip():
+                launch_intent = raw_intent.strip()
+        messages = self.messages.freeze_for_request()[0]
+        verdict = await session.adjudicate(
+            tool_name=tool_name,
+            args=args,
+            ctx=ctx,
+            messages=messages,
+            launch_intent=launch_intent,
+        )
+        if verdict.verdict != "override":
+            return denial
+        return ToolDecision(
+            verdict=ToolExecutionResponse.EXECUTE,
+            approval_type=ToolPermission.ALWAYS,
+            feedback=f"SMART classifier override: {verdict.rationale}",
         )
 
     async def _persist_project_root_grant(self, root: Path) -> str:
@@ -3384,6 +3744,9 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
         # the boundary, so drop them and the cached authority they fed.
         self._dangerous_command_grants.clear_session_state()
         self.tool_manager._invalidate_dangerous_command_authority()
+        # v0.8.0 C2: a session reset is a mutation point — the keep-alive timer
+        # stays alive (it is loop-lifetime) but the snapshot is invalidated.
+        self._keepalive_note_activity(partial_wake=True)
 
     def replace_session_lease(self, lease: SessionLease | None) -> None:
         previous = self._session_lease
@@ -3619,6 +3982,9 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
         # service; the loop keeps this name because tests capture and patch
         # the instance attribute (tests/app_server/test_subagents.py:5854).
         await self._session_transitions.clear_history()
+        # v0.8.0 C2: a cleared history is a mutation point — the timer stays
+        # alive (it is loop-lifetime) but the snapshot is invalidated.
+        self._keepalive_note_activity(partial_wake=True)
 
     @property
     def compaction_outcome(self) -> CompactionOutcome:
@@ -3643,16 +4009,30 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
         try:
             self._clean_message_history()
             await self._save_messages()
-            summary = await self.compaction_manager.compact(
-                extra_instructions,
-                manual=manual,
-                outcome=self._compaction_outcome if manual else None,
-                mode_notice=self._plan_mode_compaction_notice(),
-            )
+            # v0.8.0 C2: compaction LLM calls are REAL calls outside the turn
+            # chokepoint — wrap them so an open ping is superseded.
+            keepalive = self._keepalive_scheduler
+            if keepalive is not None:
+                keepalive.notify_real_call_started()
+            try:
+                summary = await self.compaction_manager.compact(
+                    extra_instructions,
+                    manual=manual,
+                    outcome=self._compaction_outcome if manual else None,
+                )
+            finally:
+                if keepalive is not None:
+                    keepalive.notify_real_call_finished()
             self.middleware_pipeline.reset(reset_reason=ResetReason.COMPACT)
             # A compacted conversation reads very differently from its first
             # turn; force a title refresh at the next scheduling point.
             self._title_controller.mark_compaction()
+            # v0.8.0 C2: the post-compact boundary is a mandatory
+            # invalidate(COMPACTION) + refresh site — the timer never pings a
+            # pre-compaction prefix.
+            if keepalive is not None:
+                keepalive.invalidate(KeepaliveInvalidation.COMPACTION)
+            self._keepalive_refresh_snapshot()
             return summary
         except Exception:
             try:
@@ -3662,41 +4042,6 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
                 # failed retry save must not mask it.
                 logger.debug("compaction settlement retry save failed: %s", save_error)
             raise
-
-    def _plan_mode_compaction_notice(self) -> str | None:
-        """The plan-mode re-injection notice, or None when this loop is not planning.
-
-        Read from this loop's own in-memory session metadata: the record is
-        written by entry and removed by the exit paths, so a planner loop
-        reports it, while an executor or subagent loop holds a different
-        ``SessionMetadata`` and reports nothing. Session logging disabled makes
-        the metadata ``None`` by construction, which is the accepted behavior
-        (no notice, symmetric with no resume restore).
-
-        The record is interpreted SIDECAR-FIRST before it is re-injected (design
-        §4.5): its state is a mirror, so an accepting episode re-injects its
-        accepting status and a terminal one re-injects as history that is NOT
-        active planning — a compaction can never re-arm a terminal episode. An
-        untrusted arbiter read is reported as the failure it is, never read as a
-        clean miss.
-        """
-        metadata = self.session_logger.session_metadata
-        if metadata is None:
-            return None
-        record = metadata.plan_mode
-        if record is None:
-            return None
-        observation: EpisodeObservation | None = None
-        failure: str | None = None
-        try:
-            restored = restore_episode_record(record, session_id=self.session_id)
-        except PlanEpisodeError as error:
-            failure = str(error)
-        else:
-            observation = None if restored is None else restored.observation
-        return build_plan_mode_compaction_notice(
-            record.plan_path, record.theme, episode=observation, episode_failure=failure
-        )
 
     @requires_init
     async def relocate(self, cwd: Path) -> None:

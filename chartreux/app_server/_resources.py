@@ -262,6 +262,9 @@ def _settings_catalog_wire() -> list[SettingDescriptorWire]:
     choices = {
         **agent_selection_choices(),
         "compaction_prompt_id": tuple(sorted({"compact", *custom_prompt_ids()})),
+        "safety.smart_approve_prompt_id": tuple(
+            sorted({"smart-approve-classifier", *custom_prompt_ids()})
+        ),
     }
     return [
         SettingDescriptorWire.model_validate(

@@ -64,21 +64,6 @@ ERROR_MARKERS = (
 
 _REPO_ROOT = Path(__file__).resolve().parents[3]
 
-#: ``/plan`` mode's shipped defaults name hosted planner and executor roles. The
-#: gate denies every non-loopback destination by design, so both roles are
-#: pinned to the in-gate mock model here: without that, entering plan mode
-#: dispatches a planner turn at a hosted provider and the turn simply never
-#: completes.
-PLAN_ROLES = """
-[plan.planner]
-model = "mock-model"
-thinking = "off"
-
-[plan.executor]
-model = "mock-model"
-thinking = "off"
-"""
-
 
 def chartreux_command() -> list[str]:
     """The argv that starts the CLI without a `uv` sync in the sandbox."""
@@ -178,16 +163,11 @@ class TuiDriver:
         })
         return env
 
-    def _pin_plan_roles(self) -> None:
-        """Pin plan mode's two roles to the in-gate mock model (see PLAN_ROLES)."""
-        config_path = self.home / "config.toml"
-        existing = config_path.read_text(encoding="utf-8")
-        config_path.write_text(f"{existing}\n{PLAN_ROLES}", encoding="utf-8")
-
     def spawn(self) -> TuiDriver:
         """Write the isolated config and start the TUI on a PTY."""
+        # v0.8.0 plan-mode removal retired the ``[plan]`` config block (it is a
+        # config error now), so no plan-role pin is written into the home config.
         write_e2e_config(self.home, self.provider.api_base)
-        self._pin_plan_roles()
         env = self.environment()
         assert env[TRANSPORT_ENV_VAR] == self.transport
         command = chartreux_command()

@@ -868,32 +868,6 @@ MANIFEST: Final[tuple[MethodEntry, ...]] = (
         ),
     ),
     MethodEntry(
-        method="session/plan/handoff",
-        kind=CARRIED,
-        owner="agent loop (chartreux/core/agent_loop)",
-        rationale=(
-            "The consent fence runs in the agent process over the reconfigure "
-            "carrier, and the routing arm adopts the rotated identity."
-        ),
-        tests=(
-            "tests/app_server/backend_contract/test_session_lifecycle.py::"
-            "test_plan_handoff_adopts_the_rotated_session_and_fences_the_old_id",
-        ),
-    ),
-    MethodEntry(
-        method="session/plan/record/write",
-        kind=CARRIED,
-        owner="agent loop (chartreux/core/agent_loop)",
-        rationale=(
-            "The plan record is durable state owned by the loop, and a write for "
-            "another session is refused there."
-        ),
-        tests=(
-            "tests/app_server/test_plan_mode_record.py::"
-            "test_a_write_for_another_session_is_refused",
-        ),
-    ),
-    MethodEntry(
         method="session/read",
         kind=HOST,
         owner="coordinator host handler (chartreux/app_server/_host.py)",
@@ -993,6 +967,34 @@ MANIFEST: Final[tuple[MethodEntry, ...]] = (
             "carries the same typed category as the rewind itself."
         ),
         tests=("tests/acp/test_agent_methods.py::test_rewind_mapping_pins",),
+    ),
+    MethodEntry(
+        method="session/safety/read",
+        kind=CARRIED,
+        owner="agent loop (chartreux/core/agent_loop)",
+        rationale=(
+            "The SafetyLevel lives on the loop that enforces it, so the read "
+            "crosses to the owning process on stdio and answers in-process "
+            "elsewhere; a dead root answers the death receipt, never a stale level."
+        ),
+        tests=(
+            "tests/cli/test_safety_command.py::TestSafetyWireModels::"
+            "test_read_models_round_trip",
+        ),
+    ),
+    MethodEntry(
+        method="session/safety/transition",
+        kind=CARRIED,
+        owner="agent loop (chartreux/core/agent_loop)",
+        rationale=(
+            "The transition is gated where the loop lives (idle-only, writable "
+            "audit sink, background jobs on revoke), so the decision crosses to "
+            "the owning process rather than being made from a coordinator copy."
+        ),
+        tests=(
+            "tests/cli/test_safety_command.py::TestSafetyWireModels::"
+            "test_transition_params_round_trip",
+        ),
     ),
     MethodEntry(
         method="session/settings/update",

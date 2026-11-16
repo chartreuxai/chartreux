@@ -47,6 +47,7 @@ from chartreux.core.hooks.models import (
 from chartreux.core.llm.format import ResolvedToolCall
 from chartreux.core.llm_models import ImageAttachment, PersistedToolResult
 from chartreux.core.tools import secret_redaction
+from chartreux.core.tools.permissions import dangerous_mode_active
 from chartreux.core.utils import (
     CANCELLATION_TAG,
     TOOL_ERROR_TAG,
@@ -370,10 +371,23 @@ class AgentLoopHooksMixin:
 
         Events are buffered (not streamed) because pre_tool hooks are
         gating checks expected to complete quickly.
+
+        v0.8.0 A-P1: at SafetyLevel DANGEROUS hooks stay advisory — a
+        pre_tool denial or strict failure is observed and logged but does
+        NOT block the call; rewritten arguments are still validated exactly
+        as below. UNREACHABLE-BY-STATE before the A-P1 ceremony.
         """
         events: list[HookEvent] = []
         async for ev in self._run_pre_tool_hooks(tool_call, tool_input):
             if isinstance(ev, HookToolDenial):
+                if dangerous_mode_active():
+                    logger.info(
+                        "A-P1 DANGEROUS mode: ignoring pre_tool denial from "
+                        "hook %s for tool=%s",
+                        ev.hook_name,
+                        tool_call.tool_name,
+                    )
+                    continue
                 return events, _PreToolResolution(
                     tool_call=tool_call,
                     tool_input=tool_input,

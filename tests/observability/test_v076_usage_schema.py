@@ -79,6 +79,8 @@ def test_keepalive_purpose_is_an_extension_not_a_renumbering() -> None:
         "title",
         "worktree-naming",
         "keepalive",
+        # v0.8.0 A-P2: the SMART classifier's spend attribution.
+        "smart-approve",
     }
 
 

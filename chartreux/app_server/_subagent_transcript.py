@@ -401,6 +401,9 @@ INHERITED_MODE_RESTRICTIONS_PAYLOAD_KEY = "inherited_mode_restrictions"
 INHERITED_ROOT_GRANTS_PAYLOAD_KEY = "inherited_root_grants"
 """Spawn-payload key carrying the bare roots the parent was granted at dispatch."""
 
+AUTHORITY_SNAPSHOT_PAYLOAD_KEY = "authority_snapshot"
+"""Spawn-payload key carrying the parent's safety-authority launch snapshot (v0.8.0 A-P0)."""
+
 
 class ChildTranscriptError(RuntimeError):
     """Base class for child-transcript durability and reconciliation failures."""
@@ -839,6 +842,9 @@ def encode_child_policy_payload(loop: AgentLoop) -> dict[str, Any]:
         INHERITED_ROOT_GRANTS_PAYLOAD_KEY: encode_inherited_root_grants(
             loop._dispatch_root_grants
         ),
+        # v0.8.0 A-P0: the child launch snapshot — the parent's CURRENT safety
+        # level at dispatch, so children inherit runtime authority explicitly.
+        AUTHORITY_SNAPSHOT_PAYLOAD_KEY: loop.authority_state.launch_snapshot().encode(),
     }
 
 

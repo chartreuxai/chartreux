@@ -66,7 +66,10 @@ async def _render_status(app: ChartreuxApp) -> str:
 
 def _background_results_section(text: str) -> str:
     assert "## Background Agent Results" in text
-    return text.split("## Background Agent Results", 1)[1]
+    section = text.split("## Background Agent Results", 1)[1]
+    # The section ends at the next "## " header (e.g. the v0.8.0 Keepalive
+    # block appended after it in /stats).
+    return section.split("\n## ", 1)[0]
 
 
 @pytest.mark.asyncio

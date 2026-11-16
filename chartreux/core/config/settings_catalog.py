@@ -442,6 +442,14 @@ EDITABLE_SETTINGS: tuple[SettingDescriptor, ...] = (
         "enum",
         "Prompts & Compaction",
     ),
+    SettingDescriptor(
+        "safety.smart_approve_prompt_id",
+        "SMART Approve Prompt",
+        "Prompt used by the SMART-mode approval classifier that adjudicates "
+        "denied tool calls at the smart safety level.",
+        "enum",
+        "Prompts & Compaction",
+    ),
     *(
         SettingDescriptor(
             path,

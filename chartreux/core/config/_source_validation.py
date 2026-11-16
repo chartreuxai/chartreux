@@ -69,6 +69,11 @@ _RETIRED_FIELD_GUIDANCE: dict[str, str] = {
         "identity denylist — block launch identities with [tools.task] "
         "denylist (Settings > Identities)"
     ),
+    "plan": (
+        "plan is retired; the /plan plan-mode feature was removed — delete the "
+        "[plan] block from your config and remove the CHARTREUX_PLAN__ "
+        "variables. It has no effect."
+    ),
 }
 
 

@@ -42,7 +42,6 @@ from chartreux.app_server._agent_transcript import (
 )
 from chartreux.app_server._dispatch import RequestFailure
 from chartreux.app_server._execution import SessionExecution, SessionExecutionConflict
-from chartreux.app_server._plan_record import plan_mode_record, session_plan_record
 from chartreux.app_server._policy_tree import PolicyNodeService
 from chartreux.app_server._projection import project_history
 from chartreux.app_server._resources import ResourceRequestHandler
@@ -141,14 +140,15 @@ from chartreux.app_server.agent_wire import (
     AGENT_SESSION_CONFIG_RELOAD_METHOD,
     AGENT_SESSION_HISTORY_LIST_METHOD,
     AGENT_SESSION_LIST_METHOD,
-    AGENT_SESSION_PLAN_RECORD_READ_METHOD,
-    AGENT_SESSION_PLAN_RECORD_WRITE_METHOD,
+    AGENT_SESSION_PLAN_MODE_PRESENT_METHOD,
     AGENT_SESSION_POLICY_READ_METHOD,
     AGENT_SESSION_RECONFIGURE_METHOD,
     AGENT_SESSION_RENAME_METHOD,
     AGENT_SESSION_REPLACE_METHOD,
     AGENT_SESSION_ROOTS_READ_METHOD,
     AGENT_SESSION_ROOTS_SAVE_METHOD,
+    AGENT_SESSION_SAFETY_READ_METHOD,
+    AGENT_SESSION_SAFETY_TRANSITION_METHOD,
     AGENT_SESSION_SNAPSHOT_METHOD,
     AGENT_SHELL_INTERRUPT_METHOD,
     AGENT_SHELL_RUN_METHOD,
@@ -180,7 +180,6 @@ from chartreux.app_server.agent_wire import (
     POLICY_METHODS,
     RECONFIGURE_MODE_CONFIG_WRITE,
     RECONFIGURE_MODE_HISTORY_CLEAR,
-    RECONFIGURE_MODE_PLAN_HANDOFF,
     RECONFIGURE_MODE_SETTINGS,
     SUBAGENT_RUN_METHOD,
     TURN_OUTCOME_COMPLETED,
@@ -304,7 +303,8 @@ from chartreux.app_server.protocol import (
     SessionHistoryListParams,
     SessionHistoryListResponse,
     SessionListParams,
-    SessionPlanRecordWriteParams,
+    SessionSafetyReadParams,
+    SessionSafetyTransitionParams,
     ShellRunParams,
     ShellRunResponse,
     WorkspacePromptPrepareParams,
@@ -325,6 +325,7 @@ from chartreux.core.agent_loop import AgentLoop
 from chartreux.core.agent_loop._execution_port import ExecutionTurnRequest
 from chartreux.core.agent_loop._loop_types import AgentTurnOptions
 from chartreux.core.agent_loop._request_broker import UserInputSettlement
+from chartreux.core.agent_loop._safety_authority import AuthorityActor, SafetyLevel
 from chartreux.core.config._root_persistence import read_saved_roots
 from chartreux.core.config.harness_files import init_harness_files_manager
 from chartreux.core.dangerous_commands import (
@@ -350,6 +351,7 @@ from chartreux.core.recovery_observation import (
     record_observation,
     turn_observation,
 )
+from chartreux.core.session.session_loader import SessionLoader
 from chartreux.core.subagents import (
     AgentAvailability,
     AgentBusyError,
@@ -1077,12 +1079,14 @@ class RootAgentServer:
             return await self._list_sessions(params)
         if method == AGENT_SESSION_CONFIG_RELOAD_METHOD:
             return await self._reload_config(params)
-        if method == AGENT_SESSION_PLAN_RECORD_READ_METHOD:
-            return await self._read_plan_record(params)
-        if method == AGENT_SESSION_PLAN_RECORD_WRITE_METHOD:
-            return await self._write_plan_record(params)
+        if method == AGENT_SESSION_PLAN_MODE_PRESENT_METHOD:
+            return await self._plan_mode_present(params)
         if method == AGENT_SESSION_POLICY_READ_METHOD:
             return await self._read_policy(params)
+        if method == AGENT_SESSION_SAFETY_READ_METHOD:
+            return self._safety_read(params)
+        if method == AGENT_SESSION_SAFETY_TRANSITION_METHOD:
+            return self._safety_transition(params)
         if method == AGENT_SESSION_ROOTS_READ_METHOD:
             return await self._read_roots(params)
         if method == AGENT_SESSION_ROOTS_SAVE_METHOD:
@@ -1737,14 +1741,14 @@ class RootAgentServer:
     async def _reconfigure(
         self, request_id: object, params: Mapping[str, Any]
     ) -> dict[str, Any]:
-        """Run one reconfigure mode: short here, the plan fence over the fence.
+        """Run one reconfigure mode: short here, the fence over the fence.
 
         A short mode mutates the session directly and is refused typed while a
         long operation holds the fence (one long op per root), so a settings
         update or a clear can never interleave with a compaction, a replace or
-        a handoff. The plan handoff is admitted as a long operation with the
-        coordinator's absolute deadline: its marker record, its deadline and
-        its fence are the same ones compaction uses.
+        a config write. The config write is admitted as a long operation with
+        the coordinator's absolute deadline: its marker record, its deadline
+        and its fence are the same ones compaction uses.
         """
         request = decode_reconfigure_request(params)
         if request.mode == RECONFIGURE_MODE_CONFIG_WRITE:
@@ -1758,17 +1762,6 @@ class RootAgentServer:
                 deadline=request.deadline,
                 body=lambda: self._config_write_operation(request),
             )
-        if request.mode == RECONFIGURE_MODE_PLAN_HANDOFF:
-            if request.deadline is None:
-                raise UnsupportedAgentRequestError(
-                    "a plan handoff must carry the coordinator's absolute deadline"
-                )
-            return await self._long_ops.admit(
-                request_id=str(request_id),
-                method=AGENT_SESSION_RECONFIGURE_METHOD,
-                deadline=request.deadline,
-                body=lambda: self._plan_handoff_operation(request),
-            )
         active = self._long_ops.active_op_id
         if active is not None:
             raise AgentReconfigureConflictError(
@@ -1781,15 +1774,6 @@ class RootAgentServer:
                 return encode_reconfigure_reply(service.settings_update(request))
             assert request.mode == RECONFIGURE_MODE_HISTORY_CLEAR
             return encode_reconfigure_reply(await service.history_clear(request))
-
-    async def _plan_handoff_operation(
-        self, request: ReconfigureRequest
-    ) -> dict[str, Any]:
-        """Run one plan handoff and answer with the fence outcome it reached."""
-        async with self._reconfigure_lock:
-            return encode_reconfigure_reply(
-                await self._reconfigure_service().plan_handoff(request)
-            )
 
     async def _config_write_operation(
         self, request: ReconfigureRequest
@@ -1833,48 +1817,26 @@ class RootAgentServer:
         dispatched = await self._resources().dispatch("config/reload", dict(params))
         return dispatched.response.model_dump(mode="json")
 
-    async def _read_plan_record(self, params: Mapping[str, Any]) -> dict[str, Any]:
-        """Read the durable plan mode the session's own metadata carries."""
+    async def _plan_mode_present(self, params: Mapping[str, Any]) -> dict[str, Any]:
+        """True when the session's RAW metadata carried a ``plan_mode`` key.
+
+        Detection reads the raw metadata dict through the loader choke point,
+        never the typed record — the typed ``SessionMetadata`` drops the
+        retired key (``extra="ignore"``), so only the raw dict still has it.
+        """
         loop = self._require_loop()
         if params.get("session_id") != loop.session_id:
             raise UnsupportedAgentRequestError(
-                "the plan record belongs to the root session"
+                "the plan-mode presence flag belongs to the root session"
             )
         logger = loop.session_logger
-        metadata = logger.session_metadata
-        record = (
-            None
-            if metadata is None or metadata.plan_mode is None
-            else session_plan_record(metadata.plan_mode)
+        session_dir = logger.session_dir
+        if not logger.enabled or session_dir is None:
+            return {"plan_mode_present": False}
+        raw_metadata = await asyncio.to_thread(
+            SessionLoader.load_raw_metadata, session_dir
         )
-        return {"record": None if record is None else record.model_dump(mode="json")}
-
-    async def _write_plan_record(self, params: Mapping[str, Any]) -> dict[str, Any]:
-        """Persist (or, with a null record, remove) the durable plan mode.
-
-        The reply carries the record as READ BACK, so a session whose logging is
-        disabled answers null instead of echoing a mode no resume could restore.
-        """
-        request = SessionPlanRecordWriteParams.model_validate(dict(params))
-        if request.session_id != self._require_loop().session_id:
-            raise UnsupportedAgentRequestError(
-                "the plan record belongs to the root session"
-            )
-        logger = self._require_loop().session_logger
-        record = None if request.record is None else plan_mode_record(request.record)
-        if record is None:
-            await logger.clear_plan_mode()
-        else:
-            await logger.persist_plan_mode(record)
-        metadata = logger.session_metadata
-        persisted = (
-            None
-            if metadata is None or metadata.plan_mode is None
-            else session_plan_record(metadata.plan_mode)
-        )
-        return {
-            "record": None if persisted is None else persisted.model_dump(mode="json")
-        }
+        return {"plan_mode_present": "plan_mode" in raw_metadata}
 
     async def _read_policy(self, params: Mapping[str, Any]) -> dict[str, Any]:
         """Answer the policy read from the authority this agent's loop holds.
@@ -1896,6 +1858,74 @@ class RootAgentServer:
                 and source.identity is not None
                 and source.identity.owner == orchestrator.policy_owner
             ],
+        }
+
+    def _safety_read(self, params: Mapping[str, Any]) -> dict[str, Any]:
+        """Report the loop's current SafetyLevel (v0.8.0 A-P1)."""
+        request = SessionSafetyReadParams.model_validate(dict(params))
+        loop = self._require_loop()
+        if request.session_id != loop.session_id:
+            raise UnsupportedAgentRequestError("safety read requires the root session")
+        return {"level": loop.safety_level.value}
+
+    def _safety_transition(self, params: Mapping[str, Any]) -> dict[str, Any]:
+        """One authority-level transition, gated where the loop lives (A-P1).
+
+        Idle-only: a turn in flight refuses the transition. Entering
+        DANGEROUS additionally requires a writable session audit sink — fail
+        closed. Revocation refuses while managed background jobs run. The
+        interactive ceremony lives TUI-side; this is the server-side floor,
+        mirroring the in-process handler's gates.
+        """
+        from chartreux.app_server._runtime import (
+            SessionAuditSinkUnavailableError,
+            require_writable_session_audit_sink,
+        )
+
+        request = SessionSafetyTransitionParams.model_validate(dict(params))
+        loop = self._require_loop()
+        if request.session_id != loop.session_id:
+            raise UnsupportedAgentRequestError(
+                "safety transition requires the root session"
+            )
+        current = loop.safety_level.value
+        try:
+            target = SafetyLevel(request.to)
+        except ValueError:
+            return {
+                "level": current,
+                "transitioned": False,
+                "reason": f"unknown safety level: {request.to!r}",
+            }
+        if self._active_turn_id is not None:
+            return {
+                "level": current,
+                "transitioned": False,
+                "reason": "a turn is active; safety-level transitions are idle-only",
+            }
+        if target is SafetyLevel.DANGEROUS:
+            try:
+                require_writable_session_audit_sink(loop.config)
+            except SessionAuditSinkUnavailableError as exc:
+                return {
+                    "level": current,
+                    "transitioned": False,
+                    "reason": f"no writable session audit sink: {exc}",
+                }
+        elif loop.active_background_job_count > 0:
+            return {
+                "level": current,
+                "transitioned": False,
+                "reason": (
+                    "managed background jobs are active; settle them before "
+                    "revoking authority"
+                ),
+            }
+        event = loop.authority_state.transition(target, actor=AuthorityActor.HUMAN)
+        return {
+            "level": loop.safety_level.value,
+            "transitioned": event is not None,
+            "reason": "",
         }
 
     async def _read_roots(self, params: Mapping[str, Any]) -> dict[str, Any]:
@@ -2592,7 +2622,7 @@ class RootAgentServer:
         """Run one typed owner-key lifecycle leg in this process.
 
         The explicit release on session end replaces the GC weak-drop, and
-        the re-key across a plan-handoff rotation is atomic: the handle is
+        the re-key across a session rotation is atomic: the handle is
         unchanged, so the auth bindings survive the rotation instead of
         being silently dropped mid-session.
         """

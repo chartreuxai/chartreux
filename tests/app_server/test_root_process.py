@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import base64
 from collections.abc import AsyncGenerator, AsyncIterator, Callable, Mapping
 from contextlib import aclosing, asynccontextmanager, suppress
 from datetime import UTC, datetime
@@ -26,12 +25,10 @@ from chartreux.app_server import (
     root_agent,
 )
 from chartreux.app_server._connection_protocol import ClientInfo
-from chartreux.app_server._dispatch import RequestFailure
 from chartreux.app_server._projection import project_session_log
 from chartreux.app_server._runtime import close_agent_loop
 from chartreux.app_server._session_backend_port import SessionBackendError
 from chartreux.app_server._session_model import override_active_model
-from chartreux.app_server._session_runtime_impl import ProcessRootReconfigure
 from chartreux.app_server.agent_admission import (
     OP_OUTCOME_ABORTED,
     OP_OUTCOME_COMPLETED,
@@ -69,9 +66,7 @@ from chartreux.app_server.agent_wire import (
     COMPACT_SETTLEMENT_PUBLISHED_UNSETTLED,
     RECONFIGURE_CONFLICT_ERROR,
     RECONFIGURE_MODE_CONFIG_WRITE,
-    RECONFIGURE_MODE_PLAN_HANDOFF,
     RECONFIGURE_MODE_SETTINGS,
-    RECONFIGURE_OUTCOME_ACCEPTED,
     RECONFIGURE_OUTCOME_APPLIED,
     RECONFIGURE_OUTCOME_CLEARED,
     RECONFIGURE_OUTCOME_CLEARED_WITH_FOLLOWUP_FAILURE,
@@ -101,7 +96,6 @@ from chartreux.app_server.models import (
 from chartreux.app_server.process_bootstrap import (
     ADVERTISED_CAPABILITIES,
     AGENT_WIRE_CAPABILITY_LIVE_AGENT_INVENTORY,
-    AGENT_WIRE_CAPABILITY_PLAN_HANDOFF_ROTATION,
     PROCESS_PROTOCOL_VERSION,
     ProtocolVersionMismatchError,
     ReadyFrame,
@@ -123,7 +117,6 @@ from chartreux.app_server.protocol import (
     ProtocolErrorCode,
     RuntimeReadParams,
     SessionOptions,
-    SessionPlanHandoffParams,
     SessionResumeParams,
     SessionResumeResponse,
     SessionTurnsListParams,
@@ -176,20 +169,8 @@ from chartreux.core.events import (
     UserMessageEvent,
 )
 from chartreux.core.llm_models import LLMMessage, ManualShellContext, Role
-from chartreux.core.plan_episode import (
-    STATE_ACCEPTED,
-    STATE_DRAFT,
-    PlanEpisodeSidecar,
-    accepted_snapshot_path,
-    create_sidecar,
-    ensure_episode_fence,
-    provenance_snapshot_path,
-    read_sidecar,
-    sha256_bytes,
-)
 from chartreux.core.session.session_index import MESSAGES_FILENAME
 from chartreux.core.session.session_lease import SessionBusyError, SessionLease
-from chartreux.core.session_types import PlanModeRecord, PlanScanDomain
 from chartreux.core.subagents import TaskArgs, TaskResult
 from chartreux.core.tools.base import InvokeContext
 from chartreux.core.tools.io_port import ShellCommandRequest, ShellCommandResult
@@ -1664,8 +1645,6 @@ async def _coordinated_agent(
     compact_reply_grace: float = 0.05,
     replace_deadline: float = 5.0,
     replace_reply_grace: float = 0.05,
-    handoff_deadline: float = 5.0,
-    handoff_reply_grace: float = 0.05,
     request_timeout: float = 30.0,
     drop: Callable[[dict[str, Any], bool], bool] | None = None,
     rebind: Callable[..., Any] | None = None,
@@ -1702,8 +1681,6 @@ async def _coordinated_agent(
         compact_reply_grace=compact_reply_grace,
         replace_deadline=replace_deadline,
         replace_reply_grace=replace_reply_grace,
-        handoff_deadline=handoff_deadline,
-        handoff_reply_grace=handoff_reply_grace,
     )
     try:
         await process.open(
@@ -2499,13 +2476,8 @@ def test_the_replacement_deadline_is_the_sized_wire_budget() -> None:
 # the fence. The clear acks success only after checking, against LIVE runtime
 # state, that the history and the session model pin are gone, and its receipt
 # names exactly the steps this call completed so a retry re-enters and finishes
-# the rest. The plan handoff is the full consent transaction admitted as a long
-# operation: its receipt carries the fence outcome, the episode it committed,
-# and the accounting the coordinator replays.
+# the rest.
 # ---------------------------------------------------------------------------
-
-_WIRE_EPISODE_ID = "ep-wire0001"
-_WIRE_DOCUMENT = b"# Plan\r\n\r\n## Summary\r\nCarry these exact bytes.\r\n"
 
 
 async def _layered_logging_loop(
@@ -2552,50 +2524,6 @@ async def _layered_logging_loop(
     loop = build_test_agent_loop(config=config, session_id="initial")
     await loop.persist_empty_session()
     return loop
-
-
-def _wire_episode(tmp_path: Path) -> Path:
-    """A plan episode directory whose draft carries a usable plan document."""
-    directory = tmp_path / "plan-wire-episode"
-    directory.mkdir()
-    ensure_episode_fence(directory)
-    create_sidecar(
-        directory,
-        PlanEpisodeSidecar(
-            episode_id=_WIRE_EPISODE_ID, draft_path=directory / "plan.md"
-        ),
-    )
-    (directory / "plan.md").write_bytes(_WIRE_DOCUMENT)
-    return directory
-
-
-def _wire_plan_record(directory: Path, save_dir: Path) -> PlanModeRecord:
-    """The planning session's own record for the episode under test."""
-    return PlanModeRecord(
-        plan_path=str(directory / "plan.md"),
-        theme="Carry these exact bytes",
-        planner_model="alpha",
-        planner_thinking="medium",
-        episode_id=_WIRE_EPISODE_ID,
-        sidecar_path=str(directory / ".chartreux-plan-episode.json"),
-        draft_path=str(directory / "plan.md"),
-        state=STATE_DRAFT,
-        scan_domain=PlanScanDomain(save_dir=str(save_dir), session_prefix="session"),
-    )
-
-
-def _wire_handoff_params(directory: Path, session_id: str) -> SessionPlanHandoffParams:
-    return SessionPlanHandoffParams(
-        session_id=session_id,
-        executor_model="beta",
-        executor_thinking="medium",
-        executor_identity="orchestrator",
-        plan_path=str(directory / "plan.md"),
-        episode_id=_WIRE_EPISODE_ID,
-        snapshot_path=str(accepted_snapshot_path(directory, _WIRE_EPISODE_ID)),
-        snapshot_sha256=sha256_bytes(_WIRE_DOCUMENT),
-        snapshot_bytes_b64=base64.b64encode(_WIRE_DOCUMENT).decode("ascii"),
-    )
 
 
 @pytest.mark.asyncio
@@ -2739,159 +2667,6 @@ async def test_a_partial_clear_names_its_stage_and_a_retry_finishes_it(
     assert attempts == ["clear-override", "clear-override"]
 
 
-@pytest.mark.asyncio
-async def test_a_reconfigure_handoff_runs_the_fence_and_answers_accepted(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    directory = _wire_episode(tmp_path)
-    loop = await _layered_logging_loop(monkeypatch, tmp_path)
-    await loop.session_logger.persist_plan_mode_durable(
-        _wire_plan_record(directory, tmp_path / "layered-sessions")
-    )
-    params = _wire_handoff_params(directory, loop.session_id)
-    source_session_id = loop.session_id
-    peer, serving = _serve_in_process(_LoopFactory(loop))
-    deadline = time.monotonic() + 60.0
-    try:
-        await peer.call(AGENT_OPEN_METHOD, _open_params())
-        request_id = await peer.send(
-            AGENT_SESSION_RECONFIGURE_METHOD,
-            encode_reconfigure_request(
-                mode=RECONFIGURE_MODE_PLAN_HANDOFF, deadline=deadline, handoff=params
-            ),
-        )
-        admission = await asyncio.wait_for(peer.notifications.get(), 15)
-        result = (await peer.reply(request_id))["result"]
-        snapshot = decode_session_snapshot(
-            await peer.call(AGENT_SESSION_SNAPSHOT_METHOD, {})
-        )
-    finally:
-        await peer.close()
-        with suppress(BaseException):
-            await serving
-
-    # The admission is announced under the coordinator's own request id before
-    # the reply is written, so a lost answer is still correlatable.
-    assert admission["method"] == AGENT_OP_ADMISSION_METHOD
-    assert admission["params"]["request_id"] == request_id
-    assert admission["params"]["method"] == AGENT_SESSION_RECONFIGURE_METHOD
-    assert admission["params"]["state"] == "active"
-
-    reply = decode_reconfigure_reply(result)
-    assert reply.outcome == RECONFIGURE_OUTCOME_ACCEPTED
-    assert reply.episode_id == _WIRE_EPISODE_ID
-    assert reply.attempt_generation == 1
-    assert reply.accounting is not None
-    assert reply.snapshot is not None
-
-    record = snapshot.marker_for(request_id)
-    assert record is not None
-    assert record.state == OP_STATE_TERMINAL
-    assert record.outcome == OP_OUTCOME_COMPLETED
-    assert record.deadline == deadline
-
-    # C5 landed: the episode is accepted, the executor is bound, and the live
-    # snapshot carries the attempt's provenance name.
-    sidecar = read_sidecar(directory)
-    assert sidecar is not None
-    assert sidecar.state == STATE_ACCEPTED
-    assert sidecar.executor_session_id == loop.session_id
-    assert loop.session_id != source_session_id
-    assert (
-        provenance_snapshot_path(directory, _WIRE_EPISODE_ID, 1).read_bytes()
-        == _WIRE_DOCUMENT
-    )
-    assert not accepted_snapshot_path(directory, _WIRE_EPISODE_ID).exists()
-
-    # The consented executor selection is what the live session now holds.
-    assert override_active_model(loop.config_orchestrator) == "beta"
-    assert loop._bound_identity == "orchestrator"
-
-
-@pytest.mark.asyncio
-async def test_a_lost_handoff_reply_is_settled_by_one_marker_recheck(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    directory = _wire_episode(tmp_path)
-    loop = await _layered_logging_loop(monkeypatch, tmp_path)
-    await loop.session_logger.persist_plan_mode_durable(
-        _wire_plan_record(directory, tmp_path / "layered-sessions")
-    )
-    params = _wire_handoff_params(directory, loop.session_id)
-
-    async with _coordinated_agent(
-        tmp_path,
-        handoff_deadline=2.0,
-        handoff_reply_grace=0.1,
-        drop=_drop_replies(reconfigure=1),
-        loop=loop,
-    ) as (process, transport, _):
-        reply = await process.plan_handoff(params)
-
-    # ONE re-check, never a resend: the operation's own TERMINAL record proves
-    # the fence reached its flip, and that payload is the receipt.
-    assert len(transport.requests(AGENT_SESSION_RECONFIGURE_METHOD)) == 1
-    assert reply.outcome == RECONFIGURE_OUTCOME_ACCEPTED
-    assert reply.snapshot is not None
-    # The re-check claims only what the payload proves; the reply it could not
-    # read is not invented.
-    assert reply.episode_id is None
-    sidecar = read_sidecar(directory)
-    assert sidecar is not None
-    assert sidecar.state == STATE_ACCEPTED
-    assert process.session_id == loop.session_id
-
-
-class _ClearRecorder:
-    """The process leg behind the coordinator's reconfigure leg."""
-
-    def __init__(self) -> None:
-        self.calls: list[str] = []
-
-    async def clear_history(self) -> Any:
-        self.calls.append("clear")
-        return "cleared-reply"
-
-
-@pytest.mark.asyncio
-async def test_a_refused_plan_settlement_ends_the_clear_before_any_frame() -> None:
-    process = _ClearRecorder()
-
-    async def settlement() -> str:
-        return "the plan episode could not be cancelled"
-
-    leg = ProcessRootReconfigure(
-        process=cast("RootAgentProcess", process), plan_settlement=settlement
-    )
-
-    with pytest.raises(RequestFailure) as caught:
-        await leg.clear_history()
-
-    assert caught.value.code is ProtocolErrorCode.CONFLICT
-    assert "Clear refused" in str(caught.value)
-    assert "the plan episode could not be cancelled" in str(caught.value)
-    assert "Nothing was cleared" in str(caught.value)
-    assert "keeps its state" in str(caught.value)
-    # The coordinator-owned settlement ran first, and its refusal means the
-    # clear frame is never sent.
-    assert process.calls == []
-
-
-@pytest.mark.asyncio
-async def test_an_allowed_plan_settlement_lets_the_clear_frame_through() -> None:
-    process = _ClearRecorder()
-
-    async def settlement() -> None:
-        return None
-
-    leg = ProcessRootReconfigure(
-        process=cast("RootAgentProcess", process), plan_settlement=settlement
-    )
-
-    assert await leg.clear_history() == "cleared-reply"
-    assert process.calls == ["clear"]
-
-
 # ---------------------------------------------------------------------------
 # Item 1 op 10 mode (d), package 23: the config write as a long operation.
 #
@@ -2967,7 +2742,6 @@ def test_the_ready_frame_advertises_the_agent_wire_capabilities() -> None:
     ready = parse_ready_frame(encode_ready_frame())
     assert ready.protocol_version == PROCESS_PROTOCOL_VERSION
     assert ready.capabilities == ADVERTISED_CAPABILITIES
-    assert AGENT_WIRE_CAPABILITY_PLAN_HANDOFF_ROTATION in ready.capabilities
 
 
 def test_an_older_same_version_child_announces_no_capabilities() -> None:
@@ -2980,10 +2754,7 @@ def test_an_older_same_version_child_announces_no_capabilities() -> None:
     assert ready.capabilities == frozenset()
 
 
-@pytest.mark.parametrize(
-    "capabilities",
-    ["plan-handoff-rotation", [1], [""], [None], {"plan-handoff-rotation": True}],
-)
+@pytest.mark.parametrize("capabilities", [[1], [""], [None], {"bogus": True}])
 def test_a_malformed_capability_advertisement_is_a_missing_frame(
     capabilities: Any,
 ) -> None:
@@ -3009,11 +2780,7 @@ def test_a_different_protocol_version_is_a_typed_restart_error() -> None:
     assert newer.value.received == 3
 
 
-def test_the_plan_handoff_reconfigure_is_the_only_capability_gated_request() -> None:
-    assert required_agent_capabilities(
-        AGENT_SESSION_RECONFIGURE_METHOD,
-        encode_reconfigure_request(mode=RECONFIGURE_MODE_PLAN_HANDOFF, deadline=1.0),
-    ) == frozenset({AGENT_WIRE_CAPABILITY_PLAN_HANDOFF_ROTATION})
+def test_ordinary_reconfigure_requests_need_no_capability() -> None:
     assert (
         required_agent_capabilities(
             AGENT_SESSION_RECONFIGURE_METHOD,
@@ -3031,39 +2798,6 @@ def test_the_stdio_request_default_matches_the_shared_30_second_bound() -> None:
     assert ROOT_PORT_REQUEST_TIMEOUT == 30.0
     assert PSB_REQUEST_TIMEOUT == ROOT_PORT_REQUEST_TIMEOUT
     assert PSB_REQUEST_TIMEOUT != 60.0
-
-
-@pytest.mark.asyncio
-async def test_a_child_without_the_rotation_capability_is_a_typed_skew_not_a_send(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    directory = _wire_episode(tmp_path)
-    loop = await _layered_logging_loop(monkeypatch, tmp_path)
-    await loop.session_logger.persist_plan_mode_durable(
-        _wire_plan_record(directory, tmp_path / "layered-sessions")
-    )
-    params = _wire_handoff_params(directory, loop.session_id)
-
-    async with _coordinated_agent(tmp_path, loop=loop, capabilities=frozenset()) as (
-        process,
-        transport,
-        _loop,
-    ):
-        assert process.advertised_capabilities == frozenset()
-        with pytest.raises(RootAgentCapabilitySkewError) as exc_info:
-            await process.plan_handoff(params)
-        error = exc_info.value
-        assert error.method == AGENT_SESSION_RECONFIGURE_METHOD
-        assert error.capabilities == (AGENT_WIRE_CAPABILITY_PLAN_HANDOFF_ROTATION,)
-        assert AGENT_WIRE_CAPABILITY_PLAN_HANDOFF_ROTATION in str(error)
-        assert "restart both ends on the same chartreux version" in str(error)
-        assert "was not sent" in str(error)
-        # No frame crossed the pipe: the skew is refused before any send, so
-        # there is no stale fallback and nothing to replay.
-        assert transport.requests(AGENT_SESSION_RECONFIGURE_METHOD) == []
-        # The handle still serves requests that need no additive capability.
-        snapshot = await process.snapshot(include_history=False)
-        assert snapshot.state.session.id == loop.session_id
 
 
 @pytest.mark.asyncio

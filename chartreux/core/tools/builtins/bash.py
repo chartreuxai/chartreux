@@ -53,7 +53,7 @@ from chartreux.core.tools.builtins._shell_permission_resolver import (
     shell_command_write_paths,
 )
 from chartreux.core.tools.io_port import ShellCommandRequest
-from chartreux.core.tools.permissions import PermissionContext
+from chartreux.core.tools.permissions import PermissionContext, dangerous_mode_active
 from chartreux.core.tools.ui import ToolCallDisplay, ToolResultDisplay, ToolUIData
 from chartreux.core.tools.utils import (
     DEFAULT_SENSITIVE_PATTERNS,
@@ -503,59 +503,78 @@ class Bash(
         # command's checkout/switch invocations) is collected alongside it —
         # a mutation-scope footprint that never enters the submission scan's
         # path list.
-        write_paths, write_paths_unknown = shell_command_write_paths(
-            command,
-            cwd=self.cwd,
-            workspace=self.workspace,
-            authority=self.path_authority,
-        )
-        mutation_roots, mutation_roots_unknown = shell_command_mutation_roots(
-            command,
-            cwd=self.cwd,
-            workspace=self.workspace,
-            authority=self.path_authority,
-        )
+        # v0.8.0 A-P1: on the unguarded execution path the shell policy
+        # analysis is best-effort only, so write footprints are UNKNOWABLE —
+        # the result stamps them unknown and never certifies coverage.
+        if dangerous_mode_active():
+            write_paths, write_paths_unknown = None, True
+            mutation_roots, mutation_roots_unknown = None, True
+        else:
+            write_paths, write_paths_unknown = shell_command_write_paths(
+                command,
+                cwd=self.cwd,
+                workspace=self.workspace,
+                authority=self.path_authority,
+            )
+            mutation_roots, mutation_roots_unknown = shell_command_mutation_roots(
+                command,
+                cwd=self.cwd,
+                workspace=self.workspace,
+                authority=self.path_authority,
+            )
         # S2: a whitelist glob call binds to a literal argv plan re-derived at
         # execution time (the same classifier the resolver admitted it with),
         # so a mutation between the permission check and execution is seen and
         # fails closed. A command that starts like the whitelist but cannot be
         # planned raises here — it never falls back to the shell string.
-        try:
-            glob_plan = glob_execution_plan_for_command(
-                args.command,
-                cwd=self.cwd,
-                workspace=self.workspace,
-                authority=self.path_authority,
-                scratchpad_roots=effective_scratchpad_roots(self.path_authority),
-                workspace_roots=frozenset(self.workspace.authorized_roots),
-            )
-        except GlobPlanDenial as exc:
-            raise ToolError(glob_plan_denial_text(exc, args.command)) from exc
+        # v0.8.0 A-P1: on the unguarded execution path no literal-argv or
+        # remote-exec plan is derived — those plans exist to contain what the
+        # guardrails inspected, and DANGEROUS suspends the inspection. The
+        # command runs through the plain shell-string transport below.
+        if dangerous_mode_active():
+            glob_plan = None
+            quoted_word_plan = None
+            remote_plan = None
+        else:
+            try:
+                glob_plan = glob_execution_plan_for_command(
+                    args.command,
+                    cwd=self.cwd,
+                    workspace=self.workspace,
+                    authority=self.path_authority,
+                    scratchpad_roots=effective_scratchpad_roots(self.path_authority),
+                    workspace_roots=frozenset(self.workspace.authorized_roots),
+                )
+            except GlobPlanDenial as exc:
+                raise ToolError(glob_plan_denial_text(exc, args.command)) from exc
 
-        # F1pkg3: a call whose whole double-quoted variable word the analysis
-        # resolved binds to a literal argv plan re-derived here at execution
-        # (the same classifier the resolver admitted it with), so the words
-        # that run are the words that were inspected. A call the transport
-        # cannot bind raises — it never falls back to the shell string.
-        try:
-            quoted_word_plan = quoted_word_execution_plan_for_command(
-                args.command,
-                scratchpad_roots=effective_scratchpad_roots(self.path_authority),
-                workspace_roots=frozenset(self.workspace.authorized_roots),
-            )
-        except QuotedWordPlanDenial as exc:
-            raise ToolError(quoted_word_plan_denial_text(exc, args.command)) from exc
+            # F1pkg3: a call whose whole double-quoted variable word the analysis
+            # resolved binds to a literal argv plan re-derived here at execution
+            # (the same classifier the resolver admitted it with), so the words
+            # that run are the words that were inspected. A call the transport
+            # cannot bind raises — it never falls back to the shell string.
+            try:
+                quoted_word_plan = quoted_word_execution_plan_for_command(
+                    args.command,
+                    scratchpad_roots=effective_scratchpad_roots(self.path_authority),
+                    workspace_roots=frozenset(self.workspace.authorized_roots),
+                )
+            except QuotedWordPlanDenial as exc:
+                raise ToolError(
+                    quoted_word_plan_denial_text(exc, args.command)
+                ) from exc
 
-        # S4b1b: the pinned remote-exec plan is re-derived here at execution
-        # (the S2/A2 precedent: a mutation between the permission check and
-        # execution is seen and fails closed). A bound glob plan and a
-        # remote-exec plan never coexist: the glob plan requires a whitelist
-        # read command, the remote-exec plan a standalone ssh invocation.
-        remote_plan = self._remote_exec_plan(args.command)
+            # S4b1b: the pinned remote-exec plan is re-derived here at execution
+            # (the S2/A2 precedent: a mutation between the permission check and
+            # execution is seen and fails closed). A bound glob plan and a
+            # remote-exec plan never coexist: the glob plan requires a whitelist
+            # read command, the remote-exec plan a standalone ssh invocation.
+            remote_plan = self._remote_exec_plan(args.command)
 
         literal_plan_bound = glob_plan is not None or quoted_word_plan is not None
         if (
-            not literal_plan_bound
+            not dangerous_mode_active()  # noqa: PLR0916 - the A-P1 check joins the transport terms
+            and not literal_plan_bound
             and ctx is not None
             and ctx.tool_io is not None
             and ctx.tool_io.supports_terminal
@@ -653,7 +672,16 @@ class Bash(
         proc = None
         completed = False
         try:
-            if remote_plan is not None:
+            if dangerous_mode_active():
+                # v0.8.0 A-P1 unguarded execution path: the raw command string
+                # goes to the pinned shell executor — no bound literal plan,
+                # no remote-exec grant check (network egress yields), and the
+                # write footprints were stamped unknown above. Argument
+                # validation and the normal subprocess lifecycle are unchanged.
+                proc = await spawn_shell_command(
+                    command, cwd=self.cwd, extra_env=project_env
+                )
+            elif remote_plan is not None:
                 # S4b1b: the local spawn is this process's own executor, so
                 # it is attested by construction (same network namespace and
                 # filesystem/SSH trust context the locality classifier

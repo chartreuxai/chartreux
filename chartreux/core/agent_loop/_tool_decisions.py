@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Awaitable, Callable
+import hashlib
 from pathlib import Path
 
 from pydantic import BaseModel
@@ -51,6 +52,10 @@ from chartreux.core.agent_loop._root_grants import (
     root_grant_request,
     root_grant_save_note,
     root_grant_target,
+)
+from chartreux.core.agent_loop._safety_authority import (
+    DecidedCallIdentity,
+    SessionAuthorityState,
 )
 from chartreux.core.config import ChartreuxConfigSchema
 from chartreux.core.config._dangerous_command_persistence import SavedGrantsRead
@@ -211,6 +216,11 @@ class ToolDecisionCoordinator:
         request_broker: InteractionRequestBroker,
         user_input_capability_getter: Callable[[], bool],
         is_subagent_getter: Callable[[], bool],
+        # v0.8.0 A-P0: the session authority state, read at decision time so
+        # decided calls land in the decided-call identity memory. None keeps
+        # the coordinator authority-free (bare/test constructions).
+        authority_state_getter: Callable[[], SessionAuthorityState | None]
+        | None = None,
         grant_port_getter: Callable[[], DangerousCommandGrantPersistencePort | None],
         tool_manager_getter: Callable[[], ToolManager],
         session_id_getter: Callable[[], str],
@@ -240,6 +250,7 @@ class ToolDecisionCoordinator:
         # resolved at decision time, never captured.
         self._user_input_capability_getter = user_input_capability_getter
         self._is_subagent_getter = is_subagent_getter
+        self._authority_state_getter = authority_state_getter
         self._grant_port_getter = grant_port_getter
         self._root_grant_port_getter = root_grant_port_getter
         self._tool_manager_getter = tool_manager_getter
@@ -270,7 +281,61 @@ class ToolDecisionCoordinator:
         except Exception:
             return frozenset()
 
-    async def resolve_dangerous_command_grant(
+    def _record_decided_call(
+        self,
+        tool_name: str,
+        proposal: DangerousCommandProposal,
+        *,
+        decision: str,
+        actor: str,
+    ) -> None:
+        """Record a decided call in the session's decided-call identity memory.
+
+        v0.8.0 A-P0 seam: a decided call identity is never re-decided, and the
+        record carries the audit authorizer tag of the safety level in force.
+        A coordinator without an authority state (bare/test construction)
+        records nothing.
+        """
+        if self._authority_state_getter is None:
+            return
+        state = self._authority_state_getter()
+        if state is None:
+            return
+        digest = hashlib.sha256(
+            f"{proposal.scope}\x00{proposal.command}".encode()
+        ).hexdigest()
+        state.record_decided_call(
+            DecidedCallIdentity(tool_name=tool_name, call_key=digest),
+            decision=decision,
+            actor=actor,
+        )
+
+    def _dangerous_mode_bypass(
+        self, tool_name: str, proposal: DangerousCommandProposal | None
+    ) -> ToolDecision | None:
+        """The A-P1 DANGEROUS grant bypass: execute, prompt nothing, persist nothing.
+
+        At SafetyLevel DANGEROUS the approval/grant decision is bypassed: no
+        prompt, no once permit, no session or project grant is created or
+        persisted, and prior grants/denials stay unchanged on exit. The call
+        is recorded in the decided-call memory with the ``dangerous`` actor
+        tag. UNREACHABLE-BY-STATE before the A-P1 ceremony (chunk 2) can
+        produce the level.
+        """
+        if self._authority_state_getter is None:
+            return None
+        state = self._authority_state_getter()
+        if state is None or not state.is_dangerous():
+            return None
+        if proposal is not None:
+            self._record_decided_call(
+                tool_name, proposal, decision="dangerous_mode", actor="dangerous"
+            )
+        return ToolDecision(
+            verdict=ToolExecutionResponse.EXECUTE, approval_type=ToolPermission.ALWAYS
+        )
+
+    async def resolve_dangerous_command_grant(  # noqa: PLR0911 - the A-P1 bypass adds one return
         self,
         tool: BaseTool,
         args: BaseModel,
@@ -287,6 +352,11 @@ class ToolDecisionCoordinator:
         instead of waiting. A decided call identity is never re-prompted: it
         returns the honest refusal.
         """
+        bypassed = self._dangerous_mode_bypass(
+            tool_name, ctx.dangerous_command_proposal
+        )
+        if bypassed is not None:
+            return bypassed
         proposal = ctx.dangerous_command_proposal
         if proposal is not None and proposal.destination is not None:
             # A remote-exec denial is a destination grant, a separate
@@ -335,9 +405,17 @@ class ToolDecisionCoordinator:
             return _declined_dangerous_command_decision()
         choice = await self.prompt_dangerous_command_grant(proposal, tool_call_id)
         if choice is None or choice == "deny":
-            return _prompt_outcome_decision(
+            decision = _prompt_outcome_decision(
                 store, identity, proposal, choice, ctx, tool_name
             )
+            if choice == "deny":
+                # A deny is a decision and is remembered — both as a refusal
+                # in the grant store and as a decided call in the session's
+                # authority state (v0.8.0 A-P0).
+                self._record_decided_call(
+                    tool_name, proposal, decision="refused", actor="human"
+                )
+            return decision
         return await self.resume_after_dangerous_command_grant(
             tool, args, tool_name, proposal, choice, requirements
         )
@@ -409,6 +487,11 @@ class ToolDecisionCoordinator:
                     self._tool_manager_getter()._invalidate_dangerous_command_authority()
             elif store.grant_session(requirements):
                 self._tool_manager_getter()._invalidate_dangerous_command_authority()
+            # v0.8.0 A-P0: the approval is a decided call — remember its
+            # identity in the session authority state with the authorizer tag.
+            self._record_decided_call(
+                tool_name, proposal, decision="granted", actor="human"
+            )
             # Full recheck of the original call under the approved authority. A
             # failed recheck executes nothing, destroys any unused once
             # authority, and never persists.
@@ -556,7 +639,7 @@ class ToolDecisionCoordinator:
             )
         })
 
-    async def resolve_remote_exec_grant(
+    async def resolve_remote_exec_grant(  # noqa: PLR0911 - the A-P1 bypass adds one return
         self,
         tool: BaseTool,
         args: BaseModel,
@@ -574,6 +657,11 @@ class ToolDecisionCoordinator:
         persisted destination knob named. A decided call identity is never
         re-prompted.
         """
+        bypassed = self._dangerous_mode_bypass(
+            tool_name, ctx.dangerous_command_proposal
+        )
+        if bypassed is not None:
+            return bypassed
         proposal = ctx.dangerous_command_proposal
         if proposal is None:
             return None
@@ -724,7 +812,7 @@ class ToolDecisionCoordinator:
             proposal.project, proposal.scope, destination, result
         )
 
-    async def resolve_out_of_root_grant(
+    async def resolve_out_of_root_grant(  # noqa: PLR0911 - the A-P1 bypass adds one return
         self,
         tool: BaseTool,
         args: BaseModel,
@@ -739,6 +827,9 @@ class ToolDecisionCoordinator:
         A child session never prompts, whatever its user-input capability: it
         denies with remediation and the blocker flows back to the parent.
         """
+        bypassed = self._dangerous_mode_bypass(tool_name, None)
+        if bypassed is not None:
+            return bypassed
         if tool_name not in ROOT_GRANT_TOOLS:
             return None
         if self._is_subagent_getter() or not self._user_input_capability_getter():

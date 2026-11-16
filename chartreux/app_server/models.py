@@ -933,6 +933,9 @@ class SessionLogSummary(ProtocolModel):
     path: str | None = None
     title: str | None = None
     needs_initial_auto_title: bool = False
+    # Set when the session's RAW metadata carried a retired ``plan_mode`` key:
+    # the plan document path that key records, read at the loader choke point.
+    legacy_plan_path: str | None = None
 
 
 class SavedSessionSummary(ProtocolModel):

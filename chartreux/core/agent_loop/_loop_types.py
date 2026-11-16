@@ -8,6 +8,7 @@ from pathlib import Path
 from pydantic import BaseModel
 
 from chartreux.core.agent_loop._execution_admission import ExecutionAdmission
+from chartreux.core.agent_loop._safety_authority import AuthorityLaunchSnapshot
 from chartreux.core.config._restrictions import SourceRestrictions
 from chartreux.core.hooks.models import HookConfigResult
 from chartreux.core.tools.base import ToolPermission
@@ -72,6 +73,10 @@ class AgentRuntimePolicy:
     # A dedicated slot, never a synthesized config-source authority, so policy
     # replacement and partitioning never treat session grants as policy.
     inherited_root_grants: tuple[Path, ...] = ()
+    # The session's safety-authority launch snapshot (v0.8.0 A-P0): the level
+    # a child loop is constructed with. None for roots: the loop derives its
+    # initial level from initial_level(config) (hard-coded SAFE in A-P0).
+    authority_snapshot: AuthorityLaunchSnapshot | None = None
     # Per-run budget maxes (anchor-relative to the run-admission baseline).
     # None means unconfigured: the middleware is omitted and replay admission
     # ignores the run budget.

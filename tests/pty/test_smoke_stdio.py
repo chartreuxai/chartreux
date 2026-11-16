@@ -153,88 +153,6 @@ def test_proxy_setup_screen_renders(pty_driver) -> None:
     _assert_no_wire_errors(driver, mark)
 
 
-def test_plan_mode_arms_and_reports_its_document(pty_driver) -> None:
-    """`/plan` arms plan mode and reports its document over the transport.
-
-    Entry dispatches a planner turn over the stdio topology (the harness pins
-    both plan roles to the in-gate mock model), and `/plan status` then reports
-    the armed episode. Both halves go through the app-server wire.
-    """
-    driver = pty_driver
-    _settle_to_prompt(driver)
-    mark = driver.mark()
-    driver.send("/plan")
-    time.sleep(PALETTE_SETTLE_S)
-    driver.send("\r")
-    time.sleep(PALETTE_SETTLE_S)
-    driver.send("\r")
-    driver.wait_for("Esc/Ctrl+C to interrupt", 60)
-    driver.wait_until(
-        lambda: "Esc/Ctrl+C to interrupt" not in driver.text()[-800:],
-        60,
-        "the planner turn to finish",
-    )
-    _open_command(driver, "/plan status", "Plan mode is active. Plan document:")
-    _assert_no_wire_errors(driver, mark)
-
-
-def test_plan_accept_starts_execution_after_consent(pty_driver) -> None:
-    """`/plan accept` consents the authored document into an executor session.
-
-    The §6.5 plan-accept flow: `/plan` arms plan mode (the pinned-probe arm
-    pattern above), the user authors the episode's bound document on disk, and
-    `/plan accept` opens the consent screen -- one Enter dispatches the exact
-    palette match, so a second Enter would hit the focused Cancel button and
-    cancel by default. Tab moves to `Start execution`, Enter confirms, the
-    handoff replaces the conversation over the stdio transport, and the
-    executor session takes a real provider turn.
-    """
-    driver = pty_driver
-    _settle_to_prompt(driver)
-    mark = driver.mark()
-    driver.send("/plan")
-    time.sleep(PALETTE_SETTLE_S)
-    driver.send("\r")
-    time.sleep(PALETTE_SETTLE_S)
-    driver.send("\r")
-    driver.wait_for("Esc/Ctrl+C to interrupt", 60)
-    driver.wait_until(
-        lambda: "Esc/Ctrl+C to interrupt" not in driver.text()[-800:],
-        60,
-        "the planner turn to finish",
-    )
-
-    workspaces = sorted((driver.home / "workspaces").glob("*/tasks/plan-*"))
-    assert len(workspaces) == 1, (
-        f"expected exactly one allocated plan workspace: {workspaces}"
-    )
-    document = workspaces[0] / "plan.md"
-    document.write_text(
-        "# Probe plan\n\n## Summary\n\nplan-accept summary marker.\n\n"
-        "Body: proving the arm/author/accept/consent/execution flow.\n",
-        encoding="utf-8",
-    )
-
-    driver.send("/plan accept")
-    time.sleep(PALETTE_SETTLE_S)
-    driver.send("\r")
-    driver.wait_for("Start plan execution", 60)
-    driver.send("\t")
-    time.sleep(0.8)
-    driver.send("\r")
-    driver.wait_for("Plan execution started.", 90)
-
-    submit_mark = driver.mark()
-    driver.send("executor probe run the plan")
-    time.sleep(0.4)
-    driver.send("\r")
-    driver.wait_for("from mock server", 120)
-    _assert_no_wire_errors(driver, mark)
-    assert "Plan execution cancelled" not in driver.text()[submit_mark:], (
-        "the consent carried into an execution session"
-    )
-
-
 def test_branch_refusal_names_the_in_process_route(pty_driver) -> None:
     """`/branch` refuses on stdio and names the route that carries it."""
     driver = pty_driver
@@ -367,4 +285,27 @@ def test_failed_send_restoration_keeps_the_draft_distinct(
     )
     assert "last-typingrestore-probe" not in _rendered_since(driver, mark)
     assert len(local_mock_provider.requests) == requests_before
+    _assert_no_wire_errors(driver, mark)
+
+
+def test_safety_dangerous_opens_the_ceremony_warning_screen(pty_driver) -> None:
+    """`/safety dangerous` opens the non-dismissible warning screen (v0.8.0 A-P1).
+
+    The ceremony renders over the stdio topology with the typed-phrase gate
+    visible, no wire refusal fires, and no DANGEROUS banner appears (the
+    transition needs the full ceremony, which the pilot tests in
+    tests/cli/test_safety_command.py drive through the phrase and confirm
+    screens).
+    """
+    driver = pty_driver
+    _settle_to_prompt(driver)
+    mark = driver.mark()
+    driver.send("/safety dangerous")
+    time.sleep(PALETTE_SETTLE_S)
+    driver.send("\r")
+    time.sleep(PALETTE_SETTLE_S)
+    driver.send("\r")
+    driver.wait_for("suspends every Chartreux guard", 40)
+    driver.wait_for("ENABLE DANGEROUS MODE", 40)
+    assert "DANGEROUS MODE ACTIVE" not in driver.text()
     _assert_no_wire_errors(driver, mark)

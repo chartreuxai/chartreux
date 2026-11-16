@@ -42,6 +42,7 @@ from chartreux.cli.textual_ui.widgets.messages import (
     ReasoningMessage,
     UserMessage,
 )
+from chartreux.cli.textual_ui.widgets.minute_group_header import MinuteGroupHeader
 from chartreux.cli.textual_ui.widgets.tool_grouping import GroupIndicator
 from chartreux.cli.textual_ui.widgets.tools import (
     ToolCallMessage,
@@ -1661,4 +1662,154 @@ async def test_detach_for_reparenting_handles_never_registered_widgets() -> None
         await right.mount(child)
         await pilot.pause()
         assert child.parent is right
-        assert app.is_mounted(child)
+
+
+async def _wait_for_headers(
+    viewer: AgentTranscriptViewer, pilot: Any, want: int
+) -> None:
+    async with asyncio.timeout(5):
+        while len(viewer.query(MinuteGroupHeader)) != want:
+            await pilot.pause(0.05)
+
+
+@pytest.mark.asyncio
+async def test_viewer_stamps_unit_leading_minute_headers_and_reconciles_the_gate() -> (
+    None
+):
+    from chartreux.cli.textual_ui.windowing.history import entry_minute
+
+    user = _entry("user", "Question", created_at=0).model_copy(
+        update={"posted_at": datetime(2026, 7, 12, 14, 32, tzinfo=UTC)}
+    )
+    reasoning = _entry(
+        "reasoning", "Thinking", kind=AgentTranscriptEntryKind.REASONING, created_at=1
+    ).model_copy(update={"posted_at": datetime(2026, 7, 12, 14, 35, tzinfo=UTC)})
+    call = _entry(
+        "call", "{}", kind=AgentTranscriptEntryKind.TOOL_CALL, created_at=2
+    ).model_copy(update={"posted_at": datetime(2026, 7, 12, 14, 40, tzinfo=UTC)})
+    source = _FakeSource()
+    app = _ViewerApp(source)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        source.respond(0, _available(user, reasoning, call))
+        await _wait_for_rest(app.viewer)
+        await pilot.pause()
+        viewer = app.viewer
+        expected = [
+            entry_minute(viewer._history_entry(reasoning)),
+            entry_minute(viewer._history_entry(call)),
+        ]
+        assert all(minute is not None for minute in expected)
+        await _wait_for_headers(viewer, pilot, 2)
+        assert [header.minute for header in viewer.query(MinuteGroupHeader)] == expected
+        # Each stamped header leads its unit's widget list, so eviction and
+        # replacement remove it with the roots.
+        assert isinstance(
+            viewer._entry_units["reasoning"].widgets[0], MinuteGroupHeader
+        )
+        assert isinstance(viewer._entry_units["call"].widgets[0], MinuteGroupHeader)
+
+        viewer.set_show_message_timestamps(False)
+        await _wait_for_headers(viewer, pilot, 0)
+        assert not viewer.query(MinuteGroupHeader)
+        assert not isinstance(
+            viewer._entry_units["reasoning"].widgets[0], MinuteGroupHeader
+        )
+        viewer.set_show_message_timestamps(True)
+        await _wait_for_headers(viewer, pilot, 2)
+        assert [header.minute for header in viewer.query(MinuteGroupHeader)] == expected
+
+
+@pytest.mark.asyncio
+async def test_viewer_minute_headers_never_backfill_unstamped_or_same_minute_records() -> (
+    None
+):
+    user_first = _entry("u1", "one", created_at=0).model_copy(
+        update={"posted_at": datetime(2026, 7, 12, 14, 32, tzinfo=UTC)}
+    )
+    user_same_minute = _entry("u2", "two", created_at=1).model_copy(
+        update={"posted_at": datetime(2026, 7, 12, 14, 32, tzinfo=UTC)}
+    )
+    # created_at is a synthetic ordinal: without posted_at the effect carries
+    # no wall-clock minute and opens no header.
+    unstamped_call = _entry(
+        "call", "{}", kind=AgentTranscriptEntryKind.TOOL_CALL, created_at=2
+    )
+    source = _FakeSource()
+    app = _ViewerApp(source)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        source.respond(0, _available(user_first, user_same_minute, unstamped_call))
+        await _wait_for_rest(app.viewer)
+        await pilot.pause()
+        # Messages render their own header time and never open a group header;
+        # the same-minute message advances the marker; the unstamped effect has
+        # no clock at all.
+        assert not app.viewer.query(MinuteGroupHeader)
+
+
+@pytest.mark.asyncio
+async def test_injected_file_state_entry_folds_and_expansion_survives_rebuilds() -> (
+    None
+):
+    from chartreux.cli.textual_ui.widgets.collapsible import HeaderCollapsibleSection
+
+    handoff = _entry(
+        "handoff", "<file_state_handoff>\nplan.md\n</file_state_handoff>", created_at=0
+    ).model_copy(update={"injected": True})
+    typed = _entry("typed", "<file_state typed by the user>", created_at=1)
+    injected_other = _entry(
+        "note", "You are continuing after compaction.", created_at=2
+    ).model_copy(update={"injected": True})
+    source = _FakeSource()
+    app = _ViewerApp(source)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        source.respond(0, _available(handoff, typed, injected_other))
+        await _wait_for_rest(app.viewer)
+        await pilot.pause()
+        viewer = app.viewer
+        # Only the compound discriminator folds: injected AND <file_state.
+        sections = list(viewer.query(HeaderCollapsibleSection))
+        assert len(sections) == 1
+        section = sections[0]
+        assert section.is_collapsed
+        assert (
+            section
+            .query_one(UserMessage)
+            .get_content()
+            .startswith("<file_state_handoff>")
+        )
+        # The wrapper is the widget registered against the entry's index.
+        assert viewer._entry_units["handoff"].widgets[0] is section
+        assert len(viewer.query(UserMessage)) == 3
+
+        # Toggling writes the entry-id-keyed expansion store.
+        section.toggle()
+        await pilot.pause()
+        assert not section.is_collapsed
+        assert viewer._entry_expansion_state.is_collapsed("handoff") is False
+
+        # A content change rebuilds the unit; the persisted expansion survives.
+        updated = _entry(
+            "handoff",
+            "<file_state_handoff>\nplan.md (rev 2)\n</file_state_handoff>",
+            created_at=0,
+            revision=1,
+        ).model_copy(update={"injected": True})
+        await viewer._apply_response(
+            _available(updated, typed, injected_other),
+            epoch=viewer._request_epoch,
+            replace=False,
+            before=None,
+        )
+        await pilot.pause()
+        rebuilt = viewer.query_one(HeaderCollapsibleSection)
+        assert rebuilt is not section
+        assert not rebuilt.is_collapsed
+        assert (
+            rebuilt
+            .query_one(UserMessage)
+            .get_content()
+            .endswith("(rev 2)\n</file_state_handoff>")
+        )

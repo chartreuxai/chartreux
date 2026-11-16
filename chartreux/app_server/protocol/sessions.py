@@ -95,81 +95,6 @@ class SessionResumeParams(SessionOpenParams):
     session_id: str
 
 
-LEGACY_UNVERIFIED_STATE = "legacy-unverified"
-
-
-class SessionPlanScanDomain(ProtocolModel):
-    """The P1 ``{save_dir, session_prefix}`` scan domain, as carried on the wire.
-
-    A display mirror of the sidecar's recorded domain; the sidecar remains the
-    authority (DR-69). ProtocolModel keeps the wire exact: no extra fields.
-    """
-
-    save_dir: str
-    session_prefix: str
-
-
-class SessionPlanRecord(ProtocolModel):
-    """The persisted plan-mode record as it crosses the app-server boundary.
-
-    Mirrors the session-metadata model: the record is written once at entry
-    and removed by the exit paths, so the TUI never assembles a mode from
-    anything but this.
-
-    The episode extension (design §4.1) crosses the boundary whole. Unlike the
-    persisted model, this one is ``extra=forbid``: an OLD wire reader REJECTS an
-    extended record, which is the declared legacy surface — a rejection, never
-    a silently truncated mode. A record without an ``episode_id`` is
-    ``legacy_unverified``.
-    """
-
-    plan_path: str
-    theme: str | None = None
-    planner_model: str
-    planner_thinking: str
-    pre_entry_active_model: str | None = None
-    pre_entry_planner_thinking: str | None = None
-    episode_id: str | None = None
-    sidecar_path: str | None = None
-    draft_path: str | None = None
-    snapshot_path: str | None = None
-    state: str | None = None
-    consent_sha256: str | None = None
-    attempt_generation: int | None = None
-    scan_domain: SessionPlanScanDomain | None = None
-
-    @property
-    def episode_bound(self) -> bool:
-        """True when the record carries an episode identity."""
-        return self.episode_id is not None
-
-    @property
-    def legacy_unverified(self) -> bool:
-        """The legacy marker: no episode identity means the record predates it."""
-        return not self.episode_bound
-
-    @property
-    def display_state(self) -> str | None:
-        """The state to display; a legacy record never claims a live lifecycle."""
-        if self.legacy_unverified:
-            return LEGACY_UNVERIFIED_STATE
-        return self.state
-
-
-class SessionPlanRecordWriteParams(ProtocolModel):
-    session_id: str
-    # ``None`` clears the record: /plan cancel and /clear express removal with
-    # the same call that writes it, so there is one seam, not two.
-    record: SessionPlanRecord | None = None
-
-
-class SessionPlanRecordWriteResponse(ProtocolModel):
-    # The record as READ BACK after the write: ``None`` when nothing was
-    # stored (logging disabled), so a caller cannot mistake the request for a
-    # persisted mode.
-    record: SessionPlanRecord | None = None
-
-
 class SessionMemorialItem(ProtocolModel):
     """One coordinator-durable user-visible item preserved across a respawn.
 
@@ -195,11 +120,11 @@ class SessionMemorialItem(ProtocolModel):
 
 class SessionResumeResponse(EventWatermarkResponse):
     state: PublicSessionState
-    # Carried with the adopted state rather than fetched afterwards: the
-    # restore runs inside the resume, before the session is marked ready, and
-    # a separate read would land after the point the mode must already be in
-    # place.
-    plan_record: SessionPlanRecord | None = None
+    # Set when the loaded session's raw metadata carried a ``plan_mode`` key:
+    # the session was planned under the removed plan-mode feature and resumed
+    # as an ordinary session. Detection reads the RAW metadata dict at the
+    # loader choke point, never a typed record.
+    plan_mode_present: bool = False
     # Memorial state surfaced when the resume respawned a dead generation:
     # the retired generation's queue and shell records, never re-admitted.
     memorial: list[SessionMemorialItem] = Field(default_factory=list)
@@ -557,48 +482,6 @@ class SessionHistoryClearResponse(ProtocolModel):
     session_log: SessionLogSummary
 
 
-class SessionPlanHandoffParams(ProtocolModel):
-    """Consent snapshot for a /plan accept, resolved by the client at modal open.
-
-    The server applies exactly these values or fails without starting
-    execution. ``planner_thinking_alias``/``planner_thinking_value`` carry the
-    /plan-entry thinking-key restore: the pre-entry value to restore, or removal
-    of the key when it was absent pre-entry (``planner_thinking_value=None``).
-
-    An episode-bound handoff carries the verifiable consent body: the episode
-    identity, the snapshot's path and SHA-256, and the snapshot BYTES themselves
-    base64-encoded. The bytes are the ONE authority — the digest is computed
-    over them and the path is only a locator for the plan workspace, never a
-    read path for the executor's content. A request carrying any one of these
-    fields must carry all of them; the fields are absent together on the legacy
-    (pre-episode) path.
-
-    ``snapshot_path`` names EITHER of the episode's snapshot names: the live
-    ``accepted-<episode_id>.md``, or the attempt's surviving
-    ``provenance-<episode_id>-<generation>.md``. The recovery re-offer therefore
-    passes the path it located plus that snapshot's bytes, and a request that
-    re-enters an ACCEPTING claim held by the same session continues its commit
-    from those bytes without reading the draft again (the draft is never
-    consulted after consent).
-    """
-
-    session_id: str
-    executor_model: str
-    executor_thinking: str
-    executor_identity: str
-    plan_path: str = ""
-    planner_thinking_alias: str | None = None
-    planner_thinking_value: str | None = None
-    episode_id: str | None = None
-    snapshot_path: str | None = None
-    snapshot_sha256: str | None = None
-    snapshot_bytes_b64: str | None = None
-
-
-class SessionPlanHandoffResponse(SessionHistoryClearResponse):
-    """A plan-accept handoff publishes the same replaced-session state as /clear."""
-
-
 class SessionCompactParams(ProtocolModel):
     session_id: str
     extra_instructions: str = ""
@@ -608,3 +491,27 @@ class SessionCompactResponse(ProtocolModel):
     summary: str
     state: PublicSessionState
     session_log: SessionLogSummary
+
+
+class SessionSafetyReadParams(ProtocolModel):
+    session_id: str
+
+
+class SessionSafetyReadResponse(ProtocolModel):
+    # v0.8.0 A-P1: the session's current SafetyLevel value.
+    level: str
+
+
+class SessionSafetyTransitionParams(ProtocolModel):
+    session_id: str
+    # Target level value ("safe" | "smart" | "dangerous"); validated against
+    # SafetyLevel server-side.
+    to: str
+
+
+class SessionSafetyTransitionResponse(ProtocolModel):
+    level: str
+    transitioned: bool
+    # Denial reason when the transition was refused (idle-only entry, audit
+    # sink unavailable, unknown level).
+    reason: str = ""

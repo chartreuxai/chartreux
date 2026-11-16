@@ -19,6 +19,7 @@ from chartreux.app_server.protocol import (
     AgentTranscriptToolStatus,
 )
 from chartreux.cli.textual_ui.widgets.agent_transcript import AgentTranscriptViewer
+from chartreux.cli.textual_ui.widgets.collapsible import HeaderCollapsibleSection
 from chartreux.cli.textual_ui.widgets.messages import (
     AssistantMessage,
     ReasoningMessage,
@@ -98,10 +99,17 @@ class _SnapshotSource:
             state=AgentTranscriptState.AVAILABLE,
             entries=[
                 _text_entry(
+                    "handoff",
+                    "<file_state_handoff>\n1 file: plan.md\n</file_state_handoff>",
+                    AgentTranscriptEntryKind.USER_TEXT,
+                    0,
+                    injected=True,
+                ),
+                _text_entry(
                     "user",
                     "Please inspect **this image**.",
                     AgentTranscriptEntryKind.USER_TEXT,
-                    0,
+                    1,
                     attachment_names=["diagram.png"],
                     attachment_count=1,
                 ),
@@ -109,30 +117,33 @@ class _SnapshotSource:
                     "assistant",
                     "I will inspect the image and read `src/example.py`.",
                     AgentTranscriptEntryKind.ASSISTANT_TEXT,
-                    1,
+                    2,
                     turn_duration_ms=372000,
                 ),
                 _text_entry(
                     "reasoning",
                     "First I will read the file, then summarize its contents.",
                     AgentTranscriptEntryKind.REASONING,
-                    2,
+                    3,
                 ),
-                _tool_entry("call", 3, result_entry=False),
-                _tool_entry("result", 4, result_entry=True),
+                _tool_entry("call", 4, result_entry=False),
+                _tool_entry("result", 5, result_entry=True),
             ],
             oldest_cursor="snapshot-cursor",
             has_more=False,
         )
 
         if stamped:
+            # Multi-minute stamps: the reasoning record lands two minutes after
+            # the messages, so it opens a minute group header of its own.
+            posted = {
+                "user": datetime(2026, 6, 15, 12, 34, tzinfo=UTC),
+                "assistant": datetime(2026, 6, 15, 12, 34, tzinfo=UTC),
+                "reasoning": datetime(2026, 6, 15, 12, 36, tzinfo=UTC),
+            }
             for entry in self.response.entries or []:
-                if entry.kind in {
-                    AgentTranscriptEntryKind.USER_TEXT,
-                    AgentTranscriptEntryKind.ASSISTANT_TEXT,
-                    AgentTranscriptEntryKind.REASONING,
-                }:
-                    entry.posted_at = datetime(2026, 6, 15, 12, 34, tzinfo=UTC)
+                if entry.entry_id in posted:
+                    entry.posted_at = posted[entry.entry_id]
 
     async def read_agent_transcript(
         self, agent_id: str, *, before: str | None = None, limit: int = 50
@@ -180,17 +191,19 @@ def test_snapshot_stamped_agent_transcript(snap_compare: SnapCompare) -> None:
             viewer.action_refresh()
         for _ in range(20):
             await pilot.pause(0.1)
+            handoff_unit = viewer._entry_units.get("handoff")
             if (
-                len(viewer.query(UserMessage)) == 1
+                len(viewer.query(UserMessage)) == 2
                 and len(viewer.query(AssistantMessage)) == 1
                 and len(viewer.query(ReasoningMessage)) == 1
                 and len(viewer.query(ToolResultMessage)) == 1
+                and handoff_unit is not None
+                and isinstance(handoff_unit.widgets[0], HeaderCollapsibleSection)
+                and "user" in viewer._known_entries
+                and "handoff" in viewer._known_entries
             ):
-                assert all(
-                    entry.posted_at is not None
-                    for entry in viewer._known_entries.values()
-                    if entry.kind == AgentTranscriptEntryKind.USER_TEXT
-                )
+                assert viewer._known_entries["user"].posted_at is not None
+                assert viewer._known_entries["handoff"].posted_at is None
                 return
         raise AssertionError("stamped transcript did not populate")
 
@@ -211,12 +224,15 @@ def test_snapshot_agent_transcript_viewer_renders_all_entry_kinds(
             viewer.action_refresh()
         for _ in range(20):
             await pilot.pause(0.1)
+            handoff_unit = viewer._entry_units.get("handoff")
             if (
-                len(viewer.query(UserMessage)) == 1
+                len(viewer.query(UserMessage)) == 2
                 and len(viewer.query(AssistantMessage)) == 1
                 and len(viewer.query(ReasoningMessage)) == 1
                 and len(viewer.query(ToolCallMessage)) == 1
                 and len(viewer.query(ToolResultMessage)) == 1
+                and handoff_unit is not None
+                and isinstance(handoff_unit.widgets[0], HeaderCollapsibleSection)
             ):
                 return
         raise AssertionError("agent transcript did not populate before snapshot")

@@ -34,6 +34,7 @@ class UtilityPrompt(Prompt):
     COMPACT_SYSTEM = auto()
     DANGEROUS_DIRECTORY = auto()
     PROJECT_CONTEXT = auto()
+    SMART_APPROVE_CLASSIFIER = auto()
     SESSION_TITLE = auto()
     WORKTREE_NAME = auto()
 

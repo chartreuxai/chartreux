@@ -41,12 +41,12 @@ from chartreux.core.config.models import (
     MCPServer,
     MissingAPIKeyError,
     ModelConfig,
-    PlanSectionConfig,
     ProjectContextConfig,
     ProviderConfig,
     PurposeRoute,
     PurposeRouteDefaultsConfig,
     RecoverySectionConfig,
+    SafetySectionConfig,
     SessionLoggingConfig,
     StatusLineConfig,
     SubagentsConfig,
@@ -345,6 +345,17 @@ class ChartreuxConfigSchema(ConfigSchema):
             )
         return value
 
+    @model_validator(mode="before")
+    @classmethod
+    def _reject_retired_plan_section(cls, value: Any) -> Any:
+        if isinstance(value, dict) and "plan" in value:
+            raise ValueError(
+                "'plan' is retired; the /plan plan-mode feature was removed — "
+                "delete the [plan] block from your config and remove the "
+                "CHARTREUX_PLAN__ variables. It has no effect."
+            )
+        return value
+
     @model_validator(mode="after")
     def _validate_compaction_thresholds(
         self, info: ValidationInfo
@@ -624,19 +635,19 @@ class ChartreuxConfigSchema(ConfigSchema):
         default_factory=CompletionSectionConfig
     )
 
-    # PM1: the [plan] section carries the /plan-mode selections —
-    # [plan.planner] model+thinking and [plan.executor] model+thinking+identity.
-    # An ordinary typed section: deep-merge semantics, no resolution machinery.
-    plan: Annotated[PlanSectionConfig, WithDeepMerge()] = Field(
-        default_factory=PlanSectionConfig
-    )
-
     # P5 (chunk 5b): the [keepalive] section carries the cache keep-alive
     # pilot's flag-gated surface — enabled (DEFAULT FALSE), the absolute
     # count cap, the spend cap, and the idle-gap floor. An ordinary typed
     # section: deep-merge semantics, validated like every other section.
     keepalive: Annotated[KeepaliveSectionConfig, WithDeepMerge()] = Field(
         default_factory=KeepaliveSectionConfig
+    )
+
+    # v0.8.0 A-P2: the [safety] section — default_level (safe|smart only,
+    # DANGEROUS is ceremony-only), the SMART classifier model/prompt
+    # resolution keys, and the strict per-session caps.
+    safety: Annotated[SafetySectionConfig, WithDeepMerge()] = Field(
+        default_factory=SafetySectionConfig
     )
 
     def _resolve_main_model(self) -> ResolvedModel:
@@ -739,6 +750,23 @@ class ChartreuxConfigSchema(ConfigSchema):
             thinking=self.thinking_overrides.get(resolved.base_model),
         )
 
+    def get_smart_approve_model(self) -> ModelConfig:
+        """The SMART classifier model (amendment Q4), resolved at use time.
+
+        Mirrors ``get_compaction_model`` with one deliberate difference: the
+        classifier call is pinned to thinking OFF in code — global
+        ``thinking_overrides`` do NOT apply to it (amendment Q3).
+        """
+        from chartreux.core.model_catalog.resolver import resolver_for
+
+        if not self.safety.smart_approve_model:
+            active = self.get_active_model()
+            return active.model_copy(update={"thinking": "off"})
+        resolved = resolver_for(self).resolve(self.safety.smart_approve_model)
+        return resolved.materialize(
+            auto_compact_threshold=self.auto_compact_threshold, thinking="off"
+        )
+
     def get_active_provider(self) -> ProviderConfig:
         return self.get_provider_for_model(self.get_active_model())
 
@@ -798,6 +826,16 @@ class ChartreuxConfigSchema(ConfigSchema):
             self.compaction_prompt_id,
             setting_name="compaction_prompt_id",
             builtins={"compact": UtilityPrompt.COMPACT.path},
+        )
+
+    @property
+    def smart_approve_prompt(self) -> str:
+        return load_prompt(
+            self.safety.smart_approve_prompt_id,
+            setting_name="safety.smart_approve_prompt_id",
+            builtins={
+                "smart-approve-classifier": UtilityPrompt.SMART_APPROVE_CLASSIFIER.path
+            },
         )
 
 

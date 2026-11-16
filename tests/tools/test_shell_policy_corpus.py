@@ -5793,7 +5793,15 @@ def test_f2_https_rows_pin_the_intended_verdicts(fixtures_root: Path) -> None:
             assert proposal is not None, key
             assert proposal["operations"] == ["network.egress"], key
         else:
-            assert context["denial_kind"] is None, key
+            # v0.8.0 A-P2: SYNTAX-class refusals now carry the typed "syntax"
+            # marker (previously only a reason-text prefix, kind stayed None);
+            # policy denials keep None.
+            if str(context["reason"]).startswith(
+                "Command denied: unsupported shell syntax"
+            ):
+                assert context["denial_kind"] == "syntax", key
+            else:
+                assert context["denial_kind"] is None, key
             assert context["proposal"] is None, key
             assert str(context["reason"]).startswith("Command denied:"), key
 
@@ -5873,7 +5881,15 @@ def test_p1d_environment_rows_pin_the_intended_verdicts(fixtures_root: Path) -> 
             assert proposal is not None, key
             assert proposal["operations"] == ["network.egress"], key
         else:
-            assert context["denial_kind"] is None, key
+            # v0.8.0 A-P2: SYNTAX-class refusals now carry the typed "syntax"
+            # marker (previously only a reason-text prefix, kind stayed None);
+            # policy denials keep None.
+            if str(context["reason"]).startswith(
+                "Command denied: unsupported shell syntax"
+            ):
+                assert context["denial_kind"] == "syntax", key
+            else:
+                assert context["denial_kind"] is None, key
             assert context["proposal"] is None, key
             assert str(context["reason"]).startswith("Command denied:"), key
 

@@ -546,6 +546,7 @@ def run_programmatic(
             session = await harness.start()
             await session.resources.runtime.wait_until_ready()
             await _warn_if_workspace_untrusted(session)
+            await _warn_if_legacy_plan_mode(session)
             output.start(session.history)
             async with aclosing(session.act(prompt)) as events:
                 async for event in events:
@@ -621,6 +622,17 @@ async def _warn_if_workspace_untrusted(session: AppServerSession) -> None:
         f"Warning: {details.cwd} is not trusted; project configuration "
         f"({', '.join(detected_files)}) will be ignored. Re-run with --trust "
         "to trust this folder temporarily.",
+        file=sys.stderr,
+    )
+
+
+async def _warn_if_legacy_plan_mode(session: AppServerSession) -> None:
+    if not session.resources.sessions.plan_mode_present:
+        return
+    print(
+        "Warning: this session was created in plan mode, a feature removed in "
+        "v0.8.0; it resumes as a normal session and its plan document is left "
+        "on disk.",
         file=sys.stderr,
     )
 

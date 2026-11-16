@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Callable
 
 from chartreux.core.config import ChartreuxConfigSchema, ModelConfig, ProviderConfig
 from chartreux.core.llm.backend.factory import create_backend
@@ -25,12 +26,26 @@ def select_utility_model(
     return active, config.get_provider_for_model(active)
 
 
+def select_smart_approve_model(
+    config: ChartreuxConfigSchema,
+) -> tuple[ModelConfig, ProviderConfig]:
+    """v0.8.0 A-P2: the SMART classifier's model/provider (amendment Q4).
+
+    Sibling of ``select_utility_model`` reading the ``[safety]`` key through
+    ``get_smart_approve_model()`` (use-time resolution; thinking pinned OFF
+    there). Resolution failures (unknown model, missing/disabled provider)
+    raise here and fail closed at the adjudication site.
+    """
+    model = config.get_smart_approve_model()
+    return model, config.get_provider_for_model(model)
+
+
 def is_fast_utility_model(_config: ChartreuxConfigSchema) -> bool:
     """Whether utility completions use a dedicated cheap fast model."""
     return False
 
 
-async def run_utility_completion(
+async def run_utility_completion(  # noqa: PLR0913 - the A-P2 model_selector adds one arg
     *,
     config: ChartreuxConfigSchema,
     system_prompt: str,
@@ -42,6 +57,10 @@ async def run_utility_completion(
     accounting_sink: AccountingSink | None = None,
     usage_attribution: UsageAttribution | None = None,
     purpose: UsagePurpose = UsagePurpose.CONVERSATION,
+    model_selector: Callable[
+        [ChartreuxConfigSchema], tuple[ModelConfig, ProviderConfig]
+    ]
+    | None = None,
 ) -> str | None:
     """Run a single non-streaming completion for a background nicety.
 
@@ -64,7 +83,11 @@ async def run_utility_completion(
 
     if not user_content.strip():
         return None
-    model, provider = select_utility_model(config)
+    model, provider = (
+        model_selector(config)
+        if model_selector is not None
+        else select_utility_model(config)
+    )
     if (
         skip_if_no_key
         and provider.api_key_env_var

@@ -30,6 +30,7 @@ from chartreux.app_server._subagent_recovery import (
 )
 from chartreux.app_server._subagent_transcript import (
     AGENT_CONFIG_PAYLOAD_KEY,
+    AUTHORITY_SNAPSHOT_PAYLOAD_KEY,
     CHILD_RESULT_FILENAME,
     CHILD_START_MARKER_FILENAME,
     CHILD_TOMBSTONE_FILENAME,
@@ -81,6 +82,11 @@ from chartreux.app_server.subagent_ports import (
 )
 from chartreux.core.agent_loop import AgentLoop
 from chartreux.core.agent_loop._loop_types import AgentRuntimePolicy
+from chartreux.core.agent_loop._safety_authority import (
+    AuthorityLaunchSnapshot,
+    SafetyLevel,
+    SessionAuthorityState,
+)
 from chartreux.core.config._dangerous_command_authority import (
     ProjectDangerousCommandGrant,
     ProjectRemoteExecGrant,
@@ -1026,6 +1032,11 @@ class _HandoffLoop:
         )
         self.config_orchestrator = SimpleNamespace(restrictions=())
         self._dispatch_root_grants = (Path("/granted/one"),)
+        # v0.8.0 A-P0: the fake parent loop carries a real authority state at
+        # the hard-coded SAFE level so the launch snapshot rides the payload.
+        self.authority_state = SessionAuthorityState(
+            session_id="parent", level=SafetyLevel.SAFE
+        )
 
     def file_state_handoff_message(self) -> Any:
         return None if self._content is None else SimpleNamespace(content=self._content)
@@ -1097,6 +1108,10 @@ async def test_process_handoff_payload_carries_the_provisioned_client_identity()
     assert decode_inherited_root_grants(
         handed_over[INHERITED_ROOT_GRANTS_PAYLOAD_KEY]
     ) == (Path("/granted/one"),)
+    # v0.8.0 A-P0: the safety-authority launch snapshot rides the same way.
+    assert AuthorityLaunchSnapshot.decode(
+        handed_over[AUTHORITY_SNAPSHOT_PAYLOAD_KEY]
+    ) == AuthorityLaunchSnapshot(level=SafetyLevel.SAFE)
     assert AgentConfig.model_validate(
         handed_over[AGENT_CONFIG_PAYLOAD_KEY]
     ) == AgentConfig(
@@ -1120,6 +1135,7 @@ async def test_process_handoff_payload_carries_the_provisioned_client_identity()
         INHERITED_RESTRICTIONS_PAYLOAD_KEY,
         INHERITED_MODE_RESTRICTIONS_PAYLOAD_KEY,
         INHERITED_ROOT_GRANTS_PAYLOAD_KEY,
+        AUTHORITY_SNAPSHOT_PAYLOAD_KEY,
     }
     assert decode_inherited_workspace(legacy[INHERITED_WORKSPACE_PAYLOAD_KEY]) == (
         workspace

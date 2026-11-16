@@ -62,6 +62,29 @@ def test_authorized_transcript_worker_reads_through_opened_child_directory(
     assert [entry.display_text for entry in response.entries or []] == ["saved"]
 
 
+def test_projection_marks_only_injected_user_messages() -> None:
+    from chartreux.app_server._agent_transcript import read_live_agent_transcript
+
+    messages = [
+        LLMMessage(role=Role.user, content="typed question", message_id="m-1"),
+        LLMMessage(
+            role=Role.user,
+            content="<file_state_handoff>\nplan.md\n</file_state_handoff>",
+            message_id="m-2",
+            injected=True,
+        ),
+    ]
+    response = read_live_agent_transcript(messages)
+    entries = {entry.entry_id: entry for entry in response.entries or []}
+
+    typed = entries["m-1:text"]
+    assert typed.injected is False
+    assert "injected" not in typed.model_dump(mode="json")
+    handoff = entries["m-2:text"]
+    assert handoff.injected is True
+    assert handoff.model_dump(mode="json")["injected"] is True
+
+
 def test_authorized_transcript_worker_rejects_child_symlink_escape(
     tmp_path: Path,
 ) -> None:

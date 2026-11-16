@@ -38,6 +38,7 @@ __all__ = [
     "SessionFileContainmentError",
     "SessionInfo",
     "SessionLoader",
+    "legacy_plan_mode_path",
 ]
 
 # The transcript viewer must never load arbitrarily large saved sessions.
@@ -62,6 +63,25 @@ class BoundedSessionLoad:
     state: BoundedSessionLoadState
     messages: list[dict[str, Any]] | None = None
     metadata: dict[str, Any] | None = None
+    # True when the RAW metadata dict carried a ``plan_mode`` key: the session
+    # was planned under the removed plan-mode feature. Detection reads the raw
+    # dict here — the typed SessionMetadata drops the retired key
+    # (extra="ignore"), so no typed record is consulted.
+    plan_mode_present: bool = False
+
+
+def legacy_plan_mode_path(raw_metadata: dict[str, Any]) -> str | None:
+    """The plan document path a legacy ``plan_mode`` metadata key records.
+
+    The check runs on the RAW metadata dict at the loader choke point — never
+    on a typed record, whose ``extra="ignore"`` drops the retired key. Returns
+    ``None`` when the session was never planned or the key carries no path.
+    """
+    record = raw_metadata.get("plan_mode")
+    if not isinstance(record, dict):
+        return None
+    path = record.get("plan_path")
+    return path if isinstance(path, str) and path else None
 
 
 # Upper bound for a first-message preview used as a fallback session label.
@@ -117,7 +137,12 @@ class SessionLoader:
             return BoundedSessionLoad(BoundedSessionLoadState.INVALID)
         if not SessionLoader._log_is_loadable(messages, metadata):
             return BoundedSessionLoad(BoundedSessionLoadState.INVALID)
-        return BoundedSessionLoad(BoundedSessionLoadState.AVAILABLE, messages, metadata)
+        return BoundedSessionLoad(
+            BoundedSessionLoadState.AVAILABLE,
+            messages,
+            metadata,
+            plan_mode_present="plan_mode" in metadata,
+        )
 
     @staticmethod
     def _open_bounded_file(path: Path, *, dir_fd: int | None = None) -> BinaryIO:
@@ -412,6 +437,24 @@ class SessionLoader:
             raise ValueError(
                 f"Failed to load session metadata at {session_dir}: {e}"
             ) from e
+
+    @staticmethod
+    def load_raw_metadata(session_dir: Path) -> dict[str, Any]:
+        """The RAW metadata dict, unvalidated, so retired keys survive.
+
+        Detection of removed-feature keys (e.g. ``plan_mode``) reads the raw
+        dict at this choke point — the typed ``SessionMetadata`` drops them
+        (``extra="ignore"``). Metadata-only: never reads the messages log, so
+        it is safe on the resume hot path even before the first message is
+        written. Returns an empty dict when the metadata file is absent or
+        unreadable; callers use this for best-effort flags, never typed loads.
+        """
+        metadata_path = session_dir / METADATA_FILENAME
+        try:
+            raw = json.loads(read_safe(metadata_path).text)
+        except (OSError, UnicodeDecodeError, ValueError):
+            return {}
+        return raw if isinstance(raw, dict) else {}
 
     @staticmethod
     def load_session(filepath: Path) -> tuple[list[LLMMessage], dict[str, Any]]:

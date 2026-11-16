@@ -46,6 +46,7 @@ import time
 from typing import TYPE_CHECKING, Any, Protocol
 
 from chartreux.core.completion_contract import CompletionCheckTemplate
+from chartreux.core.tools.permissions import dangerous_mode_active
 from chartreux.core.tools.secret_redaction import redact
 from chartreux.core.tools.utils import PathAccess, ToolPermission
 from chartreux.core.utils.async_subprocess import (
@@ -254,7 +255,15 @@ class CompletionCheckRunner:
         return target
 
     def _under_authorized_root(self, target: Path) -> bool:
-        """The workspace-authorized containment check for one resolved target."""
+        """The workspace-authorized containment check for one resolved target.
+
+        v0.8.0 A-P1: at SafetyLevel DANGEROUS the authorized-root containment
+        yields with the other file ceilings — the completion contract and the
+        audit classification are kept, the path gate is not. The composed
+        command's shell admission is separately bypassed in the resolver.
+        """
+        if dangerous_mode_active():
+            return True
         return self.workspace.allows(target)
 
     async def run(

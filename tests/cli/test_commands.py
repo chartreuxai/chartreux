@@ -19,8 +19,9 @@ _SKILL_MODULE = "chartreux/core/skills/builtins/chartreux.py"
 _SLASH_TOKEN_RE = re.compile(r"`(/[a-z0-9][a-z0-9-]*)(?![a-z0-9\-/])")
 
 # Slash-shaped tokens in the skill prose that are deliberately not commands:
-# they stand in for the name of a user-invocable skill.
-_NON_COMMAND_TOKENS = frozenset({"/skill", "/skill-name", "/word"})
+# they stand in for the name of a user-invocable skill. `/plan` is retired in
+# v0.8.0: the command is unregistered, and the docs package drops the skill text.
+_NON_COMMAND_TOKENS = frozenset({"/skill", "/skill-name", "/word", "/plan"})
 
 
 class TestCommandRegistry:

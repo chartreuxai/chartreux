@@ -109,7 +109,6 @@ from chartreux.core.usage import UsageAttribution, UsagePurpose
 from chartreux.observability.logging import logger
 
 if TYPE_CHECKING:
-    from chartreux.app_server.protocol import SessionPlanHandoffParams
     from chartreux.app_server.root_agent_process import (
         ReconfigureReply,
         ReplaceReply,
@@ -127,7 +126,6 @@ type TrackStartupProducer = Callable[
     [StartupAccountingContext, asyncio.Task[WorktreeResolution]], None
 ]
 type ReapCohort = Callable[[], Awaitable[object]]
-type PlanSettlement = Callable[[], Awaitable[str | None]]
 
 
 @dataclass(frozen=True, slots=True)
@@ -189,23 +187,13 @@ class ProcessRootReplace:
 class ProcessRootReconfigure:
     """The coordinator's reconfigure leg for a process-backed root.
 
-    Settings and the history clear are short modes; the plan handoff is a long
-    operation. The coordinator-owned preparation never moves across the
-    boundary: the /clear plan-episode settlement and the pin removal are the
-    coordinator TUI's own steps and run BEFORE this leg is entered, so this leg
-    only consults their outcome -- a refused settlement ends the clear with the
-    same "Nothing was cleared" refusal the user reads on the in-process path,
-    and no clear frame is ever sent.
+    Settings and the history clear are short modes; the coordinator-owned
+    preparation never moves across the boundary, so each leg simply forwards
+    to the agent process and acknowledges its reply.
     """
 
-    def __init__(
-        self,
-        *,
-        process: RootAgentProcess,
-        plan_settlement: PlanSettlement | None = None,
-    ) -> None:
+    def __init__(self, *, process: RootAgentProcess) -> None:
         self._process = process
-        self._plan_settlement = plan_settlement
 
     async def update_settings(
         self, *, max_turns: int | None = None, max_tokens: int | None = None
@@ -216,20 +204,8 @@ class ProcessRootReconfigure:
         )
 
     async def clear_history(self) -> ReconfigureReply:
-        """Refuse a clear still blocked by its plan settlement, else send it."""
-        if self._plan_settlement is not None:
-            refusal = await self._plan_settlement()
-            if refusal is not None:
-                raise RequestFailure(
-                    ProtocolErrorCode.CONFLICT,
-                    f"Clear refused: {refusal} Nothing was cleared; the plan "
-                    "episode keeps its state.",
-                )
+        """Send the history clear to the agent process."""
         return await self._process.clear_history()
-
-    async def plan_handoff(self, params: SessionPlanHandoffParams) -> ReconfigureReply:
-        """Send the consented handoff; the agent runs the full fence."""
-        return await self._process.plan_handoff(params)
 
 
 class SessionRuntimeControllerImpl:

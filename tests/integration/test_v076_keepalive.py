@@ -1,18 +1,15 @@
 """P5 chunk 5a: the strict ping accountant (core/agent_loop/_keepalive.py).
 
 The settled contract under test: the accountant is synchronous, conservative,
-and fail-closed — before each ping it reserves the prospective MAXIMUM cost
-against the absolute count + spend caps, priced in BILLABLE tokens (a
-proven-conservative provider-specific input bound incl. framing at the
-uncached input rate, plus declared max completion tokens at the completion
-price); without the conversion, prices, declared limit, attribution, or ledger
-sink it halts the deployment and no ping is sent. Supersession releases the
-reservation unspent; unknown-usage and cancelled attempts retain their full
-reservation; reconciliation on recorded usage releases reservation-minus-
-actual; the count cap counts ATTEMPTS (superseded included); every attempt
-writes a purpose=keepalive ledger row so the ledger reconstructs cap burn; and
-the gateway's ping path bypasses the finalize missing-sink tolerance — pings
-REQUIRE a sink, while ordinary calls keep the tolerance.
+and fail-closed — before each ping it reserves one ATTEMPT against the
+absolute count cap (the USD spend cap is retired: the pilot is
+attempt-capped only); without the attribution or the ledger sink it halts
+the deployment and no ping is sent. Supersession still counts the attempt;
+reconciliation settles on the recorded usage; the count cap counts ATTEMPTS
+(superseded included); every attempt writes a purpose=keepalive ledger row
+carrying its precise outcome; and the gateway's ping path bypasses the
+finalize missing-sink tolerance — pings REQUIRE a sink, while ordinary
+calls keep the tolerance.
 
 Chunk 5b (TestSnapshot): the SNAPSHOT section — the IMMUTABLE serialized
 cache-relevant prefix is snapshotted pinned to one deployment/provider and
@@ -21,14 +18,15 @@ INVALIDATED (dropped, never mutated) on any of the six design triggers
 activity incl. partial wakes, deployment failover); the ping-only generation
 settings are specified separately from the session's ordinary generation
 settings; and the [keepalive] config section ships enabled=false with
-validated caps (absolute count cap, spend cap, idle-gap floor).
+validated caps (absolute count cap, idle-gap floor) and rejects the retired
+``max_spend_usd`` key with a pointed diagnostic.
 
 Chunk 5c (TestScheduling, TestObserve, TestBudgetIsolation, TestFlagOff): the
 SCHEDULER + OBSERVE sections — ROOT-ONLY (never children), only while owned
 dependency runs are active AND the idle gap >= the configured floor, at most
 one ping in flight, supersession in BOTH phases (reserved pre-send =>
-``superseded`` released unspent; in-flight => cancelled, full reservation
-retained), ping responses never executed and never appended; the ping's OWN
+``superseded``; in-flight => cancelled — both still counted as attempts),
+ping responses never executed and never appended; the ping's OWN
 reported usage is observed and the idle cycle STOPs on cache miss,
 missing/partial usage, error, or insufficient cached-prefix coverage; the
 purpose split at the gateway's stats accumulation excludes pings from the
@@ -45,9 +43,6 @@ from collections.abc import Callable
 from dataclasses import FrozenInstanceError, fields, replace
 from datetime import UTC, datetime, timedelta
 import hashlib
-import json
-from math import ceil
-from pathlib import Path
 from typing import Any
 
 from pydantic import ValidationError
@@ -56,7 +51,6 @@ import pytest
 from chartreux.core.agent_loop._keepalive import (
     DEFAULT_MIN_CACHED_PREFIX_COVERAGE,
     DEFAULT_PING_MAX_TOKENS,
-    BillableInputRule,
     KeepaliveAccountant,
     KeepaliveCapExceededError,
     KeepaliveCaps,
@@ -76,8 +70,6 @@ from chartreux.core.agent_loop._keepalive import (
     PingGenerationSettings,
     PingTransport,
     observe_ping_usage,
-    reconstruct_keepalive_burn,
-    register_billable_input_rule,
 )
 from chartreux.core.agent_loop.errors import KeepaliveSinkRequiredError
 from chartreux.core.agent_loop.llm_gateway import (
@@ -92,9 +84,10 @@ from chartreux.core.config.chartreux_schema import (
     ChartreuxConfigSchema,
     create_default_config,
 )
+from chartreux.core.config.layer import LayerImplementationError
+from chartreux.core.config.layers.environment import EnvironmentLayer
 from chartreux.core.config.models import (
     DEFAULT_KEEPALIVE_MAX_ATTEMPTS,
-    DEFAULT_KEEPALIVE_MAX_SPEND_USD,
     DEFAULT_KEEPALIVE_MIN_IDLE_GAP_SECONDS,
     KeepaliveSectionConfig,
 )
@@ -118,25 +111,12 @@ from chartreux.core.middleware import (
 from chartreux.core.session_types import AgentStats
 from chartreux.core.usage import (
     KeepaliveLedgerEntry,
-    SnapshotState,
     UsageAttribution,
     UsagePurpose,
-    UsageReader,
     UsageRecord,
     UsageState,
-    UsageWriteDisposition,
-    UsageWriter,
-    capture_prices,
-    price_usage,
 )
 from tests.stubs.fake_backend import FakeBackend
-
-# The synthetic provider bills ceil(bytes / 4) + 16 framing tokens; the
-# registered rule (ceil(bytes / 3) + 32) provably dominates it for every size.
-SYNTHETIC_CHARS_PER_TOKEN = 4
-SYNTHETIC_FRAMING_TOKENS = 16
-SYNTHETIC_RULE = BillableInputRule(chars_per_token=3.0, framing_tokens=32)
-register_billable_input_rule("synthetic", SYNTHETIC_RULE)
 
 INPUT_PRICE = 3.0
 OUTPUT_PRICE = 6.0
@@ -151,11 +131,6 @@ ATTRIBUTION = UsageAttribution(
     wire_name="stale-wire",
     project_key="project",
 )
-
-
-def synthetic_billed_input_tokens(request_bytes: int) -> int:
-    """What the synthetic provider bills for a complete request, framing included."""
-    return ceil(request_bytes / SYNTHETIC_CHARS_PER_TOKEN) + SYNTHETIC_FRAMING_TOKENS
 
 
 def _model(**overrides: Any) -> ModelConfig:
@@ -188,7 +163,7 @@ def _accountant(
     attribution: UsageAttribution | None = ATTRIBUTION,
 ) -> KeepaliveAccountant:
     return KeepaliveAccountant(
-        caps=caps or KeepaliveCaps(max_attempts=100, max_spend_usd=1.0),
+        caps=caps or KeepaliveCaps(max_attempts=100),
         model=model or _model(),
         provider=provider,
         attribution=attribution,
@@ -241,100 +216,54 @@ class _AttemptBackend(FakeBackend):
 
 
 class TestAccountant:
-    def test_fail_closed_without_a_registered_conversion_halts_the_deployment(self):
+    def test_an_unregistered_provider_conversion_no_longer_halts_the_deployment(self):
+        # The billable-input conversion served USD estimation only; with the
+        # spend cap retired, reserve counts the attempt regardless of provider.
         sink = _ListSink()
         accountant = _accountant(provider="unregistered-provider", ledger=sink)
 
-        with pytest.raises(KeepaliveFailClosedError):
-            accountant.reserve(1000, PING_MAX_TOKENS)
-        assert accountant.halted
-        assert accountant.attempts == 0
-        # The halt sticks for the deployment: later reserves stay fail-closed.
-        with pytest.raises(KeepaliveFailClosedError):
-            accountant.reserve(1000, PING_MAX_TOKENS)
+        accountant.reserve()
+
+        assert not accountant.halted
+        assert accountant.attempts == 1
         assert sink.records == []
 
-    def test_fail_closed_without_prices_halts_the_deployment(self):
+    def test_unknown_prices_no_longer_halt_the_deployment(self):
+        # Same for the price capture: it now feeds only the ledger row's cost
+        # fields, never a cap check.
         for overrides in ({"input_price_known": False}, {"output_price_known": False}):
             accountant = _accountant(model=_model(**overrides))
-            with pytest.raises(KeepaliveFailClosedError):
-                accountant.reserve(1000, PING_MAX_TOKENS)
-            assert accountant.halted
-            assert accountant.attempts == 0
+            accountant.reserve()
+            assert not accountant.halted
+            assert accountant.attempts == 1
 
     def test_fail_closed_without_a_ledger_sink_or_attribution(self):
         no_sink = KeepaliveAccountant(
-            caps=KeepaliveCaps(max_attempts=10, max_spend_usd=1.0),
+            caps=KeepaliveCaps(max_attempts=10),
             model=_model(),
             provider="synthetic",
             attribution=ATTRIBUTION,
             ledger=None,
         )
         with pytest.raises(KeepaliveFailClosedError):
-            no_sink.reserve(1000, PING_MAX_TOKENS)
+            no_sink.reserve()
         assert no_sink.halted
+        # The halt sticks for the deployment: later reserves stay fail-closed.
+        with pytest.raises(KeepaliveFailClosedError):
+            no_sink.reserve()
 
         no_attribution = _accountant(attribution=None)
         with pytest.raises(KeepaliveFailClosedError):
-            no_attribution.reserve(1000, PING_MAX_TOKENS)
+            no_attribution.reserve()
         assert no_attribution.halted
 
-    def test_fail_closed_without_a_declared_output_limit(self):
-        accountant = _accountant()
-        with pytest.raises(KeepaliveFailClosedError):
-            accountant.reserve(1000, None)
-        assert accountant.halted
-        assert accountant.attempts == 0
-
-    @pytest.mark.parametrize(
-        "request_bytes",
-        [0, 1, 3, 4, 5, 12, 16, 17, 63, 64, 100, 255, 1024, 4097, 65537],
-    )
-    def test_the_reservation_never_undercounts_billed_tokens_incl_framing(
-        self, request_bytes: int
-    ) -> None:
-        accountant = _accountant()
-        reservation = accountant.reserve(request_bytes, PING_MAX_TOKENS)
-
-        billed = synthetic_billed_input_tokens(request_bytes)
-        assert reservation.reserved_input_tokens >= billed
-        assert reservation.reserved_input_tokens == SYNTHETIC_RULE.bound(request_bytes)
-
-    def test_the_reservation_is_priced_in_billable_tokens_at_the_uncached_rate(self):
-        accountant = _accountant()
-        reservation = accountant.reserve(1000, PING_MAX_TOKENS)
-
-        # Billable tokens, not bytes: pricing the byte count would differ.
-        expected = (
-            reservation.reserved_input_tokens * INPUT_PRICE
-            + PING_MAX_TOKENS * OUTPUT_PRICE
-        ) / 1_000_000
-        assert reservation.reserved_cost_usd == pytest.approx(expected)
-        assert reservation.reserved_cost_usd != pytest.approx(
-            (1000 * INPUT_PRICE + PING_MAX_TOKENS * OUTPUT_PRICE) / 1_000_000
-        )
-        # The whole input bound is priced at the UNCACHED rate, never the
-        # cheaper cached rate.
-        assert (
-            reservation.reserved_cost_usd
-            > (
-                reservation.reserved_input_tokens * CACHED_INPUT_PRICE
-                + PING_MAX_TOKENS * OUTPUT_PRICE
-            )
-            / 1_000_000
-        )
-
-    def test_supersession_releases_the_reservation_unspent(self):
+    def test_supersession_still_counts_the_attempt_and_writes_a_superseded_row(self):
         sink = _ListSink()
         accountant = _accountant(ledger=sink)
-        reservation = accountant.reserve(1000, PING_MAX_TOKENS)
-        assert accountant.charged_spend_usd == pytest.approx(
-            reservation.reserved_cost_usd
-        )
+        reservation = accountant.reserve()
 
         accountant.supersede(reservation)
 
-        assert accountant.charged_spend_usd == 0.0
         # The superseded attempt still counts against the count cap.
         assert accountant.attempts == 1
         assert accountant.open_attempts == 0
@@ -342,192 +271,75 @@ class TestAccountant:
         assert row.purpose is UsagePurpose.KEEPALIVE
         assert row.keepalive is not None
         assert row.keepalive.outcome is KeepaliveOutcome.SUPERSEDED
-        assert row.keepalive.retained_cost_usd == 0.0
-        assert row.keepalive.reserved_cost_usd == pytest.approx(
-            reservation.reserved_cost_usd
-        )
 
-    def test_unknown_usage_and_cancelled_attempts_retain_the_full_reservation(self):
+    def test_unknown_usage_and_cancelled_attempts_settle_their_rows(self):
         sink = _ListSink()
         accountant = _accountant(ledger=sink)
-        first = accountant.reserve(1000, PING_MAX_TOKENS)
-        second = accountant.reserve(2000, PING_MAX_TOKENS)
+        first = accountant.reserve()
+        second = accountant.reserve()
 
         accountant.mark_unknown_usage(first)
         accountant.cancel(second)
 
-        assert accountant.charged_spend_usd == pytest.approx(
-            first.reserved_cost_usd + second.reserved_cost_usd
-        )
         assert accountant.attempts == 2
         assert [_entry(row).outcome for row in sink.records] == [
             KeepaliveOutcome.UNKNOWN_USAGE,
             KeepaliveOutcome.CANCELLED,
         ]
-        for row, reservation in zip(sink.records, (first, second), strict=True):
-            assert row.keepalive is not None
-            assert row.keepalive.retained_cost_usd == pytest.approx(
-                reservation.reserved_cost_usd
-            )
 
-    def test_reconciliation_releases_reservation_minus_actual(self):
+    def test_reconciliation_settles_on_the_recorded_actual_usage(self):
         sink = _ListSink()
         accountant = _accountant(ledger=sink)
-        request_bytes = 1000
-        reservation = accountant.reserve(request_bytes, PING_MAX_TOKENS)
-        billed_input = synthetic_billed_input_tokens(request_bytes)
+        reservation = accountant.reserve()
 
         accountant.reconcile(
-            reservation,
-            input_tokens=billed_input,
-            output_tokens=20,
-            cached_input_tokens=100,
+            reservation, input_tokens=1010, output_tokens=20, cached_input_tokens=100
         )
 
-        actual = price_usage(
-            input_tokens=billed_input,
-            output_tokens=20,
-            cached_input_tokens=100,
-            prices=capture_prices(_model()),
-        ).known_cost_usd
-        # The reservation is conservative: it never undercounts the billed input.
-        assert reservation.reserved_input_tokens >= billed_input
-        assert actual < reservation.reserved_cost_usd
-        assert accountant.charged_spend_usd == pytest.approx(actual)
         (row,) = sink.records
         assert row.keepalive is not None
         assert row.keepalive.outcome is KeepaliveOutcome.COMPLETED
-        assert row.keepalive.retained_cost_usd == pytest.approx(actual)
-        assert row.keepalive.reserved_cost_usd == pytest.approx(
-            reservation.reserved_cost_usd
-        )
         assert row.purpose is UsagePurpose.KEEPALIVE
-        assert row.input_tokens == billed_input
+        assert row.input_tokens == 1010
+        assert row.output_tokens == 20
+        assert row.cached_input_tokens == 100
         assert row.usage_state is UsageState.COMPLETE
+        assert row.known_cost_usd > 0.0
 
     def test_partial_recorded_usage_falls_back_to_unknown_usage(self):
         sink = _ListSink()
         accountant = _accountant(ledger=sink)
-        reservation = accountant.reserve(1000, PING_MAX_TOKENS)
+        reservation = accountant.reserve()
 
         accountant.reconcile(
             reservation, input_tokens=266, output_tokens=None, cached_input_tokens=None
         )
 
-        assert accountant.charged_spend_usd == pytest.approx(
-            reservation.reserved_cost_usd
-        )
         assert _entry(sink.records[0]).outcome is KeepaliveOutcome.UNKNOWN_USAGE
 
     def test_the_count_cap_counts_attempts_not_completions(self):
-        accountant = _accountant(caps=KeepaliveCaps(max_attempts=2, max_spend_usd=1.0))
-        first = accountant.reserve(100, PING_MAX_TOKENS)
+        accountant = _accountant(caps=KeepaliveCaps(max_attempts=2))
+        first = accountant.reserve()
         # Superseded — never completed — yet still a counted attempt.
         accountant.supersede(first)
-        accountant.reserve(100, PING_MAX_TOKENS)
+        accountant.reserve()
 
         with pytest.raises(KeepaliveCapExceededError):
-            accountant.reserve(100, PING_MAX_TOKENS)
+            accountant.reserve()
 
         assert accountant.attempts == 2
         assert not accountant.halted
 
-    def test_the_spend_cap_denies_a_reservation_that_does_not_fit(self):
-        probe = _accountant()
-        first = probe.reserve(1000, PING_MAX_TOKENS)
-        sink = _ListSink()
-        accountant = _accountant(
-            caps=KeepaliveCaps(max_attempts=10, max_spend_usd=first.reserved_cost_usd),
-            ledger=sink,
-        )
-
-        reserved = accountant.reserve(1000, PING_MAX_TOKENS)
-        with pytest.raises(KeepaliveCapExceededError):
-            accountant.reserve(1000, PING_MAX_TOKENS)
-
-        assert accountant.attempts == 1
-        assert accountant.charged_spend_usd == pytest.approx(reserved.reserved_cost_usd)
-        assert sink.records == []
-
     def test_a_settled_reservation_cannot_be_settled_twice(self):
         sink = _ListSink()
         accountant = _accountant(ledger=sink)
-        reservation = accountant.reserve(1000, PING_MAX_TOKENS)
+        reservation = accountant.reserve()
         accountant.supersede(reservation)
 
         with pytest.raises(KeepaliveReservationStateError):
             accountant.cancel(reservation)
 
         assert len(sink.records) == 1
-
-    def test_the_ledger_reconstructs_cap_burn_from_rows(self, tmp_path: Path) -> None:
-        writer = UsageWriter(tmp_path / "usage")
-        dispositions = []
-
-        def sink(record: UsageRecord) -> None:
-            dispositions.append(writer.append(record))
-
-        accountant = KeepaliveAccountant(
-            caps=KeepaliveCaps(max_attempts=10, max_spend_usd=1.0),
-            model=_model(),
-            provider="synthetic",
-            attribution=ATTRIBUTION,
-            ledger=sink,
-        )
-        superseded = accountant.reserve(1000, PING_MAX_TOKENS)
-        accountant.supersede(superseded)
-        unknown = accountant.reserve(2000, PING_MAX_TOKENS)
-        accountant.mark_unknown_usage(unknown)
-        cancelled = accountant.reserve(3000, PING_MAX_TOKENS)
-        accountant.cancel(cancelled)
-        completed = accountant.reserve(4000, PING_MAX_TOKENS)
-        accountant.reconcile(
-            completed, input_tokens=1010, output_tokens=8, cached_input_tokens=10
-        )
-
-        assert all(
-            result.disposition is UsageWriteDisposition.APPENDED
-            for result in dispositions
-        )
-        snapshot = UsageReader(tmp_path / "usage").reconcile()
-        assert snapshot.state is SnapshotState.READY
-        records = snapshot.records
-        assert len(records) == 4
-        assert all(record.purpose is UsagePurpose.KEEPALIVE for record in records)
-        assert [_entry(record).outcome for record in records] == [
-            KeepaliveOutcome.SUPERSEDED,
-            KeepaliveOutcome.UNKNOWN_USAGE,
-            KeepaliveOutcome.CANCELLED,
-            KeepaliveOutcome.COMPLETED,
-        ]
-
-        burn = reconstruct_keepalive_burn(records)
-        assert burn == accountant.burn()
-        assert burn.attempts == 4
-        expected_spend = (
-            unknown.reserved_cost_usd
-            + cancelled.reserved_cost_usd
-            + (
-                price_usage(
-                    input_tokens=1010,
-                    output_tokens=8,
-                    cached_input_tokens=10,
-                    prices=capture_prices(_model()),
-                ).known_cost_usd
-            )
-        )
-        assert burn.retained_spend_usd == pytest.approx(expected_spend)
-
-        # The serialized row carries the keepalive entry; a row without one
-        # keeps its exact pre-keepalive shape (the field is omitted when unset).
-        first_line = (tmp_path / "usage" / "root" / "usage.jsonl").read_bytes()
-        payload = json.loads(first_line.splitlines()[0])
-        assert payload["purpose"] == "keepalive"
-        assert payload["keepalive"]["outcome"] == "superseded"
-        ordinary = records[0].model_copy(
-            update={"purpose": UsagePurpose.CONVERSATION, "keepalive": None}
-        )
-        assert "keepalive" not in json.loads(ordinary.model_dump_json())
 
     @pytest.mark.asyncio
     async def test_the_gateway_rejects_a_keepalive_ping_without_a_sink(self) -> None:
@@ -780,7 +592,6 @@ class TestSnapshot:
         assert create_default_config()["keepalive"] == {
             "enabled": False,
             "max_attempts": DEFAULT_KEEPALIVE_MAX_ATTEMPTS,
-            "max_spend_usd": DEFAULT_KEEPALIVE_MAX_SPEND_USD,
             "min_idle_gap_seconds": DEFAULT_KEEPALIVE_MIN_IDLE_GAP_SECONDS,
         }
 
@@ -794,17 +605,9 @@ class TestSnapshot:
         with pytest.raises(ValidationError):
             KeepaliveSectionConfig(max_attempts=2.5)  # type: ignore[arg-type] # strict int
         with pytest.raises(ValidationError):
-            KeepaliveSectionConfig(max_spend_usd=-0.01)
-        with pytest.raises(ValidationError):
-            KeepaliveSectionConfig(max_spend_usd=float("nan"))
-        with pytest.raises(ValidationError):
-            KeepaliveSectionConfig(max_spend_usd=True)  # a bool is not a cap
-        with pytest.raises(ValidationError):
             KeepaliveSectionConfig(min_idle_gap_seconds=-1.0)
         with pytest.raises(ValidationError):
             KeepaliveSectionConfig(min_idle_gap_seconds=True)
-        with pytest.raises(ValidationError):
-            KeepaliveSectionConfig(enabled=True, max_spend_usd=0.0)
         with pytest.raises(ValidationError):
             KeepaliveSectionConfig(enabled="yes")  # type: ignore[arg-type] # strict bool
         with pytest.raises(ValidationError):
@@ -814,24 +617,45 @@ class TestSnapshot:
             "keepalive": {
                 "enabled": True,
                 "max_attempts": 7,
-                "max_spend_usd": 0.25,
                 "min_idle_gap_seconds": 300.0,
             }
         })
         assert config.keepalive.enabled is True
         assert config.keepalive.max_attempts == 7
-        assert config.keepalive.max_spend_usd == 0.25
         assert config.keepalive.min_idle_gap_seconds == 300.0
 
         # Deep-merge: a sparse layer keeps every other typed default.
         sparse = ChartreuxConfigSchema.model_validate({"keepalive": {"enabled": True}})
         assert sparse.keepalive.enabled is True
         assert sparse.keepalive.max_attempts == DEFAULT_KEEPALIVE_MAX_ATTEMPTS
-        assert sparse.keepalive.max_spend_usd == DEFAULT_KEEPALIVE_MAX_SPEND_USD
         assert (
             sparse.keepalive.min_idle_gap_seconds
             == DEFAULT_KEEPALIVE_MIN_IDLE_GAP_SECONDS
         )
+
+    def test_enabled_true_is_self_sufficient_without_any_spend_cap(self) -> None:
+        section = KeepaliveSectionConfig.model_validate({"enabled": True})
+        assert section.enabled is True
+        assert section.max_attempts == DEFAULT_KEEPALIVE_MAX_ATTEMPTS
+
+    def test_max_spend_usd_is_rejected_as_retired_on_the_source_path(self) -> None:
+        with pytest.raises(ValidationError, match="max_spend_usd is retired"):
+            KeepaliveSectionConfig.model_validate({"max_spend_usd": 0.25})
+        with pytest.raises(ValidationError, match="max_spend_usd is retired"):
+            ChartreuxConfigSchema.model_validate({"keepalive": {"max_spend_usd": 0.25}})
+
+    @pytest.mark.asyncio
+    async def test_max_spend_usd_is_rejected_as_retired_on_the_environment_path(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("CHARTREUX_KEEPALIVE__MAX_SPEND_USD", "0.25")
+        layer = EnvironmentLayer(schema=ChartreuxConfigSchema)
+        with pytest.raises(LayerImplementationError) as raised:
+            await layer.load()
+        # The env-name walker rejects the now-unknown nested leaf by name
+        # (fail-closed, no effect); the pointed retired message is the
+        # source path's job (covered above).
+        assert "max_spend_usd" in str(raised.value.__cause__)
 
 
 # ---------------------------------------------------------------------------
@@ -965,7 +789,7 @@ class _Rig:
         self.store = KeepaliveSnapshotStore(clock=self.clock)
         self.sink = _ListSink()
         self.accountant = KeepaliveAccountant(
-            caps=caps or KeepaliveCaps(max_attempts=100, max_spend_usd=1.0),
+            caps=caps or KeepaliveCaps(max_attempts=100),
             model=_model(),
             provider="synthetic",
             attribution=ATTRIBUTION,
@@ -1106,7 +930,7 @@ class TestScheduling:
         assert not rig.scheduler.in_flight
 
     @pytest.mark.asyncio
-    async def test_supersession_in_the_reserved_phase_releases_unspent(self) -> None:
+    async def test_supersession_in_the_reserved_phase_settles_superseded(self) -> None:
         rig = _Rig(block=asyncio.Event())
         rig.snapshot()
         rig.clock.advance(300)
@@ -1125,16 +949,12 @@ class TestScheduling:
         assert rig.backend.calls == 0
         assert rig.accountant.attempts == 1
         assert rig.accountant.open_attempts == 0
-        assert rig.accountant.charged_spend_usd == 0.0
         (row,) = rig.sink.records
         assert _entry(row).outcome is KeepaliveOutcome.SUPERSEDED
-        assert _entry(row).retained_cost_usd == 0.0
         assert not rig.scheduler.in_flight
 
     @pytest.mark.asyncio
-    async def test_supersession_in_the_in_flight_phase_cancels_and_retains(
-        self,
-    ) -> None:
+    async def test_supersession_in_the_in_flight_phase_cancels(self) -> None:
         block = asyncio.Event()
         rig = _Rig(block=block)
         rig.snapshot()
@@ -1152,11 +972,8 @@ class TestScheduling:
         assert record.superseded
         assert record.phase_reached is KeepalivePhase.IN_FLIGHT
         assert rig.accountant.open_attempts == 0
-        # The wire request may have been billed: the FULL reservation is retained.
-        assert rig.accountant.charged_spend_usd > 0.0
         (row,) = rig.sink.records
         assert _entry(row).outcome is KeepaliveOutcome.CANCELLED
-        assert _entry(row).retained_cost_usd > 0.0
         assert not rig.scheduler.in_flight
 
         # While the real call is active, no new ping — and its start
@@ -1210,7 +1027,7 @@ class TestScheduling:
 
     @pytest.mark.asyncio
     async def test_the_timer_ticks_while_enabled_and_stops_on_the_cap(self) -> None:
-        rig = _Rig(caps=KeepaliveCaps(max_attempts=2, max_spend_usd=1.0))
+        rig = _Rig(caps=KeepaliveCaps(max_attempts=2))
         rig.refresh()
         rig.clock.advance(300)
         ticks = 0
@@ -1240,7 +1057,7 @@ class TestScheduling:
         store = KeepaliveSnapshotStore(clock=clock)
         sink = _ListSink()
         accountant = KeepaliveAccountant(
-            caps=KeepaliveCaps(max_attempts=100, max_spend_usd=1.0),
+            caps=KeepaliveCaps(max_attempts=100),
             model=_model(),
             provider="synthetic",
             attribution=ATTRIBUTION,
@@ -1250,9 +1067,7 @@ class TestScheduling:
         backend = _PingBackend()
         stats = AgentStats()
         rows: list[UsageRecord] = []
-        config = KeepaliveSectionConfig(
-            enabled=True, max_spend_usd=1.0, min_idle_gap_seconds=600.0
-        )
+        config = KeepaliveSectionConfig(enabled=True, min_idle_gap_seconds=600.0)
         scheduler = KeepaliveScheduler.from_config(
             config,
             gates=KeepaliveGates(
@@ -1346,7 +1161,7 @@ class TestObserve:
         ]
 
     @pytest.mark.asyncio
-    async def test_an_error_stops_the_cycle_and_retains_the_reservation(self) -> None:
+    async def test_an_error_stops_the_cycle_and_settles_unknown_usage(self) -> None:
         rig = _Rig(error=RuntimeError("boom"))
         rig.refresh()
         rig.clock.advance(300)
@@ -1358,7 +1173,6 @@ class TestObserve:
         assert record.stop is KeepaliveStopReason.ERROR
         assert rig.scheduler.stopped is KeepaliveStopReason.ERROR
         assert rig.accountant.open_attempts == 0
-        assert rig.accountant.charged_spend_usd > 0.0
         (row,) = rig.sink.records
         assert _entry(row).outcome is KeepaliveOutcome.UNKNOWN_USAGE
 
@@ -1375,7 +1189,6 @@ class TestObserve:
         assert record.stop is KeepaliveStopReason.PARTIAL_USAGE
         (row,) = rig.sink.records
         assert _entry(row).outcome is KeepaliveOutcome.UNKNOWN_USAGE
-        assert rig.accountant.charged_spend_usd > 0.0
 
     @pytest.mark.asyncio
     async def test_insufficient_coverage_stops_but_reconciles_completed(self) -> None:
@@ -1390,8 +1203,6 @@ class TestObserve:
         assert record.stop is KeepaliveStopReason.INSUFFICIENT_CACHED_COVERAGE
         (row,) = rig.sink.records
         assert _entry(row).outcome is KeepaliveOutcome.COMPLETED
-        # Reservation-minus-actual was released on the recorded usage.
-        assert rig.accountant.charged_spend_usd < _entry(row).reserved_cost_usd
 
     @pytest.mark.asyncio
     async def test_a_clean_hit_does_not_stop_and_the_cycle_can_ping_again(self) -> None:
@@ -1611,7 +1422,7 @@ class TestFlagOff:
         store = KeepaliveSnapshotStore(clock=clock)
         sink = _ListSink()
         accountant = KeepaliveAccountant(
-            caps=KeepaliveCaps(max_attempts=100, max_spend_usd=1.0),
+            caps=KeepaliveCaps(max_attempts=100),
             model=_model(),
             provider="synthetic",
             attribution=ATTRIBUTION,
@@ -1667,3 +1478,95 @@ class TestFlagOff:
         assert sink.records == []
         assert rows == []
         assert scheduler.records == ()
+
+
+class TestWiring:
+    """v0.8.0 C2: the wiring-level contract — root gate, supersession through
+    the fake transport in both phases, flag-off zero behavior, and the
+    attempts cap ending the timer.
+    """
+
+    @pytest.mark.asyncio
+    async def test_from_config_root_gate_true_and_false(self) -> None:
+        rig = _Rig(is_root=True)
+        rig.snapshot()
+        rig.clock.advance(300)
+        task = await rig.scheduler.maybe_ping()
+        assert task is not None
+        await task
+        assert rig.backend.calls == 1
+
+        child = _Rig(is_root=False)
+        child.snapshot()
+        child.clock.advance(300)
+        assert await child.scheduler.maybe_ping() is None
+        assert child.backend.calls == 0
+        assert child.accountant.attempts == 0
+
+    @pytest.mark.asyncio
+    async def test_supersession_mid_reserved_and_mid_in_flight(self) -> None:
+        # Mid-RESERVED: the real call starts before the transport ran.
+        rig = _Rig(block=asyncio.Event())
+        rig.snapshot()
+        rig.clock.advance(300)
+        task = await rig.scheduler.maybe_ping()
+        assert task is not None
+        assert rig.scheduler.phase is KeepalivePhase.RESERVED
+        rig.scheduler.notify_real_call_started()
+        record = await task
+        assert record.superseded
+        assert record.phase_reached is KeepalivePhase.RESERVED
+        assert rig.backend.calls == 0
+        assert rig.accountant.attempts == 1
+
+        # Mid-IN-FLIGHT: the transport is running when the real call starts.
+        block = asyncio.Event()
+        rig2 = _Rig(block=block)
+        rig2.snapshot()
+        rig2.clock.advance(300)
+        task2 = await rig2.scheduler.maybe_ping()
+        assert task2 is not None
+        await asyncio.sleep(0)
+        assert rig2.scheduler.phase is KeepalivePhase.IN_FLIGHT
+        assert rig2.backend.calls == 1
+        rig2.scheduler.notify_real_call_started()
+        record2 = await task2
+        assert record2.superseded
+        assert record2.phase_reached is KeepalivePhase.IN_FLIGHT
+        block.set()
+
+    @pytest.mark.asyncio
+    async def test_flag_off_produces_zero_tasks_and_zero_ledger_rows(self) -> None:
+        rig = _Rig(enabled=False)
+        rig.snapshot()
+        rig.clock.advance(10_000)
+        assert await rig.scheduler.maybe_ping() is None
+        assert not rig.scheduler.in_flight
+        assert rig.backend.calls == 0
+        assert rig.sink.records == []
+        # run() returns immediately: the timer never ticks.
+        slept: list[float] = []
+
+        async def spy_sleep(seconds: float) -> None:
+            slept.append(seconds)
+
+        await rig.scheduler.run(spy_sleep)
+        assert slept == []
+
+    @pytest.mark.asyncio
+    async def test_attempts_cap_ends_the_timer(self) -> None:
+        rig = _Rig(caps=KeepaliveCaps(max_attempts=1))
+        rig.snapshot()
+        rig.clock.advance(300)
+        task = await rig.scheduler.maybe_ping()
+        assert task is not None
+        await task
+        assert rig.backend.calls == 1
+
+        # The cap is absolute for the session: the next tick stops the cycle.
+        rig.refresh()
+        rig.clock.advance(300)
+        assert await rig.scheduler.maybe_ping() is None
+        assert rig.scheduler.stopped is KeepaliveStopReason.CAP_EXCEEDED
+        assert rig.backend.calls == 1
+        assert rig.accountant.attempts == 1

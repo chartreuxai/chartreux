@@ -47,6 +47,7 @@ from chartreux.core.subagent_submission import (
     transient_skip_notice,
     verify_admission_policy,
 )
+from chartreux.core.tools.permissions import dangerous_mode_active
 from chartreux.core.tools.secret_scan import (
     MANIFEST_FILENAME,
     FindingReason,
@@ -1516,13 +1517,26 @@ class SubagentRunAccumulator:
             # the missing sentinel path itself, so the gate adds the
             # scan-incomplete finding explicitly, with its closed
             # unknown_write_footprint reason code.
-            findings.append(
-                incomplete_finding(
+            # v0.8.0 A-P1: at SafetyLevel DANGEROUS unrestricted shell syntax
+            # makes write footprints unknowable by construction, so the
+            # unknown footprint is REPORTED (logged here, and stamped on the
+            # result by the caller) but never rejects the submission on its
+            # own — real scan findings still block. Never certify coverage.
+            if dangerous_mode_active():
+                logger.warning(
+                    "Subagent submission under DANGEROUS mode carries an "
+                    "unestablished write footprint (%s); reported, not "
+                    "blocking",
                     UNKNOWN_WRITE_FOOTPRINT,
-                    "the write surface of a shell command could not be established",
-                    reason_code=FindingReason.UNKNOWN_WRITE_FOOTPRINT,
                 )
-            )
+            else:
+                findings.append(
+                    incomplete_finding(
+                        UNKNOWN_WRITE_FOOTPRINT,
+                        "the write surface of a shell command could not be established",
+                        reason_code=FindingReason.UNKNOWN_WRITE_FOOTPRINT,
+                    )
+                )
         if admission[1]:
             # A3: the stale-freeze case — the manifest file changed after this
             # run's admission froze. The scan above already ran with every

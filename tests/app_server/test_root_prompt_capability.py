@@ -8,6 +8,10 @@ from typing import cast
 from chartreux.app_server import _runtime
 from chartreux.app_server.protocol import ClientCapabilities, ClientInfo, SessionOptions
 from chartreux.core.agent_loop import AgentRuntimePolicy
+from chartreux.core.agent_loop._safety_authority import (
+    SafetyLevel,
+    SessionAuthorityState,
+)
 from chartreux.core.config.chartreux_schema import ChartreuxConfigSchema
 from chartreux.core.config.orchestrator import ConfigOrchestrator
 
@@ -102,5 +106,11 @@ def test_runtime_policy_copy_and_child_policy_inherit_capability() -> None:
     loop.agent_manager = SimpleNamespace(config=SimpleNamespace())  # type: ignore[assignment]
     loop.tool_manager = SimpleNamespace(workspace=None)  # type: ignore[assignment]
     loop._authority_revision = 0
+    # v0.8.0 A-P0: the bare loop carries the authority state the policy
+    # properties read (launch-time snapshot plus live state).
+    loop._authority_snapshot = None
+    loop._authority_state = SessionAuthorityState(
+        session_id="test", level=SafetyLevel.SAFE
+    )
     assert loop.runtime_policy.user_input_capability is True
     assert loop.child_runtime_policy.user_input_capability is True

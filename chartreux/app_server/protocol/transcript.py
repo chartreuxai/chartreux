@@ -54,6 +54,8 @@ class AgentTranscriptEntry(ProtocolModel):
     is the content-revision hash used by paging; tool-call digests include their
     matched result because it contributes to the projected effect state.
     Attachment metadata includes names and counts only, never image sources.
+    ``injected`` marks a user message the runtime injected (spawn handoff,
+    per-edit file-state blocks) rather than one the user typed.
     """
 
     entry_id: str = Field(min_length=1, max_length=MAX_AGENT_TRANSCRIPT_ID_LENGTH)
@@ -110,6 +112,7 @@ class AgentTranscriptEntry(ProtocolModel):
     attachment_count: int = Field(default=0, ge=0, exclude_if=lambda value: value == 0)
     truncated: bool = False
     truncation: AgentTranscriptTruncation | None = None
+    injected: bool = Field(default=False, exclude_if=lambda value: not value)
 
     @model_validator(mode="after")
     def validate_entry_payload(self) -> Self:

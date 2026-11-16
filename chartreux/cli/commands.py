@@ -123,15 +123,6 @@ class CommandRegistry:
                 description="Compact conversation history by summarizing. Optionally pass instructions to guide the summary",
                 handler="_compact_history",
             ),
-            "plan": Command(
-                aliases=frozenset(["/plan"]),
-                description=(
-                    "Enter plan mode with an optional theme; /plan accept starts "
-                    "execution and /plan cancel exits"
-                ),
-                handler="_plan_command",
-                side_channel=True,
-            ),
             "exit": Command(
                 aliases=frozenset(["/exit", "exit", "quit", ":q", ":quit"]),
                 description="Exit the application",
@@ -234,6 +225,16 @@ class CommandRegistry:
                 description="Select theme",
                 handler="_show_theme",
             ),
+            "safety": Command(
+                aliases=frozenset(["/safety"]),
+                description=(
+                    "Show or change the session safety level (safe|smart|dangerous). "
+                    "/safety dangerous enters DANGEROUS only through the interactive "
+                    "warning ceremony; /safety safe revokes it atomically."
+                ),
+                handler="_safety_command",
+                side_channel=True,
+            ),
             "tmp-residue": Command(
                 aliases=frozenset(["/tmp-residue"]),
                 description=(
@@ -309,6 +310,9 @@ class CommandRegistry:
             "- `Ctrl+G` Edit input in external editor",
             "- `Ctrl+O` Toggle tool output view",
             "- `Esc Esc` Rewind to a previous message (when input is empty)",
+            "- `Shift+Tab` Cycle safety level (safe -> smart -> dangerous). Cost: "
+            "app-level reverse focus via Shift+Tab is displaced (`Tab` still "
+            "cycles forward; modal screens keep their own Shift+Tab while focused)",
             "",
             "### Special Features",
             "",
