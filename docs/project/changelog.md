@@ -2,6 +2,16 @@
 
 All notable changes to Chartreux are documented in this file.
 
+## 0.8.1 (2026-11-15)
+
+### Fixed
+
+- **Subagent transcript viewer no longer empties on projection failure.** A
+  failure while projecting or applying a transcript update no longer resets
+  the pane to empty: the error is shown as pane feedback with a retry action.
+  An empty live transcript now reads "No live output yet." instead of the
+  saved-transcript wording.
+
 ## 0.8.0 (2026-11-15)
 
 ### Added

@@ -668,9 +668,24 @@ class AgentTranscriptViewer(Vertical):
         ):
             return
         apply_start = time.perf_counter() if debug else 0.0
-        await self._apply_response(
-            response, epoch=epoch, replace=replace, before=before
-        )
+        try:
+            await self._apply_response(
+                response, epoch=epoch, replace=replace, before=before
+            )
+        except Exception:
+            # A projection or mount failure must surface as a visible status,
+            # never as an empty pane: _apply_response may already have cleared
+            # the rendered content (replace=True) before the failure.
+            logger.warning(
+                "Agent transcript apply failed agent=%s", self._agent_id, exc_info=True
+            )
+            if self._is_current(epoch):
+                self._set_feedback(
+                    "Failed: Could not render agent transcript. Displayed content is retained; press r to retry."
+                )
+                if not self._units and not self._known_entries:
+                    await self._show_status("Unable to load saved transcript.")
+            return
         if debug:
             logger.debug(
                 "Agent transcript apply: %.3fs, %d entries",
@@ -951,7 +966,9 @@ class AgentTranscriptViewer(Vertical):
             if not self._is_current(epoch):
                 return
         elif not self._units and (has_entries or replace):
-            await self._show_status("Saved transcript is empty.")
+            await self._show_status(
+                "No live output yet." if self._live else "Saved transcript is empty."
+            )
             if not self._is_current(epoch):
                 return
         await self._enforce_mount_cap(

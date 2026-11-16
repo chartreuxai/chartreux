@@ -1813,3 +1813,78 @@ async def test_injected_file_state_entry_folds_and_expansion_survives_rebuilds()
             .get_content()
             .endswith("(rev 2)\n</file_state_handoff>")
         )
+
+
+@pytest.mark.asyncio
+async def test_apply_response_failure_shows_status_instead_of_empty_pane(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A projection/mount crash must surface a visible status, never an empty pane."""
+
+    def boom(self: AgentTranscriptViewer, entry: AgentTranscriptEntry) -> Any:
+        raise ValueError("projection exploded")
+
+    monkeypatch.setattr(AgentTranscriptViewer, "_history_entry", boom)
+    source = _FakeSource()
+    app = _ViewerApp(source)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        source.respond(0, _available(_entry("e1", "hello", created_at=0)))
+        await _wait_for_rest(app.viewer)
+        await pilot.pause()
+        viewer = app.viewer
+        status = viewer._status_widget
+        assert status is not None
+        assert "Unable to load saved transcript." in str(status.render())
+        # The pane holds exactly the status widget — not zero children.
+        content = viewer._content
+        assert content is not None
+        assert list(content.children) == [status]
+        feedback = viewer.query_one("#agent-transcript-feedback", Static)
+        assert "Failed: Could not render agent transcript" in str(feedback.render())
+        worker = viewer._operation_worker
+        assert worker is None or str(worker.state) != "WorkerState.ERROR"
+
+
+@pytest.mark.asyncio
+async def test_live_agent_with_zero_messages_shows_live_empty_status() -> None:
+    source = _FakeSource()
+    app = _ViewerApp(source, live=True)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        source.respond(
+            0,
+            AgentTranscriptGetResponse(
+                state=AgentTranscriptState.AVAILABLE,
+                entries=[],
+                oldest_cursor=None,
+                has_more=False,
+            ),
+        )
+        await _wait_for_rest(app.viewer)
+        await pilot.pause()
+        status = app.viewer._status_widget
+        assert status is not None
+        assert "No live output yet." in str(status.render())
+
+
+@pytest.mark.asyncio
+async def test_saved_transcript_with_zero_entries_shows_empty_status() -> None:
+    source = _FakeSource()
+    app = _ViewerApp(source)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        source.respond(
+            0,
+            AgentTranscriptGetResponse(
+                state=AgentTranscriptState.AVAILABLE,
+                entries=[],
+                oldest_cursor=None,
+                has_more=False,
+            ),
+        )
+        await _wait_for_rest(app.viewer)
+        await pilot.pause()
+        status = app.viewer._status_widget
+        assert status is not None
+        assert "Saved transcript is empty." in str(status.render())
